@@ -493,7 +493,7 @@ final class JobProcessor: @unchecked Sendable {
                     metadata: decodedMessage.metadata,
                     symmetricKey: symmetricKey
                 )
-                try await cache.createCommunicationType(communicationModel)
+                try await cache.createCommunication(communicationModel)
             }
             
             let messageModel = try await createInboundMessageModel(
@@ -504,7 +504,7 @@ final class JobProcessor: @unchecked Sendable {
                 sessionIdentity: sessionIdentity
             )
             if shouldUpdateCommunication {
-                try await cache.updateCommunicationType(communicationModel)
+                try await cache.updateCommunication(communicationModel)
             }
             try await cache.createMessage(messageModel)
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
@@ -535,7 +535,7 @@ final class JobProcessor: @unchecked Sendable {
         sender: String,
         cache: SessionCache
     ) async throws -> CommunicationModel {
-        guard let foundCommunication = try await cache.fetchCommunicationTypes().asyncFirst(where: { model in
+        guard let foundCommunication = try await cache.fetchCommunications().asyncFirst(where: { model in
             guard let props = await model.props else { fatalError() }
             return props.members.contains(recipient) && props.members.contains(sender)
         }) else {
@@ -577,7 +577,7 @@ final class JobProcessor: @unchecked Sendable {
         var newProps = communicationProps
         newProps.messageCount = newMessageCount
         _ = try await communication.updateProps(symmetricKey: symmetricKey, props: newProps)
-        try await session.cache?.updateCommunicationType(communication)
+        try await session.cache?.updateCommunication(communication)
         return messageModel
     }
     

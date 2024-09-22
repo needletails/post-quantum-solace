@@ -46,10 +46,10 @@ public protocol CryptoSessionStore: Sendable {
     func updateContact(_ contact: ContactModel) async throws
     func removeContact(_ contact: ContactModel) async throws
 
-    func fetchCommunicationTypes() async throws -> [CommunicationModel]
-    func createCommunicationType(_ type: CommunicationModel) async throws
-    func updateCommunicationType(_ type: CommunicationModel) async throws
-    func removeCommunicationType(_ type: CommunicationModel) async throws
+    func fetchCommunications() async throws -> [CommunicationModel]
+    func createCommunication(_ type: CommunicationModel) async throws
+    func updateCommunication(_ type: CommunicationModel) async throws
+    func removeCommunication(_ type: CommunicationModel) async throws
     
     func fetchMessage(byId messageId: UUID) async throws -> MessageModel
     func fetchMessage(by sharedMessageId: String) async throws -> MessageModel

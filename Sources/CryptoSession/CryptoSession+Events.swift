@@ -501,7 +501,7 @@ actor TaskProcessor {
         
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         if shouldUpdateCommunication {
-            try await cache.updateCommunicationType(communication)
+            try await cache.updateCommunication(communication)
         }
         try await cache.createMessage(messageModel)
         return messageModel

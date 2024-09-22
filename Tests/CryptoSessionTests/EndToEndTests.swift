@@ -362,19 +362,19 @@ final class MockIdentityStore: CryptoSessionStore, @unchecked Sendable {
         
     }
     
-    func fetchCommunicationTypes() async throws -> [CommunicationModel] {
+    func fetchCommunications() async throws -> [CommunicationModel] {
         []
     }
     
-    func createCommunicationType(_ type: CommunicationModel) async throws {
+    func createCommunication(_ type: CommunicationModel) async throws {
         
     }
     
-    func updateCommunicationType(_ type: CommunicationModel) async throws {
+    func updateCommunication(_ type: CommunicationModel) async throws {
         
     }
     
-    func removeCommunicationType(_ type: CommunicationModel) async throws {
+    func removeCommunication(_ type: CommunicationModel) async throws {
         
     }
     
