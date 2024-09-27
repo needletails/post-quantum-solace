@@ -18,13 +18,13 @@ public struct SessionContext: Codable & Sendable {
     }
     
     /// The session user associated with this context.
-    var sessionUser: SessionUser
+    public var sessionUser: SessionUser
     /// Data representing the encryption key used for securing the database.
-    let databaseEncryptionKey: Data
+    public let databaseEncryptionKey: Data
     /// Unique identifier for the device associated with the session.
-    let sessionContextId: Int
+    public let sessionContextId: Int
     /// The last user configuration associated with the session.
-    var lastUserConfiguration: UserConfiguration
+    public var lastUserConfiguration: UserConfiguration
     /// The current registration state of the user.
-    var registrationState: RegistrationState
+    public var registrationState: RegistrationState
 }

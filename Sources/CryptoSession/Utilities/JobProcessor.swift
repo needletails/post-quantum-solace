@@ -269,6 +269,7 @@ final class JobProcessor: @unchecked Sendable {
         }
     }
     
+    //Outbound
     private func handleWriteMessage(
         outboundTask: OutboundTaskMessage,
         session: CryptoSession
@@ -309,13 +310,19 @@ final class JobProcessor: @unchecked Sendable {
         
         try await session.transportDelegate?.sendMessage(
             signedMessage,
-            to: sessionUser.secretName,
-            with: sessionUser.deviceIdentity,
-            pushType: outboundTask.message.pushType,
-            remoteId: outboundTask.sharedMessageIdentity
-        )
+            metadata: SignedRatchetMessageMetadata(
+                secretName: sessionUser.secretName,
+                deviceIdentity: sessionUser.deviceIdentity,
+                pushType: outboundTask.message.pushType,
+                sharedMessageIdentifier: outboundTask.sharedMessageIdentity,
+                messageType: outboundTask.message.messageType,
+                messageFlags: outboundTask.message.messageFlags,
+                recipient: outboundTask.message.recipient
+            ))
     }
     
+    
+    //Inbound
     private func handleStreamMessage(
         inboundTask: InboundTaskMessage,
         session: CryptoSession
@@ -359,7 +366,7 @@ final class JobProcessor: @unchecked Sendable {
                 //Create or update contact including new metadata
                 _ = try await session.createContact(secretName: sessionContext.sessionUser.secretName, metadata: encodedMetadata)
             case .deliveryStateChange:
-                let decodedMetadata = try BSONDecoder().decode(DeliverStateMetadata.self, from: decodedMessage.metadata)
+                let decodedMetadata = try BSONDecoder().decode(DeliveryStateMetadata.self, from: decodedMessage.metadata)
                 let symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
                 let foundMessage = try await cache.fetchMessage(by: decodedMetadata.messageId)
                 guard var props = await foundMessage.props else { fatalError() }
@@ -373,7 +380,7 @@ final class JobProcessor: @unchecked Sendable {
                 props.message = decodedMessage
                 _ = try await foundMessage.updateProps(symmetricKey: symmetricKey, props: props)
                 await session.receiverDelegate?.updatedMessage(foundMessage)
-            case .none:
+            default:
                 break
             }
             // Save
@@ -391,7 +398,7 @@ final class JobProcessor: @unchecked Sendable {
     func fetchSessionIdentity(for
                               outboundTask: OutboundTaskMessage,
                               cache: SessionCache
-    ) async throws -> SessionIdentityModel? {
+    ) async throws -> SessionIdentity? {
         for identity in try await cache.fetchSessionIdentities() {
             guard let props = await identity.props else { fatalError() }
             if props.secretName == outboundTask.recipientSecretName, props.deviceIdentity == outboundTask.recipientDeviceIdentity {
@@ -436,7 +443,7 @@ final class JobProcessor: @unchecked Sendable {
     }
     
     private func initializeRecipient(
-        sessionIdentity: SessionIdentityModel,
+        sessionIdentity: SessionIdentity,
         session: CryptoSession,
         encryptedMessage: EncryptedMessage
     ) async throws -> Data {
@@ -466,7 +473,7 @@ final class JobProcessor: @unchecked Sendable {
                                       decodedMessage: CryptoMessage,
                                       inboundTask: InboundTaskMessage,
                                       session: CryptoSession,
-                                      sessionIdentity: SessionIdentityModel
+                                      sessionIdentity: SessionIdentity
     ) async throws {
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         switch decodedMessage.recipient {
@@ -474,7 +481,7 @@ final class JobProcessor: @unchecked Sendable {
             let sender = inboundTask.senderSecretName
             
             let symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
-            var communicationModel: CommunicationModel
+            var communicationModel: BaseCommunication
             var shouldUpdateCommunication = false
             do {
                 communicationModel = try await findCommunicationType(
@@ -518,8 +525,8 @@ final class JobProcessor: @unchecked Sendable {
         recipients: Set<String>,
         metadata: Document,
         symmetricKey: SymmetricKey
-    ) async throws -> CommunicationModel {
-        return try CommunicationModel(
+    ) async throws -> BaseCommunication {
+        return try BaseCommunication(
             props: .init(
                 messageCount: 0,
                 members: recipients,
@@ -534,7 +541,7 @@ final class JobProcessor: @unchecked Sendable {
         for recipient: String,
         sender: String,
         cache: SessionCache
-    ) async throws -> CommunicationModel {
+    ) async throws -> BaseCommunication {
         guard let foundCommunication = try await cache.fetchCommunications().asyncFirst(where: { model in
             guard let props = await model.props else { fatalError() }
             return props.members.contains(recipient) && props.members.contains(sender)
@@ -549,9 +556,9 @@ final class JobProcessor: @unchecked Sendable {
         decodedMessage: CryptoMessage,
         inboundTask: InboundTaskMessage,
         session: CryptoSession,
-        communication: CommunicationModel,
-        sessionIdentity: SessionIdentityModel
-    ) async throws -> MessageModel {
+        communication: BaseCommunication,
+        sessionIdentity: SessionIdentity
+    ) async throws -> PrivateMessage {
         guard let identityProps = await sessionIdentity.props else { fatalError() }
         guard let communicationProps = await communication.props else {
             throw CryptoSession.SessionErrors.cannotFindCommunication
@@ -559,7 +566,7 @@ final class JobProcessor: @unchecked Sendable {
         
         let newMessageCount = communicationProps.messageCount + 1
         let symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
-        let messageModel = try await MessageModel(
+        let messageModel = try await PrivateMessage(
             communicationID: communication.id,
             senderIdentity: identityProps.senderIdentity,
             sharedMessageIdentity: UUID().uuidString,
@@ -581,7 +588,7 @@ final class JobProcessor: @unchecked Sendable {
         return messageModel
     }
     
-    private func verifyEncryptedMessage(cache: SessionCache, inboundTask: InboundTaskMessage) async throws -> (EncryptedMessage, SessionIdentityModel) {
+    private func verifyEncryptedMessage(cache: SessionCache, inboundTask: InboundTaskMessage) async throws -> (EncryptedMessage, SessionIdentity) {
         // Fetch identities from the session cache
         let identities = try await cache.fetchSessionIdentities()
         

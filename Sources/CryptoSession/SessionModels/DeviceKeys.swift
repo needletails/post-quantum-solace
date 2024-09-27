@@ -16,9 +16,9 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     }
     
     /// Unique identifier for the device.
-    let deviceIdentity: UUID
+    public let deviceIdentity: UUID
     /// Data representing the private signing identity of the device.
-    let privateSigningKey: Data
+    public let privateSigningKey: Data
     /// Data representing the private key of the device.
-    let privateKey: Data
+    public let privateKey: Data
 }

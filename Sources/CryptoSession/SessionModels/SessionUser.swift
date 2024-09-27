@@ -15,9 +15,9 @@ public struct SessionUser: Codable & Sendable {
         case deviceKeys = "c"    // Key for the device keys
     }
     /// The name of the secret associated with the session user.
-    let secretName: String
+    public let secretName: String
     /// Unique identifier for the device associated with the session user.
-    let deviceIdentity: UUID
+    public let deviceIdentity: UUID
     /// The device keys associated with the session user.
-    let deviceKeys: DeviceKeys
+    public let deviceKeys: DeviceKeys
 }

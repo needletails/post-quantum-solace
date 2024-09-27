@@ -7,6 +7,24 @@
 import Foundation
 import DoubleRatchetKit
 
+/// This metadata needs to be handle with care Ideally none of it should be sent over the wire. It should just be used to prepare the message for sending. 
+public struct SignedRatchetMessageMetadata: Sendable {
+    /// Recipient secretName
+    public let secretName: String
+    /// Recipient deviceIdentity
+    public let deviceIdentity: UUID
+    /// Push Notification Type
+    public let pushType: PushNotificationType
+    /// Shared Message Identifier
+    public let sharedMessageIdentifier: String
+    /// The message type
+    public let messageType: MessageType
+    /// A flag for the given message type
+    public let messageFlags: MessageFlags
+    /// The recipeint type
+    public let recipient: MessageRecipient
+}
+
 // Define a protocol for session transport
 public protocol SessionTransport: Sendable {
     
@@ -15,10 +33,7 @@ public protocol SessionTransport: Sendable {
     /// - Throws: An error if the message could not be sent.
     func sendMessage(_
                      message: SignedRatchetMessage,
-                     to secretName: String,
-                     with deviceIdentity: UUID,
-                     pushType: PushNotificationType,
-                     remoteId: String) async throws
+                     metadata: SignedRatchetMessageMetadata) async throws
     
     /// Receives a message from the network.
     /// - Returns: The received message.

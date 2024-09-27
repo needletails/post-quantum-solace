@@ -12,15 +12,16 @@ import NeedleTailCrypto
 import DoubleRatchetKit
 @preconcurrency import Crypto
 
-public struct Contact: Sendable, Codable {
+public struct Contact: Sendable, Codable, Equatable {
+    public let id: UUID
     public let secretName: String
     public var configuration: UserConfiguration
     public var metadata: Document
 }
 
 public final class ContactModel: Codable, @unchecked Sendable {
-    let id = UUID()
-    var data: Data
+    public let id = UUID()
+    public var data: Data
     
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case id = "a"
@@ -31,7 +32,7 @@ public final class ContactModel: Codable, @unchecked Sendable {
     private var symmetricKey: SymmetricKey?
     
     /// Asynchronously retrieves the decrypted properties, if available.
-    var props: UnwrappedProps? {
+    public var props: UnwrappedProps? {
         get async {
             do {
                 guard let symmetricKey = symmetricKey else { return nil }
@@ -65,6 +66,10 @@ public final class ContactModel: Codable, @unchecked Sendable {
             throw CryptoError.encryptionFailed
         }
         self.data = encryptedData
+    }
+    
+    public init(data: Data) {
+        self.data = data
     }
     
     /// Asynchronously sets the properties of the model using the provided symmetric key.
@@ -101,4 +106,27 @@ public final class ContactModel: Codable, @unchecked Sendable {
         props.metadata = metadata
         return try await updateProps(symmetricKey: symmetricKey, props: props)
     }
+}
+
+
+public struct ContactMetadata: Codable, Sendable {
+    public var status: String?
+    public var nickname: String?
+    public var firstName: String?
+    public var lastName: String?
+    public var email: String?
+    public var phone: String?
+    public var image: Data?
+}
+
+
+public struct DataPacket: Codable, Sendable {
+    public let id: UUID
+    public var data: Data
+    
+    public init(id: UUID, data: Data) {
+        self.id = id
+        self.data = data
+    }
+    
 }

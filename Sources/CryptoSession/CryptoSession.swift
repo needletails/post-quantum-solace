@@ -265,7 +265,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             }
             
             // Decode the session context from the decrypted data
-            let sessionContext = try! BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+            let sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
             
             setAppPassword(appPassword)
             await setSessionContext(sessionContext)
@@ -293,6 +293,19 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         return await crypto.deriveStrictSymmetricKey(
             data: passwordData,
             salt: saltData)
+    }
+    
+    public func verifyAppPassword(_ appPassword: String) async -> Bool {
+        do {
+            let salt = try await self.cache?.findLocalDeviceSalt()
+            let appEncryptionKey = try await getAppSymmetricKey(password: appPassword)
+            guard let data = try await self.cache?.findLocalDeviceConfiguration() else { return false }
+            let box = try AES.GCM.SealedBox(combined: data)
+            _ = try AES.GCM.open(box, using: appEncryptionKey)
+            return true
+        } catch {
+            return false
+        }
     }
     
     func loadSessionContextCache() async throws {

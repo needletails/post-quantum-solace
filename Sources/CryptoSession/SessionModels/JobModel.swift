@@ -11,8 +11,8 @@ import DoubleRatchetKit
 @preconcurrency import Crypto
 
 public final class JobModel: Codable, @unchecked Sendable {
-    let id = UUID()
-    var data: Data
+    public let id = UUID()
+    public var data: Data
     
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case id = "a"
@@ -63,6 +63,10 @@ public final class JobModel: Codable, @unchecked Sendable {
             throw CryptoError.encryptionFailed
         }
         self.data = encryptedData
+    }
+    
+    public init(data: Data) {
+        self.data = data
     }
     
     /// Asynchronously sets the properties of the model using the provided symmetric key.

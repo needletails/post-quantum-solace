@@ -7,9 +7,9 @@
 
 import DoubleRatchetKit
 
-public protocol NTMessageReceiver: Codable, Sendable {
-    func createdMessage(_ message: MessageModel) async
-    func updatedMessage(_ message: MessageModel) async
+public protocol NTMessageReceiver: Sendable {
+    func createdMessage(_ message: PrivateMessage) async
+    func updatedMessage(_ message: PrivateMessage) async
     func createContact(_ contact: Contact) async
     func contactMetadata(changed for: Contact) async
 }

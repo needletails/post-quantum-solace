@@ -6,8 +6,8 @@ import PackageDescription
 let package = Package(
     name: "crypto-session",
     platforms: [
-        .macOS(.v13),
-        .iOS(.v16),
+        .macOS(.v14),
+        .iOS(.v17),
     ],
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
@@ -17,7 +17,8 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", .upToNextMajor(from: "3.7.1")),
-        .package(url: "git@github.com:needle-tail/double-ratchet-kit.git", branch: "main"),
+//        .package(url: "git@github.com:needle-tail/double-ratchet-kit.git", branch: "main"),
+        .package(path: "../double-ratchet-kit"),
         .package(url: "git@github.com:needle-tail/needletail-crypto.git", branch: "main")
     ],
     targets: [

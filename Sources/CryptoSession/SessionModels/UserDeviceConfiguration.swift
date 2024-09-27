@@ -17,13 +17,13 @@ enum SigningErrors: Error {
 public struct UserDeviceConfiguration: Codable, Sendable {
     
     /// Unique identifier for the device.
-    let deviceIdentity: UUID
+    public let deviceIdentity: UUID
     /// Data representing the signing identity of the device.
-    let publicSigningKey: Data
+    public let publicSigningKey: Data
     /// Public key associated with the device.
-    let publicKey: Data
+    public let publicKey: Data
     /// A flag indicating if this device is the master device.
-    let isMasterDevice: Bool
+    public let isMasterDevice: Bool
 
     /// Coding keys for encoding and decoding the struct.
     enum CodingKeys: String, CodingKey, Codable, Sendable {
@@ -40,7 +40,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     ///   - publicKey: The public key data.
     ///   - isMasterDevice: A flag indicating if this is the master device.
     /// - Throws: An error if signing the configuration fails.
-    init(
+   public init(
         deviceIdentity: UUID,
         publicSigningKey: Data,
         publicKey: Data,

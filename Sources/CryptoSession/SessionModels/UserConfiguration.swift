@@ -18,8 +18,8 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
     }
     
     /// Data representing the signing identity of the user.
-    let publicSigningKey: Data
-    var signed: Signed?
+    public let publicSigningKey: Data
+    public var signed: Signed?
     
     /// An array of auxiliary device configurations associated with the user.
     /// Each `UserDeviceConfiguration` can be signed and verified.
@@ -49,7 +49,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
     public struct Signed: Codable, Sendable {
         
         /// The encoded data of the configuration.
-        let data: Data
+        public let data: Data
         let signature: Data
         
         /// Coding keys for encoding and decoding the signed struct.
@@ -81,6 +81,16 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         }
     }
 
+    public func getVerifiedDevices() throws -> [UserDeviceConfiguration] {
+        let publicKey = try Curve25519SigningPublicKey(rawRepresentation: publicSigningKey)
+        guard let signed = signed else { throw CryptoSession.SessionErrors.invalidSignature }
+        if try signed.verifySignature(publicKey: publicKey) {
+            let devices = try BSONDecoder().decodeData([UserDeviceConfiguration].self, from: signed.data)
+            return devices
+        } else {
+            return []
+        }
+    }
     
     public static func ==(lhs: UserConfiguration, rhs: UserConfiguration) -> Bool {
         return lhs.publicSigningKey == rhs.publicSigningKey
