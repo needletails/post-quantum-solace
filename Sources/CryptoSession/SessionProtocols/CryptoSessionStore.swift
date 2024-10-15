@@ -8,9 +8,14 @@ import Foundation
 import NeedleTailCrypto
 import DoubleRatchetKit
 
+
+public enum Ordering: Sendable {
+    case ascending, descending
+}
+
 /// A protocol that defines CRUD operations for managing device configurations in a database store.
 public protocol CryptoSessionStore: Sendable {
-    //TODO: Better names maybe createSessionContext, etc.
+    
     /// Creates a local device configuration with the provided data.
     /// - Parameter data: The configuration data to be stored.
     /// - Throws: An error if the operation fails, such as if the data is invalid or if there is a database error.
@@ -44,7 +49,7 @@ public protocol CryptoSessionStore: Sendable {
     func fetchContacts() async throws -> [ContactModel]
     func createContact(_ contact: ContactModel) async throws
     func updateContact(_ contact: ContactModel) async throws
-    func removeContact(_ contact: ContactModel) async throws
+    func removeContact(_ id: UUID) async throws
 
     func fetchCommunications() async throws -> [BaseCommunication]
     func createCommunication(_ type: BaseCommunication) async throws
@@ -57,8 +62,9 @@ public protocol CryptoSessionStore: Sendable {
     func updateMessage(_ message: PrivateMessage) async throws
     func removeMessage(_ message: PrivateMessage) async throws
     func listMessages(
-        in communication: UUID,
-        senderId: Int,
+        in communicationIdentity: UUID,
+        sessionContextId: Int,
+        ordering: Ordering,
         minimumOrder: Int?,
         maximumOrder: Int?,
         offsetBy: Int,

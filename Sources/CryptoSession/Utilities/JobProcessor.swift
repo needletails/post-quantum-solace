@@ -358,13 +358,12 @@ final class JobProcessor: @unchecked Sendable {
             switch decodedMessage.messageFlags {
             case .friendshipStateRequest:
                 // Create/Update Contact and modify metadata
-                
                 var decodedMetadata = try BSONDecoder().decode(FriendshipMetadata.self, from: decodedMessage.metadata)
                 //Switch states mine is theirs and theirs is mine
                 decodedMetadata.switchStates()
                 let encodedMetadata = try BSONEncoder().encode(decodedMetadata)
                 //Create or update contact including new metadata
-                _ = try await session.createContact(secretName: sessionContext.sessionUser.secretName, metadata: encodedMetadata)
+                _ = try await session.updateOrCreateContact(secretName: sessionContext.sessionUser.secretName, metadata: encodedMetadata)
             case .deliveryStateChange:
                 let decodedMetadata = try BSONDecoder().decode(DeliveryStateMetadata.self, from: decodedMessage.metadata)
                 let symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
@@ -469,6 +468,7 @@ final class JobProcessor: @unchecked Sendable {
         )
     }
     
+    /// This only handles Private Messages desipite their Communication Type. The Recipient is for reference in looking up communication models, but is not actually persisted. On initial creation of the Communication Model we need to tell it the needed metadata. If it is not on the decoded recipient and the communicationModel is not already existing, then it should be in the message metadata. like the members, admin, organizers, etc.
     private func handleDecodedMessage(_
                                       decodedMessage: CryptoMessage,
                                       inboundTask: InboundTaskMessage,
@@ -476,6 +476,7 @@ final class JobProcessor: @unchecked Sendable {
                                       sessionIdentity: SessionIdentity
     ) async throws {
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
+        
         switch decodedMessage.recipient {
         case .nickname(let recipient):
             let sender = inboundTask.senderSecretName
@@ -485,9 +486,8 @@ final class JobProcessor: @unchecked Sendable {
             var shouldUpdateCommunication = false
             do {
                 communicationModel = try await findCommunicationType(
-                    for: recipient,
-                    sender: sender,
-                    cache: cache
+                    cache: cache,
+                    communicationType: decodedMessage.recipient
                 )
                 
                 guard var newProps = await communicationModel.props else { fatalError() }
@@ -497,6 +497,7 @@ final class JobProcessor: @unchecked Sendable {
             } catch {
                 communicationModel = try await createCommunicationModel(
                     recipients: [sender, recipient],
+                    communicationType: decodedMessage.recipient,
                     metadata: decodedMessage.metadata,
                     symmetricKey: symmetricKey
                 )
@@ -516,13 +517,88 @@ final class JobProcessor: @unchecked Sendable {
             try await cache.createMessage(messageModel)
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
-        case .channel, .broadcast, .personalMessage:
+        case .personalMessage:
+            
+            let sender = inboundTask.senderSecretName
+            
+            let symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
+            var communicationModel: BaseCommunication
+            var shouldUpdateCommunication = false
+            do {
+                communicationModel = try await findCommunicationType(
+                    cache: cache,
+                    communicationType: decodedMessage.recipient
+                )
+                
+                guard var newProps = await communicationModel.props else { fatalError() }
+                newProps.messageCount += 1
+                _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: newProps)
+                shouldUpdateCommunication = true
+            } catch {
+                communicationModel = try await createCommunicationModel(
+                    recipients: [sender],
+                    communicationType: decodedMessage.recipient,
+                    metadata: decodedMessage.metadata,
+                    symmetricKey: symmetricKey
+                )
+                try await cache.createCommunication(communicationModel)
+            }
+            
+            let messageModel = try await createInboundMessageModel(
+                decodedMessage: decodedMessage,
+                inboundTask: inboundTask,
+                session: session,
+                communication: communicationModel,
+                sessionIdentity: sessionIdentity
+            )
+            if shouldUpdateCommunication {
+                try await cache.updateCommunication(communicationModel)
+            }
+            try await cache.createMessage(messageModel)
+            /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
+            await session.receiverDelegate?.createdMessage(messageModel)
+        case .channel(let channelName):
+            
+            let sender = inboundTask.senderSecretName
+            
+            let symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
+            var communicationModel: BaseCommunication
+            var shouldUpdateCommunication = false
+
+                //Channel Models need to be created before a message is sent or received
+                communicationModel = try await findCommunicationType(
+                    cache: cache,
+                    communicationType: decodedMessage.recipient
+                )
+                
+                guard var newProps = await communicationModel.props else { fatalError() }
+                newProps.messageCount += 1
+                _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: newProps)
+                shouldUpdateCommunication = true
+            
+            let messageModel = try await createInboundMessageModel(
+                decodedMessage: decodedMessage,
+                inboundTask: inboundTask,
+                session: session,
+                communication: communicationModel,
+                sessionIdentity: sessionIdentity
+            )
+            if shouldUpdateCommunication {
+                try await cache.updateCommunication(communicationModel)
+            }
+            try await cache.createMessage(messageModel)
+            /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
+            await session.receiverDelegate?.createdMessage(messageModel)
+                
+        case .broadcast:
+            //Broadcast messages are not persiseted yet
             break
         }
     }
     
     internal func createCommunicationModel(
         recipients: Set<String>,
+        communicationType: MessageRecipient,
         metadata: Document,
         symmetricKey: SymmetricKey
     ) async throws -> BaseCommunication {
@@ -531,20 +607,20 @@ final class JobProcessor: @unchecked Sendable {
                 messageCount: 0,
                 members: recipients,
                 metadata: metadata,
-                blockedMembers: []
+                blockedMembers: [],
+                communicationType: communicationType
             ),
             symmetricKey: symmetricKey
         )
     }
     
     internal func findCommunicationType(
-        for recipient: String,
-        sender: String,
-        cache: SessionCache
+        cache: SessionCache,
+        communicationType: MessageRecipient
     ) async throws -> BaseCommunication {
         guard let foundCommunication = try await cache.fetchCommunications().asyncFirst(where: { model in
             guard let props = await model.props else { fatalError() }
-            return props.members.contains(recipient) && props.members.contains(sender)
+            return props.communicationType == communicationType
         }) else {
             throw CryptoSession.SessionErrors.cannotFindCommunication // Replace with your specific error type
         }
@@ -567,7 +643,7 @@ final class JobProcessor: @unchecked Sendable {
         let newMessageCount = communicationProps.messageCount + 1
         let symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
         let messageModel = try await PrivateMessage(
-            communicationID: communication.id,
+            communicationIdentity: communication.id,
             senderIdentity: identityProps.senderIdentity,
             sharedMessageIdentity: UUID().uuidString,
             sequenceId: newMessageCount,

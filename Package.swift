@@ -16,7 +16,7 @@ let package = Package(
             targets: ["CryptoSession"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-crypto.git", .upToNextMajor(from: "3.7.1")),
+        .package(url: "https://github.com/apple/swift-crypto.git", .upToNextMajor(from: "3.8.0")),
 //        .package(url: "git@github.com:needle-tail/double-ratchet-kit.git", branch: "main"),
         .package(path: "../double-ratchet-kit"),
         .package(url: "git@github.com:needle-tail/needletail-crypto.git", branch: "main")

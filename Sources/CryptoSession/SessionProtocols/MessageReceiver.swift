@@ -12,4 +12,5 @@ public protocol NTMessageReceiver: Sendable {
     func updatedMessage(_ message: PrivateMessage) async
     func createContact(_ contact: Contact) async
     func contactMetadata(changed for: Contact) async
+    func newDeviceRequest(configuration: UserDeviceConfiguration) async
 }

@@ -16,7 +16,7 @@ protocol SessionCacheSynchronizer {
 }
 
 /// An actor that manages session caching and synchronization.
-actor SessionCache: CryptoSessionStore {
+public actor SessionCache: CryptoSessionStore {
     
     // MARK: - Properties
     
@@ -78,7 +78,7 @@ actor SessionCache: CryptoSessionStore {
     /// Creates a local device configuration and caches it.
     /// - Parameter data: The configuration data to be cached.
     /// - Throws: An error if the creation fails.
-    func createLocalDeviceConfiguration(_ data: Data) async throws {
+   public func createLocalDeviceConfiguration(_ data: Data) async throws {
         try await store.createLocalDeviceConfiguration(data)
         localDeviceConfiguration = data // Cache the data directly
     }
@@ -86,7 +86,7 @@ actor SessionCache: CryptoSessionStore {
     /// Finds the local device configuration, either from cache or the store.
     /// - Returns: The cached or fetched configuration data.
     /// - Throws: An error if the configuration cannot be found.
-    func findLocalDeviceConfiguration() async throws -> Data {
+   public func findLocalDeviceConfiguration() async throws -> Data {
         if let cachedConfig = localDeviceConfiguration {
             return cachedConfig
         }
@@ -100,14 +100,14 @@ actor SessionCache: CryptoSessionStore {
     /// Updates the local device configuration and refreshes the cache.
     /// - Parameter data: The new configuration data.
     /// - Throws: An error if the update fails.
-    func updateLocalDeviceConfiguration(_ data: Data) async throws {
+   public func updateLocalDeviceConfiguration(_ data: Data) async throws {
         try await store.updateLocalDeviceConfiguration(data)
         localDeviceConfiguration = data // Cache the updated data directly
     }
     
     /// Deletes the local device configuration and clears the cache.
     /// - Throws: An error if the deletion fails.
-    func deleteLocalDeviceConfiguration() async throws {
+   public func deleteLocalDeviceConfiguration() async throws {
         try await store.deleteLocalDeviceConfiguration()
         localDeviceConfiguration = nil
     }
@@ -117,7 +117,7 @@ actor SessionCache: CryptoSessionStore {
     /// Finds the local device salt, either from cache or the store.
     /// - Returns: The cached or fetched salt.
     /// - Throws: An error if the salt cannot be found.
-    func findLocalDeviceSalt() async throws -> String {
+   public func findLocalDeviceSalt() async throws -> String {
         if let cachedSalt = localDeviceSalt {
             return cachedSalt
         }
@@ -133,7 +133,7 @@ actor SessionCache: CryptoSessionStore {
     /// Creates a new session identity and caches it.
     /// - Parameter session: The session identity to be created.
     /// - Throws: An error if the creation fails.
-    func createSessionIdentity(_ session: SessionIdentity) async throws {
+   public func createSessionIdentity(_ session: SessionIdentity) async throws {
         try await store.createSessionIdentity(session)
         sessionIdentities.append(session)
     }
@@ -141,7 +141,7 @@ actor SessionCache: CryptoSessionStore {
     /// Fetches all session identities from the store and updates the cache.
     /// - Returns: An array of session identities.
     /// - Throws: An error if fetching fails.
-    func fetchSessionIdentities() async throws -> [SessionIdentity] {
+   public func fetchSessionIdentities() async throws -> [SessionIdentity] {
         let identities = try await store.fetchSessionIdentities()
         sessionIdentities = identities // Update the cache
         return sessionIdentities
@@ -150,7 +150,7 @@ actor SessionCache: CryptoSessionStore {
     /// Updates an existing session identity.
     /// - Parameter session: The session identity to be updated.
     /// - Throws: An error if the update fails.
-    func updateSessionIdentity(_ session: SessionIdentity) async throws {
+   public func updateSessionIdentity(_ session: SessionIdentity) async throws {
         if let index = sessionIdentities.firstIndex(where: { $0.id == session.id }) {
             sessionIdentities[index] = session
             try await store.updateSessionIdentity(session)
@@ -162,7 +162,7 @@ actor SessionCache: CryptoSessionStore {
     /// Removes a session identity from the cache and store.
     /// - Parameter session: The session identity to be removed.
     /// - Throws: An error if the removal fails.
-    func removeSessionIdentity(_ session: SessionIdentity) async throws {
+    public func removeSessionIdentity(_ session: SessionIdentity) async throws {
         sessionIdentities.removeAll(where: { $0.id == session.id })
         try await store.removeSessionIdentity(session)
     }
@@ -173,13 +173,14 @@ actor SessionCache: CryptoSessionStore {
     /// - Parameter messageId: The ID of the message to fetch.
     /// - Returns: The fetched message.
     /// - Throws: An error if fetching fails.
-    func fetchMessage(byId messageId: UUID) async throws -> PrivateMessage {
+    public func fetchMessage(byId messageId: UUID) async throws -> PrivateMessage {
         if let message = messages.first(where: { $0.id == messageId }) {
             return message
+        } else {
+            let message = try await store.fetchMessage(byId: messageId)
+            messages.append(message) // Cache the fetched message
+            return message
         }
-        let message = try await store.fetchMessage(byId: messageId)
-        messages.append(message) // Cache the fetched message
-        return message
     }
     
     
@@ -187,19 +188,20 @@ actor SessionCache: CryptoSessionStore {
     /// - Parameter sharedMessageId: The shared message ID of the message to fetch.
     /// - Returns: The fetched message.
     /// - Throws: An error if fetching fails.
-    func fetchMessage(by sharedMessageId: String) async throws -> DoubleRatchetKit.PrivateMessage {
+    public func fetchMessage(by sharedMessageId: String) async throws -> DoubleRatchetKit.PrivateMessage {
         if let message = messages.first(where: { $0.sharedMessageIdentity == sharedMessageId }) {
             return message
+        } else {
+            let message = try await store.fetchMessage(by: sharedMessageId)
+            messages.append(message) // Cache the fetched message
+            return message
         }
-        let message = try await store.fetchMessage(by: sharedMessageId)
-        messages.append(message) // Cache the fetched message
-        return message
     }
     
     /// Creates a new message and caches it.
     /// - Parameter message: The message to be created.
     /// - Throws: An error if the creation fails.
-    func createMessage(_ message: PrivateMessage) async throws {
+    public func createMessage(_ message: PrivateMessage) async throws {
         try await store.createMessage(message)
         messages.append(message)
     }
@@ -207,7 +209,7 @@ actor SessionCache: CryptoSessionStore {
     /// Updates an existing message.
     /// - Parameter message: The message to be updated.
     /// - Throws: An error if the update fails.
-    func updateMessage(_ message: PrivateMessage) async throws {
+    public func updateMessage(_ message: PrivateMessage) async throws {
         if let index = messages.firstIndex(where: { $0.id == message.id }) {
             messages[index] = message
             try await store.updateMessage(message)
@@ -219,7 +221,7 @@ actor SessionCache: CryptoSessionStore {
     /// Removes a message from the cache and store.
     /// - Parameter message: The message to be removed.
     /// - Throws: An error if the removal fails.
-    func removeMessage(_ message: PrivateMessage) async throws {
+    public func removeMessage(_ message: PrivateMessage) async throws {
         messages.removeAll(where: { $0.id == message.id })
         try await store.removeMessage(message)
     }
@@ -227,34 +229,80 @@ actor SessionCache: CryptoSessionStore {
     /// Lists messages based on various criteria.
     /// - Parameters:
     ///   - communication: The communication ID to filter messages.
-    ///   - senderId: The ID of the sender.
+    ///   - sessionContextId: The ID of the Session.
     ///   - minimumOrder: The minimum order to filter messages.
     ///   - maximumOrder: The maximum order to filter messages.
     ///   - offsetBy: The number of messages to skip.
     ///   - limit: The maximum number of messages to return.
     /// - Returns: An array of messages matching the criteria.
     /// - Throws: An error if fetching fails.
-    func listMessages(
-        in communication: UUID,
-        senderId: Int,
-        minimumOrder: Int? = nil,
-        maximumOrder: Int? = nil,
-        offsetBy: Int = 0,
-        limit: Int = 100
+    public func listMessages(
+        in communicationIdentity: UUID,
+        sessionContextId: Int,
+        ordering: Ordering,
+        minimumOrder: Int?,
+        maximumOrder: Int?,
+        offsetBy: Int,
+        limit: Int
     ) async throws -> [PrivateMessage] {
-        // Implement filtering logic based on parameters
-        return messages // Placeholder, implement filtering logic
+        
+        // Filter messages based on the provided parameters
+        let filteredMessages = messages.filter { message in
+            // Check if the message matches the communication identity
+            let matchesIdentity = message.communicationIdentity == communicationIdentity
+            let matchesSenderId = message.senderIdentity == sessionContextId
+            let matchesMinimumOrder = minimumOrder == nil || message.sequenceId > minimumOrder!
+            let matchesMaximumOrder = maximumOrder == nil || message.sequenceId < maximumOrder!
+            
+            return matchesIdentity && matchesSenderId && matchesMinimumOrder && matchesMaximumOrder
+        }
+        // Sort the results based on the ordering
+        var sortedMessages = [PrivateMessage]()
+        
+        // Check if filtered messages are empty
+        if filteredMessages.isEmpty {
+            // Handle the empty case (return an empty array or perform some other action)
+            sortedMessages.append(contentsOf: try await store.listMessages(
+                in: communicationIdentity,
+                sessionContextId: sessionContextId,
+                ordering: ordering,
+                minimumOrder: minimumOrder,
+                maximumOrder: maximumOrder,
+                offsetBy: offsetBy,
+                limit: limit))
+            
+            messages = sortedMessages
+            return sortedMessages
+        } else {
+            messages.removeAll(keepingCapacity: true)
+            switch ordering {
+            case .ascending:
+                sortedMessages = filteredMessages.sorted { $0.sequenceId < $1.sequenceId }
+            case .descending:
+                sortedMessages = filteredMessages.sorted { $0.sequenceId > $1.sequenceId }
+            }
+            
+            // Apply offset and limit for pagination
+            let startIndex = offsetBy
+            let endIndex = startIndex + limit
+            let paginatedMessages = Array(sortedMessages.dropFirst(startIndex).prefix(limit))
+            messages = paginatedMessages
+            return paginatedMessages
+        }
     }
+
+
+
     
     // MARK: - Job Methods
     
     /// Fetches all jobs from the cache or store.
     /// - Returns: An array of jobs.
     /// - Throws: An error if fetching fails.
-    func readJobs() async throws -> [JobModel] {
+    public func readJobs() async throws -> [JobModel] {
         // If the jobs cache is empty, fetch from the store
         if jobs.isEmpty {
-            jobs = try await store.readJobs() // Assuming the store has a method to fetch jobs
+            jobs = try await store.readJobs()
         }
         return jobs
     }
@@ -262,7 +310,7 @@ actor SessionCache: CryptoSessionStore {
     /// Creates a new job and caches it.
     /// - Parameter job: The job to be created.
     /// - Throws: An error if the creation fails.
-    func createJob(_ job: JobModel) async throws {
+    public func createJob(_ job: JobModel) async throws {
         try await store.createJob(job) // Persist the job in the store
         jobs.append(job) // Cache the new job
     }
@@ -270,7 +318,7 @@ actor SessionCache: CryptoSessionStore {
     /// Updates an existing job in the cache and store.
     /// - Parameter job: The job to be updated.
     /// - Throws: An error if the update fails.
-    func updateJob(_ job: JobModel) async throws {
+    public func updateJob(_ job: JobModel) async throws {
         if let index = jobs.firstIndex(where: { $0.id == job.id }) {
             jobs[index] = job // Update the cached job
             try await store.updateJob(job) // Persist the updated job in the store
@@ -282,14 +330,14 @@ actor SessionCache: CryptoSessionStore {
     /// Removes a job from the cache and store.
     /// - Parameter job: The job to be removed.
     /// - Throws: An error if the removal fails.
-    func removeJob(_ job: JobModel) async throws {
+    public func removeJob(_ job: JobModel) async throws {
         jobs.removeAll(where: { $0.id == job.id }) // Remove from cache
         try await store.removeJob(job) // Remove from the store
     }
     
     // MARK: - Error Handling
     
-    enum CacheErrors: Error {
+    public enum CacheErrors: Error {
         case localDeviceConfigurationIsNil
         case localDeviceSaltIsNil
         case sessionIdentityNotFound
@@ -306,7 +354,7 @@ extension SessionCache {
     /// Fetches all contacts from the cache or store.
     /// - Returns: An array of contacts.
     /// - Throws: An error if fetching fails.
-    func fetchContacts() async throws -> [ContactModel] {
+    public func fetchContacts() async throws -> [ContactModel] {
         if contacts.isEmpty {
             contacts = try await store.fetchContacts()
         }
@@ -316,7 +364,7 @@ extension SessionCache {
     /// Creates a new contact and caches it.
     /// - Parameter contact: The contact to be created.
     /// - Throws: An error if the creation fails.
-    func createContact(_ contact: ContactModel) async throws {
+    public func createContact(_ contact: ContactModel) async throws {
         try await store.createContact(contact)
         contacts.append(contact) // Cache the new contact
     }
@@ -324,7 +372,7 @@ extension SessionCache {
     /// Updates an existing contact in the cache and store.
     /// - Parameter contact: The contact to be updated.
     /// - Throws: An error if the update fails.
-    func updateContact(_ contact: ContactModel) async throws {
+    public func updateContact(_ contact: ContactModel) async throws {
         if let index = contacts.firstIndex(where: { $0.id == contact.id }) {
             contacts[index] = contact
             try await store.updateContact(contact)
@@ -336,9 +384,9 @@ extension SessionCache {
     /// Removes a contact from the cache and store.
     /// - Parameter contact: The contact to be removed.
     /// - Throws: An error if the removal fails.
-    func removeContact(_ contact: ContactModel) async throws {
-        contacts.removeAll(where: { $0.id == contact.id })
-        try await store.removeContact(contact)
+    public func removeContact(_ id: UUID) async throws {
+        contacts.removeAll(where: { $0.id == id })
+        try await store.removeContact(id)
     }
     
     // MARK: - Communication Type Methods
@@ -346,7 +394,7 @@ extension SessionCache {
     /// Fetches all communication types from the cache or store.
     /// - Returns: An array of communication types.
     /// - Throws: An error if fetching fails.
-    func fetchCommunications() async throws -> [DoubleRatchetKit.BaseCommunication] {
+    public func fetchCommunications() async throws -> [DoubleRatchetKit.BaseCommunication] {
         if communicationTypes.isEmpty {
             communicationTypes = try await store.fetchCommunications()
         }
@@ -356,7 +404,7 @@ extension SessionCache {
     /// Creates a new communication type and caches it.
     /// - Parameter type: The communication type to be created.
     /// - Throws: An error if the creation fails.
-    func createCommunication(_ type: DoubleRatchetKit.BaseCommunication) async throws {
+    public func createCommunication(_ type: DoubleRatchetKit.BaseCommunication) async throws {
         try await store.createCommunication(type)
         communicationTypes.append(type) // Cache the new communication type
     }
@@ -364,7 +412,7 @@ extension SessionCache {
     /// Updates an existing communication type in the cache and store.
     /// - Parameter type: The communication type to be updated.
     /// - Throws: An error if the update fails.
-    func updateCommunication(_ type: DoubleRatchetKit.BaseCommunication) async throws {
+    public func updateCommunication(_ type: DoubleRatchetKit.BaseCommunication) async throws {
         if let index = communicationTypes.firstIndex(where: { $0.id == type.id }) {
             communicationTypes[index] = type
             try await store.updateCommunication(type)
@@ -376,7 +424,7 @@ extension SessionCache {
     /// Removes a communication type from the cache and store.
     /// - Parameter type: The communication type to be removed.
     /// - Throws: An error if the removal fails.
-    func removeCommunication(_ type: DoubleRatchetKit.BaseCommunication) async throws {
+    public func removeCommunication(_ type: DoubleRatchetKit.BaseCommunication) async throws {
         communicationTypes.removeAll(where: { $0.id == type.id })
         try await store.removeCommunication(type)
     }
@@ -386,7 +434,7 @@ extension SessionCache {
     /// Creates a new media job and caches it.
     /// - Parameter packet: The `DataPacket` representing the media job to be created.
     /// - Throws: An error if the creation fails in the store.
-    func createMediaJob(_ packet: DataPacket) async throws {
+    public func createMediaJob(_ packet: DataPacket) async throws {
         try await store.createMediaJob(packet) // Persist the media job in the store
         mediaJobs.append(packet) // Cache the new media job
     }
@@ -394,7 +442,7 @@ extension SessionCache {
     /// Fetches all media jobs from the cache or store.
     /// - Returns: An array of `DataPacket` representing all media jobs.
     /// - Throws: An error if fetching fails from the store.
-    func findAllMediaJobs() async throws -> [DataPacket] {
+    public func findAllMediaJobs() async throws -> [DataPacket] {
         if mediaJobs.isEmpty {
             mediaJobs = try await store.findAllMediaJobs() // Fetch from the store if cache is empty
         }
@@ -405,7 +453,7 @@ extension SessionCache {
     /// - Parameter id: The unique identifier of the media job to fetch.
     /// - Returns: An optional `DataPacket` representing the media job if found, or `nil` if not found.
     /// - Throws: An error if fetching fails from the store.
-    func findMediaJob(_ id: UUID) async throws -> DataPacket? {
+    public func findMediaJob(_ id: UUID) async throws -> DataPacket? {
         if let job = mediaJobs.first(where: { $0.id == id }) {
             return job // Return from cache if found
         }
@@ -419,7 +467,7 @@ extension SessionCache {
     /// Deletes a media job from both the cache and the store.
     /// - Parameter id: The unique identifier of the media job to be removed.
     /// - Throws: An error if the removal fails in the store.
-    func deleteMediaJob(_ id: UUID) async throws {
+    public func deleteMediaJob(_ id: UUID) async throws {
         mediaJobs.removeAll(where: { $0.id == id }) // Remove from cache
         try await store.deleteMediaJob(id) // Remove from the store
     }

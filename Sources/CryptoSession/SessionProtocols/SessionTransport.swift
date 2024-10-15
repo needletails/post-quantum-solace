@@ -35,20 +35,19 @@ public protocol SessionTransport: Sendable {
                      message: SignedRatchetMessage,
                      metadata: SignedRatchetMessageMetadata) async throws
     
-    /// Receives a message from the network.
-    /// - Returns: The received message.
-    /// - Throws: An error if the message could not be received.
-    func receiveMessage() async throws -> String
-    
     /// Finds the user configuration from the network.
     /// - Returns: The user configuration if found.
     /// - Throws: An error if the configuration could not be found.
     func findConfiguration(for secretName: String) async throws -> UserConfiguration
     
-    /// Publishes the user configuration to the network.
+    /// Publishes the user configuration to the network. We call this for the master device and updating its bundle with new devices
     /// - Parameter configuration: The user configuration to be published.
     /// - Throws: An error if the configuration could not be published.
-    func publishUser(configuration: UserConfiguration) async throws
+    func publishUserConfiguration(_ configuration: UserConfiguration, identity: UUID?) async throws
     
+    /// This method will be called when a new device tries to register with an existing secretName. A network request is sent to the server to puclish auxillary user device configuration
+    /// - Parameters:
+    ///   - configuration: The user device configuration to be published.
+    ///   - addChildDevice: A bool describing whether this is a child device
     func publishAuxillary(configuration: UserDeviceConfiguration) async throws
 }

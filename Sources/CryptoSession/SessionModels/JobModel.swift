@@ -10,7 +10,21 @@ import NeedleTailCrypto
 import DoubleRatchetKit
 @preconcurrency import Crypto
 
-public final class JobModel: Codable, @unchecked Sendable {
+public struct Job: Sendable, Codable, Equatable {
+    public let id: UUID
+    public let sequenceId: Int
+    public let isBackgroundTask: Bool
+    var task: EncrytableTask
+    public var delayedUntil: Date?
+    public var scheduledAt: Date
+    public var attempts: Int
+    
+    public static func == (lhs: Job, rhs: Job) -> Bool {
+        return lhs.id == rhs.id
+    }
+}
+
+public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
     public let id = UUID()
     public var data: Data
     
@@ -27,9 +41,8 @@ public final class JobModel: Codable, @unchecked Sendable {
         get async {
             do {
                 guard let symmetricKey = symmetricKey else { return nil }
-                return try await setProps(symmetricKey: symmetricKey)
+                return try await decryptProps(symmetricKey: symmetricKey)
             } catch {
-                //TODO: Handle error appropriately (e.g., log it)
                 return nil
             }
         }
@@ -73,7 +86,7 @@ public final class JobModel: Codable, @unchecked Sendable {
     /// - Parameter symmetricKey: The symmetric key used for decryption.
     /// - Returns: The decrypted properties.
     /// - Throws: An error if decryption fails.
-    func setProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
+    public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         let crypto = NeedleTailCrypto()
         guard let decrypted = try crypto.decrypt(data: self.data, symmetricKey: symmetricKey) else {
             throw CryptoError.decryptionError
@@ -88,7 +101,7 @@ public final class JobModel: Codable, @unchecked Sendable {
     /// - Returns: The updated decrypted properties.
     ///
     /// - Throws: An error if encryption fails.
-    func updateProps(symmetricKey: SymmetricKey, props: Codable & Sendable) async throws -> UnwrappedProps? {
+    public func updateProps(symmetricKey: SymmetricKey, props: UnwrappedProps) async throws -> UnwrappedProps? {
         let crypto = NeedleTailCrypto()
         let data = try BSONEncoder().encodeData(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
@@ -96,5 +109,16 @@ public final class JobModel: Codable, @unchecked Sendable {
         }
         self.data = encryptedData
         return await self.props
+    }
+    
+    public func makeDecryptedModel<T: Sendable & Codable>(of: T.Type) async throws -> T {
+        guard let props = await props else { throw CryptoSession.SessionErrors.propsError }
+        return Job(
+            id: id,
+            sequenceId: props.sequenceId,
+            isBackgroundTask: props.isBackgroundTask,
+            task: props.task,
+            scheduledAt: props.scheduledAt,
+            attempts: props.attempts) as! T
     }
 }

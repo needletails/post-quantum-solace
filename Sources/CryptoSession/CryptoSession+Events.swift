@@ -65,7 +65,7 @@ extension CryptoSession {
         try await processWrite(message: message, session: CryptoSession.shared)
     }
     
-    public func createContact(
+    public func updateOrCreateContact(
         secretName: String,
         metadata: Document = [:]
     ) async throws -> ContactModel {
@@ -78,14 +78,20 @@ extension CryptoSession {
         //2. Check to see if we aleady have this contact
         if let contactModel = try await cache.fetchContacts().asyncFirst(where: { await $0.props?.secretName == secretName }) {
             guard let configuration = await contactModel.props?.configuration else { fatalError() }
+            var contactMetadata: Document
+            if metadata.isEmpty {
+                contactMetadata = await contactModel.props?.metadata ?? [:]
+            } else {
+                contactMetadata = metadata
+            }
             let contact = Contact(
                 id: contactModel.id,
                 secretName: secretName,
                 configuration: configuration,
-                metadata: metadata)
+                metadata: contactMetadata)
             _ = try await contactModel.updatePropsMetadata(symmetricKey: symmetricKey, metadata: metadata)
             try await cache.updateContact(contactModel)
-            await receiverDelegate?.createContact(contact)
+            await receiverDelegate?.contactMetadata(changed: contact)
             return contactModel
         } else {
             guard let transportDelegate = transportDelegate else { throw SessionErrors.transportNotInitialized }
@@ -133,7 +139,8 @@ extension CryptoSession {
             friendshipMetadata.unBlockFriend()
         }
         
-        let updatedProps = try await foundContact.updateProps(symmetricKey: symmetricKey, props: friendshipMetadata)
+        let metadata = try BSONEncoder().encode(friendshipMetadata)
+        let updatedProps = try await foundContact.updatePropsMetadata(symmetricKey: symmetricKey, metadata: metadata)
         guard let updatedMetadata = updatedProps?.metadata else { throw SessionErrors.propsError }
         await receiverDelegate?.contactMetadata(
             changed: .init(
@@ -143,8 +150,7 @@ extension CryptoSession {
                 metadata: updatedMetadata)
         )
         try await cache.updateContact(foundContact)
-        
-        let metadata = try BSONEncoder().encode(friendshipMetadata)
+     
         //Transport
         try await writeTextMessage(
             messageType: .nudgeLocal,
@@ -155,7 +161,11 @@ extension CryptoSession {
             destructionTime: nil)
     }
     
-    public func updateMessageDeliveryState(_ message: PrivateMessage, deliveryState: DeliveryState) async throws {
+    public func updateMessageDeliveryState(_
+                                           message: PrivateMessage,
+                                           deliveryState: DeliveryState,
+                                           allowExternalUpdate: Bool = false
+    ) async throws {
         guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
         let symmetricKey = try await getAppSymmetricKey(password: sessionContext.sessionUser.secretName)
         guard var props = await message.props else { fatalError() }
@@ -163,15 +173,18 @@ extension CryptoSession {
         _ = try await message.updateProps(symmetricKey: symmetricKey, props: props)
         await receiverDelegate?.updatedMessage(message)
         
-        let metadata = DeliveryStateMetadata(state: props.deliveryState, messageId: message.sharedMessageIdentity)
-        let encodedDeliveryState = try BSONEncoder().encode(metadata)
-        
-        try await writeTextMessage(
-            messageType: .nudgeLocal,
-            messageFlags: .deliveryStateChange,
-            recipient: props.message.recipient,
-            metadata: encodedDeliveryState,
-            pushType: .none)
+        if allowExternalUpdate {
+            
+            let metadata = DeliveryStateMetadata(state: props.deliveryState, messageId: message.sharedMessageIdentity)
+            let encodedDeliveryState = try BSONEncoder().encode(metadata)
+            
+            try await writeTextMessage(
+                messageType: .nudgeLocal,
+                messageFlags: .deliveryStateChange,
+                recipient: props.message.recipient,
+                metadata: encodedDeliveryState,
+                pushType: .none)
+        }
     }
     
     public func editCurrentMessage(_ message: PrivateMessage, newMessage: CryptoMessage) async throws {
@@ -216,7 +229,7 @@ extension CryptoSession {
             switch message.messageType {
                 //Dont save locally on any local device, but still saves the Job if we are offline and can save the SignedRatchetMessage remotely for future deliverly.
             case .nudgeLocal:
-                for identity in try await taskProcessor.resolveSessions(with: recipient, session: session) {
+                for identity in try await taskProcessor.getOurSessionIdentities(with: recipient, session: session) {
                     guard let identityProps = await identity.props else { fatalError() }
                     
                     let task = EncrytableTask(
@@ -238,9 +251,8 @@ extension CryptoSession {
                 var shouldUpdateCommunication = false
                 do {
                     communicationModel = try await taskProcessor.jobProcessor.findCommunicationType(
-                        for: recipient,
-                        sender: sessionContext.sessionUser.secretName,
-                        cache: cache
+                        cache: cache,
+                        communicationType: message.recipient
                     )
                     
                     guard var newProps = await communicationModel.props else { fatalError() }
@@ -250,6 +262,7 @@ extension CryptoSession {
                 } catch {
                     communicationModel = try await taskProcessor.jobProcessor.createCommunicationModel(
                         recipients: [sessionContext.sessionUser.secretName, recipient],
+                        communicationType: message.recipient,
                         metadata: message.metadata,
                         symmetricKey: symmetricKey
                     )
@@ -334,10 +347,12 @@ actor TaskProcessor {
         session: CryptoSession
     ) async throws {
         guard let messageProps = await message.props else { fatalError() }
-        guard session.isViable == true else { throw CryptoSession.SessionErrors.connectionIsNonViable }
+        guard session.isViable == true else {
+            throw CryptoSession.SessionErrors.connectionIsNonViable
+        }
         switch messageProps.message.recipient {
         case .nickname(let recipientName):
-            let identites = try await resolveSessions(with: recipientName, session: session)
+            let identites = try await getOurSessionIdentities(with: recipientName, session: session)
             if identites.isEmpty {
                 throw CryptoSession.SessionErrors.missingSessionIdentity
             }
@@ -374,20 +389,15 @@ actor TaskProcessor {
         }
     }
     
-    //TODO: Ensure Identities are who we they are or have not changed and handle properly
-    func resolveSessions(with recipientName: String, session: CryptoSession) async throws -> [SessionIdentity] {
-        
+    func getOurSessionIdentities(with recipientName: String, session: CryptoSession) async throws -> [SessionIdentity] {
         var sessions = [SessionIdentity]()
         
-        //Find my devices, but not the current device
         guard let sessionContext = await session.sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         
-        // Collect all session identities that have the recipient name
-        let identities = try await cache.fetchSessionIdentities()
+        let currentSessions = try await cache.fetchSessionIdentities()
         
-        // Filter identities asynchronously
-        let filtered = await identities.asyncFilter { identity in
+        let filtered = await currentSessions.asyncFilter { identity in
             // Safely cast the props to the expected type
             guard let props = await identity.props else {
                 return false // Exclude this identity if casting fails
@@ -401,41 +411,54 @@ actor TaskProcessor {
             return props.secretName == recipientName || isDifferentIdentity
         }
         
-        // Return filtered identities if not empty
+        // Return filtered identities if not empty and is not the current session
         let foundRecipients = await filtered.asyncContains(where: { await $0.props?.secretName == recipientName })
-        if !filtered.isEmpty && foundRecipients {
+        if foundRecipients {
             sessions.append(contentsOf: filtered)
         }
         
-        //TODO: This needs more work all we do is verify our user confirguration
-        //Find theirs
-        guard let transport = await session.transportDelegate else { throw CryptoSession.SessionErrors.transportNotInitialized }
-        let configuration = try await transport.findConfiguration(for: recipientName)
-        
-        //3. make sure that the identities of the user configuration are legit
-        let publicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.publicSigningKey)
-        if try configuration.signed?.verifySignature(publicKey: publicSigningKey) == false {
-            throw SigningErrors.signingFailedOnVerfication
+        // If we are empty we did not find a recipient... Let's create one
+        if filtered.isEmpty {
+            //first append our Identites, but not this current session
+            sessions.append(contentsOf: filtered)
+            
+            guard let transport = await session.transportDelegate else { throw CryptoSession.SessionErrors.transportNotInitialized }
+            
+            // Get the user configuration for the recipient
+            let configuration = try await transport.findConfiguration(for: recipientName)
+            
+            // Make sure that the identities of the user configuration are legit
+            let publicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.publicSigningKey)
+            if try configuration.signed?.verifySignature(publicKey: publicSigningKey) == false {
+                throw SigningErrors.signingFailedOnVerfication
+            }
+            
+            // Loop over each device, create and cache the identity, and append it to the array
+            for device in configuration.devices {
+               let sessionIdentity = try await createEncryptableSessionIdentityModel(with: device, session: session)
+                sessions.append(sessionIdentity)
+            }
         }
-
         return sessions
     }
     
-    //TODO: When do we need to refresh the local SessionIdentities?
+    /// A user only ever has session identies for it's self.
     func refreshLocalSessionIdentities(session: CryptoSession) async throws -> [SessionIdentity] {
         var sessions = [SessionIdentity]()
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         //This will refresh our local SessionIdentityModel
         let data = try await cache.findLocalDeviceConfiguration()
-        guard let decryptedData = try await crypto.decrypt(data: data, symmetricKey: session.getAppSymmetricKey(password: session.appPassword)) else { throw CryptoSession.SessionErrors.sessionDecryptionError }
+        guard let decryptedData = try await crypto.decrypt(data: data, symmetricKey: session.getAppSymmetricKey(password: session.appPassword)) else {
+            throw CryptoSession.SessionErrors.sessionDecryptionError
+        }
         let decodedContext = try BSONDecoder().decodeData(SessionContext.self, from: decryptedData)
         for device in decodedContext.lastUserConfiguration.devices {
-            sessions.append(try await createEncrytableSessionIdentityModel(with: device, session: session))
+            sessions.append(try await createEncryptableSessionIdentityModel(with: device, session: session))
         }
         return sessions
     }
     
-    func createEncrytableSessionIdentityModel(with device: UserDeviceConfiguration, session: CryptoSession) async throws -> SessionIdentity {
+    func createEncryptableSessionIdentityModel(with device: UserDeviceConfiguration, session: CryptoSession) async throws -> SessionIdentity {
         guard let sessionContext = await session.sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         let identity = try await SessionIdentity(
@@ -466,7 +489,7 @@ actor TaskProcessor {
         let sessionUser = sessionContext.sessionUser
         guard let communicationProps = await communication.props else { fatalError() }
         let messageModel = try await PrivateMessage(
-            communicationID: UUID(),
+            communicationIdentity: UUID(),
             senderIdentity: sessionContext.sessionContextId,
             sharedMessageIdentity: UUID().uuidString,
             sequenceId: communicationProps.messageCount,

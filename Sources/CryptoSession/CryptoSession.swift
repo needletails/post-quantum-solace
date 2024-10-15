@@ -27,7 +27,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     
     private let crypto = NeedleTailCrypto()
     let taskProcessor = TaskProcessor()
-    var cache: SessionCache?
+    public var cache: SessionCache?
     internal var transportDelegate: SessionTransport?
     internal var receiverDelegate: NTMessageReceiver?
     private(set) internal var _sessionContext: SessionContext?
@@ -79,7 +79,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         receiverDelegate = conformer
     }
     
-    enum SessionErrors: Error {
+    public enum SessionErrors: Error {
         case saltError
         case databaseNotInitialized
         case sessionNotInitialized
@@ -97,6 +97,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         case cannotFindContact
         case propsError
         case appPasswordError
+        case missingKey
     }
     
     /// Creates a new session with the provided secret name and application password.
@@ -156,6 +157,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             sessionContextId: .random(in: 1 ..< .max),
             lastUserConfiguration: userConfiguration,
             registrationState: .unregistered)
+        await setSessionContext(sessionContext)
         
         // Retrieve salt and derive symmetric key
         let salt = try await cache.findLocalDeviceSalt()
@@ -177,7 +179,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         
         // Attempt to find user configuration and handle registration
         do {
-            //We are registering a new device if this succeeds
+            //We are registering a new device to the main device if this succeeds
             let configuration = try await transportDelegate?.findConfiguration(for: secretName)
             sessionContext.registrationState = .registered
             
@@ -206,6 +208,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             return try await startSession(appPassword: appPassword)
             
         } catch {
+            //Registering a new account(device)
             // Handle errors and ensure session context is registered
             sessionContext.registrationState = .registered
             let encodedData = try BSONEncoder().encodeData(sessionContext)
@@ -216,7 +219,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             // Create local device configuration. Only locally cached and save. Private keys/info are stored. Use with care...
             try await cache.createLocalDeviceConfiguration(encryptedConfig)
             // UserConfiguration does not contain Private keys/info... so it should be safe to store publicly.
-            try await transportDelegate?.publishUser(configuration: userConfiguration)
+            try await transportDelegate?.publishUserConfiguration(userConfiguration, identity: nil)
             
             return try await startSession(appPassword: appPassword)
         }
@@ -269,10 +272,9 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             
             setAppPassword(appPassword)
             await setSessionContext(sessionContext)
-            try await loadSessionContextCache()
             return CryptoSession.shared
         } catch {
-            throw SessionErrors.sessionDecryptionError
+            throw error
         }
     }
     
@@ -282,7 +284,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             salt: saltData)
     }
     
-    func getAppSymmetricKey(password: String) async throws -> SymmetricKey {
+    public func getAppSymmetricKey(password: String) async throws -> SymmetricKey {
         guard let salt = try await cache?.findLocalDeviceSalt() else { throw SessionErrors.saltError }
         guard let passwordData = await appPassword.data(using: .utf8) else {
             throw SessionErrors.invalidPassword
@@ -308,15 +310,16 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
     
-    func loadSessionContextCache() async throws {
+    public func loadSessionContextCache() async throws {
         guard let transportDelegate = transportDelegate else { return }
         
-        // 1. If we published auxiallary device on the server. we need to make sure we know about them so...
+        // If we published auxiallary device on the server. we need to make sure we know about them so...
         //1. find the current user session context on the server
         guard var sessionContext = await sessionContext else { return }
         let configuration = try await transportDelegate.findConfiguration(for: sessionContext.sessionUser.secretName)
+
         //2. seach and discover if the current sessionContext matches the one we found on the server
-        if sessionContext.lastUserConfiguration == configuration  {
+        if sessionContext.lastUserConfiguration.signed?.data == configuration.signed?.data  {
             // do nothing
         } else {
             //3. make sure that the identities of the user configuration are legit
@@ -324,7 +327,6 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             if try configuration.signed?.verifySignature(publicKey: publicSigningKey) == false {
                 throw SigningErrors.signingFailedOnVerfication
             }
-
             //4. save/update locally and cache
             sessionContext.lastUserConfiguration = configuration
             let encodedData = try BSONEncoder().encodeData(sessionContext)
