@@ -15,8 +15,11 @@ public struct FriendshipMetadata: Sendable, Codable {
         case requested = "b"
         case accepted = "c"
         case rejected = "d"
-        case blocked = "e"
-        case unblock = "f"
+        case rejectedRequest = "e"
+        case friendshipRejected = "f"
+        case blocked = "g"
+        case blockedUser = "h"
+        case unblock = "i"
     }
     
     public var myState: State
@@ -43,29 +46,34 @@ public struct FriendshipMetadata: Sendable, Codable {
     // Method to accept a friend request
     mutating func acceptFriendRequest() {
         myState = .accepted
+        theirState = .accepted
         updateOurState()
     }
     
     // Method to reject a friend request
     mutating func rejectFriendRequest() {
-        myState = .rejected
+        myState = .rejectedRequest
+        theirState = .rejected
         updateOurState()
     }
     
     // Method to revoking friendship to original state
     mutating func revokeFriendRequest() {
         myState = .pending
+        theirState = .pending
         updateOurState()
     }
     
     // Method to block friend
     mutating func blockFriend() {
+        myState = .blockedUser
         theirState = .blocked
         updateOurState()
     }
     
-    // Method to unblock friend
+    // Method to unblock friend. If we unblock we must request friendship again.
     mutating func unBlockFriend() {
+        myState = .pending
         theirState = .pending
         updateOurState()
     }
@@ -78,11 +86,13 @@ public struct FriendshipMetadata: Sendable, Codable {
         } else if myState == .accepted && theirState == .accepted {
             ourState = .accepted
         } else if myState == .requested && theirState == .pending {
-            ourState = .requested
-        } else if myState == .rejected || theirState == .rejected {
-            ourState = .rejected
+            ourState = .pending
+        } else if myState == .rejected && theirState == .rejectedRequest || myState == .rejectedRequest && theirState == .rejected {
+            ourState = .friendshipRejected
         } else if myState == .pending && theirState == .pending {
             ourState = .pending // Both parties are pending
+        } else if theirState == .blockedUser {
+            ourState = .blocked
         } else {
             ourState = .pending // Default state if no other conditions are met
         }

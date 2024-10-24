@@ -13,19 +13,14 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
     
     /// Coding keys for encoding and decoding the struct.
     enum CodingKeys: String, CodingKey, Codable, Sendable {
-        case publicSigningKey = "a"          // Key for the signing identity data
-        case devices = "b"         // Key for the array of auxiliary device configurations
+        case publicSigningKey = "a"
+        case signed = "b"
     }
     
     /// Data representing the signing identity of the user.
     public let publicSigningKey: Data
-    public var signed: Signed?
-    
-    /// An array of auxiliary device configurations associated with the user.
-    /// Each `UserDeviceConfiguration` can be signed and verified.
-    /// The signature can be accessed via the `signed` property of `UserDeviceConfiguration`.
-    var devices: [UserDeviceConfiguration]
-    
+    public let signed: Signed
+
     /// Initializes a new `UserConfiguration` instance.
     /// - Parameters:
     ///   - signingIdentity: The signing identity data for the user.
@@ -36,15 +31,12 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         privateSigningKey: Curve25519SigningPrivateKey
     ) throws {
         self.publicSigningKey = publicSigningKey
-        self.devices = devices
         self.signed = try Signed(
             configuration: devices,
             privateSigningKey: privateSigningKey
         )
     }
-    
-    
-    
+
     /// A struct representing the signed version of the user device configuration.
     public struct Signed: Codable, Sendable {
         
@@ -83,7 +75,6 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
 
     public func getVerifiedDevices() throws -> [UserDeviceConfiguration] {
         let publicKey = try Curve25519SigningPublicKey(rawRepresentation: publicSigningKey)
-        guard let signed = signed else { throw CryptoSession.SessionErrors.invalidSignature }
         if try signed.verifySignature(publicKey: publicKey) {
             let devices = try BSONDecoder().decodeData([UserDeviceConfiguration].self, from: signed.data)
             return devices
@@ -91,7 +82,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             return []
         }
     }
-    
+
     public static func ==(lhs: UserConfiguration, rhs: UserConfiguration) -> Bool {
         return lhs.publicSigningKey == rhs.publicSigningKey
     }

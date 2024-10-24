@@ -43,6 +43,26 @@ import NeedleTailCrypto
 
 extension CryptoSession {
     
+    /// Sends a text message to a specified recipient with optional metadata and destruction settings.
+    ///
+    /// This method constructs a `CryptoMessage` object with the provided parameters and sends it asynchronously.
+    /// It performs the following actions:
+    /// 1. Creates a `CryptoMessage` instance with the specified message type, flags, recipient, text, and metadata.
+    /// 2. Sends the message using the `processWrite` method of the `CryptoSession`.
+    ///
+    /// - Parameters:
+    ///   - messageType: The type of the message being sent. This determines how the message is processed and displayed.
+    ///   - messageFlags: Flags that provide additional information about the message, such as whether it is urgent or requires acknowledgment.
+    ///   - recipient: The recipient of the message, specified as a `MessageRecipient` object. This can include user identifiers or other recipient details.
+    ///   - text: The text content of the message. This is an optional parameter and defaults to an empty string if not provided.
+    ///   - metadata: A dictionary containing additional metadata associated with the message. This can include information such as timestamps, message IDs, or other relevant data.
+    ///   - pushType: The type of push notification to be sent along with the message. This determines how the recipient is notified of the message.
+    ///   - destructionTime: An optional time interval after which the message should be destroyed. If provided, the message will be deleted after this duration. Defaults to `nil` if not specified.
+    ///
+    /// - Throws:
+    ///   - Any errors that may occur during the message creation or sending process, such as encryption errors or network issues.
+    ///
+    /// - Important: This method is asynchronous and should be awaited. Ensure that the session is properly initialized before calling this method.
     public func writeTextMessage(
         messageType: MessageType,
         messageFlags: MessageFlags,
@@ -52,94 +72,186 @@ extension CryptoSession {
         pushType: PushNotificationType,
         destructionTime: TimeInterval? = nil
     ) async throws {
-        let message = CryptoMessage(
-            messageType: messageType,
-            messageFlags: messageFlags,
-            recipient: recipient,
-            text: text,
-            pushType: pushType,
-            metadata: metadata,
-            sentDate: Date(),
-            destructionTime: destructionTime
-        )
-        try await processWrite(message: message, session: CryptoSession.shared)
+        do {
+            let message = CryptoMessage(
+                messageType: messageType,
+                messageFlags: messageFlags,
+                recipient: recipient,
+                text: text,
+                pushType: pushType,
+                metadata: metadata,
+                sentDate: Date(),
+                destructionTime: destructionTime
+            )
+            try await processWrite(message: message, session: CryptoSession.shared)
+        } catch {
+            logger.log(level: .error, message: "\(error)")
+            throw error
+        }
     }
     
+    /// Updates or creates a contact in the local cached database and notifies the client of the changes.
+    ///
+    /// This method performs the following actions:
+    /// 1. Creates a new contact or updates an existing contact in the local cached database.
+    /// 2. Notifies the local client that a contact has been created or updated.
+    /// 3. Notifies the local client of any changes to the contact's metadata.
+    ///
+    /// **Important:** After the client is notified of the local contact creation, the method
+    /// `requestFriendshipStateChange` must be called to notify the recipient of the friendship request.
+    /// This establishes a communication model that allows both parties to communicate with each other.
+    ///
+    /// - Parameters:
+    ///   - secretName: The name of the contact to be added or updated.
+    ///   - metadata: A dictionary containing predefined metadata for the contact.
+    ///     This can include nicknames and other relevant data. The default value is an empty dictionary.
+    ///
+    /// - Returns: A `ContactModel` representing the created or updated contact.
+    ///
+    /// - Throws: An error if the operation fails due to issues such as invalid parameters or database errors.
     public func updateOrCreateContact(
         secretName: String,
         metadata: Document = [:]
     ) async throws -> ContactModel {
         guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
-        guard secretName != sessionContext.sessionUser.secretName else {
+        
+        let newContactSecretName = secretName.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let mySecretName = await sessionContext.sessionUser.secretName
+        
+        guard newContactSecretName != mySecretName else {
             throw CryptoSession.SessionErrors.invalidSecretName
         }
-        let symmetricKey = try await getAppSymmetricKey(password: sessionContext.sessionUser.secretName)
+        
+        let symmetricKey = try await getAppSymmetricKey(password: mySecretName)
+        
         guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
-        //2. Check to see if we aleady have this contact
-        if let contactModel = try await cache.fetchContacts().asyncFirst(where: { await $0.props?.secretName == secretName }) {
-            guard let configuration = await contactModel.props?.configuration else { fatalError() }
-            var contactMetadata: Document
-            if metadata.isEmpty {
-                contactMetadata = await contactModel.props?.metadata ?? [:]
-            } else {
-                contactMetadata = metadata
+        
+        // Check if the contact already exists
+        if let contactModel = try await cache.fetchContacts().asyncFirst(where: { await $0.props?.secretName == newContactSecretName }) {
+            guard let configuration = await contactModel.props?.configuration else {
+                throw SessionErrors.configurationError // Use a descriptive error instead of fatalError
             }
+            
+            // Simplified metadata handling
+            let contactMetadata = metadata.isEmpty ? (await contactModel.props?.metadata ?? [:]) : metadata
+            
             let contact = Contact(
                 id: contactModel.id,
-                secretName: secretName,
+                secretName: newContactSecretName,
                 configuration: configuration,
-                metadata: contactMetadata)
-            _ = try await contactModel.updatePropsMetadata(symmetricKey: symmetricKey, metadata: metadata)
+                metadata: contactMetadata
+            )
+            
+            _ = try await contactModel.updatePropsMetadata(symmetricKey: symmetricKey, metadata: contactMetadata)
             try await cache.updateContact(contactModel)
-            await receiverDelegate?.contactMetadata(changed: contact)
+            try await receiverDelegate?.updateContact(contact)
+            
             return contactModel
         } else {
             guard let transportDelegate = transportDelegate else { throw SessionErrors.transportNotInitialized }
-            let userConfiguration = try await transportDelegate.findConfiguration(for: secretName)
+            
+            let userConfiguration = try await transportDelegate.findConfiguration(for: newContactSecretName)
             
             let contact = Contact(
-                id: UUID(),
-                secretName: secretName,
+                id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
+                secretName: newContactSecretName,
                 configuration: userConfiguration,
-                metadata: metadata)
+                metadata: metadata
+            )
             
             let contactModel = try ContactModel(
+                id: contact.id, // Use the same UUID
                 props: .init(
                     secretName: contact.secretName,
                     configuration: contact.configuration,
-                    metadata: contact.metadata),
+                    metadata: contact.metadata
+                ),
                 symmetricKey: symmetricKey
             )
             
             try await cache.createContact(contactModel)
-            await receiverDelegate?.createContact(contact)
+            try await receiverDelegate?.createContact(contact)
+            
+            // Create communication model
+            let communicationModel = try await taskProcessor.jobProcessor.createCommunicationModel(
+                recipients: [mySecretName, newContactSecretName],
+                communicationType: .nickname(newContactSecretName),
+                metadata: [:],
+                symmetricKey: symmetricKey
+            )
+            
+            try await cache.createCommunication(communicationModel)
+            
             return contactModel
         }
     }
     
-    public func requestFriendshipStateChange(state: FriendshipMetadata.State, contact: Contact) async throws {
+    /// Requests a change in the friendship state for a specified contact.
+    ///
+    /// This method allows the user to request a change in the friendship state with a contact.
+    /// It performs the following actions:
+    /// 1. Validates the session and cache state.
+    /// 2. Fetches the specified contact from the local cache.
+    /// 3. Retrieves the symmetric key for encryption.
+    /// 4. Updates the friendship metadata based on the requested state.
+    /// 5. Notifies the receiver delegate of the metadata change.
+    /// 6. Updates the contact in the local cache.
+    /// 7. Sends a message to the recipient regarding the friendship state change.
+    ///
+    /// - Parameters:
+    ///   - state: The desired friendship state to be set for the contact. This can be one of the following:
+    ///     - `.pending`: Indicates that a friend request should be revoked.
+    ///     - `.requested`: Indicates that a friend request should be sent.
+    ///     - `.accepted`: Indicates that a friend request should be accepted.
+    ///     - `.rejected`: Indicates that a friend request should be rejected.
+    ///     - `.blocked`: Indicates that the contact should be blocked.
+    ///     - `.unblock`: Indicates that the contact should be unblocked.
+    ///   - contact: The `Contact` object representing the contact whose friendship state is being changed.
+    ///
+    /// - Throws:
+    ///   - `SessionErrors.databaseNotInitialized`: If the cache is not initialized.
+    ///   - `SessionErrors.sessionNotInitialized`: If the session context is not initialized.
+    ///   - `SessionErrors.cannotFindContact`: If the specified contact cannot be found in the cache.
+    ///   - `SessionErrors.propsError`: If there is an error updating the contact's properties.
+    ///   - Any other errors that may occur during the process, such as encoding errors or network issues.
+    ///
+    /// - Important: Ensure that the session and cache are properly initialized before calling this method.
+    ///
+    /// - Note: This method is asynchronous and should be awaited.
+    public func requestFriendshipStateChange(
+        state: FriendshipMetadata.State,
+        contact: Contact
+    ) async throws {
+        logger.log(level: .info, message: "Requesting friendship state change for \(contact.secretName) to state \(state).")
         guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
         guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
         guard let foundContact = try await cache.fetchContacts().asyncFirst(where: { await $0.props?.secretName == contact.secretName }) else { throw SessionErrors.cannotFindContact }
         let symmetricKey = try await getAppSymmetricKey(password: sessionContext.sessionUser.secretName)
+        var currentMetadata: FriendshipMetadata?
         
-        var friendshipMetadata = FriendshipMetadata()
+        if contact.metadata != [:] {
+            currentMetadata = try BSONDecoder().decode(FriendshipMetadata.self, from: contact.metadata)
+        }
+        if currentMetadata == nil {
+            currentMetadata = FriendshipMetadata()
+        }
+        guard var currentMetadata = currentMetadata else { return }
         switch state {
         case .pending:
-            friendshipMetadata.revokeFriendRequest()
+            currentMetadata.revokeFriendRequest()
         case .requested:
-            friendshipMetadata.sendFriendRequest()
+            currentMetadata.sendFriendRequest()
         case .accepted:
-            friendshipMetadata.acceptFriendRequest()
-        case .rejected:
-            friendshipMetadata.rejectFriendRequest()
-        case .blocked:
-            friendshipMetadata.blockFriend()
+            currentMetadata.acceptFriendRequest()
+        case .blocked, .blockedUser:
+            currentMetadata.blockFriend()
         case .unblock:
-            friendshipMetadata.unBlockFriend()
+            currentMetadata.unBlockFriend()
+        case .rejectedRequest, .friendshipRejected, .rejected:
+            currentMetadata.rejectFriendRequest()
         }
         
-        let metadata = try BSONEncoder().encode(friendshipMetadata)
+        let metadata = try BSONEncoder().encode(currentMetadata)
         let updatedProps = try await foundContact.updatePropsMetadata(symmetricKey: symmetricKey, metadata: metadata)
         guard let updatedMetadata = updatedProps?.metadata else { throw SessionErrors.propsError }
         await receiverDelegate?.contactMetadata(
@@ -149,8 +261,13 @@ extension CryptoSession {
                 configuration: contact.configuration,
                 metadata: updatedMetadata)
         )
+        let updatedContact = try await foundContact.makeDecryptedModel(of: Contact.self, symmetricKey: symmetricKey)
+        let updated = try BSONDecoder().decode(FriendshipMetadata.self, from: updatedContact.metadata)
+
         try await cache.updateContact(foundContact)
-     
+        guard let recachedModel = try await cache.fetchContacts().asyncFirst(where: { await $0.props?.secretName == contact.secretName }) else { return }
+        let recachedContact = try await recachedModel.makeDecryptedModel(of: Contact.self, symmetricKey: symmetricKey)
+        try await receiverDelegate?.updateContact(recachedContact)
         //Transport
         try await writeTextMessage(
             messageType: .nudgeLocal,
@@ -229,7 +346,7 @@ extension CryptoSession {
             switch message.messageType {
                 //Dont save locally on any local device, but still saves the Job if we are offline and can save the SignedRatchetMessage remotely for future deliverly.
             case .nudgeLocal:
-                for identity in try await taskProcessor.getOurSessionIdentities(with: recipient, session: session) {
+                for identity in try await taskProcessor.jobProcessor.getSessionIdentities(with: recipient, session: session) {
                     guard let identityProps = await identity.props else { fatalError() }
                     
                     let task = EncrytableTask(
@@ -352,11 +469,10 @@ actor TaskProcessor {
         }
         switch messageProps.message.recipient {
         case .nickname(let recipientName):
-            let identites = try await getOurSessionIdentities(with: recipientName, session: session)
+            let identites = try await jobProcessor.getSessionIdentities(with: recipientName, session: session)
             if identites.isEmpty {
                 throw CryptoSession.SessionErrors.missingSessionIdentity
             }
-            
             for identity in identites {
                 try await writeEncryptableTask(identity: identity, message: message)
             }
@@ -389,94 +505,6 @@ actor TaskProcessor {
         }
     }
     
-    func getOurSessionIdentities(with recipientName: String, session: CryptoSession) async throws -> [SessionIdentity] {
-        var sessions = [SessionIdentity]()
-        
-        guard let sessionContext = await session.sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
-        guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
-        
-        let currentSessions = try await cache.fetchSessionIdentities()
-        
-        let filtered = await currentSessions.asyncFilter { identity in
-            // Safely cast the props to the expected type
-            guard let props = await identity.props else {
-                return false // Exclude this identity if casting fails
-            }
-            
-            // Check if the identity is not the current user's identity
-            let isDifferentIdentity = props.deviceIdentity != sessionContext.sessionUser.deviceIdentity &&
-            props.secretName != sessionContext.sessionUser.secretName
-            
-            // Return true if the secret name matches the recipient name or if it's a different identity
-            return props.secretName == recipientName || isDifferentIdentity
-        }
-        
-        // Return filtered identities if not empty and is not the current session
-        let foundRecipients = await filtered.asyncContains(where: { await $0.props?.secretName == recipientName })
-        if foundRecipients {
-            sessions.append(contentsOf: filtered)
-        }
-        
-        // If we are empty we did not find a recipient... Let's create one
-        if filtered.isEmpty {
-            //first append our Identites, but not this current session
-            sessions.append(contentsOf: filtered)
-            
-            guard let transport = await session.transportDelegate else { throw CryptoSession.SessionErrors.transportNotInitialized }
-            
-            // Get the user configuration for the recipient
-            let configuration = try await transport.findConfiguration(for: recipientName)
-            
-            // Make sure that the identities of the user configuration are legit
-            let publicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.publicSigningKey)
-            if try configuration.signed?.verifySignature(publicKey: publicSigningKey) == false {
-                throw SigningErrors.signingFailedOnVerfication
-            }
-            
-            // Loop over each device, create and cache the identity, and append it to the array
-            for device in configuration.devices {
-               let sessionIdentity = try await createEncryptableSessionIdentityModel(with: device, session: session)
-                sessions.append(sessionIdentity)
-            }
-        }
-        return sessions
-    }
-    
-    /// A user only ever has session identies for it's self.
-    func refreshLocalSessionIdentities(session: CryptoSession) async throws -> [SessionIdentity] {
-        var sessions = [SessionIdentity]()
-        guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
-        //This will refresh our local SessionIdentityModel
-        let data = try await cache.findLocalDeviceConfiguration()
-        guard let decryptedData = try await crypto.decrypt(data: data, symmetricKey: session.getAppSymmetricKey(password: session.appPassword)) else {
-            throw CryptoSession.SessionErrors.sessionDecryptionError
-        }
-        let decodedContext = try BSONDecoder().decodeData(SessionContext.self, from: decryptedData)
-        for device in decodedContext.lastUserConfiguration.devices {
-            sessions.append(try await createEncryptableSessionIdentityModel(with: device, session: session))
-        }
-        return sessions
-    }
-    
-    func createEncryptableSessionIdentityModel(with device: UserDeviceConfiguration, session: CryptoSession) async throws -> SessionIdentity {
-        guard let sessionContext = await session.sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
-        guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
-        let identity = try await SessionIdentity(
-            props: .init(
-                secretName: sessionContext.sessionUser.secretName,
-                deviceIdentity: sessionContext.sessionUser.deviceIdentity,
-                senderIdentity: sessionContext.sessionContextId,
-                publicKeyRepesentable: device.publicKey,
-                publicSigningRepresentable: device.publicSigningKey,
-                state: nil,
-                deviceName: ""
-            ),
-            symmetricKey: session.getAppSymmetricKey(password: session.appPassword)
-        )
-        try await cache.createSessionIdentity(identity)
-        return identity
-    }
-    
     /// Called on Message Save
     func createOutboundMessageModel(
         message: CryptoMessage,
@@ -489,7 +517,7 @@ actor TaskProcessor {
         let sessionUser = sessionContext.sessionUser
         guard let communicationProps = await communication.props else { fatalError() }
         let messageModel = try await PrivateMessage(
-            communicationIdentity: UUID(),
+            communicationIdentity: communication.id,
             senderIdentity: sessionContext.sessionContextId,
             sharedMessageIdentity: UUID().uuidString,
             sequenceId: communicationProps.messageCount,
@@ -506,7 +534,11 @@ actor TaskProcessor {
         
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         if shouldUpdateCommunication {
-            try await cache.updateCommunication(communication)
+            do {
+                try await cache.updateCommunication(communication)
+            } catch {
+                throw error
+            }
         }
         try await cache.createMessage(messageModel)
         return messageModel

@@ -10,7 +10,8 @@ import DoubleRatchetKit
 public protocol NTMessageReceiver: Sendable {
     func createdMessage(_ message: PrivateMessage) async
     func updatedMessage(_ message: PrivateMessage) async
-    func createContact(_ contact: Contact) async
+    func createContact(_ contact: Contact) async throws
+    func updateContact(_ contact: Contact) async throws
     func contactMetadata(changed for: Contact) async
     func newDeviceRequest(configuration: UserDeviceConfiguration) async
 }

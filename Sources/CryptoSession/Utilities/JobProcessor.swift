@@ -44,7 +44,7 @@ extension Priority: Codable {}
 
 extension NeedleTailAsyncConsumer{
     
-    func loadAndOrganizeJobs(_ job: JobModel) async {
+    func loadAndOrganizeJobs(_ job: JobModel, symmetricKey: SymmetricKey) async {
         //TODO: Delayed Tasks
         
         //        let originalDeque: Deque<TaskJob<T>> = deque
@@ -78,6 +78,7 @@ extension NeedleTailAsyncConsumer{
         //
         //            //3. Send all messages. We are neither delayed or background so we are a scheduled task. Organize and send.
         //           // Iterate through the deque to find the correct insertion point
+        job.symmetricKey = symmetricKey
         guard let props = await job.props else { fatalError() }
         let currentSequenceId = props.sequenceId
         let isDelayed = props.delayedUntil != nil
@@ -123,12 +124,17 @@ final class JobProcessor: @unchecked Sendable {
         sequenceId += 1
     }
     
-    func loadJobs(_ job: JobModel? = nil, cache: SessionCache) async throws {
+    func loadJobs(_
+                  job: JobModel? = nil,
+                  cache: SessionCache,
+                  symmetricKey: SymmetricKey
+    ) async throws {
         if let job = job {
-            await jobConsumer.loadAndOrganizeJobs(job)
+            await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
         } else {
             for job in try await cache.readJobs() {
-                await jobConsumer.loadAndOrganizeJobs(job)
+                print("JOB___", job.id)
+                await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
             }
         }
     }
@@ -139,6 +145,7 @@ final class JobProcessor: @unchecked Sendable {
         symmetricKey: SymmetricKey
     ) throws -> JobModel {
         try JobModel(
+            id: UUID(),
             props:
                     .init(
                         sequenceId: sequenceId,
@@ -163,7 +170,7 @@ final class JobProcessor: @unchecked Sendable {
             sequenceId: sequenceId,
             task: task,
             symmetricKey: symmetricKey)
-        await jobConsumer.loadAndOrganizeJobs(job)
+        await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
         try await cache.createJob(job)
         try await attemptTaskSequence(session: session)
     }
@@ -183,11 +190,12 @@ final class JobProcessor: @unchecked Sendable {
                         case .success(let job):
                             guard let props = await job.props else { fatalError() }
                             logger.log(level: .debug, message: "Running job \(props.sequenceId)")
+                            let symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
                             
                             //TODO: Handle If offline
                             if session.isViable == false {
                                 logger.log(level: .debug, message: "Skipping job \(props.sequenceId) as we are offline")
-                                await jobConsumer.loadAndOrganizeJobs(job)
+                                await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
                                 return
                             }
                             
@@ -195,7 +203,7 @@ final class JobProcessor: @unchecked Sendable {
                                 logger.log(level: .debug, message: "Task was delayed into the future")
                                 
                                 //This is urgent, We want to try this job first always until the designated time arrives. we sort via sequenceId. so old messages are always done first.
-                                await jobConsumer.loadAndOrganizeJobs(job)
+                                await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
                                 if await jobConsumer.deque.count == 0 {
                                     setIsRunning(false)
                                 }
@@ -224,12 +232,13 @@ final class JobProcessor: @unchecked Sendable {
                             
                             if await jobConsumer.deque.count == 0 {
                                 setIsRunning(false)
-                                try await loadJobs(nil, cache: cache)
+                                try await loadJobs(nil, cache: cache, symmetricKey: symmetricKey)
                             }
                         case .consumed:
+                            let symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
                             await consumedSequence()
                             setIsRunning(false)
-                            try await loadJobs(nil, cache: cache)
+                            try await loadJobs(nil, cache: cache, symmetricKey: symmetricKey)
                         }
                     }
                 }
@@ -285,7 +294,11 @@ final class JobProcessor: @unchecked Sendable {
             throw CryptoSession.SessionErrors.databaseNotInitialized
         }
         
-        guard let sessionIdentity = try await fetchSessionIdentity(for: outboundTask, cache: cache) else {
+        guard let sessionIdentity = try await fetchSessionIdentity(
+            for: outboundTask,
+            cache: cache,
+            session: session
+        ) else {
             throw JobProcessorErrors.missingIdentity
         }
         
@@ -307,12 +320,12 @@ final class JobProcessor: @unchecked Sendable {
         let encodedData = try BSONEncoder().encodeData(outboundTask.message)
         let ratchetedMessage = try await ratchetManager.ratchetEncrypt(plainText: encodedData)
         let signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
-        
+        //TODO: Need to send real to and from users
         try await session.transportDelegate?.sendMessage(
             signedMessage,
             metadata: SignedRatchetMessageMetadata(
-                secretName: sessionUser.secretName,
-                deviceIdentity: sessionUser.deviceIdentity,
+                secretName: outboundTask.recipientSecretName,
+                deviceIdentity: outboundTask.recipientDeviceIdentity,
                 pushType: outboundTask.message.pushType,
                 sharedMessageIdentifier: outboundTask.sharedMessageIdentity,
                 messageType: outboundTask.message.messageType,
@@ -331,7 +344,7 @@ final class JobProcessor: @unchecked Sendable {
             throw CryptoSession.SessionErrors.databaseNotInitialized
         }
         
-        let (encryptedMessage, sessionIdentity) = try await verifyEncryptedMessage(cache: cache, inboundTask: inboundTask)
+        let (encryptedMessage, sessionIdentity) = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
         
         guard let identityProps = await sessionIdentity.props else { fatalError() }
         
@@ -359,11 +372,24 @@ final class JobProcessor: @unchecked Sendable {
             case .friendshipStateRequest:
                 // Create/Update Contact and modify metadata
                 var decodedMetadata = try BSONDecoder().decode(FriendshipMetadata.self, from: decodedMessage.metadata)
-                //Switch states mine is theirs and theirs is mine
-                decodedMetadata.switchStates()
+                //Update our state based on the state of the sender and it's metadata.
+                switch decodedMetadata.theirState {
+                case .pending:
+                    decodedMetadata.revokeFriendRequest()
+                case .requested:
+                    decodedMetadata.sendFriendRequest()
+                case .accepted:
+                    decodedMetadata.acceptFriendRequest()
+                case .blocked, .blockedUser:
+                    decodedMetadata.blockFriend()
+                case .unblock:
+                    decodedMetadata.unBlockFriend()
+                case .rejectedRequest, .friendshipRejected, .rejected:
+                    decodedMetadata.rejectFriendRequest()
+                }
                 let encodedMetadata = try BSONEncoder().encode(decodedMetadata)
                 //Create or update contact including new metadata
-                _ = try await session.updateOrCreateContact(secretName: sessionContext.sessionUser.secretName, metadata: encodedMetadata)
+                _ = try await session.updateOrCreateContact(secretName: inboundTask.senderSecretName, metadata: encodedMetadata)
             case .deliveryStateChange:
                 let decodedMetadata = try BSONDecoder().decode(DeliveryStateMetadata.self, from: decodedMessage.metadata)
                 let symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
@@ -396,9 +422,11 @@ final class JobProcessor: @unchecked Sendable {
     
     func fetchSessionIdentity(for
                               outboundTask: OutboundTaskMessage,
-                              cache: SessionCache
+                              cache: SessionCache,
+                              session: CryptoSession
     ) async throws -> SessionIdentity? {
         for identity in try await cache.fetchSessionIdentities() {
+            identity.symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
             guard let props = await identity.props else { fatalError() }
             if props.secretName == outboundTask.recipientSecretName, props.deviceIdentity == outboundTask.recipientDeviceIdentity {
                 return identity
@@ -603,6 +631,7 @@ final class JobProcessor: @unchecked Sendable {
         symmetricKey: SymmetricKey
     ) async throws -> BaseCommunication {
         return try BaseCommunication(
+            id: UUID(),
             props: .init(
                 messageCount: 0,
                 members: recipients,
@@ -664,21 +693,18 @@ final class JobProcessor: @unchecked Sendable {
         return messageModel
     }
     
-    private func verifyEncryptedMessage(cache: SessionCache, inboundTask: InboundTaskMessage) async throws -> (EncryptedMessage, SessionIdentity) {
-        // Fetch identities from the session cache
-        let identities = try await cache.fetchSessionIdentities()
+    private func verifyEncryptedMessage(
+        session: CryptoSession,
+        inboundTask: InboundTaskMessage
+    ) async throws -> (EncryptedMessage, SessionIdentity) {
         
-        // Filter to find the matching identity based on senderSecretName
-        let sessionSpecificIdentities = await identities.asyncFilter { identity in
-            guard let props = await identity.props else { fatalError() }
-            return props.secretName == inboundTask.senderSecretName
-        }
-        
+        let identities = try await getSessionIdentities(with: inboundTask.senderSecretName, session: session)
         // Find the corresponding device identity
-        guard let sessionIdentity = await sessionSpecificIdentities.asyncFirst(where: { identity in
+        guard let sessionIdentity = await identities.asyncFirst(where: { identity in
             guard let props = await identity.props else { fatalError() }
             return props.deviceIdentity == inboundTask.senderDeviceIdentity
         }) else {
+            //If we did not have an identity we neeed to create it
             throw CryptoSession.SessionErrors.missingSessionIdentity
         }
         
@@ -709,5 +735,100 @@ final class JobProcessor: @unchecked Sendable {
         return try SignedRatchetMessage(
             message: message,
             privateSigningKey: deviceKeys.privateSigningKey)
+    }
+    
+    //TODO: Integrate refresh behavior. This means that we need to make sure our cache is updated everytime this method is called.
+    public func getSessionIdentities(with recipientName: String, session: CryptoSession) async throws -> [SessionIdentity] {
+        var sessions = [SessionIdentity]()
+        
+        guard let sessionContext = await session.sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
+        guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
+        
+        let currentSessions = try await cache.fetchSessionIdentities()
+        let filtered = await currentSessions.asyncFilter { identity in
+            do {
+                let symmetricKey = try await session.getAppSymmetricKey(password: session.appPassword)
+                let props = try await identity.makeDecryptedModel(of: _SessionIdentity.self, symmetricKey: symmetricKey)
+                
+                // Check if the identity is not the current user's identity
+                let isDifferentIdentity = props.deviceIdentity != sessionContext.sessionUser.deviceIdentity &&
+                props.secretName != sessionContext.sessionUser.secretName
+                // Return true if the secret name matches the recipient name or if it's a different identity
+                return props.secretName == recipientName || isDifferentIdentity
+            } catch {
+                return false
+            }
+        }
+
+        // Return filtered identities if not empty and is not the current session
+        let foundRecipients = await filtered.asyncContains(where: { await $0.props?.secretName == recipientName })
+        if foundRecipients {
+            sessions.append(contentsOf: filtered)
+        }
+
+        // If we are empty we did not find a recipient... Let's create one
+        if filtered.isEmpty {
+            //first append our Identites, but not this current session
+            sessions.append(contentsOf: filtered)
+            
+            guard let transport = await session.transportDelegate else { throw CryptoSession.SessionErrors.transportNotInitialized }
+            
+            // Get the user configuration for the recipient
+            let configuration = try await transport.findConfiguration(for: recipientName)
+            
+            // Make sure that the identities of the user configuration are legit
+            let publicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.publicSigningKey)
+            if try configuration.signed.verifySignature(publicKey: publicSigningKey) == false {
+                throw SigningErrors.signingFailedOnVerfication
+            }
+            configuration.publicSigningKey
+            
+            var generatedSessionContextIds = Set<Int>()
+            // Loop over each device, create and cache the identity, and append it to the array
+            let devices = try BSONDecoder().decodeData([UserDeviceConfiguration].self, from: configuration.signed.data)
+            for device in devices {
+                var sessionContextId: Int
+                repeat {
+                    sessionContextId = Int.random(in: 1 ..< .max)
+                } while generatedSessionContextIds.contains(sessionContextId)
+                
+                generatedSessionContextIds.insert(sessionContextId)
+                
+                let identity = try await createEncryptableSessionIdentityModel(
+                    with: device,
+                    for: recipientName,
+                    associatedWith: device.deviceIdentity,
+                    new: sessionContextId,
+                    session: session)
+                sessions.append(identity)
+            }
+        }
+        return sessions
+    }
+    
+    func createEncryptableSessionIdentityModel(
+        with device: UserDeviceConfiguration,
+        for secretName: String,
+        associatedWith deviceIdentity: UUID,
+        new sessionContextId: Int,
+        session: CryptoSession
+    ) async throws -> SessionIdentity {
+        guard let sessionContext = await session.sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
+        guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
+        let identity = try await SessionIdentity(
+            props: .init(
+                secretName: secretName,
+                deviceIdentity: deviceIdentity,
+                senderIdentity: sessionContextId,
+                publicKeyRepesentable: device.publicKey,
+                publicSigningRepresentable: device.publicSigningKey,
+                state: nil,
+                deviceName: "",
+                isMasterDevice: device.isMasterDevice
+            ),
+            symmetricKey: session.getAppSymmetricKey(password: session.appPassword)
+        )
+        try await cache.createSessionIdentity(identity)
+        return identity
     }
 }

@@ -218,11 +218,19 @@ class EndToEndTests {
 
 
 struct ReceiverDelegate: NTMessageReceiver {
-    func createdMessage(_ message: MessageModel) async {
+    func updateContact(_ contact: Contact) async throws {
+        print("Update contact: \(contact)")
+    }
+    
+    func newDeviceRequest(configuration: UserDeviceConfiguration) async {
+        print("New Device")
+    }
+    
+    func createdMessage(_ message: PrivateMessage) async {
         await print("Created message: \(String(describing: message.props?.sendersIdentity))")
     }
     
-    func updatedMessage(_ message: MessageModel) async {
+    func updatedMessage(_ message: PrivateMessage) async {
         print("Updated message: \(message)")
     }
     
@@ -246,12 +254,13 @@ struct ReceivedMessage {
 // Mock implementations of the required protocols
 final class MockTransportDelegate: SessionTransport, @unchecked Sendable {
     
+    
     var streamContinuation: AsyncStream<ReceivedMessage>.Continuation?
     
     
-    func sendMessage(_ message: SignedRatchetMessage, to secretName: String, with deviceIdentity: UUID, pushType: PushNotificationType, remoteId: String) async throws {
-        let received = ReceivedMessage(message: message, sender: secretName, deviceIdentity: deviceIdentity, messageId: remoteId)
-        streamContinuation!.yield(received)
+    func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
+//        let received = ReceivedMessage(message: message, sender: secretName, deviceIdentity: deviceIdentity, messageId: remoteId)
+//        streamContinuation!.yield(received)
     }
     
     func receiveMessage() async throws -> String {
@@ -265,7 +274,7 @@ final class MockTransportDelegate: SessionTransport, @unchecked Sendable {
         return userConfiguration
     }
     
-    func publishUser(configuration: UserConfiguration) async throws {
+    func publishUserConfiguration(_ configuration: UserConfiguration, identity: UUID?) async throws {
         self.userConfiguration = configuration
     }
     
@@ -286,7 +295,8 @@ final class MockTransportDelegate: SessionTransport, @unchecked Sendable {
 }
 
 final class MockIdentityStore: CryptoSessionStore, @unchecked Sendable {
-    var identities = [SessionIdentityModel]()
+    
+    var identities = [SessionIdentity]()
     let crypto = NeedleTailCrypto()
     var mockUserData: MockUserData
     let session: CryptoSession
@@ -297,6 +307,42 @@ final class MockIdentityStore: CryptoSessionStore, @unchecked Sendable {
         self.isSender = isSender
     }
     
+    func createLocalSessionContext(_ data: Data) async throws {
+        
+    }
+    
+    func findLocalSessionContext() async throws -> Data {
+        Data()
+    }
+    
+    func updateLocalSessionContext(_ data: Data) async throws {
+        
+    }
+    
+    func deleteLocalSessionContext() async throws {
+        
+    }
+    
+    func removeContact(_ id: UUID) async throws {
+        
+    }
+    
+    func createMediaJob(_ packet: DataPacket) async throws {
+        
+    }
+    
+    func findAllMediaJobs() async throws -> [DataPacket] {
+        []
+    }
+    
+    func findMediaJob(_ id: UUID) async throws -> DataPacket? {
+        nil
+    }
+    
+    func deleteMediaJob(_ id: UUID) async throws {
+        
+    }
+    
     func updateLocalDeviceConfiguration(_ data: Data) async throws {
         
     }
@@ -305,11 +351,11 @@ final class MockIdentityStore: CryptoSessionStore, @unchecked Sendable {
         
     }
     
-    func createSessionIdentity(_ session: SessionIdentityModel) async throws {
+    func createSessionIdentity(_ session: SessionIdentity) async throws {
         identities.append(session)
     }
     
-    func fetchSessionIdentities() async throws -> [SessionIdentityModel] {
+    func fetchSessionIdentities() async throws -> [SessionIdentity] {
         let privateSigningKey = MockUserData.getPrivateSigningKey()
         let privateKey = MockUserData.getPrivateKey()
         if identities.isEmpty, await identities.first?.props?.publicSigningRepresentable != privateSigningKey?.publicKey.rawRepresentation {
@@ -323,14 +369,14 @@ final class MockIdentityStore: CryptoSessionStore, @unchecked Sendable {
             let symmetricKey = await crypto.deriveStrictSymmetricKey(data: passwordData, salt: saltData)
             
          
-            let props = SessionIdentityModel.Props(
+            let props = SessionIdentity.Props(
                 secretName: isSender ? mockUserData.rsn : mockUserData.ssn,
                 deviceIdentity: isSender ? mockUserData.receiverPublicIdentity : mockUserData.senderPublicIdentity!,
                 senderIdentity: mockUserData.sci,
                 publicKeyRepesentable: privateKey!.publicKey.rawRepresentation,
                 publicSigningRepresentable: privateSigningKey!.publicKey.rawRepresentation,
                 deviceName: mockUserData.dn)
-            let identity = try SessionIdentityModel(
+            let identity = try SessionIdentity(
                 props: props,
                 symmetricKey: symmetricKey)
             identities.append(identity)
@@ -338,11 +384,11 @@ final class MockIdentityStore: CryptoSessionStore, @unchecked Sendable {
         return identities
     }
     
-    func updateSessionIdentity(_ session: SessionIdentityModel) async throws {
+    func updateSessionIdentity(_ session: SessionIdentity) async throws {
         
     }
     
-    func removeSessionIdentity(_ session: SessionIdentityModel) async throws {
+    func removeSessionIdentity(_ session: SessionIdentity) async throws {
         
     }
     
@@ -362,46 +408,42 @@ final class MockIdentityStore: CryptoSessionStore, @unchecked Sendable {
         
     }
     
-    func fetchCommunications() async throws -> [CommunicationModel] {
+    func fetchCommunications() async throws -> [BaseCommunication] {
         []
     }
     
-    func createCommunication(_ type: CommunicationModel) async throws {
+    func createCommunication(_ type: BaseCommunication) async throws {
         
     }
     
-    func updateCommunication(_ type: CommunicationModel) async throws {
+    func updateCommunication(_ type: BaseCommunication) async throws {
         
     }
     
-    func removeCommunication(_ type: CommunicationModel) async throws {
+    func removeCommunication(_ type: BaseCommunication) async throws {
         
     }
     
-    func fetchMessage(byId messageId: UUID) async throws -> MessageModel {
+    func fetchMessage(byId messageId: UUID) async throws -> PrivateMessage {
         return mockMessageModel
     }
     
-    func fetchMessage(by sharedMessageId: String) async throws -> MessageModel {
+    func fetchMessage(by sharedMessageId: String) async throws -> PrivateMessage {
         return mockMessageModel
     }
     
-    func createMessage(_ message: MessageModel) async throws {
+    func createMessage(_ message: PrivateMessage) async throws {
         
     }
     
-    func updateMessage(_ message: MessageModel) async throws {
+    func updateMessage(_ message: PrivateMessage) async throws {
         
     }
     
-    func removeMessage(_ message: MessageModel) async throws {
+    func removeMessage(_ message: PrivateMessage) async throws {
         
     }
-    
-    func listMessages(in communication: UUID, senderId: Int, minimumOrder: Int?, maximumOrder: Int?, offsetBy: Int, limit: Int) async throws -> [MessageModel] {
-        []
-    }
-    
+
     func readJobs() async throws -> [JobModel] {
         []
     }
@@ -430,7 +472,7 @@ final class MockIdentityStore: CryptoSessionStore, @unchecked Sendable {
     func findLocalDeviceConfiguration() async throws -> Data {
         return encyrptedConfigurationForTesting
     }
-    var mockMessageModel: MessageModel!
+    var mockMessageModel: PrivateMessage!
     var encyrptedConfigurationForTesting = Data()
     func createLocalDeviceConfiguration(_ configuration: Data) async throws {
         encyrptedConfigurationForTesting = configuration
@@ -489,7 +531,7 @@ struct MockUserData {
         pushType: .message,
         metadata: [:],
         sentDate: Date(),
-        destructionDate: nil)
+        destructionTime: nil)
     let smi = "123456789"
     
     let session: CryptoSession

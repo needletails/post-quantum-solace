@@ -9,6 +9,7 @@ import Foundation
 import BSON
 import NeedleTailHelpers
 import NeedleTailCrypto
+import NeedleTailLogger
 @preconcurrency import Crypto
 
 public enum RegistrationState: Codable, Sendable {
@@ -27,6 +28,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     
     private let crypto = NeedleTailCrypto()
     let taskProcessor = TaskProcessor()
+    let logger = NeedleTailLogger(.init(label: "[CryptoSession]"))
     public var cache: SessionCache?
     internal var transportDelegate: SessionTransport?
     internal var receiverDelegate: NTMessageReceiver?
@@ -115,7 +117,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         secretName: String,
         appPassword: String
     ) async throws -> CryptoSession {
-        
+        let secretName = secretName.lowercased()
         // Ensure identity store is initialized
         guard let cache = cache else {
             throw SessionErrors.databaseNotInitialized
@@ -138,7 +140,9 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         let sessionUser = SessionUser(
             secretName: secretName,
             deviceIdentity: deviceIdentity,
-            deviceKeys: deviceKeys)
+            deviceKeys: deviceKeys,
+            metadata: .init()
+        )
 
         let device = try UserDeviceConfiguration(
             deviceIdentity: deviceKeys.deviceIdentity,
@@ -150,6 +154,8 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             publicSigningKey: privateSigningKey.publicKey.rawRepresentation,
             devices: [device],
             privateSigningKey: privateSigningKey)
+        
+        let decoded = try BSONDecoder().decodeData([UserDeviceConfiguration].self, from: userConfiguration.signed.data)
         
         var sessionContext = SessionContext(
             sessionUser: sessionUser,
@@ -189,7 +195,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             }
             
             // Create local device configuration. Only locally cached and save. Private keys/info are stored. Use with care...
-            try await cache.createLocalDeviceConfiguration(encryptedConfig)
+            try await cache.createLocalSessionContext(encryptedConfig)
             
             let deviceKeyPublicSigningKey = try Curve25519SigningPrivateKey(rawRepresentation: deviceKeys.privateKey)
             if configuration?.publicSigningKey == deviceKeyPublicSigningKey.publicKey.rawRepresentation {
@@ -217,7 +223,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             }
             
             // Create local device configuration. Only locally cached and save. Private keys/info are stored. Use with care...
-            try await cache.createLocalDeviceConfiguration(encryptedConfig)
+            try await cache.createLocalSessionContext(encryptedConfig)
             // UserConfiguration does not contain Private keys/info... so it should be safe to store publicly.
             try await transportDelegate?.publishUserConfiguration(userConfiguration, identity: nil)
             
@@ -259,7 +265,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             salt: saltData)
         
         // Retrieve the local device configuration
-        let data = try await cache.findLocalDeviceConfiguration()
+        let data = try await cache.findLocalSessionContext()
         
         do {
             // Decrypt the configuration data
@@ -269,7 +275,6 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             
             // Decode the session context from the decrypted data
             let sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
-            
             setAppPassword(appPassword)
             await setSessionContext(sessionContext)
             return CryptoSession.shared
@@ -301,7 +306,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         do {
             let salt = try await self.cache?.findLocalDeviceSalt()
             let appEncryptionKey = try await getAppSymmetricKey(password: appPassword)
-            guard let data = try await self.cache?.findLocalDeviceConfiguration() else { return false }
+            guard let data = try await self.cache?.findLocalSessionContext() else { return false }
             let box = try AES.GCM.SealedBox(combined: data)
             _ = try AES.GCM.open(box, using: appEncryptionKey)
             return true
@@ -319,12 +324,12 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         let configuration = try await transportDelegate.findConfiguration(for: sessionContext.sessionUser.secretName)
 
         //2. seach and discover if the current sessionContext matches the one we found on the server
-        if sessionContext.lastUserConfiguration.signed?.data == configuration.signed?.data  {
+        if sessionContext.lastUserConfiguration.signed.data == configuration.signed.data  {
             // do nothing
         } else {
             //3. make sure that the identities of the user configuration are legit
             let publicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.publicSigningKey)
-            if try configuration.signed?.verifySignature(publicKey: publicSigningKey) == false {
+            if try configuration.signed.verifySignature(publicKey: publicSigningKey) == false {
                 throw SigningErrors.signingFailedOnVerfication
             }
             //4. save/update locally and cache
@@ -335,7 +340,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 symmetricKey: getAppSymmetricKey(password: self.appPassword)) else {
                 throw SessionErrors.sessionEncryptionError
             }
-            try await cache?.updateLocalDeviceConfiguration(encryptedConfig)
+            try await cache?.updateLocalSessionContext(encryptedConfig)
         }
     }
 }

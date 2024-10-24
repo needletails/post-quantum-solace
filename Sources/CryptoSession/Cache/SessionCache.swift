@@ -18,6 +18,7 @@ protocol SessionCacheSynchronizer {
 /// An actor that manages session caching and synchronization.
 public actor SessionCache: CryptoSessionStore {
     
+    
     // MARK: - Properties
     
     private let store: CryptoSessionStore
@@ -51,7 +52,7 @@ public actor SessionCache: CryptoSessionStore {
     /// - Throws: An error if any fetching operation fails.
     func refreshCache() async throws {
         // Refresh local device configuration
-        localDeviceConfiguration = try await findLocalDeviceConfiguration()
+        localDeviceConfiguration = try await findLocalSessionContext()
         // Refresh local device salt
         localDeviceSalt = try await findLocalDeviceSalt()
         // Refresh contacts
@@ -78,19 +79,19 @@ public actor SessionCache: CryptoSessionStore {
     /// Creates a local device configuration and caches it.
     /// - Parameter data: The configuration data to be cached.
     /// - Throws: An error if the creation fails.
-   public func createLocalDeviceConfiguration(_ data: Data) async throws {
-        try await store.createLocalDeviceConfiguration(data)
+   public func createLocalSessionContext(_ data: Data) async throws {
+        try await store.createLocalSessionContext(data)
         localDeviceConfiguration = data // Cache the data directly
     }
     
     /// Finds the local device configuration, either from cache or the store.
     /// - Returns: The cached or fetched configuration data.
     /// - Throws: An error if the configuration cannot be found.
-   public func findLocalDeviceConfiguration() async throws -> Data {
+   public func findLocalSessionContext() async throws -> Data {
         if let cachedConfig = localDeviceConfiguration {
             return cachedConfig
         }
-        localDeviceConfiguration = try await store.findLocalDeviceConfiguration()
+        localDeviceConfiguration = try await store.findLocalSessionContext()
         guard let config = localDeviceConfiguration else {
             throw CacheErrors.localDeviceConfigurationIsNil
         }
@@ -100,15 +101,15 @@ public actor SessionCache: CryptoSessionStore {
     /// Updates the local device configuration and refreshes the cache.
     /// - Parameter data: The new configuration data.
     /// - Throws: An error if the update fails.
-   public func updateLocalDeviceConfiguration(_ data: Data) async throws {
-        try await store.updateLocalDeviceConfiguration(data)
+   public func updateLocalSessionContext(_ data: Data) async throws {
+        try await store.updateLocalSessionContext(data)
         localDeviceConfiguration = data // Cache the updated data directly
     }
     
     /// Deletes the local device configuration and clears the cache.
     /// - Throws: An error if the deletion fails.
-   public func deleteLocalDeviceConfiguration() async throws {
-        try await store.deleteLocalDeviceConfiguration()
+   public func deleteLocalSessionContext() async throws {
+        try await store.deleteLocalSessionContext()
         localDeviceConfiguration = nil
     }
     
@@ -162,9 +163,9 @@ public actor SessionCache: CryptoSessionStore {
     /// Removes a session identity from the cache and store.
     /// - Parameter session: The session identity to be removed.
     /// - Throws: An error if the removal fails.
-    public func removeSessionIdentity(_ session: SessionIdentity) async throws {
-        sessionIdentities.removeAll(where: { $0.id == session.id })
-        try await store.removeSessionIdentity(session)
+    public func removeSessionIdentity(_ id: UUID) async throws {
+        sessionIdentities.removeAll(where: { $0.id == id })
+        try await store.removeSessionIdentity(id)
     }
     
     // MARK: - Message Methods
@@ -188,7 +189,7 @@ public actor SessionCache: CryptoSessionStore {
     /// - Parameter sharedMessageId: The shared message ID of the message to fetch.
     /// - Returns: The fetched message.
     /// - Throws: An error if fetching fails.
-    public func fetchMessage(by sharedMessageId: String) async throws -> DoubleRatchetKit.PrivateMessage {
+    public func fetchMessage(by sharedMessageId: String) async throws -> PrivateMessage {
         if let message = messages.first(where: { $0.sharedMessageIdentity == sharedMessageId }) {
             return message
         } else {
@@ -226,73 +227,21 @@ public actor SessionCache: CryptoSessionStore {
         try await store.removeMessage(message)
     }
     
-    /// Lists messages based on various criteria.
-    /// - Parameters:
-    ///   - communication: The communication ID to filter messages.
-    ///   - sessionContextId: The ID of the Session.
-    ///   - minimumOrder: The minimum order to filter messages.
-    ///   - maximumOrder: The maximum order to filter messages.
-    ///   - offsetBy: The number of messages to skip.
-    ///   - limit: The maximum number of messages to return.
-    /// - Returns: An array of messages matching the criteria.
-    /// - Throws: An error if fetching fails.
-    public func listMessages(
-        in communicationIdentity: UUID,
+    //The Cursor will keep track of or stream state
+    public func streamMessages(
+        offSet: Int,
+        limit: Int,
+        communicationIdentity: UUID,
         sessionContextId: Int,
-        ordering: Ordering,
-        minimumOrder: Int?,
-        maximumOrder: Int?,
-        offsetBy: Int,
-        limit: Int
-    ) async throws -> [PrivateMessage] {
-        
-        // Filter messages based on the provided parameters
-        let filteredMessages = messages.filter { message in
-            // Check if the message matches the communication identity
-            let matchesIdentity = message.communicationIdentity == communicationIdentity
-            let matchesSenderId = message.senderIdentity == sessionContextId
-            let matchesMinimumOrder = minimumOrder == nil || message.sequenceId > minimumOrder!
-            let matchesMaximumOrder = maximumOrder == nil || message.sequenceId < maximumOrder!
-            
-            return matchesIdentity && matchesSenderId && matchesMinimumOrder && matchesMaximumOrder
-        }
-        // Sort the results based on the ordering
-        var sortedMessages = [PrivateMessage]()
-        
-        // Check if filtered messages are empty
-        if filteredMessages.isEmpty {
-            // Handle the empty case (return an empty array or perform some other action)
-            sortedMessages.append(contentsOf: try await store.listMessages(
-                in: communicationIdentity,
-                sessionContextId: sessionContextId,
-                ordering: ordering,
-                minimumOrder: minimumOrder,
-                maximumOrder: maximumOrder,
-                offsetBy: offsetBy,
-                limit: limit))
-            
-            messages = sortedMessages
-            return sortedMessages
-        } else {
-            messages.removeAll(keepingCapacity: true)
-            switch ordering {
-            case .ascending:
-                sortedMessages = filteredMessages.sorted { $0.sequenceId < $1.sequenceId }
-            case .descending:
-                sortedMessages = filteredMessages.sorted { $0.sequenceId > $1.sequenceId }
-            }
-            
-            // Apply offset and limit for pagination
-            let startIndex = offsetBy
-            let endIndex = startIndex + limit
-            let paginatedMessages = Array(sortedMessages.dropFirst(startIndex).prefix(limit))
-            messages = paginatedMessages
-            return paginatedMessages
-        }
+        sequenceId: Int
+    ) async throws -> (AsyncThrowingStream<[PrivateMessage], Error>, AsyncThrowingStream<[PrivateMessage], Error>.Continuation?) {
+         try await store.streamMessages(
+            offSet: offSet,
+            limit: limit,
+            communicationIdentity: communicationIdentity,
+            sessionContextId: sessionContextId,
+            sequenceId: sequenceId)
     }
-
-
-
     
     // MARK: - Job Methods
     
@@ -413,12 +362,12 @@ extension SessionCache {
     /// - Parameter type: The communication type to be updated.
     /// - Throws: An error if the update fails.
     public func updateCommunication(_ type: DoubleRatchetKit.BaseCommunication) async throws {
-        if let index = communicationTypes.firstIndex(where: { $0.id == type.id }) {
-            communicationTypes[index] = type
-            try await store.updateCommunication(type)
-        } else {
-            throw CacheErrors.communicationTypeNotFound
-        }
+            if let index = communicationTypes.firstIndex(where: { $0.id == type.id }) {
+                communicationTypes[index] = type
+                try await store.updateCommunication(type)
+            } else {
+                throw CacheErrors.communicationTypeNotFound
+            }
     }
     
     /// Removes a communication type from the cache and store.

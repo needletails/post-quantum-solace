@@ -20,7 +20,8 @@ public struct Contact: Sendable, Codable, Equatable {
 }
 
 public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendable {
-    public let id = UUID()
+    
+    public let id: UUID
     public var data: Data
     
     enum CodingKeys: String, CodingKey, Codable & Sendable {
@@ -29,7 +30,7 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     /// SymmetricKey can be updated.
-    private var symmetricKey: SymmetricKey?
+    public var symmetricKey: SymmetricKey?
     
     /// Asynchronously retrieves the decrypted properties, if available.
     public var props: UnwrappedProps? {
@@ -55,9 +56,11 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     init(
+        id: UUID,
         props: UnwrappedProps,
         symmetricKey: SymmetricKey
     ) throws {
+        self.id = id
         self.symmetricKey = symmetricKey
         let crypto = NeedleTailCrypto()
         let data = try BSONEncoder().encodeData(props)
@@ -67,7 +70,11 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         self.data = encryptedData
     }
     
-    public init(data: Data) {
+    public init(
+        id: UUID,
+        data: Data
+    ) {
+        self.id = id
         self.data = data
     }
     
@@ -107,7 +114,8 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         return try await updateProps(symmetricKey: symmetricKey, props: props)
     }
     
-    public func makeDecryptedModel<T: Sendable & Codable>(of: T.Type) async throws -> T {
+    public func makeDecryptedModel<T: Sendable & Codable>(of: T.Type, symmetricKey: SymmetricKey) async throws -> T {
+        self.symmetricKey = symmetricKey
         guard let props = await props else { throw CryptoSession.SessionErrors.propsError }
         return Contact(
             id: id,

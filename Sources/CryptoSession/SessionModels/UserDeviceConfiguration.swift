@@ -52,3 +52,30 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         self.isMasterDevice = isMasterDevice
     }
 }
+
+public struct UserSession: Codable, Sendable, Hashable {
+    let id = UUID()
+    public let secretName: String
+    public let identity: UUID
+    public let configuration: UserDeviceConfiguration
+    public let deviceName: String
+    
+    public init(
+        secretName: String,
+        configuration: UserDeviceConfiguration,
+        deviceName: String
+    ) {
+        self.secretName = secretName
+        self.identity = configuration.deviceIdentity
+        self.configuration = configuration
+        self.deviceName = deviceName
+    }
+    
+    public static func == (lhs: UserSession, rhs: UserSession) -> Bool {
+        return lhs.id == rhs.id
+    }
+    
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+}
