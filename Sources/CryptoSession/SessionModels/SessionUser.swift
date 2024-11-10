@@ -11,14 +11,14 @@ public struct SessionUser: Codable & Sendable {
     /// Coding keys for encoding and decoding the struct.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case secretName = "a"
-        case deviceIdentity = "b"
+        case deviceId = "b"
         case deviceKeys = "c"
         case metadata = "d"
     }
     /// The name of the secret associated with the session user.
     public let secretName: String
     /// Unique identifier for the device associated with the session user.
-    public let deviceIdentity: UUID
+    public let deviceId: UUID
     /// The device keys associated with the session user.
     public let deviceKeys: DeviceKeys
     /// The User Specific Metadata

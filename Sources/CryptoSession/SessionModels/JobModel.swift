@@ -33,20 +33,15 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         case data = "b"
     }
     
-    /// SymmetricKey can be updated.
-    internal var symmetricKey: SymmetricKey?
-    
     /// Asynchronously retrieves the decrypted properties, if available.
-    var props: UnwrappedProps? {
-        get async {
-            do {
-                guard let symmetricKey = symmetricKey else { return nil }
-                return try await decryptProps(symmetricKey: symmetricKey)
-            } catch {
-                return nil
-            }
+    public func props(symmetricKey: SymmetricKey) async -> UnwrappedProps? {
+        do {
+            return try await decryptProps(symmetricKey: symmetricKey)
+        } catch {
+            return nil
         }
     }
+
     
     public struct UnwrappedProps: Codable & Sendable {
         private enum CodingKeys: String, CodingKey, Sendable {
@@ -71,7 +66,6 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         symmetricKey: SymmetricKey
     ) throws {
         self.id = id
-        self.symmetricKey = symmetricKey
         let crypto = NeedleTailCrypto()
         let data = try BSONEncoder().encodeData(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
@@ -111,12 +105,13 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             throw CryptoError.encryptionFailed
         }
         self.data = encryptedData
-        return await self.props
+        return try await self.decryptProps(symmetricKey: symmetricKey)
     }
     
     public func makeDecryptedModel<T: Sendable & Codable>(of: T.Type, symmetricKey: SymmetricKey) async throws -> T {
-        self.symmetricKey = symmetricKey
-        guard let props = await props else { throw CryptoSession.SessionErrors.propsError }
+        guard let props = await props(symmetricKey: symmetricKey) else {
+            throw CryptoSession.SessionErrors.propsError
+        }
         return Job(
             id: id,
             sequenceId: props.sequenceId,

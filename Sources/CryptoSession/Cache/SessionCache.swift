@@ -9,6 +9,8 @@ import BSON
 import NeedleTailHelpers
 import NeedleTailCrypto
 import DoubleRatchetKit
+import NeedleTailStructures
+@preconcurrency import Crypto
 
 /// A protocol defining the requirements for a cache synchronizer.
 protocol SessionCacheSynchronizer {
@@ -190,7 +192,7 @@ public actor SessionCache: CryptoSessionStore {
     /// - Returns: The fetched message.
     /// - Throws: An error if fetching fails.
     public func fetchMessage(by sharedMessageId: String) async throws -> PrivateMessage {
-        if let message = messages.first(where: { $0.sharedMessageIdentity == sharedMessageId }) {
+        if let message = messages.first(where: { $0.sharedId == sharedMessageId }) {
             return message
         } else {
             let message = try await store.fetchMessage(by: sharedMessageId)
@@ -202,18 +204,32 @@ public actor SessionCache: CryptoSessionStore {
     /// Creates a new message and caches it.
     /// - Parameter message: The message to be created.
     /// - Throws: An error if the creation fails.
-    public func createMessage(_ message: PrivateMessage) async throws {
-        try await store.createMessage(message)
+    public func createMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws {
+        try await store.createMessage(message, symmetricKey: symmetricKey)
         messages.append(message)
+    }
+    
+    public func insertMessage(_ message: PrivateMessage) async throws {
+        if !messages.contains(where: { $0.id == message.id }) {
+            messages.append(message)
+            messages.sorted(by: { $0.sequenceNumber < $1.sequenceNumber })
+        }
     }
     
     /// Updates an existing message.
     /// - Parameter message: The message to be updated.
     /// - Throws: An error if the update fails.
-    public func updateMessage(_ message: PrivateMessage) async throws {
+    public func updateMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws {
         if let index = messages.firstIndex(where: { $0.id == message.id }) {
             messages[index] = message
-            try await store.updateMessage(message)
+            try await store.updateMessage(message, symmetricKey: symmetricKey)
+            
+//            let foundMessage = try await store.fetchMessage(byId: message.id)
+            
+//            if let downloadStateBinary = try await foundMessage.decryptProps(symmetricKey: symmetricKey).message.metadata["multipartUploadState"] as? Binary {
+//                let mediaDownloadState = try BSONDecoder().decode(MultipartDownloadState.self,from: Document(data: downloadStateBinary.data))
+//                print("NEW UPLOAD STATE: \(mediaDownloadState)")
+//            }
         } else {
             throw CacheErrors.messageNotFound
         }
@@ -231,15 +247,13 @@ public actor SessionCache: CryptoSessionStore {
     public func streamMessages(
         offSet: Int,
         limit: Int,
-        communicationIdentity: UUID,
-        sessionContextId: Int,
+        sharedIdentifier: UUID,
         sequenceId: Int
     ) async throws -> (AsyncThrowingStream<[PrivateMessage], Error>, AsyncThrowingStream<[PrivateMessage], Error>.Continuation?) {
          try await store.streamMessages(
             offSet: offSet,
             limit: limit,
-            communicationIdentity: communicationIdentity,
-            sessionContextId: sessionContextId,
+            sharedIdentifier: sharedIdentifier,
             sequenceId: sequenceId)
     }
     
@@ -421,3 +435,5 @@ extension SessionCache {
         try await store.deleteMediaJob(id) // Remove from the store
     }
 }
+
+extension SymmetricKey: @unchecked Sendable {}

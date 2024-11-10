@@ -56,7 +56,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     nonisolated func synchronizeLocalConfiguration(_ data: Data) {
         Task { [weak self] in
             guard let self else { return }
-            let symmetricKey = try await self.getAppSymmetricKey(password: appPassword)
+            let symmetricKey = try await self.getAppSymmetricKey()
             guard let decryptedData = try self.crypto.decrypt(data: data, symmetricKey: symmetricKey) else { return }
             let context = try BSONDecoder().decodeData(SessionContext.self, from: decryptedData)
             await setSessionContext(context)
@@ -130,22 +130,22 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         // Create User/Identity key that represents this device
         let privateKey = crypto.generateCurve25519PrivateKey()
         let privateSigningKey = crypto.generateCurve25519SigningPrivateKey()
-        let deviceIdentity = UUID()
+        let deviceId = UUID()
         
         let deviceKeys = DeviceKeys(
-            deviceIdentity: deviceIdentity,
+            deviceId: deviceId,
             privateSigningKey: privateSigningKey.rawRepresentation,
             privateKey: privateKey.rawRepresentation)
         
         let sessionUser = SessionUser(
             secretName: secretName,
-            deviceIdentity: deviceIdentity,
+            deviceId: deviceId,
             deviceKeys: deviceKeys,
             metadata: .init()
         )
 
         let device = try UserDeviceConfiguration(
-            deviceIdentity: deviceKeys.deviceIdentity,
+            deviceId: deviceKeys.deviceId,
             publicSigningKey: privateSigningKey.publicKey.rawRepresentation,
             publicKey: privateKey.publicKey.rawRepresentation,
             isMasterDevice: true)
@@ -203,7 +203,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             }
             
             let auxillaryConfiguration = try UserDeviceConfiguration(
-                deviceIdentity: deviceKeys.deviceIdentity,
+                deviceId: deviceKeys.deviceId,
                 publicSigningKey: deviceKeyPublicSigningKey.publicKey.rawRepresentation,
                 publicKey: privateKey.publicKey.rawRepresentation,
                 isMasterDevice: false)
@@ -289,7 +289,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             salt: saltData)
     }
     
-    public func getAppSymmetricKey(password: String) async throws -> SymmetricKey {
+    public func getAppSymmetricKey() async throws -> SymmetricKey {
         guard let salt = try await cache?.findLocalDeviceSalt() else { throw SessionErrors.saltError }
         guard let passwordData = await appPassword.data(using: .utf8) else {
             throw SessionErrors.invalidPassword
@@ -304,8 +304,16 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     
     public func verifyAppPassword(_ appPassword: String) async -> Bool {
         do {
-            let salt = try await self.cache?.findLocalDeviceSalt()
-            let appEncryptionKey = try await getAppSymmetricKey(password: appPassword)
+            guard let salt = try await cache?.findLocalDeviceSalt() else { throw SessionErrors.saltError }
+            guard let passwordData = await appPassword.data(using: .utf8) else {
+                throw SessionErrors.invalidPassword
+            }
+            guard let saltData = salt.data(using: .utf8) else {
+                throw SessionErrors.saltError
+            }
+            let appEncryptionKey = await crypto.deriveStrictSymmetricKey(
+                data: passwordData,
+                salt: saltData)
             guard let data = try await self.cache?.findLocalSessionContext() else { return false }
             let box = try AES.GCM.SealedBox(combined: data)
             _ = try AES.GCM.open(box, using: appEncryptionKey)
@@ -337,7 +345,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             let encodedData = try BSONEncoder().encodeData(sessionContext)
             guard let encryptedConfig = try await crypto.encrypt(
                 data: encodedData,
-                symmetricKey: getAppSymmetricKey(password: self.appPassword)) else {
+                symmetricKey: getAppSymmetricKey()) else {
                 throw SessionErrors.sessionEncryptionError
             }
             try await cache?.updateLocalSessionContext(encryptedConfig)

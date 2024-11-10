@@ -17,17 +17,17 @@ enum SigningErrors: Error {
 public struct UserDeviceConfiguration: Codable, Sendable {
     
     /// Unique identifier for the device.
-    public let deviceIdentity: UUID
+    public let deviceId: UUID
     /// Data representing the signing identity of the device.
     public let publicSigningKey: Data
     /// Public key associated with the device.
     public let publicKey: Data
     /// A flag indicating if this device is the master device.
     public let isMasterDevice: Bool
-
+    
     /// Coding keys for encoding and decoding the struct.
     enum CodingKeys: String, CodingKey, Codable, Sendable {
-        case deviceIdentity = "a"
+        case deviceId = "a"
         case publicSigningKey = "b"
         case publicKey = "c"
         case isMasterDevice = "d"
@@ -35,18 +35,18 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     
     /// Initializes a new `UserDeviceConfiguration` instance.
     /// - Parameters:
-    ///   - deviceIdentity: The unique identifier for the device.
+    ///   - deviceId: The unique identifier for the device.
     ///   - signingIdentity: The signing identity data.
     ///   - publicKey: The public key data.
     ///   - isMasterDevice: A flag indicating if this is the master device.
     /// - Throws: An error if signing the configuration fails.
-   public init(
-        deviceIdentity: UUID,
+    public init(
+        deviceId: UUID,
         publicSigningKey: Data,
         publicKey: Data,
         isMasterDevice: Bool
     ) throws {
-        self.deviceIdentity = deviceIdentity
+        self.deviceId = deviceId
         self.publicSigningKey = publicSigningKey
         self.publicKey = publicKey
         self.isMasterDevice = isMasterDevice
@@ -66,7 +66,7 @@ public struct UserSession: Codable, Sendable, Hashable {
         deviceName: String
     ) {
         self.secretName = secretName
-        self.identity = configuration.deviceIdentity
+        self.identity = configuration.deviceId
         self.configuration = configuration
         self.deviceName = deviceName
     }

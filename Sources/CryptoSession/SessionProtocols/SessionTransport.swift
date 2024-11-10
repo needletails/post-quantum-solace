@@ -11,8 +11,8 @@ import DoubleRatchetKit
 public struct SignedRatchetMessageMetadata: Sendable {
     /// Recipient secretName
     public let secretName: String
-    /// Recipient deviceIdentity
-    public let deviceIdentity: UUID
+    /// Recipient deviceId
+    public let deviceId: UUID
     /// Push Notification Type
     public let pushType: PushNotificationType
     /// Shared Message Identifier

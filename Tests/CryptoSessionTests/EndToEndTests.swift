@@ -38,7 +38,7 @@ class EndToEndTests {
         _session.isViable = true
         await _session.setReceiverDelegate(conformer: ReceiverDelegate())
         let session = try! await _session.createSession(secretName: mockUserData.ssn, appPassword: mockUserData.sap)
-        mockUserData.senderPublicIdentity = await session.sessionContext?.sessionUser.deviceIdentity
+        mockUserData.senderPublicIdentity = await session.sessionContext?.sessionUser.deviceId
         return session
     }
     
@@ -51,7 +51,7 @@ class EndToEndTests {
         _session.isViable = true
         await _session.setReceiverDelegate(conformer: ReceiverDelegate())
         let session = try! await _session.createSession(secretName: mockUserData.rsn, appPassword: mockUserData.sap)
-        //            mockUserData.receiverPublicIdentity = await session.sessionContext?.sessionUser.deviceIdentity
+        //            mockUserData.receiverPublicIdentity = await session.sessionContext?.sessionUser.deviceId
         return session
     }
     
@@ -66,13 +66,13 @@ class EndToEndTests {
         let senderSession = try await senderSession()
         
         let keys1 = await DeviceKeys(
-            deviceIdentity: senderSession.sessionContext!.sessionUser.deviceKeys.deviceIdentity,
+            deviceId: senderSession.sessionContext!.sessionUser.deviceKeys.deviceId,
             privateSigningKey: privateSigningKey!.rawRepresentation,
             privateKey: privateKey!.rawRepresentation)
         
         let user1 = await SessionUser(
             secretName: senderSession.sessionContext!.sessionUser.secretName,
-            deviceIdentity: senderSession.sessionContext!.sessionUser.deviceIdentity,
+            deviceId: senderSession.sessionContext!.sessionUser.deviceId,
             deviceKeys: keys1)
         
         let context1 = await SessionContext(
@@ -96,13 +96,13 @@ class EndToEndTests {
         
         let recipentSession = try await recipentSession()
         let keys = DeviceKeys(
-            deviceIdentity: mockUserData.receiverPublicIdentity,
+            deviceId: mockUserData.receiverPublicIdentity,
             privateSigningKey: privateSigningKey!.rawRepresentation,
             privateKey: privateKey!.rawRepresentation)
         
         let user = await SessionUser(
             secretName:  recipentSession.sessionContext!.sessionUser.secretName,
-            deviceIdentity: mockUserData.receiverPublicIdentity,
+            deviceId: mockUserData.receiverPublicIdentity,
             deviceKeys: keys)
         
         let context = await SessionContext(
@@ -119,7 +119,7 @@ class EndToEndTests {
                 try await recipentSession.receiveMessage(
                     message: received.message,
                     sender: received.sender,
-                    deviceIdentity: received.deviceIdentity,
+                    deviceId: received.deviceId,
                     messageId: received.messageId)
             })
             return
@@ -138,13 +138,13 @@ class EndToEndTests {
         let senderSession = try await senderSession()
         
         let keys1 = await DeviceKeys(
-            deviceIdentity: senderSession.sessionContext!.sessionUser.deviceKeys.deviceIdentity,
+            deviceId: senderSession.sessionContext!.sessionUser.deviceKeys.deviceId,
             privateSigningKey: privateSigningKey!.rawRepresentation,
             privateKey: privateKey!.rawRepresentation)
         
         let user1 = await SessionUser(
             secretName: senderSession.sessionContext!.sessionUser.secretName,
-            deviceIdentity: senderSession.sessionContext!.sessionUser.deviceIdentity,
+            deviceId: senderSession.sessionContext!.sessionUser.deviceId,
             deviceKeys: keys1)
         
         let context1 = await SessionContext(
@@ -180,13 +180,13 @@ class EndToEndTests {
         
         let recipentSession = try await recipentSession()
         let keys = DeviceKeys(
-            deviceIdentity: mockUserData.receiverPublicIdentity,
+            deviceId: mockUserData.receiverPublicIdentity,
             privateSigningKey: privateSigningKey!.rawRepresentation,
             privateKey: privateKey!.rawRepresentation)
         
         let user = await SessionUser(
             secretName:  recipentSession.sessionContext!.sessionUser.secretName,
-            deviceIdentity: mockUserData.receiverPublicIdentity,
+            deviceId: mockUserData.receiverPublicIdentity,
             deviceKeys: keys)
         
         let context = await SessionContext(
@@ -204,7 +204,7 @@ class EndToEndTests {
                 try await recipentSession.receiveMessage(
                     message: received.message,
                     sender: received.sender,
-                    deviceIdentity: received.deviceIdentity,
+                    deviceId: received.deviceId,
                     messageId: received.messageId)
             })
             
@@ -247,7 +247,7 @@ struct ReceiverDelegate: NTMessageReceiver {
 struct ReceivedMessage {
     let message: SignedRatchetMessage
     let sender: String
-    let deviceIdentity: UUID
+    let deviceId: UUID
     let messageId: String
 }
 
@@ -259,7 +259,7 @@ final class MockTransportDelegate: SessionTransport, @unchecked Sendable {
     
     
     func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
-//        let received = ReceivedMessage(message: message, sender: secretName, deviceIdentity: deviceIdentity, messageId: remoteId)
+//        let received = ReceivedMessage(message: message, sender: secretName, deviceId: deviceId, messageId: remoteId)
 //        streamContinuation!.yield(received)
     }
     
@@ -371,7 +371,7 @@ final class MockIdentityStore: CryptoSessionStore, @unchecked Sendable {
          
             let props = SessionIdentity.Props(
                 secretName: isSender ? mockUserData.rsn : mockUserData.ssn,
-                deviceIdentity: isSender ? mockUserData.receiverPublicIdentity : mockUserData.senderPublicIdentity!,
+                deviceId: isSender ? mockUserData.receiverPublicIdentity : mockUserData.senderPublicIdentity!,
                 senderIdentity: mockUserData.sci,
                 publicKeyRepesentable: privateKey!.publicKey.rawRepresentation,
                 publicSigningRepresentable: privateSigningKey!.publicKey.rawRepresentation,

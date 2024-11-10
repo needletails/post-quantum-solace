@@ -29,20 +29,15 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         case data = "b"
     }
     
-    /// SymmetricKey can be updated.
-    public var symmetricKey: SymmetricKey?
-    
     /// Asynchronously retrieves the decrypted properties, if available.
-    public var props: UnwrappedProps? {
-        get async {
-            do {
-                guard let symmetricKey = symmetricKey else { return nil }
-                return try await decryptProps(symmetricKey: symmetricKey)
-            } catch {
-                return nil
-            }
+    public func props(symmetricKey: SymmetricKey) async -> UnwrappedProps? {
+        do {
+            return try await decryptProps(symmetricKey: symmetricKey)
+        } catch {
+            return nil
         }
     }
+
     
     public struct UnwrappedProps: Codable, Sendable {
         private enum CodingKeys: String, CodingKey, Sendable {
@@ -61,7 +56,6 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         symmetricKey: SymmetricKey
     ) throws {
         self.id = id
-        self.symmetricKey = symmetricKey
         let crypto = NeedleTailCrypto()
         let data = try BSONEncoder().encodeData(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
@@ -105,18 +99,19 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
             throw CryptoError.encryptionFailed
         }
         self.data = encryptedData
-        return await self.props
+        return await self.props(symmetricKey: symmetricKey)
     }
     
-    public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Document) async throws -> UnwrappedProps? {
+    public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Document, with key: String) async throws -> UnwrappedProps? {
         var props = try await decryptProps(symmetricKey: symmetricKey)
-        props.metadata = metadata
+        props.metadata[key] = metadata
         return try await updateProps(symmetricKey: symmetricKey, props: props)
     }
     
     public func makeDecryptedModel<T: Sendable & Codable>(of: T.Type, symmetricKey: SymmetricKey) async throws -> T {
-        self.symmetricKey = symmetricKey
-        guard let props = await props else { throw CryptoSession.SessionErrors.propsError }
+        guard let props = await props(symmetricKey: symmetricKey) else {
+            throw CryptoSession.SessionErrors.propsError
+        }
         return Contact(
             id: id,
             secretName: props.secretName,
@@ -124,14 +119,42 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
             metadata: props.metadata) as! T
     }
     
-    public func updateContactNickname(_ nick: String) async throws {
-        guard let props = await props else { throw CryptoSession.SessionErrors.propsError }
-        guard let symmetricKey = await symmetricKey else { throw CryptoSession.SessionErrors.missingKey }
-        var decoded = try BSONDecoder().decode(ContactMetadata.self, from: props.metadata)
-        decoded.nickname = nick
+    public func updateContact(_ metadata: ContactMetadata, symmetricKey: SymmetricKey) async throws {
+        guard var props = await props(symmetricKey: symmetricKey) else {
+            throw CryptoSession.SessionErrors.propsError
+        }
+        
+        // Decode the existing metadata
+        var decoded: ContactMetadata = try props.metadata.decode(forKey: "contactMetadata")
+        
+        // Update properties only if they are not nil
+        if let status = metadata.status {
+            decoded.status = status
+        }
+        if let nickname = metadata.nickname {
+            decoded.nickname = nickname
+        }
+        if let firstName = metadata.firstName {
+            decoded.firstName = firstName
+        }
+        if let lastName = metadata.lastName {
+            decoded.lastName = lastName
+        }
+        if let email = metadata.email {
+            decoded.email = email
+        }
+        if let image = metadata.image {
+            decoded.image = image
+        }
+        
+        // Encode the updated metadata
         let encoded = try BSONEncoder().encode(decoded)
-        _ = try await updatePropsMetadata(symmetricKey: symmetricKey, metadata: encoded)
+        props.metadata["contactMetadata"] = encoded
+        
+        // Update the properties
+        _ = try await updateProps(symmetricKey: symmetricKey, props: props)
     }
+
 }
 
 
@@ -165,4 +188,37 @@ public struct DataPacket: Codable, Sendable {
         self.data = data
     }
     
+}
+
+
+extension Document {
+    /* EXAMPLE
+     let doc1 = AnimalObject(animals: ["dog", "cat", "bird", "fish", "hedgehog"])
+     let doc2 = NatureObject(types: ["pop", "water", "juice", "coffee", "tea"])
+     let doc3 = DrinkObject(drinks: ["mountain", "river", "valley", "hill", "lake"])
+     
+     var combinedDocument: Document = [:]
+     let encoded1: Document = try! BSONEncoder().encode(doc1)
+     let encoded2: Document = try! BSONEncoder().encode(doc2)
+     let encoded3: Document = try! BSONEncoder().encode(doc3)
+     
+     combinedDocument["animals"] = encoded1
+     combinedDocument["types"] = encoded2
+     combinedDocument["drinks"] = encoded3
+     //Store CombinedDocument
+     
+     
+     //Get desired Document
+     let decoded: DrinkObject = try! combinedDocument.decode(forKey: "drinks")
+     
+     */
+    /// - Parameter key: document key to find and decode
+    /// - Returns: the Codable object
+    public func decode<T: Codable>(forKey key: String) throws -> T {
+        guard let value = self[key] else {
+            throw DecodingError.dataCorrupted(DecodingError.Context(codingPath: [], debugDescription: "Key \(key) not found in document"))
+        }
+        guard let data = try BSONEncoder().encodePrimitive(value) else { fatalError() }
+        return try BSONDecoder().decode(T.self, fromPrimitive: data)
+    }
 }

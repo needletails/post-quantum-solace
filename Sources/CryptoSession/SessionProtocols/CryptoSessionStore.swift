@@ -7,7 +7,7 @@
 import Foundation
 import NeedleTailCrypto
 import DoubleRatchetKit
-
+import Crypto
 
 public enum Ordering: Sendable {
     case ascending, descending
@@ -58,14 +58,13 @@ public protocol CryptoSessionStore: Sendable {
     
     func fetchMessage(byId messageId: UUID) async throws -> PrivateMessage
     func fetchMessage(by sharedMessageId: String) async throws -> PrivateMessage
-    func createMessage(_ message: PrivateMessage) async throws
-    func updateMessage(_ message: PrivateMessage) async throws
+    func createMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws
+    func updateMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws
     func removeMessage(_ message: PrivateMessage) async throws
     func streamMessages(
         offSet: Int,
         limit: Int,
-        communicationIdentity: UUID,
-        sessionContextId: Int,
+        sharedIdentifier: UUID,
         sequenceId: Int
     ) async throws -> (AsyncThrowingStream<[PrivateMessage], Error>, AsyncThrowingStream<[PrivateMessage], Error>.Continuation?)
     
