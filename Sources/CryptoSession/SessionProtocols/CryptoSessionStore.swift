@@ -67,6 +67,7 @@ public protocol CryptoSessionStore: Sendable {
         sharedIdentifier: UUID,
         sequenceId: Int
     ) async throws -> (AsyncThrowingStream<[PrivateMessage], Error>, AsyncThrowingStream<[PrivateMessage], Error>.Continuation?)
+    func messageCount(for sharedIdentifier: UUID) async throws -> Int
     
     func readJobs() async throws -> [JobModel]
     func createJob(_ job: JobModel) async throws

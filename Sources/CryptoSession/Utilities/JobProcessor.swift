@@ -419,16 +419,53 @@ final class JobProcessor: @unchecked Sendable {
                 }
             case .editMessage:
                 do {
-                    let decodedMetadata = try BSONDecoder().decode(EditMessageMetadata.self, from: decodedMessage.metadata)
+                    let decodedMetadata = try BSONDecoder().decode(EditMessageMetadata<String>.self, from: decodedMessage.metadata)
                     let foundMessage = try await cache.fetchMessage(by: decodedMetadata.sharedId)
                     let appSymmetricKey = try await session.getAppSymmetricKey()
                     guard var props = await foundMessage.props(symmetricKey: appSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
-                    props.message.text = decodedMetadata.text
+                    props.message.text = decodedMetadata.value
                     _ = try await foundMessage.updateProps(symmetricKey: appSymmetricKey, props: props)
                     try await cache.updateMessage(foundMessage, symmetricKey: appSymmetricKey)
                     await session.receiverDelegate?.updatedMessage(foundMessage)
                 } catch {
                     logger.log(level: .error, message: "Error Editing Message: \(error)")
+                }
+            case .editMessageMetadata(let key):
+                do {
+                    let appSymmetricKey = try await session.getAppSymmetricKey()
+                    
+                    //We receive messsage metadata, this is not the actual prrivate messages metadata yet. We will insert it into the CryptoMessage's metadata after decoding
+                    let receivedMetadata = try BSONDecoder().decode([EditMessageMetadata<Data>].self, from: decodedMessage.metadata)
+        
+                    //1. Find this current message's metadata
+                    guard let newReaction = receivedMetadata.first(where: { $0.sender == inboundTask.senderSecretName }) else { return }
+                    let foundMessage = try await cache.fetchMessage(by: newReaction.sharedId)
+                    
+                    let decryptedMessage = try await foundMessage.makeDecryptedModel(of: _PrivateMessage.self, symmetricKey: appSymmetricKey)
+                    
+                    var currentMetadata = [EditMessageMetadata<Data>]()
+                   
+                    do {
+                        let binary: Binary = try decryptedMessage.message.metadata.decode(forKey: key)
+                        currentMetadata = try BSONDecoder().decode([EditMessageMetadata<Data>].self, from: Document(data: binary.data))
+                    } catch {}
+                    
+                    if let reaction = currentMetadata.first(where: { $0.sender == inboundTask.senderSecretName }) {
+                        currentMetadata.removeAll(where: { $0.sender == inboundTask.senderSecretName })
+                        currentMetadata.append(EditMessageMetadata(value: newReaction.value, sharedId: newReaction.sharedId, sender: newReaction.sender))
+                    } else {
+                        currentMetadata.append(EditMessageMetadata(value: newReaction.value, sharedId: newReaction.sharedId, sender: newReaction.sender))
+                    }
+                    
+                    let newMetadata = try BSONEncoder().encode(currentMetadata)
+                    _ = try await foundMessage.updatePropsMetadata(
+                        symmetricKey: appSymmetricKey,
+                        metadata: newMetadata.makeData(),
+                        with: key)
+                    try await cache.updateMessage(foundMessage, symmetricKey: appSymmetricKey)
+                    await session.receiverDelegate?.updatedMessage(foundMessage)
+                } catch {
+                    logger.log(level: .error, message: "Error Updating Message Metadata: \(error)")
                 }
                 //This updates our communication Model for us locally on Inbound writes
             case .communicationSynchronization:

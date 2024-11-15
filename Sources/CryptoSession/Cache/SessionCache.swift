@@ -81,7 +81,7 @@ public actor SessionCache: CryptoSessionStore {
     /// Creates a local device configuration and caches it.
     /// - Parameter data: The configuration data to be cached.
     /// - Throws: An error if the creation fails.
-   public func createLocalSessionContext(_ data: Data) async throws {
+    public func createLocalSessionContext(_ data: Data) async throws {
         try await store.createLocalSessionContext(data)
         localDeviceConfiguration = data // Cache the data directly
     }
@@ -89,7 +89,7 @@ public actor SessionCache: CryptoSessionStore {
     /// Finds the local device configuration, either from cache or the store.
     /// - Returns: The cached or fetched configuration data.
     /// - Throws: An error if the configuration cannot be found.
-   public func findLocalSessionContext() async throws -> Data {
+    public func findLocalSessionContext() async throws -> Data {
         if let cachedConfig = localDeviceConfiguration {
             return cachedConfig
         }
@@ -103,14 +103,14 @@ public actor SessionCache: CryptoSessionStore {
     /// Updates the local device configuration and refreshes the cache.
     /// - Parameter data: The new configuration data.
     /// - Throws: An error if the update fails.
-   public func updateLocalSessionContext(_ data: Data) async throws {
+    public func updateLocalSessionContext(_ data: Data) async throws {
         try await store.updateLocalSessionContext(data)
         localDeviceConfiguration = data // Cache the updated data directly
     }
     
     /// Deletes the local device configuration and clears the cache.
     /// - Throws: An error if the deletion fails.
-   public func deleteLocalSessionContext() async throws {
+    public func deleteLocalSessionContext() async throws {
         try await store.deleteLocalSessionContext()
         localDeviceConfiguration = nil
     }
@@ -120,7 +120,7 @@ public actor SessionCache: CryptoSessionStore {
     /// Finds the local device salt, either from cache or the store.
     /// - Returns: The cached or fetched salt.
     /// - Throws: An error if the salt cannot be found.
-   public func findLocalDeviceSalt() async throws -> String {
+    public func findLocalDeviceSalt() async throws -> String {
         if let cachedSalt = localDeviceSalt {
             return cachedSalt
         }
@@ -136,7 +136,7 @@ public actor SessionCache: CryptoSessionStore {
     /// Creates a new session identity and caches it.
     /// - Parameter session: The session identity to be created.
     /// - Throws: An error if the creation fails.
-   public func createSessionIdentity(_ session: SessionIdentity) async throws {
+    public func createSessionIdentity(_ session: SessionIdentity) async throws {
         try await store.createSessionIdentity(session)
         sessionIdentities.append(session)
     }
@@ -144,7 +144,7 @@ public actor SessionCache: CryptoSessionStore {
     /// Fetches all session identities from the store and updates the cache.
     /// - Returns: An array of session identities.
     /// - Throws: An error if fetching fails.
-   public func fetchSessionIdentities() async throws -> [SessionIdentity] {
+    public func fetchSessionIdentities() async throws -> [SessionIdentity] {
         let identities = try await store.fetchSessionIdentities()
         sessionIdentities = identities // Update the cache
         return sessionIdentities
@@ -153,7 +153,7 @@ public actor SessionCache: CryptoSessionStore {
     /// Updates an existing session identity.
     /// - Parameter session: The session identity to be updated.
     /// - Throws: An error if the update fails.
-   public func updateSessionIdentity(_ session: SessionIdentity) async throws {
+    public func updateSessionIdentity(_ session: SessionIdentity) async throws {
         if let index = sessionIdentities.firstIndex(where: { $0.id == session.id }) {
             sessionIdentities[index] = session
             try await store.updateSessionIdentity(session)
@@ -209,6 +209,10 @@ public actor SessionCache: CryptoSessionStore {
         messages.append(message)
     }
     
+    public func getMessageCount(from communicationId: UUID) -> Int {
+        messages.filter({ $0.communicationId == communicationId }).count
+    }
+    
     public func insertMessage(_ message: PrivateMessage) async throws {
         if !messages.contains(where: { $0.id == message.id }) {
             messages.append(message)
@@ -223,13 +227,6 @@ public actor SessionCache: CryptoSessionStore {
         if let index = messages.firstIndex(where: { $0.id == message.id }) {
             messages[index] = message
             try await store.updateMessage(message, symmetricKey: symmetricKey)
-            
-//            let foundMessage = try await store.fetchMessage(byId: message.id)
-            
-//            if let downloadStateBinary = try await foundMessage.decryptProps(symmetricKey: symmetricKey).message.metadata["multipartUploadState"] as? Binary {
-//                let mediaDownloadState = try BSONDecoder().decode(MultipartDownloadState.self,from: Document(data: downloadStateBinary.data))
-//                print("NEW UPLOAD STATE: \(mediaDownloadState)")
-//            }
         } else {
             throw CacheErrors.messageNotFound
         }
@@ -250,11 +247,15 @@ public actor SessionCache: CryptoSessionStore {
         sharedIdentifier: UUID,
         sequenceId: Int
     ) async throws -> (AsyncThrowingStream<[PrivateMessage], Error>, AsyncThrowingStream<[PrivateMessage], Error>.Continuation?) {
-         try await store.streamMessages(
+        try await store.streamMessages(
             offSet: offSet,
             limit: limit,
             sharedIdentifier: sharedIdentifier,
             sequenceId: sequenceId)
+    }
+    
+    public func messageCount(for sharedIdentifier: UUID) async throws -> Int {
+        try await store.messageCount(for: sharedIdentifier)
     }
     
     // MARK: - Job Methods
@@ -376,12 +377,12 @@ extension SessionCache {
     /// - Parameter type: The communication type to be updated.
     /// - Throws: An error if the update fails.
     public func updateCommunication(_ type: DoubleRatchetKit.BaseCommunication) async throws {
-            if let index = communicationTypes.firstIndex(where: { $0.id == type.id }) {
-                communicationTypes[index] = type
-                try await store.updateCommunication(type)
-            } else {
-                throw CacheErrors.communicationTypeNotFound
-            }
+        if let index = communicationTypes.firstIndex(where: { $0.id == type.id }) {
+            communicationTypes[index] = type
+            try await store.updateCommunication(type)
+        } else {
+            throw CacheErrors.communicationTypeNotFound
+        }
     }
     
     /// Removes a communication type from the cache and store.
@@ -393,7 +394,7 @@ extension SessionCache {
     }
     
     // MARK: - Media Job Methods
-
+    
     /// Creates a new media job and caches it.
     /// - Parameter packet: The `DataPacket` representing the media job to be created.
     /// - Throws: An error if the creation fails in the store.
@@ -401,7 +402,7 @@ extension SessionCache {
         try await store.createMediaJob(packet) // Persist the media job in the store
         mediaJobs.append(packet) // Cache the new media job
     }
-
+    
     /// Fetches all media jobs from the cache or store.
     /// - Returns: An array of `DataPacket` representing all media jobs.
     /// - Throws: An error if fetching fails from the store.
@@ -411,7 +412,7 @@ extension SessionCache {
         }
         return mediaJobs // Return the cached media jobs
     }
-
+    
     /// Finds a specific media job by its ID, either from the cache or the store.
     /// - Parameter id: The unique identifier of the media job to fetch.
     /// - Returns: An optional `DataPacket` representing the media job if found, or `nil` if not found.
@@ -426,7 +427,7 @@ extension SessionCache {
         }
         return job // Return the fetched job or nil if not found
     }
-
+    
     /// Deletes a media job from both the cache and the store.
     /// - Parameter id: The unique identifier of the media job to be removed.
     /// - Throws: An error if the removal fails in the store.

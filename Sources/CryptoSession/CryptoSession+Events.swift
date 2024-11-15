@@ -402,7 +402,7 @@ extension CryptoSession {
         await receiverDelegate?.updatedMessage(message)
         
         
-        let editMetadata = EditMessageMetadata(text: newText, sharedId: message.sharedId)
+        let editMetadata = EditMessageMetadata(value: newText, sharedId: message.sharedId, sender: "")
         let metadata = try BSONEncoder().encode(editMetadata)
         //2. re-send
         try await writeTextMessage(
@@ -432,13 +432,15 @@ public struct DeliveryStateMetadata: Codable, Sendable {
     }
 }
 
-public struct EditMessageMetadata: Codable, Sendable {
-    public let text: String
+public struct EditMessageMetadata<T: Codable & Sendable>: Codable, Sendable {
+    public let value: T
     public let sharedId: String
+    public let sender: String
     
-    public init(text: String, sharedId: String) {
-        self.text = text
+    public init(value: T, sharedId: String, sender: String) {
+        self.value = value
         self.sharedId = sharedId
+        self.sender = sender
     }
 }
 
@@ -458,24 +460,17 @@ extension CryptoSession {
         message: CryptoMessage,
         session: CryptoSession
     ) async throws {
-        print("Nudge local1", message.messageFlags)
         guard let sessionContext = await session.sessionContext else { throw SessionErrors.sessionNotInitialized }
-        print("Nudge local2", message.messageFlags)
         guard let cache = await session.cache else { throw SessionErrors.databaseNotInitialized }
-        print("Nudge local3", message.messageFlags)
         let appSymmetricKey = try await getAppSymmetricKey()
-        print("Nudge local4", message.messageFlags)
         switch message.recipient {
         case .nickname(let recipient):
             switch message.messageType {
                
                 //Dont save locally on any local device, but still saves the Job if we are offline and can save the SignedRatchetMessage remotely for future deliverly.
             case .nudgeLocal:
-                print("Nudge local5", recipient)
                 for identity in try await taskProcessor.jobProcessor.getSessionIdentities(with: recipient, session: session) {
-                    print("Nudge local6", message.messageFlags)
                     guard let identityProps = await identity.props(symmetricKey: appSymmetricKey) else { fatalError() }
-                    print("Nudge local7", message.messageFlags)
                     switch message.messageFlags {
                         //This updates our communication Model for us locally on outbound writes
                     case .communicationSynchronization:
@@ -493,7 +488,6 @@ extension CryptoSession {
                         try await cache.updateCommunication(communicationModel)
                         logger.log(level: .debug, message: "Updated Communication Model For Synchronization with Shared Id: \(props?.sharedId)")
                     default:
-                        print("Nudge local", message.messageFlags)
                         break
                     }
                    
