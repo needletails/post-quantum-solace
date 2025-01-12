@@ -4,7 +4,7 @@
 //
 //  Created by Cole M on 9/12/24.
 //
-//import NeedleTailStructures
+
 import Foundation
 import BSON
 import NeedleTailHelpers
@@ -350,5 +350,14 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             }
             try await cache?.updateLocalSessionContext(encryptedConfig)
         }
+    }
+    
+    public func resumeJobQueue() async throws {
+        guard let cache else { fatalError("Cache must be initialized") }
+        try await taskProcessor.jobProcessor.loadJobs(
+            nil,
+            cache: cache,
+            symmetricKey: getAppSymmetricKey(),
+            session: self)
     }
 }

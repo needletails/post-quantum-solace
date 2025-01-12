@@ -9,7 +9,6 @@ import BSON
 import NeedleTailHelpers
 import NeedleTailCrypto
 import DoubleRatchetKit
-import NeedleTailStructures
 @preconcurrency import Crypto
 
 /// A protocol defining the requirements for a cache synchronizer.

@@ -9,7 +9,7 @@ import DoubleRatchetKit
 import Crypto
 
 public protocol NTMessageReceiver: Sendable {
-    func receivedLocalNudge(_ message: CryptoMessage) async
+    func receivedLocalNudge(_ message: CryptoMessage, sender: String) async
     func createdMessage(_ message: PrivateMessage) async
     func updatedMessage(_ message: PrivateMessage) async
     func deletedMessage(_ message: PrivateMessage) async

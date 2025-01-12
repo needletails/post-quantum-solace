@@ -86,7 +86,7 @@ extension CryptoSession {
 
             try await processWrite(message: message, session: CryptoSession.shared)
         } catch {
-            logger.log(level: .error, message: "\(error)")
+            await self.logger.log(level: .error, message: "\(error)")
             throw error
         }
     }
@@ -181,7 +181,7 @@ extension CryptoSession {
     
     
     public func sendCommunicationSynchronization(contact secretName: String) async throws {
-        logger.log(level: .debug, message: "Sending communication synchronization to \(secretName)")
+        await self.logger.log(level: .debug, message: "Sending communication synchronization to \(secretName)")
         guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
         let mySecretName = await sessionContext.sessionUser.secretName
         
@@ -199,10 +199,10 @@ extension CryptoSession {
                 cache: cache,
                 communicationType: .nickname(secretName),
                 session: self)
-            logger.log(level: .debug, message: "Found Communication Model")
+            await self.logger.log(level: .debug, message: "Found Communication Model")
             shouldUpdateCommunication = true
         } catch {
-            logger.log(level: .debug, message: "Creating Communication Model")
+            await self.logger.log(level: .debug, message: "Creating Communication Model")
             // Create communication model
             communicationModel = try await taskProcessor.jobProcessor.createCommunicationModel(
                 recipients: [mySecretName, secretName],
@@ -227,10 +227,10 @@ extension CryptoSession {
             try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
-                logger.log(level: .debug, message: "Updated Communication Model")
+                await self.logger.log(level: .debug, message: "Updated Communication Model")
             } else {
                 try await cache.createCommunication(communicationModel)
-                logger.log(level: .debug, message: "Created Communication Model")
+                await self.logger.log(level: .debug, message: "Created Communication Model")
             }
             
             //Send Communication Synchronization Message Once
@@ -242,9 +242,9 @@ extension CryptoSession {
                 metadata: [:],
                 pushType: .none,
                 destructionTime: nil)
-            logger.log(level: .debug, message: "Sent communication synchronization")
+            await self.logger.log(level: .debug, message: "Sent communication synchronization")
         } else {
-            logger.log(level: .debug, message: "Shared Id already exists")
+            await self.logger.log(level: .debug, message: "Shared Id already exists")
         }
     }
     
@@ -284,7 +284,7 @@ extension CryptoSession {
         state: FriendshipMetadata.State,
         contact: Contact
     ) async throws {
-        logger.log(level: .info, message: "Requesting friendship state change for \(contact.secretName) to state \(state).")
+        await self.logger.log(level: .info, message: "Requesting friendship state change for \(contact.secretName) to state \(state).")
         guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
         guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
         let appSymmetricKey = try await getAppSymmetricKey()
@@ -338,17 +338,35 @@ extension CryptoSession {
         let recachedContact = try await recachedModel.makeDecryptedModel(of: Contact.self, symmetricKey: symmetricKey)
         try await receiverDelegate?.updateContact(recachedContact)
         
+        func dataFromBool(_ value: Bool) -> Data {
+            // Convert Bool to UInt8 (0 for false, 1 for true)
+            let byte: UInt8 = value ? 1 : 0
+            // Create Data from the byte
+            return Data([byte])
+        }
+        
+        var blockUnblockData: Data?
+        if currentMetadata.theirState == .blocked || currentMetadata.theirState == .blockedUser {
+            blockUnblockData = dataFromBool(true)
+        }
+        
+        if currentMetadata.theirState == .unblock {
+            blockUnblockData = dataFromBool(false)
+        }
+        
         //Transport
         try await writeTextMessage(
             messageType: .nudgeLocal,
-            messageFlags: .friendshipStateRequest,
+            messageFlags: .friendshipStateRequest(blockUnblockData),
             recipient: .nickname(contact.secretName),
             metadata: metadata,
             pushType: .contactRequest,
             destructionTime: nil)
             
-        logger.log(level: .info, message: "Sent Friendship State Change Request")
+        await self.logger.log(level: .info, message: "Sent Friendship State Change Request")
     }
+    
+
     
     public func updateMessageDeliveryState(_
                                            message: PrivateMessage,
@@ -378,7 +396,7 @@ extension CryptoSession {
     }
     
     public func sendContactCreatedAcknowledgment(recipient secretName: String) async throws {
-        logger.log(level: .debug, message: "Sending Contact Created Acknowledgment")
+        await self.logger.log(level: .debug, message: "Sending Contact Created Acknowledgment")
         guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
         try await writeTextMessage(
             messageType: .nudgeLocal,
@@ -386,7 +404,7 @@ extension CryptoSession {
             recipient: .nickname(secretName),
             metadata: [:],
             pushType: .none)
-        logger.log(level: .debug, message: "Sent Contact Created Acknowledgment")
+        await self.logger.log(level: .debug, message: "Sent Contact Created Acknowledgment")
     }
     
     public func editCurrentMessage(_ message: PrivateMessage, newText: String) async throws {
@@ -475,18 +493,18 @@ extension CryptoSession {
                         //This updates our communication Model for us locally on outbound writes
                     case .communicationSynchronization:
                         guard !message.text.isEmpty else { return }
-                        logger.log(level: .debug, message: "Requester Synchronizing Communication Message")
+                        await self.logger.log(level: .debug, message: "Requester Synchronizing Communication Message")
                         let communicationModel = try await taskProcessor.jobProcessor.findCommunicationType(
                             cache: cache,
                             communicationType: message.recipient,
                             session: session
                         )
-                        logger.log(level: .debug, message: "Found Communication Model For Synchronization: \(communicationModel)")
+                        await self.logger.log(level: .debug, message: "Found Communication Model For Synchronization: \(communicationModel)")
                         var props = try await communicationModel.props(symmetricKey: appSymmetricKey)
                         props?.sharedId = UUID(uuidString: message.text)
                         try await communicationModel.updateProps(symmetricKey: appSymmetricKey, props: props)
                         try await cache.updateCommunication(communicationModel)
-                        logger.log(level: .debug, message: "Updated Communication Model For Synchronization with Shared Id: \(props?.sharedId)")
+                        await self.logger.log(level: .debug, message: "Updated Communication Model For Synchronization with Shared Id: \(props?.sharedId)")
                     default:
                         break
                     }
@@ -608,9 +626,7 @@ actor TaskProcessor {
     ) async throws {
         let appSymmetricKey = try await session.getAppSymmetricKey()
         guard let messageProps = await message.props(symmetricKey: appSymmetricKey) else { fatalError() }
-        guard session.isViable == true else {
-            throw CryptoSession.SessionErrors.connectionIsNonViable
-        }
+
         switch messageProps.message.recipient {
         case .nickname(let recipientName):
             let identites = try await jobProcessor.getSessionIdentities(with: recipientName, session: session)

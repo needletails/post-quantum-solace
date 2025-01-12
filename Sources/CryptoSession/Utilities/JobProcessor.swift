@@ -126,13 +126,20 @@ final class JobProcessor: @unchecked Sendable {
     func loadJobs(_
                   job: JobModel? = nil,
                   cache: SessionCache,
-                  symmetricKey: SymmetricKey
+                  symmetricKey: SymmetricKey,
+                  session: CryptoSession? = nil
     ) async throws {
         if let job = job {
             await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
+            if let session = session {
+                try await attemptTaskSequence(session: session)
+            }
         } else {
             for job in try await cache.readJobs() {
                 await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
+                if let session = session {
+                    try await attemptTaskSequence(session: session)
+                }
             }
         }
     }
@@ -177,7 +184,7 @@ final class JobProcessor: @unchecked Sendable {
     func attemptTaskSequence(session: CryptoSession) async throws {
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         if !isRunning {
-            logger.log(level: .debug, message: "Starting job queue")
+            await self.logger.log(level: .debug, message: "Starting job queue")
             isRunning = true
             try await withThrowingTaskGroup(of: Void.self) { [weak self] group in
                 guard let self else { fatalError() }
@@ -189,17 +196,17 @@ final class JobProcessor: @unchecked Sendable {
                             
                             let symmetricKey = try await session.getAppSymmetricKey()
                             guard let props = await job.props(symmetricKey: symmetricKey) else { fatalError() }
-                            logger.log(level: .debug, message: "Running job \(props.sequenceId)")
+                            await self.logger.log(level: .debug, message: "Running job \(props.sequenceId)")
                             
-                            //TODO: Handle If offline
                             if session.isViable == false {
-                                logger.log(level: .debug, message: "Skipping job \(props.sequenceId) as we are offline")
+                                await self.logger.log(level: .debug, message: "Skipping job \(props.sequenceId) as we are offline")
                                 await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
+                                isRunning = false
                                 return
                             }
                             
                             if let delayedUntil = props.delayedUntil, delayedUntil >= Date() {
-                                logger.log(level: .debug, message: "Task was delayed into the future")
+                                await self.logger.log(level: .debug, message: "Task was delayed into the future")
                                 
                                 //This is urgent, We want to try this job first always until the designated time arrives. we sort via sequenceId. so old messages are always done first.
                                 await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
@@ -209,9 +216,8 @@ final class JobProcessor: @unchecked Sendable {
                                 break
                             }
                             
-                            
                             do {
-                                logger.log(level: .debug, message: "Executing Job \(props.sequenceId)")
+                                await self.logger.log(level: .debug, message: "Executing Job \(props.sequenceId)")
                                 
                                 try await performRatchet(
                                     task: props.task.task,
@@ -220,12 +226,13 @@ final class JobProcessor: @unchecked Sendable {
                                 
                                 try await cache.removeJob(job)
                             } catch {
-                                logger.log(level: .error, message: "Job error \(error)")
+                                await self.logger.log(level: .error, message: "Job error \(error)")
                                 
                                 //TODO: Work in delay logic on fail
                                 
-                                if await jobConsumer.deque.count == 0 {
+                                if await jobConsumer.deque.count == 0 || Task.isCancelled {
                                     setIsRunning(false)
+                                    return
                                 }
                             }
                             
@@ -250,7 +257,7 @@ final class JobProcessor: @unchecked Sendable {
     }
     
     func consumedSequence() async {
-        logger.log(level: .debug, message: "No jobs to run")
+        await self.logger.log(level: .debug, message: "No jobs to run")
         //TODO: Clean up
     }
     
@@ -282,7 +289,7 @@ final class JobProcessor: @unchecked Sendable {
         outboundTask: OutboundTaskMessage,
         session: CryptoSession
     ) async throws {
-        logger.log(level: .debug, message: "Performing Ratchet")
+        await self.logger.log(level: .debug, message: "Performing Ratchet")
         
         guard let sessionContext = await session.sessionContext else {
             throw CryptoSession.SessionErrors.sessionNotInitialized
@@ -328,7 +335,7 @@ final class JobProcessor: @unchecked Sendable {
         let encodedData = try BSONEncoder().encodeData(outboundTask.message)
         let ratchetedMessage = try await ratchetManager.ratchetEncrypt(plainText: encodedData)
         let signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
-    
+        
         try await session.transportDelegate?.sendMessage(
             signedMessage,
             metadata: SignedRatchetMessageMetadata(
@@ -369,7 +376,7 @@ final class JobProcessor: @unchecked Sendable {
         }
         
         let decodedMessage = try BSONDecoder().decode(CryptoMessage.self, from: Document(data: decryptedData))
-
+        
         //Decryption has occured
         switch decodedMessage.messageType {
             
@@ -415,7 +422,7 @@ final class JobProcessor: @unchecked Sendable {
                     try await cache.updateMessage(foundMessage, symmetricKey: appSymmetricKey)
                     await session.receiverDelegate?.updatedMessage(foundMessage)
                 } catch {
-                    logger.log(level: .error, message: "Error Changing Delivery State: \(error)")
+                    await self.logger.log(level: .error, message: "Error Changing Delivery State: \(error)")
                 }
             case .editMessage:
                 do {
@@ -428,7 +435,7 @@ final class JobProcessor: @unchecked Sendable {
                     try await cache.updateMessage(foundMessage, symmetricKey: appSymmetricKey)
                     await session.receiverDelegate?.updatedMessage(foundMessage)
                 } catch {
-                    logger.log(level: .error, message: "Error Editing Message: \(error)")
+                    await self.logger.log(level: .error, message: "Error Editing Message: \(error)")
                 }
             case .editMessageMetadata(let key):
                 do {
@@ -436,7 +443,7 @@ final class JobProcessor: @unchecked Sendable {
                     
                     //We receive messsage metadata, this is not the actual prrivate messages metadata yet. We will insert it into the CryptoMessage's metadata after decoding
                     let receivedMetadata = try BSONDecoder().decode([EditMessageMetadata<Data>].self, from: decodedMessage.metadata)
-        
+                    
                     //1. Find this current message's metadata
                     guard let newReaction = receivedMetadata.first(where: { $0.sender == inboundTask.senderSecretName }) else { return }
                     let foundMessage = try await cache.fetchMessage(by: newReaction.sharedId)
@@ -444,7 +451,7 @@ final class JobProcessor: @unchecked Sendable {
                     let decryptedMessage = try await foundMessage.makeDecryptedModel(of: _PrivateMessage.self, symmetricKey: appSymmetricKey)
                     
                     var currentMetadata = [EditMessageMetadata<Data>]()
-                   
+                    
                     do {
                         let binary: Binary = try decryptedMessage.message.metadata.decode(forKey: key)
                         currentMetadata = try BSONDecoder().decode([EditMessageMetadata<Data>].self, from: Document(data: binary.data))
@@ -465,12 +472,12 @@ final class JobProcessor: @unchecked Sendable {
                     try await cache.updateMessage(foundMessage, symmetricKey: appSymmetricKey)
                     await session.receiverDelegate?.updatedMessage(foundMessage)
                 } catch {
-                    logger.log(level: .error, message: "Error Updating Message Metadata: \(error)")
+                    await self.logger.log(level: .error, message: "Error Updating Message Metadata: \(error)")
                 }
                 //This updates our communication Model for us locally on Inbound writes
             case .communicationSynchronization:
                 guard !decodedMessage.text.isEmpty else { return }
-                logger.log(level: .debug, message: "Received Communication Synchronization Message")
+                await self.logger.log(level: .debug, message: "Received Communication Synchronization Message")
                 let symmetricKey = try await session.getAppSymmetricKey()
                 
                 var communicationModel: BaseCommunication?
@@ -488,7 +495,7 @@ final class JobProcessor: @unchecked Sendable {
                         communicationType: .nickname(inboundTask.senderSecretName),
                         metadata: decodedMessage.metadata,
                         symmetricKey: symmetricKey
-                        )
+                    )
                     guard let communicationModel = communicationModel else { return }
                     try await cache.createCommunication(communicationModel)
                 }
@@ -503,32 +510,32 @@ final class JobProcessor: @unchecked Sendable {
                 }
                 
                 guard let communicationModel = communicationModel else { return }
-                logger.log(level: .debug, message: "Found Communication Model For Synchronization: \(communicationModel)")
+                await self.logger.log(level: .debug, message: "Found Communication Model For Synchronization: \(communicationModel)")
                 var props = try await communicationModel.props(symmetricKey: symmetricKey)
                 props?.sharedId = UUID(uuidString: decodedMessage.text)
                 try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
                 try await cache.updateCommunication(communicationModel)
-                logger.log(level: .debug, message: "Updated Communication Model For Synchronization with Shared Id: \(props?.sharedId)")
+                await self.logger.log(level: .debug, message: "Updated Communication Model For Synchronization with Shared Id: \(props?.sharedId)")
             case .contactCreated:
-                logger.log(level: .debug, message: "Received Contact Request Recipient Created Contact Message")
+                await self.logger.log(level: .debug, message: "Received Contact Request Recipient Created Contact Message")
                 try await session.sendCommunicationSynchronization(contact: inboundTask.senderSecretName)
             case .revokeMessage:
                 do {
-                let decodedMetadata = try BSONDecoder().decode(RevokeMessageMetadata.self, from: decodedMessage.metadata)
-                let symmetricKey = try await session.getAppSymmetricKey()
-                let foundMessage = try await cache.fetchMessage(by: decodedMetadata.sharedId)
-                _ = try await cache.removeMessage(foundMessage)
-                await session.receiverDelegate?.deletedMessage(foundMessage)
-            } catch {
-                logger.log(level: .error, message: "Error Revoking Message: \(error)")
-            }
+                    let decodedMetadata = try BSONDecoder().decode(RevokeMessageMetadata.self, from: decodedMessage.metadata)
+                    let symmetricKey = try await session.getAppSymmetricKey()
+                    let foundMessage = try await cache.fetchMessage(by: decodedMetadata.sharedId)
+                    _ = try await cache.removeMessage(foundMessage)
+                    await session.receiverDelegate?.deletedMessage(foundMessage)
+                } catch {
+                    await self.logger.log(level: .error, message: "Error Revoking Message: \(error)")
+                }
             case .dccSymmetricKey:
                 //Stash the key on the connection for this user to retrieve later
                 let decodedKey = try BSONDecoder().decode(SymmetricKey.self, from: decodedMessage.metadata)
                 await session.receiverDelegate?.passDCCKey(decodedKey)
             default:
                 //Passthrough nothing special to do
-                await session.receiverDelegate?.receivedLocalNudge(decodedMessage)
+                await session.receiverDelegate?.receivedLocalNudge(decodedMessage, sender: inboundTask.senderSecretName)
             }
             // Save
         default:
@@ -643,7 +650,7 @@ final class JobProcessor: @unchecked Sendable {
                     communicationType: .nickname(inboundTask.senderSecretName),
                     session: session
                 )
-              
+                
                 var communication = try await communicationModel.makeDecryptedModel(of: Communication.self, symmetricKey: appSymmetricKey)
                 communication.messageCount += 1
                 
@@ -678,6 +685,7 @@ final class JobProcessor: @unchecked Sendable {
                 communication: communicationModel,
                 sessionIdentity: sessionIdentity
             )
+            
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
             }
@@ -735,6 +743,7 @@ final class JobProcessor: @unchecked Sendable {
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
             }
+
             try await cache.createMessage(messageModel, symmetricKey: appSymmetricKey)
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
@@ -830,7 +839,7 @@ final class JobProcessor: @unchecked Sendable {
         guard let communicationProps = await communication.props(symmetricKey: try session.getAppSymmetricKey()) else {
             throw CryptoSession.SessionErrors.cannotFindCommunication
         }
-
+        
         let newMessageCount = communicationProps.messageCount + 1
         let symmetricKey = try await session.getAppSymmetricKey()
         let messageModel = try await PrivateMessage(
@@ -900,8 +909,7 @@ final class JobProcessor: @unchecked Sendable {
             message: message,
             privateSigningKey: deviceKeys.privateSigningKey)
     }
-    
-    //TODO: Integrate refresh behavior. This means that we need to make sure our cache is updated everytime this method is called.
+
     public func getSessionIdentities(with recipientName: String, session: CryptoSession) async throws -> [SessionIdentity] {
         var sessions = [SessionIdentity]()
         
