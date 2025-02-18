@@ -13,6 +13,16 @@ public enum Ordering: Sendable {
     case ascending, descending
 }
 
+public struct _WrappedPrivateMessage: Sendable {
+    public let sharedCommunicationId: String
+    public let message: PrivateMessage
+    
+    public init(sharedCommunicationId: String, message: PrivateMessage) {
+        self.sharedCommunicationId = sharedCommunicationId
+        self.message = message
+    }
+}
+
 /// A protocol that defines CRUD operations for managing device configurations in a database store.
 public protocol CryptoSessionStore: Sendable {
     
@@ -27,9 +37,12 @@ public protocol CryptoSessionStore: Sendable {
     func findLocalSessionContext() async throws -> Data
     
     /// Retrieves the local device salt.
-    /// - Returns: The salt string associated with the local device.
+    /// - Returns: The salt data associated with the local device.
     /// - Throws: An error if the operation fails, such as if the salt does not exist or if there is a database error.
-    func findLocalDeviceSalt() async throws -> String
+    func findLocalDeviceSalt(keyData: Data) async throws -> Data
+    
+    /// Deletes  the local device salt from the local database.
+    func deleteLocalDeviceSalt() async throws
     
     /// Updates the local device configuration with the provided data.
     /// - Parameter data: The new configuration data to be stored.
@@ -56,6 +69,7 @@ public protocol CryptoSessionStore: Sendable {
     func updateCommunication(_ type: BaseCommunication) async throws
     func removeCommunication(_ type: BaseCommunication) async throws
     
+    func fetchMessages(sharedCommunicationId: UUID) async throws -> [_WrappedPrivateMessage]
     func fetchMessage(byId messageId: UUID) async throws -> PrivateMessage
     func fetchMessage(by sharedMessageId: String) async throws -> PrivateMessage
     func createMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws
@@ -76,6 +90,8 @@ public protocol CryptoSessionStore: Sendable {
     
     func createMediaJob(_ packet: DataPacket) async throws
     func findAllMediaJobs() async throws -> [DataPacket]
+    func findMediaJobs(for recipient: String, symmetricKey: SymmetricKey) async throws -> [DataPacket]
+    func findMediaJob(for sharedId: String, symmetricKey: SymmetricKey) async throws -> DataPacket?
     func findMediaJob(_ id: UUID) async throws -> DataPacket?
     func deleteMediaJob(_ id: UUID) async throws
 }

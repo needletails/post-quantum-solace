@@ -17,6 +17,13 @@ public struct Contact: Sendable, Codable, Equatable {
     public let secretName: String
     public var configuration: UserConfiguration
     public var metadata: Document
+    
+    public init(id: UUID, secretName: String, configuration: UserConfiguration, metadata: Document) {
+        self.id = id
+        self.secretName = secretName
+        self.configuration = configuration
+        self.metadata = metadata
+    }
 }
 
 public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendable {
@@ -105,6 +112,19 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Document, with key: String) async throws -> UnwrappedProps? {
         var props = try await decryptProps(symmetricKey: symmetricKey)
         props.metadata[key] = metadata
+        return try await updateProps(symmetricKey: symmetricKey, props: props)
+    }
+    
+    public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Document) async throws -> UnwrappedProps? {
+        var props = try await decryptProps(symmetricKey: symmetricKey)
+        
+        var newMetadata: Document = [:]
+        for key in metadata.keys {
+            if let value = metadata[key] {
+                newMetadata[key] = value
+            }
+        }
+        props.metadata = newMetadata
         return try await updateProps(symmetricKey: symmetricKey, props: props)
     }
     

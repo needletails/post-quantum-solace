@@ -16,6 +16,6 @@ public protocol NTMessageReceiver: Sendable {
     func createContact(_ contact: Contact, needsSynchronization: Bool) async throws
     func updateContact(_ contact: Contact) async throws
     func contactMetadata(changed for: Contact) async
-    func newDeviceRequest(configuration: UserDeviceConfiguration) async
     func passDCCKey(_ key: SymmetricKey) async
+    func updatedCommunication(_ model: BaseCommunication, members: Set<String>) async
 }

@@ -6,19 +6,17 @@
 //
 import Foundation
 import BSON
-import NeedleTailHelpers
 import NeedleTailCrypto
 import DoubleRatchetKit
 @preconcurrency import Crypto
 
 /// A protocol defining the requirements for a cache synchronizer.
-protocol SessionCacheSynchronizer {
-    func synchronizeLocalConfiguration(_ data: Data)
+protocol SessionCacheSynchronizer: Sendable {
+    func synchronizeLocalConfiguration(_ data: Data) async throws
 }
 
 /// An actor that manages session caching and synchronization.
 public actor SessionCache: CryptoSessionStore {
-    
     
     // MARK: - Properties
     
@@ -29,17 +27,24 @@ public actor SessionCache: CryptoSessionStore {
     private var communicationTypes = [DoubleRatchetKit.BaseCommunication]()
     private var jobs = [JobModel]()
     private var mediaJobs = [DataPacket]()
-    
+    private var _localDeviceConfiguration: Data?
     private var localDeviceConfiguration: Data? {
-        didSet {
-            if let localDeviceConfiguration = localDeviceConfiguration {
-                synchronizer?.synchronizeLocalConfiguration(localDeviceConfiguration)
-            }
+        get async {
+            _localDeviceConfiguration
         }
     }
     
-    private var localDeviceSalt: String?
+    func setLocalDeviceConfiguration(_ configuration: Data) async throws {
+        try await synchronizer?.synchronizeLocalConfiguration(configuration)
+        self._localDeviceConfiguration = configuration
+    }
+    
+    private var localDeviceSalt: Data?
     var synchronizer: SessionCacheSynchronizer?
+    
+    func setSynchronizer(_ synchronizer: SessionCacheSynchronizer?) {
+        self.synchronizer = synchronizer
+    }
     
     // MARK: - Initializer
     
@@ -49,31 +54,6 @@ public actor SessionCache: CryptoSessionStore {
     
     // MARK: - Cache Management
     
-    /// Refreshes the entire cache by fetching the latest configurations, salts, contacts, communication types, and messages.
-    /// - Throws: An error if any fetching operation fails.
-    func refreshCache() async throws {
-        // Refresh local device configuration
-        localDeviceConfiguration = try await findLocalSessionContext()
-        // Refresh local device salt
-        localDeviceSalt = try await findLocalDeviceSalt()
-        // Refresh contacts
-        contacts = try await store.fetchContacts()
-        // Refresh communication types
-        communicationTypes = try await store.fetchCommunications()
-        // Refresh messages (if needed, implement logic to fetch messages based on your requirements)
-        //        messages = try await store.fetchMessages() // Assuming a method exists in the store to fetch all messages
-    }
-    
-    /// Clears the cache by setting all cached properties to nil or empty.
-    func dumpCache() {
-        localDeviceConfiguration = nil
-        localDeviceSalt = nil
-        sessionIdentities.removeAll()
-        messages.removeAll()
-        contacts.removeAll()
-        communicationTypes.removeAll()
-    }
-    
     
     // MARK: - Local Device Configuration Methods
     
@@ -82,36 +62,31 @@ public actor SessionCache: CryptoSessionStore {
     /// - Throws: An error if the creation fails.
     public func createLocalSessionContext(_ data: Data) async throws {
         try await store.createLocalSessionContext(data)
-        localDeviceConfiguration = data // Cache the data directly
+        try await setLocalDeviceConfiguration(data)
     }
     
     /// Finds the local device configuration, either from cache or the store.
     /// - Returns: The cached or fetched configuration data.
     /// - Throws: An error if the configuration cannot be found.
     public func findLocalSessionContext() async throws -> Data {
-        if let cachedConfig = localDeviceConfiguration {
-            return cachedConfig
-        }
-        localDeviceConfiguration = try await store.findLocalSessionContext()
-        guard let config = localDeviceConfiguration else {
-            throw CacheErrors.localDeviceConfigurationIsNil
-        }
-        return config
+        let data = try await store.findLocalSessionContext()
+        try await setLocalDeviceConfiguration(data)
+        return data
     }
     
     /// Updates the local device configuration and refreshes the cache.
     /// - Parameter data: The new configuration data.
     /// - Throws: An error if the update fails.
     public func updateLocalSessionContext(_ data: Data) async throws {
-        try await store.updateLocalSessionContext(data)
-        localDeviceConfiguration = data // Cache the updated data directly
+        try await store.deleteLocalSessionContext()
+        try await self.createLocalSessionContext(data)
     }
     
     /// Deletes the local device configuration and clears the cache.
     /// - Throws: An error if the deletion fails.
     public func deleteLocalSessionContext() async throws {
         try await store.deleteLocalSessionContext()
-        localDeviceConfiguration = nil
+        _localDeviceConfiguration = nil
     }
     
     // MARK: - Local Device Salt Methods
@@ -119,15 +94,20 @@ public actor SessionCache: CryptoSessionStore {
     /// Finds the local device salt, either from cache or the store.
     /// - Returns: The cached or fetched salt.
     /// - Throws: An error if the salt cannot be found.
-    public func findLocalDeviceSalt() async throws -> String {
+    public func findLocalDeviceSalt(keyData: Data) async throws -> Data {
         if let cachedSalt = localDeviceSalt {
             return cachedSalt
+        } else {
+            localDeviceSalt = try await store.findLocalDeviceSalt(keyData: keyData)
+            guard let salt = localDeviceSalt else {
+                throw CacheErrors.localDeviceSaltIsNil
+            }
+            return salt
         }
-        localDeviceSalt = try await store.findLocalDeviceSalt()
-        guard let salt = localDeviceSalt else {
-            throw CacheErrors.localDeviceSaltIsNil
-        }
-        return salt
+    }
+    
+    public func deleteLocalDeviceSalt() async throws {
+      try await store.deleteLocalDeviceSalt()
     }
     
     // MARK: - Session Identity Methods
@@ -198,6 +178,23 @@ public actor SessionCache: CryptoSessionStore {
             messages.append(message) // Cache the fetched message
             return message
         }
+    }
+    
+    @Sendable
+    public func fetchMessage(
+        by callId: String,
+        work: @escaping @Sendable (PrivateMessage) async -> PrivateMessage?)
+    async throws -> PrivateMessage? {
+        for message in messages {
+            if let found = await work(message) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    public func fetchMessages(sharedCommunicationId: UUID) async throws -> [_WrappedPrivateMessage] {
+        try await store.fetchMessages(sharedCommunicationId: sharedCommunicationId)
     }
     
     /// Creates a new message and caches it.
@@ -328,7 +325,7 @@ extension SessionCache {
     /// - Parameter contact: The contact to be created.
     /// - Throws: An error if the creation fails.
     public func createContact(_ contact: ContactModel) async throws {
-        try await store.createContact(contact)
+        try! await store.createContact(contact)
         contacts.append(contact) // Cache the new contact
     }
     
@@ -425,6 +422,14 @@ extension SessionCache {
             mediaJobs.append(job) // Cache the fetched job if found
         }
         return job // Return the fetched job or nil if not found
+    }
+    
+    public func findMediaJobs(for recipient: String, symmetricKey: SymmetricKey) async throws -> [DataPacket] {
+        try await store.findMediaJobs(for: recipient, symmetricKey: symmetricKey)
+    }
+    
+    public func findMediaJob(for sharedId: String, symmetricKey: SymmetricKey) async throws -> DataPacket? {
+        try await store.findMediaJob(for: sharedId, symmetricKey: symmetricKey)
     }
     
     /// Deletes a media job from both the cache and the store.

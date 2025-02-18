@@ -6,8 +6,9 @@
 //
 import Foundation
 import DoubleRatchetKit
-
-/// This metadata needs to be handle with care Ideally none of it should be sent over the wire. It should just be used to prepare the message for sending. 
+import Crypto
+import BSON
+/// This metadata needs to be handle with care Ideally none of it should be sent over the wire. It should just be used to prepare the message for sending.
 public struct SignedRatchetMessageMetadata: Sendable {
     /// Recipient secretName
     public let secretName: String
@@ -18,9 +19,9 @@ public struct SignedRatchetMessageMetadata: Sendable {
     /// Shared Message Identifier
     public let sharedMessageIdentifier: String
     /// The message type
-    public let messageType: MessageType
+    public var messageType: MessageType
     /// A flag for the given message type
-    public let messageFlags: MessageFlags
+    public var messageFlags: MessageFlags
     /// The recipeint type
     public let recipient: MessageRecipient
 }
@@ -43,11 +44,12 @@ public protocol SessionTransport: Sendable {
     /// Publishes the user configuration to the network. We call this for the master device and updating its bundle with new devices
     /// - Parameter configuration: The user configuration to be published.
     /// - Throws: An error if the configuration could not be published.
-    func publishUserConfiguration(_ configuration: UserConfiguration, identity: UUID?) async throws
+    func publishUserConfiguration(_ configuration: UserConfiguration, updateKeyBundle: Bool) async throws
     
-    /// This method will be called when a new device tries to register with an existing secretName. A network request is sent to the server to puclish auxillary user device configuration
-    /// - Parameters:
-    ///   - configuration: The user device configuration to be published.
-    ///   - addChildDevice: A bool describing whether this is a child device
-    func publishAuxillary(configuration: UserDeviceConfiguration) async throws
+    func createUploadPacket(
+        secretName: String,
+        deviceId: UUID,
+        recipient: MessageRecipient,
+        metadata: Document
+    ) async
 }

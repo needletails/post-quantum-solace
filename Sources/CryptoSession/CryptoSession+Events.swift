@@ -8,6 +8,7 @@ import Foundation
 import BSON
 import DoubleRatchetKit
 import NeedleTailCrypto
+import NeedleTailLogger
 @preconcurrency import Crypto
 /*
  # Messaging Data Structure
@@ -83,7 +84,7 @@ extension CryptoSession {
                 sentDate: Date(),
                 destructionTime: destructionTime
             )
-
+            
             try await processWrite(message: message, session: CryptoSession.shared)
         } catch {
             await self.logger.log(level: .error, message: "\(error)")
@@ -91,6 +92,92 @@ extension CryptoSession {
         }
     }
     
+    
+    public struct SharedContactInfo: Codable, Sendable {
+        public let secretName: String
+        public let metadata: Document
+        public let sharedCommunicationId: UUID?
+        
+        public init(secretName: String, metadata: Document, sharedCommunicationId: UUID?) {
+            self.secretName = secretName
+            self.metadata = metadata
+            self.sharedCommunicationId = sharedCommunicationId
+        }
+    }
+    
+    //For Device Contact and Communication Synchronization
+    public func addContacts(_ infos: [SharedContactInfo]) async throws {
+        guard let mySecretName = await sessionContext?.sessionUser.secretName else { return }
+        let contacts = try await cache?.fetchContacts()
+        let symmetricKey = try await getAppSymmetricKey()
+        
+        let filteredInfos = await infos.asyncFilter { info in
+            // Check if contacts is not nil and does not contain the secretName
+            let containsSecretName = await contacts?.asyncContains { contact in
+                if let secretName = await contact.props(symmetricKey: symmetricKey)?.secretName {
+                    return info.secretName == secretName
+                }
+                return false
+            } ?? false // If contacts is nil, return false
+
+            // We want to include `info` only if `containsSecretName` is false
+            return !containsSecretName
+        }
+        
+        for info in filteredInfos {
+            guard let transportDelegate = transportDelegate else { throw SessionErrors.transportNotInitialized }
+            guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
+            let userConfiguration = try await transportDelegate.findConfiguration(for: info.secretName)
+            
+            let contact = Contact(
+                id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
+                secretName: info.secretName,
+                configuration: userConfiguration,
+                metadata: info.metadata
+            )
+            
+            let contactModel = try ContactModel(
+                id: contact.id, // Use the same UUID
+                props: .init(
+                    secretName: contact.secretName,
+                    configuration: contact.configuration,
+                    metadata: contact.metadata
+                ),
+                symmetricKey: symmetricKey
+            )
+            
+            try await cache.createContact(contactModel)
+            
+//            await messageObserver?.setCreatedContact(contact)
+//            var nicks = [NeedleTailNick]()
+//            for device in try contact.configuration.getVerifiedDevices() {
+//                if let nick = NeedleTailNick(name: contact.secretName, deviceId: device.deviceId) {
+//                    nicks.append(nick)
+//                }
+//            }
+//            try await ntSession.getIRCConnection().writer?.requestOnlineNicks(nicks)
+            
+            await self.logger.log(level: .debug, message: "Creating Communication Model")
+            // Create communication model
+            let communicationModel = try await taskProcessor.jobProcessor.createCommunicationModel(
+                recipients: [mySecretName, info.secretName],
+                communicationType: .nickname(info.secretName),
+                metadata: [:],
+                symmetricKey: symmetricKey
+            )
+            
+            guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
+                throw CryptoSession.SessionErrors.propsError
+            }
+            
+            props.sharedId = info.sharedCommunicationId
+            
+            try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
+            try await cache.createCommunication(communicationModel)
+            try await receiverDelegate?.updatedCommunication(communicationModel, members: [info.secretName])
+            await self.logger.log(level: .debug, message: "Created Communication Model")
+        }
+    }
     /// Updates or creates a contact in the local cached database and notifies the client of the changes.
     ///
     /// This method performs the following actions:
@@ -115,7 +202,9 @@ extension CryptoSession {
         metadata: Document = [:],
         needsSynchronization: Bool
     ) async throws -> ContactModel {
-        guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
+        guard let sessionContext = await sessionContext else {
+            throw SessionErrors.sessionNotInitialized
+        }
         
         let newContactSecretName = secretName.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let mySecretName = await sessionContext.sessionUser.secretName
@@ -126,16 +215,19 @@ extension CryptoSession {
         
         let appSymmetricKey = try await getAppSymmetricKey()
         
-        guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
+        guard let cache else {
+            throw SessionErrors.databaseNotInitialized
+        }
         
         // Check if the contact already exists
         if let contactModel = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: appSymmetricKey)?.secretName == newContactSecretName }) {
-            guard let configuration = await contactModel.props(symmetricKey: appSymmetricKey)?.configuration else {
+            guard let props = await contactModel.props(symmetricKey: appSymmetricKey) else {
                 throw SessionErrors.configurationError
             }
             
             // Simplified metadata handling
-            let contactMetadata = metadata.isEmpty ? (await contactModel.props(symmetricKey: appSymmetricKey)?.metadata ?? [:]) : metadata
+            let configuration = props.configuration
+            let contactMetadata = metadata.isEmpty ? (props.metadata ?? [:]) : metadata
             
             let contact = Contact(
                 id: contactModel.id,
@@ -146,13 +238,15 @@ extension CryptoSession {
             
             _ = try await contactModel.updatePropsMetadata(
                 symmetricKey: appSymmetricKey,
-                metadata: contactMetadata,
-                with: "customMetadata")
+                metadata: contactMetadata)
+            
             try await cache.updateContact(contactModel)
             try await receiverDelegate?.updateContact(contact)
             return contactModel
         } else {
-            guard let transportDelegate = transportDelegate else { throw SessionErrors.transportNotInitialized }
+            guard let transportDelegate = transportDelegate else {
+                throw SessionErrors.transportNotInitialized
+            }
             
             let userConfiguration = try await transportDelegate.findConfiguration(for: newContactSecretName)
             
@@ -175,20 +269,21 @@ extension CryptoSession {
             
             try await cache.createContact(contactModel)
             try await receiverDelegate?.createContact(contact, needsSynchronization: needsSynchronization)
+            
+            _ = try await updateOrCreateCommunication(
+                mySecretName: mySecretName,
+                theirSecretName: newContactSecretName)
+            
             return contactModel
         }
     }
     
-    
-    public func sendCommunicationSynchronization(contact secretName: String) async throws {
-        await self.logger.log(level: .debug, message: "Sending communication synchronization to \(secretName)")
-        guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
-        let mySecretName = await sessionContext.sessionUser.secretName
+    //For Contact to Contact Communication Synchronization
+    private func updateOrCreateCommunication(mySecretName: String, theirSecretName: String) async throws -> String? {
         
-        guard secretName != mySecretName else {
-            throw CryptoSession.SessionErrors.invalidSecretName
+        guard let cache = cache else {
+            throw SessionErrors.databaseNotInitialized
         }
-        guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
         
         let symmetricKey = try await getAppSymmetricKey()
         
@@ -197,7 +292,7 @@ extension CryptoSession {
         do {
             communicationModel = try await taskProcessor.jobProcessor.findCommunicationType(
                 cache: cache,
-                communicationType: .nickname(secretName),
+                communicationType: .nickname(theirSecretName),
                 session: self)
             await self.logger.log(level: .debug, message: "Found Communication Model")
             shouldUpdateCommunication = true
@@ -205,8 +300,8 @@ extension CryptoSession {
             await self.logger.log(level: .debug, message: "Creating Communication Model")
             // Create communication model
             communicationModel = try await taskProcessor.jobProcessor.createCommunicationModel(
-                recipients: [mySecretName, secretName],
-                communicationType: .nickname(secretName),
+                recipients: [mySecretName, theirSecretName],
+                communicationType: .nickname(theirSecretName),
                 metadata: [:],
                 symmetricKey: symmetricKey
             )
@@ -227,25 +322,45 @@ extension CryptoSession {
             try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
+                try await receiverDelegate?.updatedCommunication(communicationModel, members: [theirSecretName])
                 await self.logger.log(level: .debug, message: "Updated Communication Model")
             } else {
                 try await cache.createCommunication(communicationModel)
+                try await receiverDelegate?.updatedCommunication(communicationModel, members: [theirSecretName])
                 await self.logger.log(level: .debug, message: "Created Communication Model")
             }
-            
-            //Send Communication Synchronization Message Once
-            try await writeTextMessage(
-                messageType: .nudgeLocal,
-                messageFlags: .communicationSynchronization,
-                recipient: .nickname(secretName),
-                text: sharedIdentifier.uuidString,
-                metadata: [:],
-                pushType: .none,
-                destructionTime: nil)
-            await self.logger.log(level: .debug, message: "Sent communication synchronization")
+            return sharedIdentifier.uuidString
         } else {
             await self.logger.log(level: .debug, message: "Shared Id already exists")
+            return nil
         }
+    }
+    
+    //For Contact to Contact Communication Synchronization
+    public func sendCommunicationSynchronization(contact secretName: String) async throws {
+        await self.logger.log(level: .debug, message: "Sending communication synchronization to \(secretName)")
+        guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
+        let mySecretName = await sessionContext.sessionUser.secretName
+        
+        guard secretName != mySecretName else {
+            throw CryptoSession.SessionErrors.invalidSecretName
+        }
+        
+        guard let sharedIdentifier = try await updateOrCreateCommunication(
+            mySecretName: mySecretName,
+            theirSecretName: secretName
+        ) else { return }
+        
+        //Send Communication Synchronization Message Once
+        try await writeTextMessage(
+            messageType: .nudgeLocal,
+            messageFlags: .communicationSynchronization,
+            recipient: .nickname(secretName),
+            text: sharedIdentifier,
+            metadata: [:],
+            pushType: .none,
+            destructionTime: nil)
+        await self.logger.log(level: .debug, message: "Sent communication synchronization")
     }
     
     /// Requests a change in the friendship state for a specified contact.
@@ -319,18 +434,19 @@ extension CryptoSession {
         let metadata = try BSONEncoder().encode(currentMetadata)
         let updatedProps = try await foundContact.updatePropsMetadata(
             symmetricKey: symmetricKey,
-            metadata: metadata,
-            with: "friendshipMetadata")
+            metadata: metadata)
+        
         guard let updatedMetadata = updatedProps?.metadata else {
             throw SessionErrors.propsError
         }
+        
         await receiverDelegate?.contactMetadata(
             changed: .init(
                 id: contact.id,
                 secretName: contact.secretName,
                 configuration: contact.configuration,
-                metadata: updatedMetadata)
-        )
+                metadata: updatedMetadata))
+        
         let updatedContact = try await foundContact.makeDecryptedModel(of: Contact.self, symmetricKey: symmetricKey)
         
         try await cache.updateContact(foundContact)
@@ -359,7 +475,7 @@ extension CryptoSession {
             messageType: .nudgeLocal,
             messageFlags: .friendshipStateRequest(blockUnblockData),
             recipient: .nickname(contact.secretName),
-            metadata: metadata,
+            metadata: ["friendshipMetadata": metadata],
             pushType: .contactRequest,
             destructionTime: nil)
             
@@ -371,12 +487,13 @@ extension CryptoSession {
     public func updateMessageDeliveryState(_
                                            message: PrivateMessage,
                                            deliveryState: DeliveryState,
+                                           messageRecipient: MessageRecipient,
                                            allowExternalUpdate: Bool = false
     ) async throws {
         guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
         guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
         let appSymmetricKey = try await getAppSymmetricKey()
-        guard var props = await message.props(symmetricKey: appSymmetricKey) else { fatalError() }
+        guard var props = await message.props(symmetricKey: appSymmetricKey) else { throw SessionErrors.propsError }
         props.deliveryState = deliveryState
         _ = try await message.updateProps(symmetricKey: appSymmetricKey, props: props)
         try await cache.updateMessage(message, symmetricKey: appSymmetricKey)
@@ -389,7 +506,7 @@ extension CryptoSession {
             try await writeTextMessage(
                 messageType: .nudgeLocal,
                 messageFlags: .deliveryStateChange,
-                recipient: .nickname(props.sendersSecretName),
+                recipient: messageRecipient,
                 metadata: encodedDeliveryState,
                 pushType: .none)
         }
@@ -474,103 +591,30 @@ public struct RevokeMessageMetadata: Codable, Sendable {
 //MARK: Outbound
 extension CryptoSession {
     
+    /// This method will loop through each targets user device configuration and send 1 DoubleRatcheted message for each device per target.
     func processWrite(
         message: CryptoMessage,
         session: CryptoSession
     ) async throws {
-        guard let sessionContext = await session.sessionContext else { throw SessionErrors.sessionNotInitialized }
-        guard let cache = await session.cache else { throw SessionErrors.databaseNotInitialized }
-        let appSymmetricKey = try await getAppSymmetricKey()
-        switch message.recipient {
-        case .nickname(let recipient):
-            switch message.messageType {
-               
-                //Dont save locally on any local device, but still saves the Job if we are offline and can save the SignedRatchetMessage remotely for future deliverly.
-            case .nudgeLocal:
-                for identity in try await taskProcessor.jobProcessor.getSessionIdentities(with: recipient, session: session) {
-                    guard let identityProps = await identity.props(symmetricKey: appSymmetricKey) else { fatalError() }
-                    switch message.messageFlags {
-                        //This updates our communication Model for us locally on outbound writes
-                    case .communicationSynchronization:
-                        guard !message.text.isEmpty else { return }
-                        await self.logger.log(level: .debug, message: "Requester Synchronizing Communication Message")
-                        let communicationModel = try await taskProcessor.jobProcessor.findCommunicationType(
-                            cache: cache,
-                            communicationType: message.recipient,
-                            session: session
-                        )
-                        await self.logger.log(level: .debug, message: "Found Communication Model For Synchronization: \(communicationModel)")
-                        var props = try await communicationModel.props(symmetricKey: appSymmetricKey)
-                        props?.sharedId = UUID(uuidString: message.text)
-                        try await communicationModel.updateProps(symmetricKey: appSymmetricKey, props: props)
-                        try await cache.updateCommunication(communicationModel)
-                        await self.logger.log(level: .debug, message: "Updated Communication Model For Synchronization with Shared Id: \(props?.sharedId)")
-                    default:
-                        break
-                    }
-                   
-                    let task = EncrytableTask(
-                        task: .writeMessage(OutboundTaskMessage(
-                            message: message,
-                            recipientSecretName: identityProps.secretName,
-                            recipientDeviceId: identityProps.deviceId,
-                            localId: UUID(),
-                            sharedId: UUID().uuidString
-                        )
-                        )
-                    )
-                    try await taskProcessor.jobProcessor.queueTask(task, session: session)
-                }
-            default:
-                
-                // Saves the message locally on all devices directed to.
-                var communicationModel: BaseCommunication
-                var shouldUpdateCommunication = false
-                do {
-                    communicationModel = try await taskProcessor.jobProcessor.findCommunicationType(
-                        cache: cache,
-                        communicationType: message.recipient,
-                        session: session
-                    )
-                    
-                    guard var newProps = await communicationModel.props(symmetricKey: appSymmetricKey) else { fatalError() }
-                    newProps.messageCount += 1
-                    _ = try await communicationModel.updateProps(symmetricKey: appSymmetricKey, props: newProps)
-                    shouldUpdateCommunication = true
-                } catch {
-                    communicationModel = try await taskProcessor.jobProcessor.createCommunicationModel(
-                        recipients: [sessionContext.sessionUser.secretName, recipient],
-                        communicationType: message.recipient,
-                        metadata: message.metadata,
-                        symmetricKey: appSymmetricKey
-                    )
-                }
-                
-                /// Create the message model and save locally
-                let encryptableMessage = try await taskProcessor.createOutboundMessageModel(
-                    message: message,
-                    communication: communicationModel,
-                    session: session,
-                    symmetricKey: appSymmetricKey,
-                    shouldUpdateCommunication: shouldUpdateCommunication
-                )
-                
-                /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
-                await session.receiverDelegate?.createdMessage(encryptableMessage)
-                
-                /// Send to Targets incluning my other devices
-                try await taskProcessor.processMessageTask(
-                    message: encryptableMessage,
-                    session: session
-                )
-            }
-        case .channel(_):
-            break
-        case .personalMessage:
-            break
-        case .broadcast:
-            break
+        guard let sessionContext = await session.sessionContext else {
+            throw SessionErrors.sessionNotInitialized
         }
+        guard let cache = await session.cache else {
+            throw SessionErrors.databaseNotInitialized
+        }
+        let appSymmetricKey = try await getAppSymmetricKey()
+        let mySecretName = await sessionContext.sessionUser.secretName
+        
+        
+        try await taskProcessor.outboundTask(
+            message: message,
+            cache: cache,
+            symmetricKey: appSymmetricKey,
+            session: session,
+            sender: mySecretName,
+            type: message.recipient,
+            shouldPersist: message.messageType == .nudgeLocal ? false : true,
+            logger: logger)
     }
 }
 
@@ -589,12 +633,344 @@ extension CryptoSession {
             senderDeviceId: deviceId,
             sharedMessageId: messageId
         )
-        try await taskProcessor.receiveMessageTask(
+        try await taskProcessor.inboundTask(
             message,
             session: CryptoSession.shared)
     }
+}
+
+actor TaskProcessor {
+    
+    let jobProcessor = JobProcessor()
+    let crypto = NeedleTailCrypto()
     
     
+    //Outbound
+    func outboundTask(
+        message: CryptoMessage,
+        cache: SessionCache,
+        symmetricKey: SymmetricKey,
+        session: CryptoSession,
+        sender: String,
+        type: MessageRecipient,
+        shouldPersist: Bool,
+        logger: NeedleTailLogger
+    ) async throws {
+        
+        var identities = [SessionIdentity]()
+        var recipients = Set<String>()
+        
+        defer {
+            identities.removeAll()
+            recipients.removeAll()
+        }
+        
+        switch type {
+        case .personalMessage:
+            
+            identities = try await gatherPersonalIdentities(
+                session: session,
+                sender: sender,
+                logger: logger)
+            
+            recipients.insert(sender)
+            
+        case .nickname(let nickname):
+            
+            identities = try await gatherPrivateMessageIdentities(
+                session: session,
+                target: nickname,
+                logger: logger)
+            recipients.insert(sender)
+            recipients.insert(nickname)
+            
+        case .channel(_): //We pass the entire type for members look up
+            
+            let (channelIdentities, members) = try await gatherChannelIdentities(
+                cache: cache,
+                session: session,
+                symmetricKey: symmetricKey,
+                type: type,
+                logger: logger)
+            identities = channelIdentities
+            recipients.union(members)
+         
+        case .broadcast:
+           break
+        }
+        
+        try await queueEncryptableTask(
+            for: identities,
+            message: message,
+            cache: cache,
+            session: session,
+            symmetricKey: symmetricKey,
+            sender: sender,
+            recipients: recipients,
+            shouldPersist: shouldPersist,
+            logger: logger)
+    }
+    
+    
+    private func gatherPersonalIdentities(
+        session: CryptoSession,
+        sender: String,
+        logger: NeedleTailLogger
+    ) async throws -> [SessionIdentity] {
+        //Get Identities only for me
+        var identities = try await session.getSessionIdentities(with: sender)
+        if identities.isEmpty {
+            identities = try await session.refreshSessionIdentities(for: sender, from: [])
+        }
+        await logger.log(level: .info, message: "Gathered \(identities.count) Personal Session Identities")
+        return identities
+    }
+    
+    private func gatherPrivateMessageIdentities(
+        session: CryptoSession,
+        target: String,
+        logger: NeedleTailLogger
+    ) async throws -> [SessionIdentity] {
+        //Get Identities only for me
+        var identities = try await session.getSessionIdentities(with: target)
+        if identities.isEmpty {
+            identities = try await session.refreshSessionIdentities(for: target, from: [])
+        }
+        await logger.log(level: .info, message: "Gathered \(identities.count) Private Message Session Identities")
+        return identities
+    }
+    private func gatherChannelIdentities(
+        cache: SessionCache,
+        session: CryptoSession,
+        symmetricKey: SymmetricKey,
+        type: MessageRecipient,
+        logger: NeedleTailLogger
+    ) async throws -> ([SessionIdentity], Set<String>) {
+        var communicationModel: BaseCommunication
+        var shouldUpdateCommunication = false
+        do {
+            communicationModel = try await jobProcessor.findCommunicationType(
+                cache: cache,
+                communicationType: type,
+                session: session
+            )
+            
+            guard var newProps = await communicationModel.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
+            newProps.messageCount += 1
+            _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: newProps)
+            shouldUpdateCommunication = true
+        } catch {
+            throw CryptoSession.SessionErrors.channelNotCreated
+        }
+
+        
+        //1. Collect Members of channel
+        guard let props = await communicationModel.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
+        let members = props.members
+        
+        var identities = [SessionIdentity]()
+        //3. Double Ratchet for all memebers and their devices
+        for member in members {
+            identities = try await session.getSessionIdentities(with: member)
+            if identities.isEmpty {
+                identities = try await session.refreshSessionIdentities(for: member, from: [])
+            }
+        }
+        await logger.log(level: .info, message: "Gathered \(identities.count) Channel Session Identities")
+        return (identities, members)
+    }
+    
+    private func queueEncryptableTask(for
+                                      sessionIdentities: [SessionIdentity],
+                                      message: CryptoMessage,
+                                      cache: SessionCache,
+                                      session: CryptoSession,
+                                      symmetricKey: SymmetricKey,
+                                      sender: String,
+                                      recipients: Set<String>,
+                                      shouldPersist: Bool,
+                                      logger: NeedleTailLogger
+    ) async throws {
+        var task: EncrytableTask
+        var message = message
+        var encryptableMessage: PrivateMessage?
+        
+        if shouldPersist {
+            //1. Pass messages to be cached and saved on the local database
+            var communicationModel: BaseCommunication
+            var shouldUpdateCommunication = false
+            do {
+                communicationModel = try await jobProcessor.findCommunicationType(
+                    cache: cache,
+                    communicationType: message.recipient,
+                    session: session)
+                
+                guard var newProps = await communicationModel.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
+                
+                newProps.messageCount += 1
+                _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: newProps)
+                shouldUpdateCommunication = true
+            } catch {
+                communicationModel = try await jobProcessor.createCommunicationModel(
+                    recipients: recipients,
+                    communicationType: message.recipient,
+                    metadata: message.metadata,
+                    symmetricKey: symmetricKey)
+                
+                try await session.receiverDelegate?.updatedCommunication(communicationModel, members: recipients)
+            }
+            
+            /// Create the message model and save locally
+            let message = try await createOutboundMessageModel(
+                message: message,
+                communication: communicationModel,
+                session: session,
+                symmetricKey: symmetricKey,
+                members: recipients,
+                sharedId: UUID().uuidString,
+                shouldUpdateCommunication: shouldUpdateCommunication)
+            
+            /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
+            await session.receiverDelegate?.createdMessage(message)
+            encryptableMessage = message
+        }
+        
+        for identity in sessionIdentities {
+        
+            switch message.messageType {
+            case .media:
+                //If we are media we need to send a media packet. Due to how large media is and the load it would place on the crypto layer we never double ratchet the actual media. The following is the basic process.
+                
+                // 1. We send the media message using the double ratchet. This contains the needed symmetric key in order to decrypt the media once it has been downloaded from storage. It is a one time key and is destroyed and replaced with the app symmetric key each and everytime the media is retrieve from the local disk after the download has completed.
+                
+                // 2. We generate an upload packet for each media message recipient. This includes all devices for a recipient and the current users devices
+                
+                // 3. After the media message is sent on the transport layer, if we have created upload packets we send them via the proper upload to storage method.
+                
+                if let props = try await identity.props(symmetricKey: symmetricKey) {
+                    guard let encryptableMessage else { fatalError() }
+                    guard var messageProps = try await encryptableMessage.props(symmetricKey: symmetricKey) else { fatalError() }
+                    let mediaSymmetricKey = try crypto.userInfoKey(UUID().uuidString)
+                    let encodedKey = try BSONEncoder().encodeData(mediaSymmetricKey)
+                    let synchronizationIdentifier = UUID().uuidString
+                    messageProps.message.metadata["symmetricKey"] = encodedKey
+                    messageProps.message.metadata["synchronizationIdentifier"] = synchronizationIdentifier
+                    try await encryptableMessage.updateProps(symmetricKey: symmetricKey, props: messageProps)
+                    try await session.cache?.updateMessage(encryptableMessage, symmetricKey: symmetricKey)
+
+                    await session.transportDelegate?.createUploadPacket(
+                        secretName: props.secretName,
+                        deviceId: props.deviceId,
+                        recipient: message.recipient,
+                        metadata:  messageProps.message.metadata)
+                }
+            default:
+                break
+            }
+            
+            //Only Persist local
+            if shouldPersist {
+                guard let encryptableMessage else { return }
+                guard let messageProps = await encryptableMessage.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
+                guard let identityProps = await identity.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
+                task = EncrytableTask(
+                    task: .writeMessage(OutboundTaskMessage(
+                        message: messageProps.message,
+                        recipientSecretName: identityProps.secretName,
+                        recipientDeviceId: identityProps.deviceId,
+                        localId: encryptableMessage.id,
+                        sharedId: encryptableMessage.sharedId))
+                )
+                
+            } else {
+                switch message.messageFlags {
+                    //This updates our communication Model for us locally on outbound writes
+                case .communicationSynchronization:
+                    guard !message.text.isEmpty else { return }
+                    await logger.log(level: .debug, message: "Requester Synchronizing Communication Message")
+                    let communicationModel = try await jobProcessor.findCommunicationType(
+                        cache: cache,
+                        communicationType: message.recipient,
+                        session: session
+                    )
+                    await logger.log(level: .debug, message: "Found Communication Model For Synchronization: \(communicationModel)")
+                    var props = try await communicationModel.props(symmetricKey: symmetricKey)
+                    props?.sharedId = UUID(uuidString: message.text)
+                    try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
+                    try await cache.updateCommunication(communicationModel)
+                    await logger.log(level: .debug, message: "Updated Communication Model For Synchronization with Shared Id: \(props?.sharedId)")
+                default:
+                    break
+                }
+                
+                guard let identityProps = await identity.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
+                
+                task = EncrytableTask(
+                    task: .writeMessage(OutboundTaskMessage(
+                        message: message,
+                        recipientSecretName: identityProps.secretName,
+                        recipientDeviceId: identityProps.deviceId,
+                        localId: UUID(),
+                        sharedId: UUID().uuidString))
+                )
+            }
+            
+            try await jobProcessor.queueTask(task, session: session)
+        }
+    }
+
+
+    /// Called on Message Save
+    func createOutboundMessageModel(
+        message: CryptoMessage,
+        communication: BaseCommunication,
+        session: CryptoSession,
+        symmetricKey: SymmetricKey,
+        members: Set<String>,
+        sharedId: String,
+        shouldUpdateCommunication: Bool = false
+    ) async throws -> PrivateMessage {
+        guard let sessionContext = await session.sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
+        let sessionUser = sessionContext.sessionUser
+        guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else { fatalError() }
+        let messageModel = try await PrivateMessage(
+            id: UUID(),
+            communicationId: communication.id,
+            sessionContextId: sessionContext.sessionContextId,
+            sharedId: sharedId,
+            sequenceNumber: communicationProps.messageCount,
+            props: .init(
+                base: communication,
+                sendDate: Date(),
+                deliveryState: .sending,
+                message: message,
+                sendersSecretName: sessionUser.secretName,
+                sendersId: sessionUser.deviceId
+            ),
+            symmetricKey: symmetricKey)
+        
+        guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
+        if shouldUpdateCommunication {
+            do {
+                try await cache.updateCommunication(communication)
+                try await session.receiverDelegate?.updatedCommunication(communication, members: members)
+            } catch {
+                throw error
+            }
+        }
+        try await cache.createMessage(messageModel, symmetricKey: try await session.getAppSymmetricKey())
+        return messageModel
+    }
+}
+
+//MARK: Inbound
+extension TaskProcessor {
+    func inboundTask(_ message: InboundTaskMessage, session: CryptoSession) async throws {
+        try await jobProcessor.queueTask(
+            EncrytableTask(task: .streamMessage(message)),
+            session: session)
+        
+    }
 }
 
 struct OutboundTaskMessage: Codable & Sendable {
@@ -611,108 +987,4 @@ struct InboundTaskMessage: Codable & Sendable {
     let senderSecretName: String
     let senderDeviceId: UUID
     let sharedMessageId: String
-}
-
-actor TaskProcessor {
-    
-    let jobProcessor = JobProcessor()
-    let crypto = NeedleTailCrypto()
-    
-    
-    //Outbound
-    func processMessageTask(
-        message: PrivateMessage,
-        session: CryptoSession
-    ) async throws {
-        let appSymmetricKey = try await session.getAppSymmetricKey()
-        guard let messageProps = await message.props(symmetricKey: appSymmetricKey) else { fatalError() }
-
-        switch messageProps.message.recipient {
-        case .nickname(let recipientName):
-            let identites = try await jobProcessor.getSessionIdentities(with: recipientName, session: session)
-            if identites.isEmpty {
-                throw CryptoSession.SessionErrors.missingSessionIdentity
-            }
-            for identity in identites {
-                try await writeEncryptableTask(identity: identity, message: message)
-            }
-        case .channel(_):
-            //Look up members of this channel name. THen we can do a batch process of what is done for nickname
-            break
-        case .broadcast:
-            break
-        case .personalMessage:
-            break
-        }
-        
-        func writeEncryptableTask(
-            identity: SessionIdentity,
-            message: PrivateMessage
-        ) async throws {
-            let appSymmetricKey = try await session.getAppSymmetricKey()
-            guard let messageProps = await message.props(symmetricKey: appSymmetricKey) else { fatalError() }
-            guard let identityProps = await identity.props(symmetricKey: appSymmetricKey) else { fatalError() }
-            let task = EncrytableTask(
-                task: .writeMessage(OutboundTaskMessage(
-                    message: messageProps.message,
-                    recipientSecretName: identityProps.secretName,
-                    recipientDeviceId: identityProps.deviceId,
-                    localId: message.id,
-                    sharedId: message.sharedId
-                )
-                )
-            )
-            try await jobProcessor.queueTask(task, session: session)
-        }
-    }
-    
-    /// Called on Message Save
-    func createOutboundMessageModel(
-        message: CryptoMessage,
-        communication: BaseCommunication,
-        session: CryptoSession,
-        symmetricKey: SymmetricKey,
-        shouldUpdateCommunication: Bool = false
-    ) async throws -> PrivateMessage {
-        guard let sessionContext = await session.sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
-        let sessionUser = sessionContext.sessionUser
-        guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else { fatalError() }
-        let messageModel = try await PrivateMessage(
-            id: UUID(),
-            communicationId: communication.id,
-            sessionContextId: sessionContext.sessionContextId,
-            sharedId: UUID().uuidString,
-            sequenceNumber: communicationProps.messageCount,
-            props: .init(
-                base: communication,
-                sendDate: Date(),
-                deliveryState: .sending,
-                message: message,
-                sendersSecretName: sessionUser.secretName,
-                sendersId: sessionUser.deviceId
-            ),
-            symmetricKey: symmetricKey
-        )
-        
-        guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
-        if shouldUpdateCommunication {
-            do {
-                try await cache.updateCommunication(communication)
-            } catch {
-                throw error
-            }
-        }
-        try await cache.createMessage(messageModel, symmetricKey: try await session.getAppSymmetricKey())
-        return messageModel
-    }
-}
-
-//MARK: Inbound
-extension TaskProcessor {
-    func receiveMessageTask(_ message: InboundTaskMessage, session: CryptoSession) async throws {
-        try await jobProcessor.queueTask(
-            EncrytableTask(task: .streamMessage(message)),
-            session: session)
-        
-    }
 }

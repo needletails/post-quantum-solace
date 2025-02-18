@@ -222,10 +222,6 @@ struct ReceiverDelegate: NTMessageReceiver {
         print("Update contact: \(contact)")
     }
     
-    func newDeviceRequest(configuration: UserDeviceConfiguration) async {
-        print("New Device")
-    }
-    
     func createdMessage(_ message: PrivateMessage) async {
         await print("Created message: \(String(describing: message.props?.sendersIdentity))")
     }
@@ -274,14 +270,10 @@ final class MockTransportDelegate: SessionTransport, @unchecked Sendable {
         return userConfiguration
     }
     
-    func publishUserConfiguration(_ configuration: UserConfiguration, identity: UUID?) async throws {
+    func publishUserConfiguration(_ configuration: UserConfiguration) async throws {
         self.userConfiguration = configuration
     }
-    
-    func publishAuxillary(configuration: UserDeviceConfiguration) async throws {
-        
-    }
-    
+
     var shouldReturnConfiguration: Bool = true
     var userConfiguration: UserConfiguration?
     

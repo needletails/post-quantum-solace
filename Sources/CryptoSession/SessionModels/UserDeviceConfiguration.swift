@@ -6,7 +6,6 @@
 //
 import Foundation
 import BSON
-import NeedleTailHelpers
 
 /// Errors that can occur during signing operations.
 enum SigningErrors: Error {
@@ -22,6 +21,8 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     public let publicSigningKey: Data
     /// Public key associated with the device.
     public let publicKey: Data
+    /// An optional Device Name to identify What device this actualy is.
+    public let deviceName: String?
     /// A flag indicating if this device is the master device.
     public let isMasterDevice: Bool
     
@@ -30,7 +31,8 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         case deviceId = "a"
         case publicSigningKey = "b"
         case publicKey = "c"
-        case isMasterDevice = "d"
+        case deviceName = "d"
+        case isMasterDevice = "e"
     }
     
     /// Initializes a new `UserDeviceConfiguration` instance.
@@ -44,31 +46,32 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         deviceId: UUID,
         publicSigningKey: Data,
         publicKey: Data,
+        deviceName: String?,
         isMasterDevice: Bool
     ) throws {
         self.deviceId = deviceId
         self.publicSigningKey = publicSigningKey
         self.publicKey = publicKey
+        self.deviceName = deviceName
         self.isMasterDevice = isMasterDevice
     }
 }
 
 public struct UserSession: Codable, Sendable, Hashable {
-    let id = UUID()
+    public let id: UUID
     public let secretName: String
     public let identity: UUID
     public let configuration: UserDeviceConfiguration
-    public let deviceName: String
     
     public init(
+        id: UUID,
         secretName: String,
-        configuration: UserDeviceConfiguration,
-        deviceName: String
+        configuration: UserDeviceConfiguration
     ) {
+        self.id = id
         self.secretName = secretName
         self.identity = configuration.deviceId
         self.configuration = configuration
-        self.deviceName = deviceName
     }
     
     public static func == (lhs: UserSession, rhs: UserSession) -> Bool {

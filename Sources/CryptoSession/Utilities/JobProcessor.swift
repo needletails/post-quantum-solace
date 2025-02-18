@@ -167,7 +167,6 @@ final class JobProcessor: @unchecked Sendable {
     public func queueTask(_
                           task: EncrytableTask,
                           session: CryptoSession) async throws {
-        
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         incrementId()
         let symmetricKey = try await session.getAppSymmetricKey()
@@ -186,73 +185,65 @@ final class JobProcessor: @unchecked Sendable {
         if !isRunning {
             await self.logger.log(level: .debug, message: "Starting job queue")
             isRunning = true
-            try await withThrowingTaskGroup(of: Void.self) { [weak self] group in
-                guard let self else { fatalError() }
-                group.addTask { [weak self] in
-                    guard let self else { fatalError() }
-                    for try await result in NeedleTailAsyncSequence(consumer: jobConsumer) {
-                        switch result {
-                        case .success(let job):
-                            
-                            let symmetricKey = try await session.getAppSymmetricKey()
-                            guard let props = await job.props(symmetricKey: symmetricKey) else { fatalError() }
-                            await self.logger.log(level: .debug, message: "Running job \(props.sequenceId)")
-                            
-                            if session.isViable == false {
-                                await self.logger.log(level: .debug, message: "Skipping job \(props.sequenceId) as we are offline")
-                                await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
-                                isRunning = false
-                                return
-                            }
-                            
-                            if let delayedUntil = props.delayedUntil, delayedUntil >= Date() {
-                                await self.logger.log(level: .debug, message: "Task was delayed into the future")
-                                
-                                //This is urgent, We want to try this job first always until the designated time arrives. we sort via sequenceId. so old messages are always done first.
-                                await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
-                                if await jobConsumer.deque.count == 0 {
-                                    setIsRunning(false)
-                                }
-                                break
-                            }
-                            
-                            do {
-                                await self.logger.log(level: .debug, message: "Executing Job \(props.sequenceId)")
-                                
-                                try await performRatchet(
-                                    task: props.task.task,
-                                    session: session
-                                )
-                                
-                                try await cache.removeJob(job)
-                            } catch {
-                                await self.logger.log(level: .error, message: "Job error \(error)")
-                                
-                                //TODO: Work in delay logic on fail
-                                
-                                if await jobConsumer.deque.count == 0 || Task.isCancelled {
-                                    setIsRunning(false)
-                                    return
-                                }
-                            }
-                            
-                            if await jobConsumer.deque.count == 0 {
-                                setIsRunning(false)
-                                try await loadJobs(nil, cache: cache, symmetricKey: symmetricKey)
-                            }
-                        case .consumed:
-                            let symmetricKey = try await session.getAppSymmetricKey()
-                            await consumedSequence()
+            let symmetricKey = try await session.getAppSymmetricKey()
+            for try await result in NeedleTailAsyncSequence(consumer: jobConsumer) {
+                switch result {
+                case .success(let job):
+                    
+                    guard let props = await job.props(symmetricKey: symmetricKey) else { fatalError() }
+                    await self.logger.log(level: .debug, message: "Running job \(props.sequenceId)")
+                    
+                    if session.isViable == false {
+                        await self.logger.log(level: .debug, message: "Skipping job \(props.sequenceId) as we are offline")
+                        await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
+                        isRunning = false
+                        return
+                    }
+                    
+                    if let delayedUntil = props.delayedUntil, delayedUntil >= Date() {
+                        await self.logger.log(level: .debug, message: "Task was delayed into the future")
+                        
+                        //This is urgent, We want to try this job first always until the designated time arrives. we sort via sequenceId. so old messages are always done first.
+                        await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
+                        if await jobConsumer.deque.count == 0 {
                             setIsRunning(false)
-                            try await loadJobs(nil, cache: cache, symmetricKey: symmetricKey)
+                        }
+                        break
+                    }
+                    
+                    do {
+                        await self.logger.log(level: .debug, message: "Executing Job \(props.sequenceId)")
+                        
+                        try await performRatchet(
+                            task: props.task.task,
+                            session: session)
+                        
+                        try await cache.removeJob(job)
+                    } catch {
+                        await self.logger.log(level: .error, message: "Job error \(error)")
+                        
+                        //TODO: Work in delay logic on fail
+                        
+                        if await jobConsumer.deque.count == 0 || Task.isCancelled {
+                            setIsRunning(false)
+                            return
                         }
                     }
-                }
-                try await group.next()
-                if await jobConsumer.deque.count == 0 {
+                    
+                    if await jobConsumer.deque.count == 0 {
+                        setIsRunning(false)
+                        try await loadJobs(nil, cache: cache, symmetricKey: symmetricKey)
+                    }
+                case .consumed:
+                    let symmetricKey = try await session.getAppSymmetricKey()
+                    await consumedSequence()
                     setIsRunning(false)
+                    try await loadJobs(nil, cache: cache, symmetricKey: symmetricKey)
                 }
             }
+        }
+        if await jobConsumer.deque.count == 0 {
+            setIsRunning(false)
         }
     }
     
@@ -295,7 +286,6 @@ final class JobProcessor: @unchecked Sendable {
             throw CryptoSession.SessionErrors.sessionNotInitialized
         }
         
-        let sessionUser = sessionContext.sessionUser
         guard let cache = await session.cache else {
             throw CryptoSession.SessionErrors.databaseNotInitialized
         }
@@ -307,20 +297,24 @@ final class JobProcessor: @unchecked Sendable {
         ) else {
             throw JobProcessorErrors.missingIdentity
         }
+        
         let appSymmetricKey = try await session.getAppSymmetricKey()
-        guard let props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
+        guard let props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else {
+            throw JobProcessorErrors.missingIdentity
+        }
+        
         let recipientPublicKeyRepresentable = props.publicKeyRepesentable
         let recipientPublicKey = try Curve25519PublicKey(rawRepresentation: recipientPublicKeyRepresentable)
         let secretName = await props.secretName
         
         let symmetricKey = try await deriveSymmetricKey(
             for: secretName,
-            my: sessionUser.deviceKeys.privateKey,
+            my: sessionContext.sessionUser.deviceKeys.privateKey,
             their: recipientPublicKey
         )
         
         try await ratchetManager.senderInitialization(
-            deviceId: sessionIdentity,
+            sessionIdentity: sessionIdentity,
             secretKey: symmetricKey,
             sessionSymmetricKey: appSymmetricKey,
             recipientPublicKey: recipientPublicKey)
@@ -335,7 +329,7 @@ final class JobProcessor: @unchecked Sendable {
         let encodedData = try BSONEncoder().encodeData(outboundTask.message)
         let ratchetedMessage = try await ratchetManager.ratchetEncrypt(plainText: encodedData)
         let signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
-        
+
         try await session.transportDelegate?.sendMessage(
             signedMessage,
             metadata: SignedRatchetMessageMetadata(
@@ -362,7 +356,9 @@ final class JobProcessor: @unchecked Sendable {
         let (encryptedMessage, sessionIdentity) = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
         
         let appSymmetricKey = try await session.getAppSymmetricKey()
-        guard let props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
+        guard let props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else {
+            throw JobProcessorErrors.missingIdentity
+        }
         
         let decryptedData: Data
         if props.state != nil {
@@ -382,11 +378,10 @@ final class JobProcessor: @unchecked Sendable {
             
             //Don't Save received Message
         case .nudgeLocal:
-            //TODO: Is this valid for channel communications????? Or do we place it in the Private Message case???? We do not save this message!!!!
             switch decodedMessage.messageFlags {
-            case .friendshipStateRequest:
+            case .friendshipStateRequest(let data):
                 // Create/Update Contact and modify metadata
-                var decodedMetadata = try BSONDecoder().decode(FriendshipMetadata.self, from: decodedMessage.metadata)
+                var decodedMetadata = try BSONDecoder().decode(FriendshipMetadata.self, from: decodedMessage.metadata["friendshipMetadata"] as? Document ?? [:])
                 //Update our state based on the state of the sender and it's metadata.
                 switch decodedMetadata.theirState {
                 case .pending:
@@ -402,7 +397,9 @@ final class JobProcessor: @unchecked Sendable {
                 case .rejectedRequest, .friendshipRejected, .rejected:
                     decodedMetadata.rejectFriendRequest()
                 }
+                
                 let encodedMetadata = try BSONEncoder().encode(decodedMetadata)
+                
                 //Create or update contact including new metadata
                 _ = try await session.updateOrCreateContact(
                     secretName: inboundTask.senderSecretName,
@@ -480,33 +477,27 @@ final class JobProcessor: @unchecked Sendable {
                 await self.logger.log(level: .debug, message: "Received Communication Synchronization Message")
                 let symmetricKey = try await session.getAppSymmetricKey()
                 
+                //This can happen on multidevice support when a sender is also sending a message to it's master/child device.
+                let isMe = await inboundTask.senderSecretName == session.sessionContext?.sessionUser.secretName
+                
                 var communicationModel: BaseCommunication?
                 do {
                     //Need to flop sender/recipient
                     communicationModel = try await findCommunicationType(
                         cache: cache,
-                        communicationType: .nickname(inboundTask.senderSecretName),
+                        communicationType: .nickname(isMe ? decodedMessage.recipient.nicknameDescription : inboundTask.senderSecretName),
                         session: session
                     )
                 } catch {
                     //Need to flop sender/recipient
                     communicationModel = try await createCommunicationModel(
-                        recipients: [getRecipientSecretName(decodedMessage.recipient), inboundTask.senderSecretName],
-                        communicationType: .nickname(inboundTask.senderSecretName),
+                        recipients: [decodedMessage.recipient.nicknameDescription, inboundTask.senderSecretName],
+                        communicationType: .nickname(isMe ? decodedMessage.recipient.nicknameDescription : inboundTask.senderSecretName),
                         metadata: decodedMessage.metadata,
                         symmetricKey: symmetricKey
                     )
                     guard let communicationModel = communicationModel else { return }
                     try await cache.createCommunication(communicationModel)
-                }
-                
-                func getRecipientSecretName(_ recipient: MessageRecipient) -> String {
-                    switch recipient {
-                    case .nickname(let name):
-                        return name
-                    default:
-                        fatalError()
-                    }
                 }
                 
                 guard let communicationModel = communicationModel else { return }
@@ -515,10 +506,18 @@ final class JobProcessor: @unchecked Sendable {
                 props?.sharedId = UUID(uuidString: decodedMessage.text)
                 try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
                 try await cache.updateCommunication(communicationModel)
+                if let members = props?.members {
+                    try await session.receiverDelegate?.updatedCommunication(communicationModel, members: members)
+                }
                 await self.logger.log(level: .debug, message: "Updated Communication Model For Synchronization with Shared Id: \(props?.sharedId)")
             case .contactCreated:
+                //This can happen on multidevice support when a sender is also sending a message to it's master/child device.
+                let isMe = await inboundTask.senderSecretName == session.sessionContext?.sessionUser.secretName
                 await self.logger.log(level: .debug, message: "Received Contact Request Recipient Created Contact Message")
-                try await session.sendCommunicationSynchronization(contact: inboundTask.senderSecretName)
+                try await session.sendCommunicationSynchronization(contact: isMe ? decodedMessage.recipient.nicknameDescription : inboundTask.senderSecretName)
+            case .addContacts:
+                let contacts = try BSONDecoder().decode([CryptoSession.SharedContactInfo].self, from: decodedMessage.metadata)
+                try await session.addContacts(contacts)
             case .revokeMessage:
                 do {
                     let decodedMetadata = try BSONDecoder().decode(RevokeMessageMetadata.self, from: decodedMessage.metadata)
@@ -534,11 +533,15 @@ final class JobProcessor: @unchecked Sendable {
                 let decodedKey = try BSONDecoder().decode(SymmetricKey.self, from: decodedMessage.metadata)
                 await session.receiverDelegate?.passDCCKey(decodedKey)
             default:
+                //This can happen on multidevice support when a sender is also sending a message to it's master/child device.
+                let isMe = await inboundTask.senderSecretName == session.sessionContext?.sessionUser.secretName
                 //Passthrough nothing special to do
-                await session.receiverDelegate?.receivedLocalNudge(decodedMessage, sender: inboundTask.senderSecretName)
+                await session.receiverDelegate?.receivedLocalNudge(decodedMessage, sender: isMe ? decodedMessage.recipient.nicknameDescription : inboundTask.senderSecretName)
             }
+            
             // Save
         default:
+            
             /// Now we can handle the message
             try await handleDecodedMessage(
                 decodedMessage,
@@ -609,7 +612,7 @@ final class JobProcessor: @unchecked Sendable {
         
         let appSymmetricKey = try await session.getAppSymmetricKey()
         guard var props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
-        
+       
         let sendersPublicKeyRepresentable = await props.publicKeyRepesentable
         let symmetricKey = try await deriveSymmetricKey(
             for: sessionUser.secretName,
@@ -620,7 +623,7 @@ final class JobProcessor: @unchecked Sendable {
         let localPrivateKey = try Curve25519PrivateKey(rawRepresentation: sessionUser.deviceKeys.privateKey)
         
         return try await ratchetManager.recipientInitialization(
-            deviceId: sessionIdentity,
+            sessionIdentity: sessionIdentity,
             sessionSymmetricKey: appSymmetricKey,
             secretKey: symmetricKey,
             localPrivateKey: localPrivateKey,
@@ -640,14 +643,16 @@ final class JobProcessor: @unchecked Sendable {
         
         switch decodedMessage.recipient {
         case .nickname(let recipient):
-            let sender = inboundTask.senderSecretName
+            
             var communicationModel: BaseCommunication
             var shouldUpdateCommunication = false
+            //This can happen on multidevice support when a sender is also sending a message to it's master/child device.
+            let isMe = await inboundTask.senderSecretName == session.sessionContext?.sessionUser.secretName
             do {
                 //Need to flip recipient
                 communicationModel = try await findCommunicationType(
                     cache: cache,
-                    communicationType: .nickname(inboundTask.senderSecretName),
+                    communicationType: .nickname(isMe ? recipient : inboundTask.senderSecretName),
                     session: session
                 )
                 
@@ -671,16 +676,19 @@ final class JobProcessor: @unchecked Sendable {
                 //Need to flip recipient
                 communicationModel = try await createCommunicationModel(
                     recipients: [recipient, inboundTask.senderSecretName],
-                    communicationType: .nickname(inboundTask.senderSecretName),
+                    communicationType: .nickname(isMe ? recipient : inboundTask.senderSecretName),
                     metadata: decodedMessage.metadata,
                     symmetricKey: appSymmetricKey
                 )
                 try await cache.createCommunication(communicationModel)
+                try await session.receiverDelegate?.updatedCommunication(communicationModel, members: [recipient, inboundTask.senderSecretName])
             }
             
             let messageModel = try await createInboundMessageModel(
                 decodedMessage: decodedMessage,
                 inboundTask: inboundTask,
+                sendersSecretName: inboundTask.senderSecretName,
+                senderDeviceId: inboundTask.senderDeviceId,
                 session: session,
                 communication: communicationModel,
                 sessionIdentity: sessionIdentity
@@ -688,14 +696,18 @@ final class JobProcessor: @unchecked Sendable {
             
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
+                if let members = try await communicationModel.props(symmetricKey: session.getAppSymmetricKey())?.members {
+                    try await session.receiverDelegate?.updatedCommunication(communicationModel, members: members)
+                }
             }
+            
             try await cache.createMessage(messageModel, symmetricKey: appSymmetricKey)
             let props = await messageModel.props(symmetricKey: appSymmetricKey)
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
         case .personalMessage:
-            
             let sender = inboundTask.senderSecretName
+            guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return }
             
             let appSymmetricKey = try await session.getAppSymmetricKey()
             var communicationModel: BaseCommunication
@@ -724,26 +736,31 @@ final class JobProcessor: @unchecked Sendable {
                 
                 shouldUpdateCommunication = true
             } catch {
+                
                 communicationModel = try await createCommunicationModel(
                     recipients: [sender],
                     communicationType: decodedMessage.recipient,
                     metadata: decodedMessage.metadata,
-                    symmetricKey: appSymmetricKey
-                )
+                    symmetricKey: appSymmetricKey)
+                
                 try await cache.createCommunication(communicationModel)
+                try await session.receiverDelegate?.updatedCommunication(communicationModel, members: [mySecretName])
             }
             
             let messageModel = try await createInboundMessageModel(
                 decodedMessage: decodedMessage,
                 inboundTask: inboundTask,
+                sendersSecretName: sender,
+                senderDeviceId: inboundTask.senderDeviceId,
                 session: session,
                 communication: communicationModel,
                 sessionIdentity: sessionIdentity
             )
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
+                try await session.receiverDelegate?.updatedCommunication(communicationModel, members: [mySecretName])
             }
-
+            
             try await cache.createMessage(messageModel, symmetricKey: appSymmetricKey)
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
@@ -770,6 +787,8 @@ final class JobProcessor: @unchecked Sendable {
             let messageModel = try await createInboundMessageModel(
                 decodedMessage: decodedMessage,
                 inboundTask: inboundTask,
+                sendersSecretName: sender,
+                senderDeviceId: inboundTask.senderDeviceId,
                 session: session,
                 communication: communicationModel,
                 sessionIdentity: sessionIdentity
@@ -800,10 +819,8 @@ final class JobProcessor: @unchecked Sendable {
                 members: recipients,
                 metadata: metadata,
                 blockedMembers: [],
-                communicationType: communicationType
-            ),
-            symmetricKey: symmetricKey
-        )
+                communicationType: communicationType),
+            symmetricKey: symmetricKey)
     }
     
     internal func findCommunicationType(
@@ -830,12 +847,16 @@ final class JobProcessor: @unchecked Sendable {
     private func createInboundMessageModel(
         decodedMessage: CryptoMessage,
         inboundTask: InboundTaskMessage,
+        sendersSecretName: String,
+        senderDeviceId: UUID,
         session: CryptoSession,
         communication: BaseCommunication,
         sessionIdentity: SessionIdentity
     ) async throws -> PrivateMessage {
         let appSymmetricKey = try await session.getAppSymmetricKey()
-        guard var props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
+        guard var props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else {
+            throw JobProcessorErrors.missingIdentity
+        }
         guard let communicationProps = await communication.props(symmetricKey: try session.getAppSymmetricKey()) else {
             throw CryptoSession.SessionErrors.cannotFindCommunication
         }
@@ -853,11 +874,11 @@ final class JobProcessor: @unchecked Sendable {
                 sendDate: decodedMessage.sentDate,
                 deliveryState: .received,
                 message: decodedMessage,
-                sendersSecretName: inboundTask.senderSecretName,
-                sendersId: inboundTask.senderDeviceId
+                sendersSecretName: sendersSecretName,
+                sendersId: senderDeviceId
             ),
-            symmetricKey: symmetricKey
-        )
+            symmetricKey: symmetricKey)
+        
         var newProps = communicationProps
         newProps.messageCount = newMessageCount
         _ = try await communication.updateProps(symmetricKey: symmetricKey, props: newProps)
@@ -869,15 +890,17 @@ final class JobProcessor: @unchecked Sendable {
         session: CryptoSession,
         inboundTask: InboundTaskMessage
     ) async throws -> (EncryptedMessage, SessionIdentity) {
-        
-        let identities = try await getSessionIdentities(with: inboundTask.senderSecretName, session: session)
+        var identities = try await session.getSessionIdentities(with: inboundTask.senderSecretName)
+        if identities.isEmpty {
+            identities = try await session.refreshSessionIdentities(for: inboundTask.senderSecretName, from: [])
+        }
         let appSymmetricKey = try await session.getAppSymmetricKey()
-        // Find the corresponding device identity
+
         guard let sessionIdentity = await identities.asyncFirst(where: { identity in
             guard var props = await identity.props(symmetricKey: appSymmetricKey) else { return false }
             return props.deviceId == inboundTask.senderDeviceId
         }) else {
-            //If we did not have an identity we neeed to create it
+            //If we did not have an identity we need to create it
             throw CryptoSession.SessionErrors.missingSessionIdentity
         }
         
@@ -896,7 +919,7 @@ final class JobProcessor: @unchecked Sendable {
             let document = Document(data: signedMessage.data)
             return (try BSONDecoder().decode(EncryptedMessage.self, from: document), sessionIdentity)
         } else {
-            //If this happens the public key is not the  same as the one that signed it or the data has been tampered with
+            //If this happens the public key is not the same as the one that signed it or the data has been tampered with
             throw CryptoSession.SessionErrors.invalidSignature
         }
     }
@@ -909,99 +932,250 @@ final class JobProcessor: @unchecked Sendable {
             message: message,
             privateSigningKey: deviceKeys.privateSigningKey)
     }
+}
 
-    public func getSessionIdentities(with recipientName: String, session: CryptoSession) async throws -> [SessionIdentity] {
-        var sessions = [SessionIdentity]()
-        
-        guard let sessionContext = await session.sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
-        guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
-        
-        let currentSessions = try await cache.fetchSessionIdentities()
-        let filtered = await currentSessions.asyncFilter { identity in
-            do {
-                let symmetricKey = try await session.getAppSymmetricKey()
-                let props = try await identity.makeDecryptedModel(of: _SessionIdentity.self, symmetricKey: symmetricKey)
-                
-                // Check if the identity is not the current user's identity
-                let isDifferentIdentity = props.deviceId != sessionContext.sessionUser.deviceId &&
-                props.secretName != sessionContext.sessionUser.secretName
-                // Return true if the secret name matches the recipient name or if it's a different identity
-                return props.secretName == recipientName || isDifferentIdentity
-            } catch {
-                return false
+
+extension Array {
+    
+    /// Asynchronously finds the first element in the array that satisfies the given predicate.
+    ///
+    /// This method iterates through the elements of the array and evaluates the provided asynchronous
+    /// predicate for each element. If the predicate returns `true` for an element, that element is
+    /// returned. If no elements satisfy the predicate, `nil` is returned.
+    ///
+    /// - Parameter predicate: An asynchronous closure that takes an element of the array and returns
+    ///   a Boolean value indicating whether the element satisfies a certain condition. The closure
+    ///   is marked as `@Sendable`, meaning it can be safely used across concurrency domains.
+    ///
+    /// - Returns: The first element that satisfies the predicate, or `nil` if no such element is found.
+    ///
+    /// - Complexity: O(n), where n is the number of elements in the array. The function may suspend
+    ///   while waiting for the predicate to complete, so it should be used in an asynchronous context.
+    ///
+    /// - Note: This function is designed to work with arrays of any type, as long as the type conforms
+    ///   to the requirements of the predicate closure.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// let numbers = [1, 3, 5, 7, 8, 10]
+    ///
+    /// // Asynchronous predicate function
+    /// func isEven(_ number: Int) async -> Bool {
+    ///     return number % 2 == 0
+    /// }
+    ///
+    /// Task {
+    ///     if let firstEven = await numbers.asyncFirst(where: isEven) {
+    ///         print("The first even number is \(firstEven).") // Output: The first even number is 8.
+    ///     } else {
+    ///         print("No even number found.")
+    ///     }
+    /// }
+    /// ```
+    public func asyncFirst(where predicate: @Sendable (Element) async -> Bool) async -> Element? {
+        for element in self {
+            if await predicate(element) {
+                return element
             }
         }
-        
-        // Return filtered identities if not empty and is not the current session
-        let appSymmetricKey = try await session.getAppSymmetricKey()
-        let foundRecipients = await filtered.asyncContains(where: { await $0.props(symmetricKey: appSymmetricKey)?.secretName == recipientName })
-        if foundRecipients {
-            sessions.append(contentsOf: filtered)
-        }
-        
-        // If we are empty we did not find a recipient... Let's create one
-        if filtered.isEmpty {
-            //first append our Identites, but not this current session
-            sessions.append(contentsOf: filtered)
-            
-            guard let transport = await session.transportDelegate else { throw CryptoSession.SessionErrors.transportNotInitialized }
-            
-            // Get the user configuration for the recipient
-            let configuration = try await transport.findConfiguration(for: recipientName)
-            
-            // Make sure that the identities of the user configuration are legit
-            let publicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.publicSigningKey)
-            if try configuration.signed.verifySignature(publicKey: publicSigningKey) == false {
-                throw SigningErrors.signingFailedOnVerfication
-            }
-            configuration.publicSigningKey
-            
-            var generatedSessionContextIds = Set<Int>()
-            // Loop over each device, create and cache the identity, and append it to the array
-            let devices = try BSONDecoder().decodeData([UserDeviceConfiguration].self, from: configuration.signed.data)
-            for device in devices {
-                var sessionContextIdentifier: Int
-                repeat {
-                    sessionContextIdentifier = Int.random(in: 1 ..< .max)
-                } while generatedSessionContextIds.contains(sessionContextIdentifier)
-                
-                generatedSessionContextIds.insert(sessionContextIdentifier)
-                
-                let identity = try await createEncryptableSessionIdentityModel(
-                    with: device,
-                    for: recipientName,
-                    associatedWith: device.deviceId,
-                    new: sessionContextIdentifier,
-                    session: session)
-                sessions.append(identity)
-            }
-        }
-        return sessions
+        return nil
     }
     
-    func createEncryptableSessionIdentityModel(
-        with device: UserDeviceConfiguration,
-        for secretName: String,
-        associatedWith deviceId: UUID,
-        new sessionContextId: Int,
-        session: CryptoSession
-    ) async throws -> SessionIdentity {
-        guard let sessionContext = await session.sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
-        guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
-        let identity = try await SessionIdentity(
-            props: .init(
-                secretName: secretName,
-                deviceId: deviceId,
-                sessionContextId: sessionContextId,
-                publicKeyRepesentable: device.publicKey,
-                publicSigningRepresentable: device.publicSigningKey,
-                state: nil,
-                deviceName: "",
-                isMasterDevice: device.isMasterDevice
-            ),
-            symmetricKey: session.getAppSymmetricKey()
-        )
-        try await cache.createSessionIdentity(identity)
-        return identity
+    public func asyncMap<T>(transform: @Sendable (Element) async -> T) async -> [T] {
+        var results = [T]()
+        for element in self {
+            let result = await transform(element)
+            results.append(result)
+        }
+        return results
     }
+    
+    public func asyncCompactMap<T>(transform: @Sendable (Element) async -> T?) async -> [T] {
+        var results = [T]()
+        for element in self {
+            if let result = await transform(element) {
+                results.append(result)
+            }
+        }
+        return results
+    }
+    
+    // Asynchronously finds the index of the first element in the array that satisfies the given predicate.
+    ///
+    /// This method iterates through the elements of the array and evaluates the provided asynchronous
+    /// predicate for each element. If the predicate returns `true` for an element, the index of that
+    /// element is returned. If no elements satisfy the predicate, `nil` is returned.
+    ///
+    /// - Parameter predicate: An asynchronous closure that takes an element of the array and returns
+    ///   a Boolean value indicating whether the element satisfies a certain condition. The closure
+    ///   is marked as `@Sendable`, meaning it can be safely used across concurrency domains.
+    ///
+    /// - Returns: The index of the first element that satisfies the predicate, or `nil` if no such
+    ///   element is found.
+    ///
+    /// - Complexity: O(n), where n is the number of elements in the array. The function may suspend
+    ///   while waiting for the predicate to complete, so it should be used in an asynchronous context.
+    ///
+    /// - Note: This function is designed to work with arrays of any type, as long as the type conforms
+    ///   to the requirements of the predicate closure.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// let numbers = [1, 3, 5, 7, 8, 10]
+    ///
+    /// // Asynchronous predicate function
+    /// func isEven(_ number: Int) async -> Bool {
+    ///     return number % 2 == 0
+    /// }
+    ///
+    /// Task {
+    ///     if let index = await numbers.firstAsyncIndex(where: isEven) {
+    ///         print("The first even number is at index \(index).") // Output: The first even number is at index 4.
+    ///     } else {
+    ///         print("No even number found.")
+    ///     }
+    /// }
+    /// ```
+    public func firstAsyncIndex(where predicate: @Sendable (Element) async -> Bool) async -> Int? {
+        for (index, element) in self.enumerated() {
+            if await predicate(element) {
+                return index
+            }
+        }
+        return nil
+    }
+    
+    /// Asynchronously filters the array based on the given predicate.
+    ///
+    /// This method iterates through the elements of the array and evaluates the provided asynchronous
+    /// predicate for each element. If the predicate returns `true` for an element, that element is
+    /// included in the resulting array. The method returns a new array containing all elements that
+    /// satisfy the predicate.
+    ///
+    /// - Parameter predicate: An asynchronous closure that takes an element of the array and returns
+    ///   a Boolean value indicating whether the element should be included in the resulting array.
+    ///   The closure is marked as `@Sendable`, meaning it can be safely used across concurrency domains.
+    ///
+    /// - Returns: An array containing the elements that satisfy the predicate.
+    ///
+    /// - Complexity: O(n), where n is the number of elements in the array. The function may suspend
+    ///   while waiting for the predicate to complete, so it should be used in an asynchronous context.
+    ///
+    /// - Note: This function is designed to work with arrays of any type, as long as the type conforms
+    ///   to the requirements of the predicate closure.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// let numbers = [1, 2, 3, 4, 5]
+    ///
+    /// // Asynchronous predicate function
+    /// func isEven(_ number: Int) async -> Bool {
+    ///     return number % 2 == 0
+    /// }
+    ///
+    /// Task {
+    ///     let evenNumbers = await numbers.asyncFilter(where: isEven)
+    ///     print("Even numbers: \(evenNumbers)") // Output: Even numbers: [2, 4]
+    /// }
+    /// ```
+    public func asyncFilter(_ predicate: @Sendable (Element) async -> Bool) async -> [Element] {
+        var result: [Element] = []
+        for element in self {
+            if await predicate(element) {
+                result.append(element)
+            }
+        }
+        return result
+    }
+    
+    
+    /// Asynchronously removes all elements that satisfy the given predicate from the current array.
+    ///
+    /// This method evaluates the provided asynchronous predicate for each element in the array. If the
+    /// predicate returns `true` for an element, that element is removed from the array. The method
+    /// updates the current array to contain only the elements that do not satisfy the predicate.
+    ///
+    /// - Parameter predicate: An asynchronous closure that takes an element of the array and returns
+    ///   a Boolean value indicating whether the element should be removed from the array. The closure
+    ///   is marked as `@Sendable`, meaning it can be safely used across concurrency domains.
+    ///
+    /// - Returns: This method does not return a value. It modifies the current array in place to
+    ///   exclude the elements that satisfy the predicate.
+    ///
+    /// - Complexity: O(n), where n is the number of elements in the array. The function may suspend
+    ///   while waiting for the predicate to complete, so it should be used in an asynchronous context.
+    ///
+    /// - Note: This function is designed to work with arrays of any type, as long as the type conforms
+    ///   to the requirements of the predicate closure.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// var numbers = [1, 2, 3, 4, 5]
+    ///
+    /// // Asynchronous predicate function
+    /// func isEven(_ number: Int) async -> Bool {
+    ///     return number % 2 == 0
+    /// }
+    ///
+    /// Task {
+    ///     await numbers.asyncRemoveAll(where: isEven)
+    ///     print("Remaining numbers: \(numbers)") // Output: Remaining numbers: [1, 3, 5]
+    /// }
+    /// ```
+    public mutating func asyncRemoveAll(where predicate: @Sendable (Element) async -> Bool) async {
+        // Create a new array with elements that should remain
+        let filteredArray = await asyncFilter { element in
+            await !predicate(element)
+        }
+        // Update the current array
+        self = filteredArray
+    }
+    
+    /// Asynchronously checks if the array contains an element that satisfies the given predicate.
+    ///
+    /// This method iterates through the elements of the array and evaluates the provided asynchronous
+    /// predicate for each element. If the predicate returns `true` for any element, the method returns
+    /// `true`. If no elements satisfy the predicate, the method returns `false`.
+    ///
+    /// - Parameter predicate: An asynchronous closure that takes an element of the array and returns
+    ///   a Boolean value indicating whether the element satisfies a certain condition. The closure
+    ///   is marked as `@Sendable`, meaning it can be safely used across concurrency domains.
+    ///
+    /// - Returns: A Boolean value indicating whether the array contains an element that satisfies the
+    ///   predicate.
+    ///
+    /// - Complexity: O(n), where n is the number of elements in the array. The function may suspend
+    ///   while waiting for the predicate to complete, so it should be used in an asynchronous context.
+    ///
+    /// - Note: This function is designed to work with arrays of any type, as long as the type conforms
+    ///   to the requirements of the predicate closure.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// let numbers = [1, 2, 3, 4, 5]
+    ///
+    /// // Asynchronous predicate function
+    /// func isEven(_ number: Int) async -> Bool {
+    ///     return number % 2 == 0
+    /// }
+    ///
+    /// Task {
+    ///     let containsEven = await numbers.asyncContains(where: isEven)
+    ///     print("Contains even number: \(containsEven)") // Output: Contains even number: true
+    /// }
+    /// ```
+    public func asyncContains(where predicate: @Sendable (Element) async -> Bool) async -> Bool {
+        for element in self {
+            if await predicate(element) {
+                return true
+            }
+        }
+        return false
+    }
+    
 }
