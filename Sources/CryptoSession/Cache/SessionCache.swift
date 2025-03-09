@@ -48,7 +48,7 @@ public actor SessionCache: CryptoSessionStore {
     
     // MARK: - Initializer
     
-    init(store: CryptoSessionStore) {
+    public init(store: CryptoSessionStore) {
         self.store = store
     }
     
@@ -216,6 +216,10 @@ public actor SessionCache: CryptoSessionStore {
         }
     }
     
+    public func fetchCachedMessages(from sharedId: String) async throws -> [PrivateMessage] {
+        messages.filter { $0.sharedId == sharedId }
+    }
+    
     /// Updates an existing message.
     /// - Parameter message: The message to be updated.
     /// - Throws: An error if the update fails.
@@ -237,17 +241,8 @@ public actor SessionCache: CryptoSessionStore {
     }
     
     //The Cursor will keep track of or stream state
-    public func streamMessages(
-        offSet: Int,
-        limit: Int,
-        sharedIdentifier: UUID,
-        sequenceId: Int
-    ) async throws -> (AsyncThrowingStream<[PrivateMessage], Error>, AsyncThrowingStream<[PrivateMessage], Error>.Continuation?) {
-        try await store.streamMessages(
-            offSet: offSet,
-            limit: limit,
-            sharedIdentifier: sharedIdentifier,
-            sequenceId: sequenceId)
+    public func streamMessages(sharedIdentifier: UUID) async throws -> (AsyncThrowingStream<PrivateMessage, Error>, AsyncThrowingStream<PrivateMessage, Error>.Continuation?) {
+        try await store.streamMessages(sharedIdentifier: sharedIdentifier)
     }
     
     public func messageCount(for sharedIdentifier: UUID) async throws -> Int {
@@ -428,8 +423,8 @@ extension SessionCache {
         try await store.findMediaJobs(for: recipient, symmetricKey: symmetricKey)
     }
     
-    public func findMediaJob(for sharedId: String, symmetricKey: SymmetricKey) async throws -> DataPacket? {
-        try await store.findMediaJob(for: sharedId, symmetricKey: symmetricKey)
+    public func findMediaJob(for synchronizationIdentifier: String, symmetricKey: SymmetricKey) async throws -> DataPacket? {
+        try await store.findMediaJob(for: synchronizationIdentifier, symmetricKey: symmetricKey)
     }
     
     /// Deletes a media job from both the cache and the store.

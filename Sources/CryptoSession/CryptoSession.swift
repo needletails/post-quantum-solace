@@ -114,6 +114,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         case connectionIsNonViable = "Connection is non-viable."
         case invalidPassword = "Invalid password."
         case invalidSecretName = "Invalid secret name."
+        case invalidDeviceIdentity = "Invalid device identity."
         case missingSessionIdentity = "Missing session identity."
         case invalidSignature = "Invalid signature."
         case missingSignature = "Missing signature."
@@ -122,9 +123,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         case cannotFindContact = "Cannot find contact."
         case propsError = "Properties error."
         case appPasswordError = "Application password error."
-        case missingKey = "Missing key."
         case registrationError = "Registration error."
-        case channelNotCreated = "Channel could not be created."
         case userExists = "User already exists."
         case cannotFindUserConfiguration = "Cannot find user configuration."
         case unknownError = "An unknown error occurred."
@@ -196,7 +195,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         await setAppPassword(appPassword)
         let secretName = secretName.lowercased()
         // Ensure identity store is initialized
-        guard let cache = cache else {
+        guard let cache else {
             throw SessionErrors.databaseNotInitialized
         }
         
@@ -320,6 +319,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 metadata: .init()
             )
             
+            //Used as the name suggestion to encrypt the local db models, this is their SymmetricKey
             let databaseEncryptionKey = generateDatabasaeEncryptionKey()
             
             let userConfiguration = try await createNewUser(
@@ -457,11 +457,12 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     public func startSession(appPassword: String) async throws -> CryptoSession {
         await setAppPassword(appPassword)
         // Ensure the identity store is initialized
-        guard let cache = cache else {
+        guard let cache else {
             throw SessionErrors.databaseNotInitialized
         }
         
         // Retrieve the local device configuration
+        //TODO: After we switch app and db keys use db keys to decrypt our sessioncontext
         let data = try await cache.findLocalSessionContext()
         
         // Convert the application password to Data
@@ -491,6 +492,12 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         } catch {
             throw error
         }
+    }
+    
+    //TODO: We need to switch usage of AppSymmetricKey and dbSMK
+    public func getDatabaseEncryptionKey() async throws -> SymmetricKey {
+        guard let data = await sessionContext?.databaseEncryptionKey else { throw SessionErrors.sessionNotInitialized }
+        return SymmetricKey(data: data)
     }
     
     public func getAppSymmetricKey() async throws -> SymmetricKey {
@@ -527,8 +534,90 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
     
+    
+    //TODO: After we switch app and db keys do this
+    public func changeAppPassword(_ newPassword: String) async throws {
+//        guard let passwordData = newPassword.data(using: .utf8) else {
+//            throw SessionErrors.appPasswordError
+//        }
+//        guard let cache else {
+//            throw SessionErrors.databaseNotInitialized
+//        }
+//        // Remove Current Salt
+//        try await cache.deleteLocalDeviceSalt()
+//        // Retrieve salt and derive symmetric key
+//        let saltData = try await cache.findLocalDeviceSalt(keyData: passwordData)
+//        
+//        let appSymmetricKey = await crypto.deriveStrictSymmetricKey(
+//            data: passwordData,
+//            salt: saltData)
+//        
+//        
+//        //This might take awhile
+//        for contact in try await cache.fetchContacts() {
+//            let props = try await contact.decryptProps(symmetricKey: getAppSymmetricKey())
+//            try await contact.updateProps(symmetricKey: appSymmetricKey, props: props)
+//            try await cache.updateContact(contact)
+//        }
+//        
+//        for job in try await cache.readJobs() {
+//            let props = try await job.decryptProps(symmetricKey: getAppSymmetricKey())
+//            try await job.updateProps(symmetricKey: appSymmetricKey, props: props)
+//            try await cache.updateJob(job)
+//        }
+//        
+//        for communication in try await cache.fetchCommunications() {
+//            let props = try await communication.decryptProps(symmetricKey: getAppSymmetricKey())
+//            try await communication.updateProps(symmetricKey: appSymmetricKey, props: props)
+//            try await cache.updateCommunication(communication)
+//            
+//            guard let sharedId = props.sharedId else { continue }
+//            for wrapped in try await cache.fetchMessages(sharedCommunicationId: sharedId) {
+//                let message = wrapped.message
+//                let props = try await message.decryptProps(symmetricKey: getAppSymmetricKey())
+//                try await message.updateProps(symmetricKey: appSymmetricKey, props: props)
+//                try await cache.updateMessage(message, symmetricKey: appSymmetricKey)
+//            }
+//        }
+//        
+//        for identity in try await cache.fetchSessionIdentities() {
+//            let props = try await identity.decryptProps(symmetricKey: getAppSymmetricKey())
+//            try await identity.updateProps(symmetricKey: appSymmetricKey, props: props)
+//            try await cache.updateSessionIdentity(identity)
+//        }
+//        
+//        
+//        //
+//        let data = try await cache.findLocalSessionContext()
+//        
+//        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
+//            throw SessionErrors.sessionDecryptionError
+//        }
+//        
+//        // Decode the session context from the decrypted data
+//        var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+//        
+////        sessionContext.
+//        
+//        await setSessionContext(sessionContext)
+//        
+//        let encodedData = try BSONEncoder().encode(sessionContext).makeData()
+//        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
+//            throw CryptoSession.SessionErrors.sessionEncryptionError
+//        }
+//        
+//        try await cache.updateLocalSessionContext(encryptedConfig)
+//        
+//        //Set App Password
+//        await setAppPassword(newPassword)
+        
+        
+    }
+    
     public func resumeJobQueue() async throws {
-        guard let cache else { fatalError("Cache must be initialized") }
+        guard let cache else {
+            throw SessionErrors.databaseNotInitialized
+        }
         try await taskProcessor.jobProcessor.loadJobs(
             nil,
             cache: cache,

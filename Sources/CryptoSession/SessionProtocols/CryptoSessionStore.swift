@@ -75,12 +75,7 @@ public protocol CryptoSessionStore: Sendable {
     func createMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws
     func updateMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws
     func removeMessage(_ message: PrivateMessage) async throws
-    func streamMessages(
-        offSet: Int,
-        limit: Int,
-        sharedIdentifier: UUID,
-        sequenceId: Int
-    ) async throws -> (AsyncThrowingStream<[PrivateMessage], Error>, AsyncThrowingStream<[PrivateMessage], Error>.Continuation?)
+    func streamMessages(sharedIdentifier: UUID) async throws -> (AsyncThrowingStream<PrivateMessage, Error>, AsyncThrowingStream<PrivateMessage, Error>.Continuation?)
     func messageCount(for sharedIdentifier: UUID) async throws -> Int
     
     func readJobs() async throws -> [JobModel]
@@ -91,7 +86,7 @@ public protocol CryptoSessionStore: Sendable {
     func createMediaJob(_ packet: DataPacket) async throws
     func findAllMediaJobs() async throws -> [DataPacket]
     func findMediaJobs(for recipient: String, symmetricKey: SymmetricKey) async throws -> [DataPacket]
-    func findMediaJob(for sharedId: String, symmetricKey: SymmetricKey) async throws -> DataPacket?
+    func findMediaJob(for synchronizationIdentifier: String, symmetricKey: SymmetricKey) async throws -> DataPacket?
     func findMediaJob(_ id: UUID) async throws -> DataPacket?
     func deleteMediaJob(_ id: UUID) async throws
 }

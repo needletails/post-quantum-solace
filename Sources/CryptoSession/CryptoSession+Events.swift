@@ -82,9 +82,8 @@ extension CryptoSession {
                 pushType: pushType,
                 metadata: metadata,
                 sentDate: Date(),
-                destructionTime: destructionTime
-            )
-            
+                destructionTime: destructionTime)
+
             try await processWrite(message: message, session: CryptoSession.shared)
         } catch {
             await self.logger.log(level: .error, message: "\(error)")
@@ -133,8 +132,7 @@ extension CryptoSession {
                 id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
                 secretName: info.secretName,
                 configuration: userConfiguration,
-                metadata: info.metadata
-            )
+                metadata: info.metadata)
             
             let contactModel = try ContactModel(
                 id: contact.id, // Use the same UUID
@@ -222,7 +220,7 @@ extension CryptoSession {
         // Check if the contact already exists
         if let contactModel = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: appSymmetricKey)?.secretName == newContactSecretName }) {
             guard let props = await contactModel.props(symmetricKey: appSymmetricKey) else {
-                throw SessionErrors.configurationError
+                throw SessionErrors.propsError
             }
             
             // Simplified metadata handling
@@ -233,8 +231,7 @@ extension CryptoSession {
                 id: contactModel.id,
                 secretName: newContactSecretName,
                 configuration: configuration,
-                metadata: contactMetadata
-            )
+                metadata: contactMetadata)
             
             _ = try await contactModel.updatePropsMetadata(
                 symmetricKey: appSymmetricKey,
@@ -254,8 +251,7 @@ extension CryptoSession {
                 id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
                 secretName: newContactSecretName,
                 configuration: userConfiguration,
-                metadata: metadata
-            )
+                metadata: metadata)
             
             let contactModel = try ContactModel(
                 id: contact.id, // Use the same UUID
@@ -431,28 +427,25 @@ extension CryptoSession {
             currentMetadata.rejectFriendRequest()
         }
         
-        let metadata = try BSONEncoder().encode(currentMetadata)
+        let metadata = try BSONEncoder().encode(["friendshipMetadata": currentMetadata])
         let updatedProps = try await foundContact.updatePropsMetadata(
             symmetricKey: symmetricKey,
             metadata: metadata)
+        
+        try await cache.updateContact(foundContact)
         
         guard let updatedMetadata = updatedProps?.metadata else {
             throw SessionErrors.propsError
         }
         
-        await receiverDelegate?.contactMetadata(
-            changed: .init(
-                id: contact.id,
-                secretName: contact.secretName,
-                configuration: contact.configuration,
-                metadata: updatedMetadata))
+        let updatedContact = Contact(
+            id: contact.id,
+            secretName: contact.secretName,
+            configuration: contact.configuration,
+            metadata: updatedMetadata)
         
-        let updatedContact = try await foundContact.makeDecryptedModel(of: Contact.self, symmetricKey: symmetricKey)
-        
-        try await cache.updateContact(foundContact)
-        guard let recachedModel = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: appSymmetricKey)?.secretName == contact.secretName }) else { return }
-        let recachedContact = try await recachedModel.makeDecryptedModel(of: Contact.self, symmetricKey: symmetricKey)
-        try await receiverDelegate?.updateContact(recachedContact)
+        await receiverDelegate?.contactMetadata(changed: updatedContact)
+        try await receiverDelegate?.updateContact(updatedContact)
         
         func dataFromBool(_ value: Bool) -> Data {
             // Convert Bool to UInt8 (0 for false, 1 for true)
@@ -739,6 +732,7 @@ actor TaskProcessor {
         await logger.log(level: .info, message: "Gathered \(identities.count) Private Message Session Identities")
         return identities
     }
+    
     private func gatherChannelIdentities(
         cache: SessionCache,
         session: CryptoSession,
@@ -757,10 +751,14 @@ actor TaskProcessor {
             
             guard var newProps = await communicationModel.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
             newProps.messageCount += 1
-            _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: newProps)
-            shouldUpdateCommunication = true
+            do {
+                _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: newProps)
+                shouldUpdateCommunication = true
+            } catch {
+                throw CryptoSession.SessionErrors.propsError
+            }
         } catch {
-            throw CryptoSession.SessionErrors.channelNotCreated
+            throw CryptoSession.SessionErrors.cannotFindCommunication
         }
 
         
@@ -836,7 +834,6 @@ actor TaskProcessor {
         }
         
         for identity in sessionIdentities {
-        
             switch message.messageType {
             case .media:
                 //If we are media we need to send a media packet. Due to how large media is and the load it would place on the crypto layer we never double ratchet the actual media. The following is the basic process.
@@ -858,7 +855,7 @@ actor TaskProcessor {
                     try await encryptableMessage.updateProps(symmetricKey: symmetricKey, props: messageProps)
                     try await session.cache?.updateMessage(encryptableMessage, symmetricKey: symmetricKey)
 
-                    await session.transportDelegate?.createUploadPacket(
+                    try await session.transportDelegate?.createUploadPacket(
                         secretName: props.secretName,
                         deviceId: props.deviceId,
                         recipient: message.recipient,
@@ -904,15 +901,13 @@ actor TaskProcessor {
                 }
                 
                 guard let identityProps = await identity.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
-                
                 task = EncrytableTask(
                     task: .writeMessage(OutboundTaskMessage(
                         message: message,
                         recipientSecretName: identityProps.secretName,
                         recipientDeviceId: identityProps.deviceId,
                         localId: UUID(),
-                        sharedId: UUID().uuidString))
-                )
+                        sharedId: UUID().uuidString)))
             }
             
             try await jobProcessor.queueTask(task, session: session)

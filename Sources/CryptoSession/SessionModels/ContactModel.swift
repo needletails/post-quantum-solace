@@ -118,7 +118,7 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Document) async throws -> UnwrappedProps? {
         var props = try await decryptProps(symmetricKey: symmetricKey)
         
-        var newMetadata: Document = [:]
+        var newMetadata = props.metadata
         for key in metadata.keys {
             if let value = metadata[key] {
                 newMetadata[key] = value
@@ -139,42 +139,50 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
             metadata: props.metadata) as! T
     }
     
-    public func updateContact(_ metadata: ContactMetadata, symmetricKey: SymmetricKey) async throws {
+    public func updateContact(_ metadata: ContactMetadata, symmetricKey: SymmetricKey) async throws -> UnwrappedProps? {
         guard var props = await props(symmetricKey: symmetricKey) else {
             throw CryptoSession.SessionErrors.propsError
         }
         
-        // Decode the existing metadata
-        var decoded: ContactMetadata = try props.metadata.decode(forKey: "contactMetadata")
-        
-        // Update properties only if they are not nil
-        if let status = metadata.status {
-            decoded.status = status
-        }
-        if let nickname = metadata.nickname {
-            decoded.nickname = nickname
-        }
-        if let firstName = metadata.firstName {
-            decoded.firstName = firstName
-        }
-        if let lastName = metadata.lastName {
-            decoded.lastName = lastName
-        }
-        if let email = metadata.email {
-            decoded.email = email
-        }
-        if let image = metadata.image {
-            decoded.image = image
+        var contactMetadata: ContactMetadata
+        if let metaDoc = props.metadata["contactMetadata"] as? Document, !metaDoc.isEmpty {
+            // Decode the existing metadata
+            contactMetadata = try props.metadata.decode(forKey: "contactMetadata")
+            // Update properties only if they are not nil
+            if let status = metadata.status {
+                contactMetadata.status = status
+            }
+            if let nickname = metadata.nickname {
+                contactMetadata.nickname = nickname
+            }
+            if let firstName = metadata.firstName {
+                contactMetadata.firstName = firstName
+            }
+            if let lastName = metadata.lastName {
+                contactMetadata.lastName = lastName
+            }
+            if let email = metadata.email {
+                contactMetadata.email = email
+            }
+            if let image = metadata.image {
+                contactMetadata.image = image
+            }
+        } else {
+            contactMetadata = ContactMetadata(
+                status: metadata.status,
+                nickname: metadata.nickname,
+                firstName: metadata.firstName,
+                lastName: metadata.lastName,
+                email: metadata.email,
+                image: metadata.image)
         }
         
         // Encode the updated metadata
-        let encoded = try BSONEncoder().encode(decoded)
-        props.metadata["contactMetadata"] = encoded
-        
-        // Update the properties
-        _ = try await updateProps(symmetricKey: symmetricKey, props: props)
+        let encoded = try BSONEncoder().encode(["contactMetadata": contactMetadata])
+        return try await updatePropsMetadata(
+            symmetricKey: symmetricKey,
+            metadata: encoded)
     }
-
 }
 
 
@@ -195,6 +203,90 @@ public struct ContactMetadata: Codable, Sendable {
         self.email = email
         self.phone = phone
         self.image = image
+    }
+    
+    public func updating(status: String) -> ContactMetadata {
+        return ContactMetadata(
+            status: status,
+            nickname: self.nickname,
+            firstName: self.firstName,
+            lastName: self.lastName,
+            email: self.email,
+            phone: self.phone,
+            image: self.image
+        )
+    }
+    
+    public func updating(nickname: String) -> ContactMetadata {
+        return ContactMetadata(
+            status: self.status,
+            nickname: nickname,
+            firstName: self.firstName,
+            lastName: self.lastName,
+            email: self.email,
+            phone: self.phone,
+            image: self.image
+        )
+    }
+    
+    public func updating(firstName: String) -> ContactMetadata {
+        return ContactMetadata(
+            status: self.status,
+            nickname: self.nickname,
+            firstName: firstName,
+            lastName: self.lastName,
+            email: self.email,
+            phone: self.phone,
+            image: self.image
+        )
+    }
+    
+    public func updating(lastName: String) -> ContactMetadata {
+        return ContactMetadata(
+            status: self.status,
+            nickname: self.nickname,
+            firstName: self.firstName,
+            lastName: lastName,
+            email: self.email,
+            phone: self.phone,
+            image: self.image
+        )
+    }
+    
+    public func updating(email: String) -> ContactMetadata {
+        return ContactMetadata(
+            status: self.status,
+            nickname: self.nickname,
+            firstName: self.firstName,
+            lastName: self.lastName,
+            email: email,
+            phone: self.phone,
+            image: self.image
+        )
+    }
+    
+    public func updating(phone: String) -> ContactMetadata {
+        return ContactMetadata(
+            status: self.status,
+            nickname: self.nickname,
+            firstName: self.firstName,
+            lastName: self.lastName,
+            email: self.email,
+            phone: phone,
+            image: self.image
+        )
+    }
+    
+    public func updating(image: Data) -> ContactMetadata {
+        return ContactMetadata(
+            status: self.status,
+            nickname: self.nickname,
+            firstName: self.firstName,
+            lastName: self.lastName,
+            email: self.email,
+            phone: self.phone,
+            image: image
+        )
     }
 }
 

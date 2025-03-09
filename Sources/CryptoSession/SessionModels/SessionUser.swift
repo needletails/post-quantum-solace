@@ -22,6 +22,6 @@ public struct SessionUser: Codable & Sendable {
     /// The device keys associated with the session user.
     public let deviceKeys: DeviceKeys
     /// The User Specific Metadata
-    public let metadata: ContactMetadata
+    public var metadata: ContactMetadata
     
 }

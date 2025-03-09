@@ -51,5 +51,5 @@ public protocol SessionTransport: Sendable {
         deviceId: UUID,
         recipient: MessageRecipient,
         metadata: Document
-    ) async
+    ) async throws
 }

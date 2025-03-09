@@ -375,7 +375,6 @@ final class JobProcessor: @unchecked Sendable {
         
         //Decryption has occured
         switch decodedMessage.messageType {
-            
             //Don't Save received Message
         case .nudgeLocal:
             switch decodedMessage.messageFlags {
@@ -398,7 +397,7 @@ final class JobProcessor: @unchecked Sendable {
                     decodedMetadata.rejectFriendRequest()
                 }
                 
-                let encodedMetadata = try BSONEncoder().encode(decodedMetadata)
+                let encodedMetadata = try BSONEncoder().encode(["friendshipMetadata": decodedMetadata])
                 
                 //Create or update contact including new metadata
                 _ = try await session.updateOrCreateContact(
@@ -541,7 +540,7 @@ final class JobProcessor: @unchecked Sendable {
             
             // Save
         default:
-            
+
             /// Now we can handle the message
             try await handleDecodedMessage(
                 decodedMessage,
@@ -640,10 +639,8 @@ final class JobProcessor: @unchecked Sendable {
     ) async throws {
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         let appSymmetricKey = try await session.getAppSymmetricKey()
-        
         switch decodedMessage.recipient {
         case .nickname(let recipient):
-            
             var communicationModel: BaseCommunication
             var shouldUpdateCommunication = false
             //This can happen on multidevice support when a sender is also sending a message to it's master/child device.
@@ -838,7 +835,7 @@ final class JobProcessor: @unchecked Sendable {
                 return false
             }
         }) else {
-            throw CryptoSession.SessionErrors.cannotFindCommunication // Replace with your specific error type
+            throw CryptoSession.SessionErrors.cannotFindCommunication
         }
         
         return foundCommunication
@@ -853,16 +850,15 @@ final class JobProcessor: @unchecked Sendable {
         communication: BaseCommunication,
         sessionIdentity: SessionIdentity
     ) async throws -> PrivateMessage {
-        let appSymmetricKey = try await session.getAppSymmetricKey()
-        guard var props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else {
+        let symmetricKey = try await session.getAppSymmetricKey()
+        guard var props = await sessionIdentity.props(symmetricKey: symmetricKey) else {
             throw JobProcessorErrors.missingIdentity
         }
-        guard let communicationProps = await communication.props(symmetricKey: try session.getAppSymmetricKey()) else {
-            throw CryptoSession.SessionErrors.cannotFindCommunication
+        guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else {
+            throw CryptoSession.SessionErrors.propsError
         }
         
         let newMessageCount = communicationProps.messageCount + 1
-        let symmetricKey = try await session.getAppSymmetricKey()
         let messageModel = try await PrivateMessage(
             id: UUID(),
             communicationId: communication.id,
