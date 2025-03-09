@@ -871,7 +871,7 @@ final class JobProcessor: @unchecked Sendable {
                 deliveryState: .received,
                 message: decodedMessage,
                 sendersSecretName: sendersSecretName,
-                sendersId: senderDeviceId
+                sendersDeviceId: senderDeviceId
             ),
             symmetricKey: symmetricKey)
         

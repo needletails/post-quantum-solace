@@ -940,7 +940,7 @@ actor TaskProcessor {
                 deliveryState: .sending,
                 message: message,
                 sendersSecretName: sessionUser.secretName,
-                sendersId: sessionUser.deviceId
+                sendersDeviceId: sessionUser.deviceId
             ),
             symmetricKey: symmetricKey)
         
