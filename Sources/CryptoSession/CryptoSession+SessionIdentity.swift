@@ -39,7 +39,7 @@ extension CryptoSession {
                 deviceName: device.deviceName ?? "Unknown Device Name",
                 isMasterDevice: device.isMasterDevice
             ),
-            symmetricKey: getAppSymmetricKey()
+            symmetricKey: getDatabaseSymmetricKey()
         )
         try await cache.createSessionIdentity(identity)
         return identity
@@ -53,10 +53,10 @@ extension CryptoSession {
         guard let cache = await cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         
         let identities = try await cache.fetchSessionIdentities()
-        let symmetricKey = try await getAppSymmetricKey()
+        let symmetricKey = try await getDatabaseSymmetricKey()
         return await identities.asyncFilter { identity in
             do {
-                let symmetricKey = try await getAppSymmetricKey()
+                let symmetricKey = try await getDatabaseSymmetricKey()
                 let props = try await identity.makeDecryptedModel(of: _SessionIdentity.self, symmetricKey: symmetricKey)
                 // Check if the identity is not the current user's identity
                 let myChildIdentity = props.secretName == sessionContext.sessionUser.secretName && props.deviceId != sessionContext.sessionUser.deviceId
@@ -85,7 +85,7 @@ extension CryptoSession {
 
         // Create a set of existing device IDs from the filtered identities for quick lookup
         let existingDeviceIds = await Set(filtered.asyncCompactMap {
-            try? await $0.props(symmetricKey: getAppSymmetricKey())?.deviceId }
+            try? await $0.props(symmetricKey: getDatabaseSymmetricKey())?.deviceId }
         )
         
         for device in verifiedDevices {

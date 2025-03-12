@@ -226,9 +226,12 @@ public actor SessionCache: CryptoSessionStore {
     public func updateMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws {
         if let index = messages.firstIndex(where: { $0.id == message.id }) {
             messages[index] = message
-            try await store.updateMessage(message, symmetricKey: symmetricKey)
         } else {
-            throw CacheErrors.messageNotFound
+            do {
+                try await store.updateMessage(message, symmetricKey: symmetricKey)
+            } catch {
+                throw CacheErrors.messageNotFound
+            }
         }
     }
     

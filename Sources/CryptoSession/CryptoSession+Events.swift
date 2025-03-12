@@ -108,7 +108,7 @@ extension CryptoSession {
     public func addContacts(_ infos: [SharedContactInfo]) async throws {
         guard let mySecretName = await sessionContext?.sessionUser.secretName else { return }
         let contacts = try await cache?.fetchContacts()
-        let symmetricKey = try await getAppSymmetricKey()
+        let symmetricKey = try await getDatabaseSymmetricKey()
         
         let filteredInfos = await infos.asyncFilter { info in
             // Check if contacts is not nil and does not contain the secretName
@@ -211,15 +211,15 @@ extension CryptoSession {
             throw CryptoSession.SessionErrors.invalidSecretName
         }
         
-        let appSymmetricKey = try await getAppSymmetricKey()
+        let symmetricKey = try await getDatabaseSymmetricKey()
         
         guard let cache else {
             throw SessionErrors.databaseNotInitialized
         }
         
         // Check if the contact already exists
-        if let contactModel = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: appSymmetricKey)?.secretName == newContactSecretName }) {
-            guard let props = await contactModel.props(symmetricKey: appSymmetricKey) else {
+        if let contactModel = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.secretName == newContactSecretName }) {
+            guard let props = await contactModel.props(symmetricKey: symmetricKey) else {
                 throw SessionErrors.propsError
             }
             
@@ -234,9 +234,9 @@ extension CryptoSession {
                 metadata: contactMetadata)
             
             _ = try await contactModel.updatePropsMetadata(
-                symmetricKey: appSymmetricKey,
+                symmetricKey: symmetricKey,
                 metadata: contactMetadata)
-            
+
             try await cache.updateContact(contactModel)
             try await receiverDelegate?.updateContact(contact)
             return contactModel
@@ -260,7 +260,7 @@ extension CryptoSession {
                     configuration: contact.configuration,
                     metadata: contact.metadata
                 ),
-                symmetricKey: appSymmetricKey
+                symmetricKey: symmetricKey
             )
             
             try await cache.createContact(contactModel)
@@ -281,7 +281,7 @@ extension CryptoSession {
             throw SessionErrors.databaseNotInitialized
         }
         
-        let symmetricKey = try await getAppSymmetricKey()
+        let symmetricKey = try await getDatabaseSymmetricKey()
         
         var communicationModel: BaseCommunication?
         var shouldUpdateCommunication = false
@@ -303,7 +303,7 @@ extension CryptoSession {
             )
         }
         
-        guard let communicationModel = communicationModel else {
+        guard let communicationModel else {
             throw CryptoSession.SessionErrors.cannotFindCommunication
         }
         guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
@@ -398,9 +398,9 @@ extension CryptoSession {
         await self.logger.log(level: .info, message: "Requesting friendship state change for \(contact.secretName) to state \(state).")
         guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
         guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
-        let appSymmetricKey = try await getAppSymmetricKey()
-        guard let foundContact = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: appSymmetricKey)?.secretName == contact.secretName }) else { throw SessionErrors.cannotFindContact }
-        let symmetricKey = try await getAppSymmetricKey()
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        guard let foundContact = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.secretName == contact.secretName }) else { throw SessionErrors.cannotFindContact }
+        
         var currentMetadata: FriendshipMetadata?
         
         if let friendshipDocument = contact.metadata["friendshipMetadata"] as? Document, !friendshipDocument.isEmpty {
@@ -409,6 +409,11 @@ extension CryptoSession {
         if currentMetadata == nil {
             currentMetadata = FriendshipMetadata()
         }
+        
+        if currentMetadata?.myState == .blocked {
+            throw CryptoSession.SessionErrors.userIsBlocked
+        }
+        
         guard var currentMetadata = currentMetadata else { return }
         //Do not allow state changes that are not different, i.e. my state is .accepted cannot acceptFriendRequest() again
         if currentMetadata.myState == .accepted && state == .accepted { return }
@@ -420,31 +425,30 @@ extension CryptoSession {
         case .accepted:
             currentMetadata.acceptFriendRequest()
         case .blocked, .blockedUser:
-            currentMetadata.blockFriend()
+            currentMetadata.blockFriend(receivedBlock: false)
         case .unblock:
-            currentMetadata.unBlockFriend()
+            currentMetadata.acceptFriendRequest()
         case .rejectedRequest, .friendshipRejected, .rejected:
             currentMetadata.rejectFriendRequest()
         }
         
-        let metadata = try BSONEncoder().encode(["friendshipMetadata": currentMetadata])
+        let metadata = try BSONEncoder().encode(currentMetadata)
         let updatedProps = try await foundContact.updatePropsMetadata(
             symmetricKey: symmetricKey,
-            metadata: metadata)
+            metadata: metadata, with: "friendshipMetadata")
         
         try await cache.updateContact(foundContact)
         
         guard let updatedMetadata = updatedProps?.metadata else {
             throw SessionErrors.propsError
         }
-        
+
         let updatedContact = Contact(
             id: contact.id,
             secretName: contact.secretName,
             configuration: contact.configuration,
             metadata: updatedMetadata)
         
-        await receiverDelegate?.contactMetadata(changed: updatedContact)
         try await receiverDelegate?.updateContact(updatedContact)
         
         func dataFromBool(_ value: Bool) -> Data {
@@ -469,9 +473,8 @@ extension CryptoSession {
             messageFlags: .friendshipStateRequest(blockUnblockData),
             recipient: .nickname(contact.secretName),
             metadata: ["friendshipMetadata": metadata],
-            pushType: .contactRequest,
+            pushType: currentMetadata.myState == .requested ? .contactRequest : .none,
             destructionTime: nil)
-            
         await self.logger.log(level: .info, message: "Sent Friendship State Change Request")
     }
     
@@ -485,11 +488,11 @@ extension CryptoSession {
     ) async throws {
         guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
         guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
-        let appSymmetricKey = try await getAppSymmetricKey()
-        guard var props = await message.props(symmetricKey: appSymmetricKey) else { throw SessionErrors.propsError }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        guard var props = await message.props(symmetricKey: symmetricKey) else { throw SessionErrors.propsError }
         props.deliveryState = deliveryState
-        _ = try await message.updateProps(symmetricKey: appSymmetricKey, props: props)
-        try await cache.updateMessage(message, symmetricKey: appSymmetricKey)
+        _ = try await message.updateProps(symmetricKey: symmetricKey, props: props)
+        try await cache.updateMessage(message, symmetricKey: symmetricKey)
         await receiverDelegate?.updatedMessage(message)
         
         if allowExternalUpdate {
@@ -520,13 +523,13 @@ extension CryptoSession {
     public func editCurrentMessage(_ message: PrivateMessage, newText: String) async throws {
         guard let sessionContext = await sessionContext else { throw SessionErrors.sessionNotInitialized }
         guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
-        let appSymmetricKey = try await getAppSymmetricKey()
-        guard var props = await message.props(symmetricKey: appSymmetricKey) else { fatalError() }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        guard var props = await message.props(symmetricKey: symmetricKey) else { return }
         
         props.message.text = newText
-        _ = try await message.updateProps(symmetricKey: appSymmetricKey, props: props)
+        _ = try await message.updateProps(symmetricKey: symmetricKey, props: props)
 
-        try await cache.updateMessage(message, symmetricKey: appSymmetricKey)
+        try await cache.updateMessage(message, symmetricKey: symmetricKey)
         await receiverDelegate?.updatedMessage(message)
         
         
@@ -595,14 +598,14 @@ extension CryptoSession {
         guard let cache = await session.cache else {
             throw SessionErrors.databaseNotInitialized
         }
-        let appSymmetricKey = try await getAppSymmetricKey()
+        let symmetricKey = try await getDatabaseSymmetricKey()
         let mySecretName = await sessionContext.sessionUser.secretName
         
         
         try await taskProcessor.outboundTask(
             message: message,
             cache: cache,
-            symmetricKey: appSymmetricKey,
+            symmetricKey: symmetricKey,
             session: session,
             sender: mySecretName,
             type: message.recipient,
@@ -953,7 +956,7 @@ actor TaskProcessor {
                 throw error
             }
         }
-        try await cache.createMessage(messageModel, symmetricKey: try await session.getAppSymmetricKey())
+        try await cache.createMessage(messageModel, symmetricKey: try await session.getDatabaseSymmetricKey())
         return messageModel
     }
 }

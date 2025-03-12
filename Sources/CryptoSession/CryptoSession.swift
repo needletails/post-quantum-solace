@@ -130,6 +130,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         case missingAuthInfo = "Missing authentication information in the payload"
         case userNotFound = "Could not find the user requested"
         case accessDenied = "Denied Access to the requested resource"
+        case userIsBlocked = "The User is Blocked, cannot request friendship changes"
     }
     
     public struct CryptographicBundle: Sendable {
@@ -199,8 +200,6 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             throw SessionErrors.databaseNotInitialized
         }
         
-        let databaseEncryptionKey = generateDatabasaeEncryptionKey()
-        
         let bundle = try await createDeviceCryptographicBundle(isMaster: true)
         
         let sessionUser = SessionUser(
@@ -212,7 +211,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         
         var sessionContext = SessionContext(
             sessionUser: sessionUser,
-            databaseEncryptionKey: databaseEncryptionKey,
+            databaseEncryptionKey: generateDatabasaeEncryptionKey(),
             sessionContextId: .random(in: 1 ..< .max),
             lastUserConfiguration: bundle.userConfiguration,
             registrationState: .unregistered)
@@ -229,6 +228,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             data: passwordData,
             salt: saltData)
         
+        let databaseEncryptionKey = try await getDatabaseSymmetricKey()
         
         try await createInitialTransport()
         
@@ -254,19 +254,19 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 
             case .userNotFound:
                 // UserConfiguration does not contain Private keys/info... so it should be safe to store publicly.
-                try await transportDelegate?.publishUserConfiguration(bundle.userConfiguration, updateKeyBundle: false)
+                try! await transportDelegate?.publishUserConfiguration(bundle.userConfiguration, updateKeyBundle: false)
                 
                 sessionContext.registrationState = .registered
                 await setSessionContext(sessionContext)
                 
                 
                 let encodedData = try BSONEncoder().encodeData(sessionContext)
-                guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: appSymmetricKey) else {
+                guard let encryptedConfig = try! crypto.encrypt(data: encodedData, symmetricKey: appSymmetricKey) else {
                     throw SessionErrors.sessionEncryptionError
                 }
                 
                 // Create local device configuration. Only locally cached and save. Private keys/info are stored. Use with care...
-                try await cache.createLocalSessionContext(encryptedConfig)
+                try! await cache.createLocalSessionContext(encryptedConfig)
                 
                 
                 //Create Communication Model for personal messages
@@ -276,25 +276,25 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                     recipients: [secretName],
                     communicationType: .personalMessage,
                     metadata: [:],
-                    symmetricKey: appSymmetricKey)
+                    symmetricKey: databaseEncryptionKey)
                 
-                guard var props = await communicationModel.props(symmetricKey: appSymmetricKey) else {
+                guard var props = await communicationModel.props(symmetricKey: databaseEncryptionKey) else {
                     throw CryptoSession.SessionErrors.propsError
                 }
                 
                 props.sharedId = UUID()
                 
-                try await communicationModel.updateProps(symmetricKey: appSymmetricKey, props: props)
+                try! await communicationModel.updateProps(symmetricKey: databaseEncryptionKey, props: props)
                 
-                try await cache.createCommunication(communicationModel)
-                try await receiverDelegate?.updatedCommunication(communicationModel, members: [secretName])
+                try! await cache.createCommunication(communicationModel)
+                try! await receiverDelegate?.updatedCommunication(communicationModel, members: [secretName])
                 await self.logger.log(level: .debug, message: "Created Communication Model")
                 
             default:
                 throw sessionError
             }
         } catch {
-            print("ERROR", error)
+            await logger.log(level: .error, message: "Error Creating Session, \(error)")
         }
         return CryptoSession.shared
     }
@@ -349,7 +349,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             // Retrieve salt and derive symmetric key
             let saltData = try await cache.findLocalDeviceSalt(keyData: passwordData)
             
-            let appSymmetricKey = await crypto.deriveStrictSymmetricKey(
+            let symmetricKey = await crypto.deriveStrictSymmetricKey(
                 data: passwordData,
                 salt: saltData)
             
@@ -357,7 +357,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             await setSessionContext(sessionContext)
             
             let encodedData = try BSONEncoder().encode(sessionContext).makeData()
-            guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: appSymmetricKey) else {
+            guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: symmetricKey) else {
                 throw SessionErrors.sessionEncryptionError
             }
             
@@ -371,15 +371,15 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 recipients: [credentials.secretName],
                 communicationType: .personalMessage,
                 metadata: [:],
-                symmetricKey: appSymmetricKey)
+                symmetricKey: symmetricKey)
             
-            guard var props = await communicationModel.props(symmetricKey: appSymmetricKey) else {
+            guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
                 throw CryptoSession.SessionErrors.propsError
             }
             
             props.sharedId = UUID()
             
-            try await communicationModel.updateProps(symmetricKey: appSymmetricKey, props: props)
+            try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
             
             try await cache.createCommunication(communicationModel)
             try await receiverDelegate?.updatedCommunication(communicationModel, members: [credentials.secretName])
@@ -408,7 +408,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         await setSessionContext(sessionContext)
         
         let encodedData = try BSONEncoder().encode(sessionContext).makeData()
-        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
+        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getDatabaseSymmetricKey()) else {
             throw CryptoSession.SessionErrors.sessionEncryptionError
         }
         
@@ -462,7 +462,6 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         
         // Retrieve the local device configuration
-        //TODO: After we switch app and db keys use db keys to decrypt our sessioncontext
         let data = try await cache.findLocalSessionContext()
         
         // Convert the application password to Data
@@ -474,13 +473,13 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         let saltData = try await cache.findLocalDeviceSalt(keyData: passwordData)
         
         // Derive the symmetric key from the password and salt
-        let appSymmetricKey = await crypto.deriveStrictSymmetricKey(
+        let symmetricKey = await crypto.deriveStrictSymmetricKey(
             data: passwordData,
             salt: saltData)
         
         do {
             // Decrypt the configuration data
-            guard let configurationData = try crypto.decrypt(data: data, symmetricKey: appSymmetricKey) else {
+            guard let configurationData = try! crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
                 throw SessionErrors.sessionDecryptionError
             }
             
@@ -494,8 +493,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
     
-    //TODO: We need to switch usage of AppSymmetricKey and dbSMK
-    public func getDatabaseEncryptionKey() async throws -> SymmetricKey {
+    public func getDatabaseSymmetricKey() async throws -> SymmetricKey {
         guard let data = await sessionContext?.databaseEncryptionKey else { throw SessionErrors.sessionNotInitialized }
         return SymmetricKey(data: data)
     }
@@ -534,84 +532,40 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
     
-    
-    //TODO: After we switch app and db keys do this
     public func changeAppPassword(_ newPassword: String) async throws {
-//        guard let passwordData = newPassword.data(using: .utf8) else {
-//            throw SessionErrors.appPasswordError
-//        }
-//        guard let cache else {
-//            throw SessionErrors.databaseNotInitialized
-//        }
-//        // Remove Current Salt
-//        try await cache.deleteLocalDeviceSalt()
-//        // Retrieve salt and derive symmetric key
-//        let saltData = try await cache.findLocalDeviceSalt(keyData: passwordData)
-//        
-//        let appSymmetricKey = await crypto.deriveStrictSymmetricKey(
-//            data: passwordData,
-//            salt: saltData)
-//        
-//        
-//        //This might take awhile
-//        for contact in try await cache.fetchContacts() {
-//            let props = try await contact.decryptProps(symmetricKey: getAppSymmetricKey())
-//            try await contact.updateProps(symmetricKey: appSymmetricKey, props: props)
-//            try await cache.updateContact(contact)
-//        }
-//        
-//        for job in try await cache.readJobs() {
-//            let props = try await job.decryptProps(symmetricKey: getAppSymmetricKey())
-//            try await job.updateProps(symmetricKey: appSymmetricKey, props: props)
-//            try await cache.updateJob(job)
-//        }
-//        
-//        for communication in try await cache.fetchCommunications() {
-//            let props = try await communication.decryptProps(symmetricKey: getAppSymmetricKey())
-//            try await communication.updateProps(symmetricKey: appSymmetricKey, props: props)
-//            try await cache.updateCommunication(communication)
-//            
-//            guard let sharedId = props.sharedId else { continue }
-//            for wrapped in try await cache.fetchMessages(sharedCommunicationId: sharedId) {
-//                let message = wrapped.message
-//                let props = try await message.decryptProps(symmetricKey: getAppSymmetricKey())
-//                try await message.updateProps(symmetricKey: appSymmetricKey, props: props)
-//                try await cache.updateMessage(message, symmetricKey: appSymmetricKey)
-//            }
-//        }
-//        
-//        for identity in try await cache.fetchSessionIdentities() {
-//            let props = try await identity.decryptProps(symmetricKey: getAppSymmetricKey())
-//            try await identity.updateProps(symmetricKey: appSymmetricKey, props: props)
-//            try await cache.updateSessionIdentity(identity)
-//        }
-//        
-//        
-//        //
-//        let data = try await cache.findLocalSessionContext()
-//        
-//        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
-//            throw SessionErrors.sessionDecryptionError
-//        }
-//        
-//        // Decode the session context from the decrypted data
-//        var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
-//        
-////        sessionContext.
-//        
-//        await setSessionContext(sessionContext)
-//        
-//        let encodedData = try BSONEncoder().encode(sessionContext).makeData()
-//        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
-//            throw CryptoSession.SessionErrors.sessionEncryptionError
-//        }
-//        
-//        try await cache.updateLocalSessionContext(encryptedConfig)
-//        
-//        //Set App Password
-//        await setAppPassword(newPassword)
         
+        guard let cache else {
+            throw SessionErrors.databaseNotInitialized
+        }
         
+        let data = try await cache.findLocalSessionContext()
+        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
+            throw SessionErrors.sessionDecryptionError
+        }
+        // Decode the session context from the decrypted data
+        var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+        try await cache.deleteLocalDeviceSalt()
+        
+        guard let passwordData = newPassword.data(using: .utf8) else {
+            throw SessionErrors.appPasswordError
+        }
+        
+        // Retrieve salt and derive symmetric key
+        let saltData = try await cache.findLocalDeviceSalt(keyData: passwordData)
+        
+        let symmetricKey = await crypto.deriveStrictSymmetricKey(
+            data: passwordData,
+            salt: saltData)
+        
+        let encodedData = try BSONEncoder().encodeData(sessionContext)
+        guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: symmetricKey) else {
+            throw SessionErrors.sessionEncryptionError
+        }
+        
+        // Create local device configuration. Only locally cached and save. Private keys/info are stored. Use with care...
+        try await cache.updateLocalSessionContext(encryptedConfig)
+        
+        await setAppPassword(newPassword)
     }
     
     public func resumeJobQueue() async throws {
@@ -621,7 +575,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         try await taskProcessor.jobProcessor.loadJobs(
             nil,
             cache: cache,
-            symmetricKey: getAppSymmetricKey(),
+            symmetricKey: getDatabaseSymmetricKey(),
             session: self)
     }
     
@@ -633,7 +587,6 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         linkDelegate = nil
         _sessionContext = nil
         _appPassword = ""
-        await print("SHUT DOWN CALLED", sessionContext)
     }
     
 #if os(iOS)

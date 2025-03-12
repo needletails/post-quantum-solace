@@ -169,7 +169,7 @@ final class JobProcessor: @unchecked Sendable {
                           session: CryptoSession) async throws {
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         incrementId()
-        let symmetricKey = try await session.getAppSymmetricKey()
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
         let job = try createJobModel(
             sequenceId: sequenceId,
             task: task,
@@ -185,7 +185,7 @@ final class JobProcessor: @unchecked Sendable {
         if !isRunning {
             await self.logger.log(level: .debug, message: "Starting job queue")
             isRunning = true
-            let symmetricKey = try await session.getAppSymmetricKey()
+            let symmetricKey = try await session.getDatabaseSymmetricKey()
             for try await result in NeedleTailAsyncSequence(consumer: jobConsumer) {
                 switch result {
                 case .success(let job):
@@ -235,7 +235,7 @@ final class JobProcessor: @unchecked Sendable {
                         try await loadJobs(nil, cache: cache, symmetricKey: symmetricKey)
                     }
                 case .consumed:
-                    let symmetricKey = try await session.getAppSymmetricKey()
+                    let symmetricKey = try await session.getDatabaseSymmetricKey()
                     await consumedSequence()
                     setIsRunning(false)
                     try await loadJobs(nil, cache: cache, symmetricKey: symmetricKey)
@@ -298,8 +298,8 @@ final class JobProcessor: @unchecked Sendable {
             throw JobProcessorErrors.missingIdentity
         }
         
-        let appSymmetricKey = try await session.getAppSymmetricKey()
-        guard let props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else {
+        let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
+        guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else {
             throw JobProcessorErrors.missingIdentity
         }
         
@@ -316,7 +316,7 @@ final class JobProcessor: @unchecked Sendable {
         try await ratchetManager.senderInitialization(
             sessionIdentity: sessionIdentity,
             secretKey: symmetricKey,
-            sessionSymmetricKey: appSymmetricKey,
+            sessionSymmetricKey: databaseSymmetricKey,
             recipientPublicKey: recipientPublicKey)
         
         //Remove file locations before sending
@@ -355,8 +355,8 @@ final class JobProcessor: @unchecked Sendable {
         
         let (encryptedMessage, sessionIdentity) = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
         
-        let appSymmetricKey = try await session.getAppSymmetricKey()
-        guard let props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else {
+        let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
+        guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else {
             throw JobProcessorErrors.missingIdentity
         }
         
@@ -381,6 +381,7 @@ final class JobProcessor: @unchecked Sendable {
             case .friendshipStateRequest(let data):
                 // Create/Update Contact and modify metadata
                 var decodedMetadata = try BSONDecoder().decode(FriendshipMetadata.self, from: decodedMessage.metadata["friendshipMetadata"] as? Document ?? [:])
+                
                 //Update our state based on the state of the sender and it's metadata.
                 switch decodedMetadata.theirState {
                 case .pending:
@@ -390,9 +391,9 @@ final class JobProcessor: @unchecked Sendable {
                 case .accepted:
                     decodedMetadata.acceptFriendRequest()
                 case .blocked, .blockedUser:
-                    decodedMetadata.blockFriend()
+                    decodedMetadata.blockFriend(receivedBlock: true)
                 case .unblock:
-                    decodedMetadata.unBlockFriend()
+                    decodedMetadata.acceptFriendRequest()
                 case .rejectedRequest, .friendshipRejected, .rejected:
                     decodedMetadata.rejectFriendRequest()
                 }
@@ -405,17 +406,17 @@ final class JobProcessor: @unchecked Sendable {
                     metadata: encodedMetadata,
                     needsSynchronization: false
                 )
+                    
             case .deliveryStateChange:
                 do {
                     let decodedMetadata = try BSONDecoder().decode(DeliveryStateMetadata.self, from: decodedMessage.metadata)
-                    let symmetricKey = try await session.getAppSymmetricKey()
+                    let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
                     let foundMessage = try await cache.fetchMessage(by: decodedMetadata.sharedId)
-                    
-                    let appSymmetricKey = try await session.getAppSymmetricKey()
-                    guard var props = await foundMessage.props(symmetricKey: appSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
+
+                    guard var props = await foundMessage.props(symmetricKey: databaseSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
                     props.deliveryState = decodedMetadata.state
-                    _ = try await foundMessage.updateProps(symmetricKey: symmetricKey, props: props)
-                    try await cache.updateMessage(foundMessage, symmetricKey: appSymmetricKey)
+                    _ = try await foundMessage.updateProps(symmetricKey: databaseSymmetricKey, props: props)
+                    try await cache.updateMessage(foundMessage, symmetricKey: databaseSymmetricKey)
                     await session.receiverDelegate?.updatedMessage(foundMessage)
                 } catch {
                     await self.logger.log(level: .error, message: "Error Changing Delivery State: \(error)")
@@ -424,18 +425,18 @@ final class JobProcessor: @unchecked Sendable {
                 do {
                     let decodedMetadata = try BSONDecoder().decode(EditMessageMetadata<String>.self, from: decodedMessage.metadata)
                     let foundMessage = try await cache.fetchMessage(by: decodedMetadata.sharedId)
-                    let appSymmetricKey = try await session.getAppSymmetricKey()
-                    guard var props = await foundMessage.props(symmetricKey: appSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
+                    let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
+                    guard var props = await foundMessage.props(symmetricKey: databaseSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
                     props.message.text = decodedMetadata.value
-                    _ = try await foundMessage.updateProps(symmetricKey: appSymmetricKey, props: props)
-                    try await cache.updateMessage(foundMessage, symmetricKey: appSymmetricKey)
+                    _ = try await foundMessage.updateProps(symmetricKey: databaseSymmetricKey, props: props)
+                    try await cache.updateMessage(foundMessage, symmetricKey: databaseSymmetricKey)
                     await session.receiverDelegate?.updatedMessage(foundMessage)
                 } catch {
                     await self.logger.log(level: .error, message: "Error Editing Message: \(error)")
                 }
             case .editMessageMetadata(let key):
                 do {
-                    let appSymmetricKey = try await session.getAppSymmetricKey()
+                    let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
                     
                     //We receive messsage metadata, this is not the actual prrivate messages metadata yet. We will insert it into the CryptoMessage's metadata after decoding
                     let receivedMetadata = try BSONDecoder().decode([EditMessageMetadata<Data>].self, from: decodedMessage.metadata)
@@ -444,7 +445,7 @@ final class JobProcessor: @unchecked Sendable {
                     guard let newReaction = receivedMetadata.first(where: { $0.sender == inboundTask.senderSecretName }) else { return }
                     let foundMessage = try await cache.fetchMessage(by: newReaction.sharedId)
                     
-                    let decryptedMessage = try await foundMessage.makeDecryptedModel(of: _PrivateMessage.self, symmetricKey: appSymmetricKey)
+                    let decryptedMessage = try await foundMessage.makeDecryptedModel(of: _PrivateMessage.self, symmetricKey: databaseSymmetricKey)
                     
                     var currentMetadata = [EditMessageMetadata<Data>]()
                     
@@ -462,10 +463,10 @@ final class JobProcessor: @unchecked Sendable {
                     
                     let newMetadata = try BSONEncoder().encode(currentMetadata)
                     _ = try await foundMessage.updatePropsMetadata(
-                        symmetricKey: appSymmetricKey,
+                        symmetricKey: databaseSymmetricKey,
                         metadata: newMetadata.makeData(),
                         with: key)
-                    try await cache.updateMessage(foundMessage, symmetricKey: appSymmetricKey)
+                    try await cache.updateMessage(foundMessage, symmetricKey: databaseSymmetricKey)
                     await session.receiverDelegate?.updatedMessage(foundMessage)
                 } catch {
                     await self.logger.log(level: .error, message: "Error Updating Message Metadata: \(error)")
@@ -474,7 +475,7 @@ final class JobProcessor: @unchecked Sendable {
             case .communicationSynchronization:
                 guard !decodedMessage.text.isEmpty else { return }
                 await self.logger.log(level: .debug, message: "Received Communication Synchronization Message")
-                let symmetricKey = try await session.getAppSymmetricKey()
+                let symmetricKey = try await session.getDatabaseSymmetricKey()
                 
                 //This can happen on multidevice support when a sender is also sending a message to it's master/child device.
                 let isMe = await inboundTask.senderSecretName == session.sessionContext?.sessionUser.secretName
@@ -520,7 +521,7 @@ final class JobProcessor: @unchecked Sendable {
             case .revokeMessage:
                 do {
                     let decodedMetadata = try BSONDecoder().decode(RevokeMessageMetadata.self, from: decodedMessage.metadata)
-                    let symmetricKey = try await session.getAppSymmetricKey()
+                    let symmetricKey = try await session.getDatabaseSymmetricKey()
                     let foundMessage = try await cache.fetchMessage(by: decodedMetadata.sharedId)
                     _ = try await cache.removeMessage(foundMessage)
                     await session.receiverDelegate?.deletedMessage(foundMessage)
@@ -557,8 +558,8 @@ final class JobProcessor: @unchecked Sendable {
                               session: CryptoSession
     ) async throws -> SessionIdentity? {
         for identity in try await cache.fetchSessionIdentities() {
-            let appSymmetricKey = try await session.getAppSymmetricKey()
-            guard var props = await identity.props(symmetricKey: appSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
+            let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
+            guard var props = await identity.props(symmetricKey: databaseSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
             if props.secretName == outboundTask.recipientSecretName, props.deviceId == outboundTask.recipientDeviceId {
                 return identity
             }
@@ -609,8 +610,8 @@ final class JobProcessor: @unchecked Sendable {
             throw JobProcessorErrors.missingIdentity
         }
         
-        let appSymmetricKey = try await session.getAppSymmetricKey()
-        guard var props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
+        let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
+        guard var props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
        
         let sendersPublicKeyRepresentable = await props.publicKeyRepesentable
         let symmetricKey = try await deriveSymmetricKey(
@@ -623,7 +624,7 @@ final class JobProcessor: @unchecked Sendable {
         
         return try await ratchetManager.recipientInitialization(
             sessionIdentity: sessionIdentity,
-            sessionSymmetricKey: appSymmetricKey,
+            sessionSymmetricKey: databaseSymmetricKey,
             secretKey: symmetricKey,
             localPrivateKey: localPrivateKey,
             initialMessage: encryptedMessage
@@ -638,7 +639,7 @@ final class JobProcessor: @unchecked Sendable {
                                       sessionIdentity: SessionIdentity
     ) async throws {
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
-        let appSymmetricKey = try await session.getAppSymmetricKey()
+        let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
         switch decodedMessage.recipient {
         case .nickname(let recipient):
             var communicationModel: BaseCommunication
@@ -653,11 +654,11 @@ final class JobProcessor: @unchecked Sendable {
                     session: session
                 )
                 
-                var communication = try await communicationModel.makeDecryptedModel(of: Communication.self, symmetricKey: appSymmetricKey)
+                var communication = try await communicationModel.makeDecryptedModel(of: Communication.self, symmetricKey: databaseSymmetricKey)
                 communication.messageCount += 1
                 
                 _ = try await communicationModel.updateProps(
-                    symmetricKey: appSymmetricKey,
+                    symmetricKey: databaseSymmetricKey,
                     props: BaseCommunication.UnwrappedProps(
                         sharedId: communication.sharedId,
                         messageCount: communication.messageCount,
@@ -675,7 +676,7 @@ final class JobProcessor: @unchecked Sendable {
                     recipients: [recipient, inboundTask.senderSecretName],
                     communicationType: .nickname(isMe ? recipient : inboundTask.senderSecretName),
                     metadata: decodedMessage.metadata,
-                    symmetricKey: appSymmetricKey
+                    symmetricKey: databaseSymmetricKey
                 )
                 try await cache.createCommunication(communicationModel)
                 try await session.receiverDelegate?.updatedCommunication(communicationModel, members: [recipient, inboundTask.senderSecretName])
@@ -693,20 +694,20 @@ final class JobProcessor: @unchecked Sendable {
             
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
-                if let members = try await communicationModel.props(symmetricKey: session.getAppSymmetricKey())?.members {
+                if let members = try await communicationModel.props(symmetricKey: databaseSymmetricKey)?.members {
                     try await session.receiverDelegate?.updatedCommunication(communicationModel, members: members)
                 }
             }
             
-            try await cache.createMessage(messageModel, symmetricKey: appSymmetricKey)
-            let props = await messageModel.props(symmetricKey: appSymmetricKey)
+            try! await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            let props = await messageModel.props(symmetricKey: databaseSymmetricKey)
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
         case .personalMessage:
             let sender = inboundTask.senderSecretName
             guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return }
             
-            let appSymmetricKey = try await session.getAppSymmetricKey()
+            let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
             var communicationModel: BaseCommunication
             var shouldUpdateCommunication = false
             do {
@@ -716,11 +717,11 @@ final class JobProcessor: @unchecked Sendable {
                     session: session
                 )
                 
-                var communication = try await communicationModel.makeDecryptedModel(of: Communication.self, symmetricKey: appSymmetricKey)
+                var communication = try await communicationModel.makeDecryptedModel(of: Communication.self, symmetricKey: databaseSymmetricKey)
                 communication.messageCount += 1
                 
                 _ = try await communicationModel.updateProps(
-                    symmetricKey: appSymmetricKey,
+                    symmetricKey: databaseSymmetricKey,
                     props: BaseCommunication.UnwrappedProps(
                         sharedId: communication.sharedId,
                         messageCount: communication.messageCount,
@@ -738,7 +739,7 @@ final class JobProcessor: @unchecked Sendable {
                     recipients: [sender],
                     communicationType: decodedMessage.recipient,
                     metadata: decodedMessage.metadata,
-                    symmetricKey: appSymmetricKey)
+                    symmetricKey: databaseSymmetricKey)
                 
                 try await cache.createCommunication(communicationModel)
                 try await session.receiverDelegate?.updatedCommunication(communicationModel, members: [mySecretName])
@@ -758,14 +759,12 @@ final class JobProcessor: @unchecked Sendable {
                 try await session.receiverDelegate?.updatedCommunication(communicationModel, members: [mySecretName])
             }
             
-            try await cache.createMessage(messageModel, symmetricKey: appSymmetricKey)
+            try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
         case .channel(let channelName):
             
             let sender = inboundTask.senderSecretName
-            
-            let symmetricKey = try await session.getAppSymmetricKey()
             var communicationModel: BaseCommunication
             var shouldUpdateCommunication = false
             
@@ -776,9 +775,9 @@ final class JobProcessor: @unchecked Sendable {
                 session: session
             )
             
-            guard var newProps = await communicationModel.props(symmetricKey: symmetricKey) else { fatalError() }
+            guard var newProps = await communicationModel.props(symmetricKey: databaseSymmetricKey) else { return }
             newProps.messageCount += 1
-            _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: newProps)
+            _ = try await communicationModel.updateProps(symmetricKey: databaseSymmetricKey, props: newProps)
             shouldUpdateCommunication = true
             
             let messageModel = try await createInboundMessageModel(
@@ -793,7 +792,7 @@ final class JobProcessor: @unchecked Sendable {
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
             }
-            try await cache.createMessage(messageModel, symmetricKey: appSymmetricKey)
+            try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
             
@@ -826,7 +825,7 @@ final class JobProcessor: @unchecked Sendable {
         session: CryptoSession
     ) async throws -> BaseCommunication {
         let communications = try await cache.fetchCommunications()
-        let symmetricKey = try await session.getAppSymmetricKey()
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
         guard let foundCommunication = await communications.asyncFirst(where: { model in
             do {
                 let decrypted = try await model.makeDecryptedModel(of: Communication.self, symmetricKey: symmetricKey)
@@ -850,7 +849,7 @@ final class JobProcessor: @unchecked Sendable {
         communication: BaseCommunication,
         sessionIdentity: SessionIdentity
     ) async throws -> PrivateMessage {
-        let symmetricKey = try await session.getAppSymmetricKey()
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
         guard var props = await sessionIdentity.props(symmetricKey: symmetricKey) else {
             throw JobProcessorErrors.missingIdentity
         }
@@ -890,10 +889,10 @@ final class JobProcessor: @unchecked Sendable {
         if identities.isEmpty {
             identities = try await session.refreshSessionIdentities(for: inboundTask.senderSecretName, from: [])
         }
-        let appSymmetricKey = try await session.getAppSymmetricKey()
+        let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
 
         guard let sessionIdentity = await identities.asyncFirst(where: { identity in
-            guard var props = await identity.props(symmetricKey: appSymmetricKey) else { return false }
+            guard var props = await identity.props(symmetricKey: databaseSymmetricKey) else { return false }
             return props.deviceId == inboundTask.senderDeviceId
         }) else {
             //If we did not have an identity we need to create it
@@ -901,7 +900,7 @@ final class JobProcessor: @unchecked Sendable {
         }
         
         // Unwrap properties and retrieve the public signing key
-        guard var props = await sessionIdentity.props(symmetricKey: appSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
+        guard var props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
         let sendersPublicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: props.publicSigningRepresentable)
         
         // Verify the signature

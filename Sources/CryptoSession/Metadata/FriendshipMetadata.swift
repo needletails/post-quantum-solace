@@ -65,9 +65,9 @@ public struct FriendshipMetadata: Sendable, Codable {
     }
     
     // Method to block friend
-    mutating func blockFriend() {
-        myState = .blockedUser
-        theirState = .blocked
+    mutating func blockFriend(receivedBlock: Bool) {
+        myState = receivedBlock ? .blocked : .blockedUser
+        theirState = receivedBlock ? .blockedUser : .blocked
         updateOurState()
     }
     
