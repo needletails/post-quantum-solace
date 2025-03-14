@@ -323,7 +323,7 @@ extension SessionCache {
     /// - Parameter contact: The contact to be created.
     /// - Throws: An error if the creation fails.
     public func createContact(_ contact: ContactModel) async throws {
-        try! await store.createContact(contact)
+        try await store.createContact(contact)
         contacts.append(contact) // Cache the new contact
     }
     

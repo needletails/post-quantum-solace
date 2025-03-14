@@ -131,6 +131,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         case userNotFound = "Could not find the user requested"
         case accessDenied = "Denied Access to the requested resource"
         case userIsBlocked = "The User is Blocked, cannot request friendship changes"
+        case missingMessage = "The Message cannot be processed because it is missing"
     }
     
     public struct CryptographicBundle: Sendable {
@@ -254,19 +255,19 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 
             case .userNotFound:
                 // UserConfiguration does not contain Private keys/info... so it should be safe to store publicly.
-                try! await transportDelegate?.publishUserConfiguration(bundle.userConfiguration, updateKeyBundle: false)
+                try await transportDelegate?.publishUserConfiguration(bundle.userConfiguration, updateKeyBundle: false)
                 
                 sessionContext.registrationState = .registered
                 await setSessionContext(sessionContext)
                 
                 
                 let encodedData = try BSONEncoder().encodeData(sessionContext)
-                guard let encryptedConfig = try! crypto.encrypt(data: encodedData, symmetricKey: appSymmetricKey) else {
+                guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: appSymmetricKey) else {
                     throw SessionErrors.sessionEncryptionError
                 }
                 
                 // Create local device configuration. Only locally cached and save. Private keys/info are stored. Use with care...
-                try! await cache.createLocalSessionContext(encryptedConfig)
+                try await cache.createLocalSessionContext(encryptedConfig)
                 
                 
                 //Create Communication Model for personal messages
@@ -284,10 +285,10 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 
                 props.sharedId = UUID()
                 
-                try! await communicationModel.updateProps(symmetricKey: databaseEncryptionKey, props: props)
+                try await communicationModel.updateProps(symmetricKey: databaseEncryptionKey, props: props)
                 
-                try! await cache.createCommunication(communicationModel)
-                try! await receiverDelegate?.updatedCommunication(communicationModel, members: [secretName])
+                try await cache.createCommunication(communicationModel)
+                try await receiverDelegate?.updatedCommunication(communicationModel, members: [secretName])
                 await self.logger.log(level: .debug, message: "Created Communication Model")
                 
             default:
@@ -366,24 +367,25 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             
             //Create Communication Model for personal messages
             await self.logger.log(level: .debug, message: "Creating Communication Model")
-            
+            let databaseSymmetricKey = try await getDatabaseSymmetricKey()
             let communicationModel = try await taskProcessor.jobProcessor.createCommunicationModel(
                 recipients: [credentials.secretName],
                 communicationType: .personalMessage,
                 metadata: [:],
-                symmetricKey: symmetricKey)
+                symmetricKey: databaseSymmetricKey)
             
-            guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
+            guard var props = await communicationModel.props(symmetricKey: databaseSymmetricKey) else {
                 throw CryptoSession.SessionErrors.propsError
             }
             
             props.sharedId = UUID()
             
-            try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
+            try await communicationModel.updateProps(symmetricKey: databaseSymmetricKey, props: props)
             
             try await cache.createCommunication(communicationModel)
             try await receiverDelegate?.updatedCommunication(communicationModel, members: [credentials.secretName])
             await self.logger.log(level: .debug, message: "Created Communication Model")
+            
             return try await startSession(appPassword: credentials.password)
         } else {
             throw SessionErrors.registrationError
@@ -408,7 +410,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         await setSessionContext(sessionContext)
         
         let encodedData = try BSONEncoder().encode(sessionContext).makeData()
-        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getDatabaseSymmetricKey()) else {
+        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
             throw CryptoSession.SessionErrors.sessionEncryptionError
         }
         
@@ -479,7 +481,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         
         do {
             // Decrypt the configuration data
-            guard let configurationData = try! crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
+            guard let configurationData = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
                 throw SessionErrors.sessionDecryptionError
             }
             

@@ -44,7 +44,7 @@ extension Priority: Codable {}
 
 extension NeedleTailAsyncConsumer{
     
-    func loadAndOrganizeJobs(_ job: JobModel, symmetricKey: SymmetricKey) async {
+    func loadAndOrganizeJobs(_ job: JobModel, symmetricKey: SymmetricKey) async throws {
         //TODO: Delayed Tasks
         
         //        let originalDeque: Deque<TaskJob<T>> = deque
@@ -78,7 +78,7 @@ extension NeedleTailAsyncConsumer{
         //
         //            //3. Send all messages. We are neither delayed or background so we are a scheduled task. Organize and send.
         //           // Iterate through the deque to find the correct insertion point
-        guard let props = await job.props(symmetricKey: symmetricKey) else { fatalError() }
+        guard let props = await job.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
         let currentSequenceId = props.sequenceId
         let isDelayed = props.delayedUntil != nil
         if !props.isBackgroundTask || !isDelayed {
@@ -130,13 +130,13 @@ final class JobProcessor: @unchecked Sendable {
                   session: CryptoSession? = nil
     ) async throws {
         if let job = job {
-            await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
+            try await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
             if let session = session {
                 try await attemptTaskSequence(session: session)
             }
         } else {
             for job in try await cache.readJobs() {
-                await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
+                try await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
                 if let session = session {
                     try await attemptTaskSequence(session: session)
                 }
@@ -174,7 +174,7 @@ final class JobProcessor: @unchecked Sendable {
             sequenceId: sequenceId,
             task: task,
             symmetricKey: symmetricKey)
-        await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
+        try await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
         try await cache.createJob(job)
         try await attemptTaskSequence(session: session)
     }
@@ -190,12 +190,12 @@ final class JobProcessor: @unchecked Sendable {
                 switch result {
                 case .success(let job):
                     
-                    guard let props = await job.props(symmetricKey: symmetricKey) else { fatalError() }
+                    guard let props = await job.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
                     await self.logger.log(level: .debug, message: "Running job \(props.sequenceId)")
                     
                     if session.isViable == false {
                         await self.logger.log(level: .debug, message: "Skipping job \(props.sequenceId) as we are offline")
-                        await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
+                        try await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
                         isRunning = false
                         return
                     }
@@ -204,7 +204,7 @@ final class JobProcessor: @unchecked Sendable {
                         await self.logger.log(level: .debug, message: "Task was delayed into the future")
                         
                         //This is urgent, We want to try this job first always until the designated time arrives. we sort via sequenceId. so old messages are always done first.
-                        await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
+                        try await jobConsumer.loadAndOrganizeJobs(job, symmetricKey: symmetricKey)
                         if await jobConsumer.deque.count == 0 {
                             setIsRunning(false)
                         }
@@ -400,11 +400,14 @@ final class JobProcessor: @unchecked Sendable {
                 
                 let encodedMetadata = try BSONEncoder().encode(["friendshipMetadata": decodedMetadata])
                 
+                guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return }
+                let isMe = await inboundTask.senderSecretName == mySecretName
+                
                 //Create or update contact including new metadata
                 _ = try await session.updateOrCreateContact(
-                    secretName: inboundTask.senderSecretName,
+                    secretName: isMe ? decodedMessage.recipient.nicknameDescription : inboundTask.senderSecretName,
                     metadata: encodedMetadata,
-                    needsSynchronization: false
+                    requestFriendship: false
                 )
                     
             case .deliveryStateChange:
@@ -478,7 +481,8 @@ final class JobProcessor: @unchecked Sendable {
                 let symmetricKey = try await session.getDatabaseSymmetricKey()
                 
                 //This can happen on multidevice support when a sender is also sending a message to it's master/child device.
-                let isMe = await inboundTask.senderSecretName == session.sessionContext?.sessionUser.secretName
+                guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return }
+                let isMe = await inboundTask.senderSecretName == mySecretName
                 
                 var communicationModel: BaseCommunication?
                 do {
@@ -492,7 +496,7 @@ final class JobProcessor: @unchecked Sendable {
                     //Need to flop sender/recipient
                     communicationModel = try await createCommunicationModel(
                         recipients: [decodedMessage.recipient.nicknameDescription, inboundTask.senderSecretName],
-                        communicationType: .nickname(isMe ? decodedMessage.recipient.nicknameDescription : inboundTask.senderSecretName),
+                        communicationType: .nickname(isMe ? mySecretName : inboundTask.senderSecretName),
                         metadata: decodedMessage.metadata,
                         symmetricKey: symmetricKey
                     )
@@ -511,8 +515,9 @@ final class JobProcessor: @unchecked Sendable {
                 }
                 await self.logger.log(level: .debug, message: "Updated Communication Model For Synchronization with Shared Id: \(props?.sharedId)")
             case .contactCreated:
+                guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return }
                 //This can happen on multidevice support when a sender is also sending a message to it's master/child device.
-                let isMe = await inboundTask.senderSecretName == session.sessionContext?.sessionUser.secretName
+                let isMe = await inboundTask.senderSecretName == mySecretName
                 await self.logger.log(level: .debug, message: "Received Contact Request Recipient Created Contact Message")
                 try await session.sendCommunicationSynchronization(contact: isMe ? decodedMessage.recipient.nicknameDescription : inboundTask.senderSecretName)
             case .addContacts:
@@ -533,10 +538,12 @@ final class JobProcessor: @unchecked Sendable {
                 let decodedKey = try BSONDecoder().decode(SymmetricKey.self, from: decodedMessage.metadata)
                 await session.receiverDelegate?.passDCCKey(decodedKey)
             default:
+                guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return }
                 //This can happen on multidevice support when a sender is also sending a message to it's master/child device.
-                let isMe = await inboundTask.senderSecretName == session.sessionContext?.sessionUser.secretName
+                let isMe = await inboundTask.senderSecretName == mySecretName
+                
                 //Passthrough nothing special to do
-                await session.receiverDelegate?.receivedLocalNudge(decodedMessage, sender: isMe ? decodedMessage.recipient.nicknameDescription : inboundTask.senderSecretName)
+                await session.receiverDelegate?.receivedLocalNudge(decodedMessage, sender: isMe ? mySecretName : inboundTask.senderSecretName)
             }
             
             // Save
@@ -699,7 +706,7 @@ final class JobProcessor: @unchecked Sendable {
                 }
             }
             
-            try! await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
             let props = await messageModel.props(symmetricKey: databaseSymmetricKey)
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)

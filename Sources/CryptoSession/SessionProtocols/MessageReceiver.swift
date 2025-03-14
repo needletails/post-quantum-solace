@@ -13,7 +13,8 @@ public protocol NTMessageReceiver: Sendable {
     func createdMessage(_ message: PrivateMessage) async
     func updatedMessage(_ message: PrivateMessage) async
     func deletedMessage(_ message: PrivateMessage) async
-    func createContact(_ contact: Contact, needsSynchronization: Bool) async throws
+    func createdContact(_ contact: Contact) async throws
+    func synchronize(contact: Contact, requestFriendship: Bool) async throws
     func updateContact(_ contact: Contact) async throws
     func contactMetadata(changed for: Contact) async
     func passDCCKey(_ key: SymmetricKey) async

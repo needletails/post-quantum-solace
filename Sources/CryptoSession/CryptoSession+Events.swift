@@ -126,6 +126,7 @@ extension CryptoSession {
         for info in filteredInfos {
             guard let transportDelegate = transportDelegate else { throw SessionErrors.transportNotInitialized }
             guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
+            
             let userConfiguration = try await transportDelegate.findConfiguration(for: info.secretName)
             
             let contact = Contact(
@@ -145,15 +146,7 @@ extension CryptoSession {
             )
             
             try await cache.createContact(contactModel)
-            
-//            await messageObserver?.setCreatedContact(contact)
-//            var nicks = [NeedleTailNick]()
-//            for device in try contact.configuration.getVerifiedDevices() {
-//                if let nick = NeedleTailNick(name: contact.secretName, deviceId: device.deviceId) {
-//                    nicks.append(nick)
-//                }
-//            }
-//            try await ntSession.getIRCConnection().writer?.requestOnlineNicks(nicks)
+            try await receiverDelegate?.createdContact(contact)
             
             await self.logger.log(level: .debug, message: "Creating Communication Model")
             // Create communication model
@@ -198,7 +191,7 @@ extension CryptoSession {
     public func updateOrCreateContact(
         secretName: String,
         metadata: Document = [:],
-        needsSynchronization: Bool
+        requestFriendship: Bool
     ) async throws -> ContactModel {
         guard let sessionContext = await sessionContext else {
             throw SessionErrors.sessionNotInitialized
@@ -264,7 +257,8 @@ extension CryptoSession {
             )
             
             try await cache.createContact(contactModel)
-            try await receiverDelegate?.createContact(contact, needsSynchronization: needsSynchronization)
+            try await receiverDelegate?.createdContact(contact)
+            try await receiverDelegate?.synchronize(contact: contact, requestFriendship: requestFriendship)
             
             _ = try await updateOrCreateCommunication(
                 mySecretName: mySecretName,
@@ -494,7 +488,6 @@ extension CryptoSession {
         _ = try await message.updateProps(symmetricKey: symmetricKey, props: props)
         try await cache.updateMessage(message, symmetricKey: symmetricKey)
         await receiverDelegate?.updatedMessage(message)
-        
         if allowExternalUpdate {
             let metadata = DeliveryStateMetadata(state: props.deliveryState, sharedId: message.sharedId)
             let encodedDeliveryState = try BSONEncoder().encode(metadata)
@@ -714,10 +707,7 @@ actor TaskProcessor {
         logger: NeedleTailLogger
     ) async throws -> [SessionIdentity] {
         //Get Identities only for me
-        var identities = try await session.getSessionIdentities(with: sender)
-        if identities.isEmpty {
-            identities = try await session.refreshSessionIdentities(for: sender, from: [])
-        }
+        let identities = try await session.refreshIdentities(secretName: sender)
         await logger.log(level: .info, message: "Gathered \(identities.count) Personal Session Identities")
         return identities
     }
@@ -728,10 +718,7 @@ actor TaskProcessor {
         logger: NeedleTailLogger
     ) async throws -> [SessionIdentity] {
         //Get Identities only for me
-        var identities = try await session.getSessionIdentities(with: target)
-        if identities.isEmpty {
-            identities = try await session.refreshSessionIdentities(for: target, from: [])
-        }
+        let identities = try await session.refreshIdentities(secretName: target)
         await logger.log(level: .info, message: "Gathered \(identities.count) Private Message Session Identities")
         return identities
     }
@@ -772,10 +759,7 @@ actor TaskProcessor {
         var identities = [SessionIdentity]()
         //3. Double Ratchet for all memebers and their devices
         for member in members {
-            identities = try await session.getSessionIdentities(with: member)
-            if identities.isEmpty {
-                identities = try await session.refreshSessionIdentities(for: member, from: [])
-            }
+            identities.append(contentsOf: try await session.refreshIdentities(secretName: member))
         }
         await logger.log(level: .info, message: "Gathered \(identities.count) Channel Session Identities")
         return (identities, members)
@@ -848,8 +832,8 @@ actor TaskProcessor {
                 // 3. After the media message is sent on the transport layer, if we have created upload packets we send them via the proper upload to storage method.
                 
                 if let props = try await identity.props(symmetricKey: symmetricKey) {
-                    guard let encryptableMessage else { fatalError() }
-                    guard var messageProps = try await encryptableMessage.props(symmetricKey: symmetricKey) else { fatalError() }
+                    guard let encryptableMessage else { throw CryptoSession.SessionErrors.missingMessage }
+                    guard var messageProps = try await encryptableMessage.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
                     let mediaSymmetricKey = try crypto.userInfoKey(UUID().uuidString)
                     let encodedKey = try BSONEncoder().encodeData(mediaSymmetricKey)
                     let synchronizationIdentifier = UUID().uuidString
@@ -930,7 +914,7 @@ actor TaskProcessor {
     ) async throws -> PrivateMessage {
         guard let sessionContext = await session.sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
         let sessionUser = sessionContext.sessionUser
-        guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else { fatalError() }
+        guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
         let messageModel = try await PrivateMessage(
             id: UUID(),
             communicationId: communication.id,

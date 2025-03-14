@@ -330,7 +330,11 @@ extension Document {
         guard let value = self[key] else {
             throw DecodingError.dataCorrupted(DecodingError.Context(codingPath: [], debugDescription: "Key \(key) not found in document"))
         }
-        guard let data = try BSONEncoder().encodePrimitive(value) else { fatalError() }
+        guard let data = try BSONEncoder().encodePrimitive(value) else { throw Errors.primitiveIsNil }
         return try BSONDecoder().decode(T.self, fromPrimitive: data)
+    }
+    
+    enum Errors: Error {
+        case primitiveIsNil
     }
 }

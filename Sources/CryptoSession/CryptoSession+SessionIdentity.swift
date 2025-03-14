@@ -12,10 +12,10 @@ import BSON
 
 extension CryptoSession {
     
-    public func refreshIdentities(secretName: String) async throws {
+    public func refreshIdentities(secretName: String) async throws -> [SessionIdentity] {
         let filtered = try await getSessionIdentities(with: secretName)
         //Allways make sure the identities are up to date
-        try await refreshSessionIdentities(for: secretName, from: filtered)
+        return try await refreshSessionIdentities(for: secretName, from: filtered)
     }
     
     public func createEncryptableSessionIdentityModel(
@@ -112,7 +112,6 @@ extension CryptoSession {
                 } while generatedSessionContextIds.contains(sessionContextId)
                 
                 generatedSessionContextIds.insert(sessionContextId)
-                
                 let identity = try await createEncryptableSessionIdentityModel(
                     with: device,
                     for: recipientName,
