@@ -57,7 +57,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     }
 }
 
-public struct UserSession: Codable, Sendable, Hashable {
+public struct UserSession: Identifiable, Codable, Sendable, Hashable {
     public let id: UUID
     public let secretName: String
     public let identity: UUID

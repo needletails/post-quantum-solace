@@ -10,14 +10,15 @@ import Foundation
 import BSON
 import NeedleTailCrypto
 import DoubleRatchetKit
-@preconcurrency import Crypto
+import Crypto
+import NIOConcurrencyHelpers
 
 public struct Contact: Sendable, Codable, Equatable {
     public let id: UUID
     public let secretName: String
     public var configuration: UserConfiguration
     public var metadata: Document
-    
+
     public init(id: UUID, secretName: String, configuration: UserConfiguration, metadata: Document) {
         self.id = id
         self.secretName = secretName
@@ -30,6 +31,8 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     
     public let id: UUID
     public var data: Data
+    private let lock = NIOLock()
+    private let crypto = NeedleTailCrypto()
     
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case id = "a"
@@ -55,15 +58,24 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         public let secretName: String
         public var configuration: UserConfiguration
         public var metadata: Document
+        
+        public init(
+            secretName: String,
+            configuration: UserConfiguration,
+            metadata: Document
+        ) {
+            self.secretName = secretName
+            self.configuration = configuration
+            self.metadata = metadata
+        }
     }
     
-    init(
+    public init(
         id: UUID,
         props: UnwrappedProps,
         symmetricKey: SymmetricKey
     ) throws {
         self.id = id
-        let crypto = NeedleTailCrypto()
         let data = try BSONEncoder().encodeData(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.encryptionFailed
@@ -85,9 +97,10 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     /// - Returns: The decrypted properties.
     /// - Throws: An error if decryption fails.
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
-        let crypto = NeedleTailCrypto()
+        lock.lock()
+        defer { lock.unlock() }
         guard let decrypted = try crypto.decrypt(data: self.data, symmetricKey: symmetricKey) else {
-            throw CryptoError.decryptionError
+            throw CryptoError.decryptionFailed
         }
         return try BSONDecoder().decodeData(UnwrappedProps.self, from: decrypted)
     }
@@ -100,13 +113,19 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     ///
     /// - Throws: An error if encryption fails.
     public func updateProps(symmetricKey: SymmetricKey, props: UnwrappedProps) async throws -> UnwrappedProps? {
-        let crypto = NeedleTailCrypto()
+        lock.lock()
         let data = try BSONEncoder().encodeData(props)
-        guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-            throw CryptoError.encryptionFailed
+        do {
+            guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
+                throw CryptoError.encryptionFailed
+            }
+            self.data = encryptedData
+            lock.unlock()
+            return try await self.decryptProps(symmetricKey: symmetricKey)
+        } catch {
+            lock.unlock()
+            throw error
         }
-        self.data = encryptedData
-        return await self.props(symmetricKey: symmetricKey)
     }
     
     public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Document, with key: String) async throws -> UnwrappedProps? {
@@ -130,7 +149,7 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     
     public func makeDecryptedModel<T: Sendable & Codable>(of: T.Type, symmetricKey: SymmetricKey) async throws -> T {
         guard let props = await props(symmetricKey: symmetricKey) else {
-            throw CryptoSession.SessionErrors.propsError
+            throw Errors.propsError
         }
         return Contact(
             id: id,
@@ -140,8 +159,8 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     public func updateContact(_ metadata: ContactMetadata, symmetricKey: SymmetricKey) async throws -> UnwrappedProps? {
-        guard var props = await props(symmetricKey: symmetricKey) else {
-            throw CryptoSession.SessionErrors.propsError
+        guard let props = await props(symmetricKey: symmetricKey) else {
+            throw Errors.propsError
         }
         
         var contactMetadata: ContactMetadata
@@ -177,11 +196,16 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
                 image: metadata.image)
         }
         
+        let metadata = try BSONEncoder().encode(contactMetadata)
         // Encode the updated metadata
-        let encoded = try BSONEncoder().encode(["contactMetadata": contactMetadata])
         return try await updatePropsMetadata(
             symmetricKey: symmetricKey,
-            metadata: encoded)
+            metadata: metadata,
+            with: "contactMetadata")
+    }
+    
+    private enum Errors: Error {
+        case propsError
     }
 }
 
@@ -304,26 +328,6 @@ public struct DataPacket: Codable, Sendable {
 
 
 extension Document {
-    /* EXAMPLE
-     let doc1 = AnimalObject(animals: ["dog", "cat", "bird", "fish", "hedgehog"])
-     let doc2 = NatureObject(types: ["pop", "water", "juice", "coffee", "tea"])
-     let doc3 = DrinkObject(drinks: ["mountain", "river", "valley", "hill", "lake"])
-     
-     var combinedDocument: Document = [:]
-     let encoded1: Document = try! BSONEncoder().encode(doc1)
-     let encoded2: Document = try! BSONEncoder().encode(doc2)
-     let encoded3: Document = try! BSONEncoder().encode(doc3)
-     
-     combinedDocument["animals"] = encoded1
-     combinedDocument["types"] = encoded2
-     combinedDocument["drinks"] = encoded3
-     //Store CombinedDocument
-     
-     
-     //Get desired Document
-     let decoded: DrinkObject = try! combinedDocument.decode(forKey: "drinks")
-     
-     */
     /// - Parameter key: document key to find and decode
     /// - Returns: the Codable object
     public func decode<T: Codable>(forKey key: String) throws -> T {
@@ -338,3 +342,117 @@ extension Document {
         case primitiveIsNil
     }
 }
+
+public struct SDPNegotiationMetadata: Codable, Sendable, Equatable {
+    public let offerSecretName: String
+    public let offerDeviceId: String
+    public let answerDeviceId: String
+    
+    public init(
+        offerSecretName: String,
+        offerDeviceId: String,
+        answerDeviceId: String
+    ) {
+        self.offerSecretName = offerSecretName
+        self.offerDeviceId = offerDeviceId
+        self.answerDeviceId = answerDeviceId
+    }
+}
+
+public struct StartCallMetadata: Codable, Sendable, Equatable {
+    
+    public let offerParticipant: Call.Participant
+    public let answerParticipant: Call.Participant?
+    public var sharedMessageId: String?
+    public let communicationId: String
+    public let supportsVideo: Bool
+    
+    public init(
+        offerParticipant: Call.Participant,
+        answerParticipant: Call.Participant? = nil,
+        sharedMessageId: String? = nil,
+        communicationId: String,
+        supportsVideo: Bool
+    ) {
+        self.offerParticipant = offerParticipant
+        self.answerParticipant = answerParticipant
+        self.sharedMessageId = sharedMessageId
+        self.communicationId = communicationId
+        self.supportsVideo = supportsVideo
+    }
+}
+
+
+/// This struct represents a call object. A session can have many calls potentially, meaning a currentCall, previousCall, and callOnHold. Each call object can be encoded into data and set on a BaseCommunication metadata. A call needs to contain an identifier for the base communication Id.
+public struct Call: Sendable, Codable, Equatable {
+    
+    public struct Props: Sendable, Codable {
+        public var id: UUID
+        public var data: Data
+        public init(id: UUID, data: Data) {
+            self.id = id
+            self.data = data
+        }
+    }
+    
+    public struct Participant: Sendable, Codable, Equatable {
+        public let secretName: String
+        public let nickname: String
+        public var deviceId: String
+        
+        public init(secretName: String, nickname: String, deviceId: String) {
+            self.secretName = secretName
+            self.nickname = nickname
+            self.deviceId = deviceId
+        }
+    }
+    
+    
+    public var id: UUID
+    public var sharedMessageIdentifier: String?
+    public var sharedCommunicationId: String
+    public var sender: Participant
+    public var recipients: [Participant]
+    public var createdAt: Date
+    public var updatedAt: Date?
+    public var endedAt: Date?
+    public var supportsVideo: Bool
+    public var unanswered: Bool?
+    public var rejected: Bool?
+    public var failed: Bool?
+    public var isActive: Bool
+    public var metadata: Document
+     
+    public init(
+        id: UUID = UUID(),
+        sharedMessageIdentifier: String? = nil,
+        sharedCommunicationId: String,
+        sender: Participant,
+        recipients: [Participant],
+        createdAt: Date = Date(),
+        updatedAt: Date? = nil,
+        endedAt: Date? = nil,
+        supportsVideo: Bool = false,
+        unanswered: Bool? = nil,
+        rejected: Bool? = nil,
+        failed: Bool? = nil,
+        isActive: Bool = false,
+        metadata: Document = [:]
+    ) {
+        self.id = id
+        self.sharedMessageIdentifier = sharedMessageIdentifier
+        self.sharedCommunicationId = sharedCommunicationId
+        self.sender = sender
+        self.recipients = recipients
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.endedAt = endedAt
+        self.supportsVideo = supportsVideo
+        self.unanswered = unanswered
+        self.rejected = rejected
+        self.failed = failed
+        self.isActive = isActive
+        self.metadata = metadata
+    }
+}
+

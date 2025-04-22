@@ -8,7 +8,68 @@ import Foundation
 import BSON
 import NeedleTailCrypto
 import DoubleRatchetKit
-@preconcurrency import Crypto
+import NeedleTailAsyncSequence
+import Crypto
+
+public struct OutboundTaskMessage: Codable & Sendable {
+    public var message: CryptoMessage
+    public let recipientIdentity: SessionIdentity
+    public let localId: UUID
+    public let sharedId: String
+    
+    public init(
+        message: CryptoMessage,
+        recipientIdentity: SessionIdentity,
+        localId: UUID,
+        sharedId: String
+    ) {
+        self.message = message
+        self.recipientIdentity = recipientIdentity
+        self.localId = localId
+        self.sharedId = sharedId
+    }
+}
+
+
+public struct InboundTaskMessage: Codable & Sendable {
+    public let message: SignedRatchetMessage
+    public let senderSecretName: String
+    public let senderDeviceId: UUID
+    public let sharedMessageId: String
+    
+    public init(
+        message: SignedRatchetMessage,
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        sharedMessageId: String
+    ) {
+        self.message = message
+        self.senderSecretName = senderSecretName
+        self.senderDeviceId = senderDeviceId
+        self.sharedMessageId = sharedMessageId
+    }
+}
+
+
+public enum TaskType: Codable & Sendable {
+    case streamMessage(InboundTaskMessage), writeMessage(OutboundTaskMessage)
+}
+
+public struct EncrytableTask: Codable & Sendable {
+    public let task: TaskType
+    public let priority: Priority
+    public let scheduledAt: Date
+    
+    public init(
+        task: TaskType,
+        priority: Priority = .standard,
+        scheduledAt: Date = Date()
+    ) {
+        self.task = task
+        self.priority = priority
+        self.scheduledAt = scheduledAt
+    }
+}
 
 public struct Job: Sendable, Codable, Equatable {
     public let id: UUID
@@ -52,15 +113,32 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             case scheduledAt = "e"
             case attempts = "f"
         }
-        let sequenceId: Int
-        var task: EncrytableTask
-        let isBackgroundTask: Bool
-        var delayedUntil: Date?
-        var scheduledAt: Date
-        var attempts: Int
+        public let sequenceId: Int
+        public var task: EncrytableTask
+        public let isBackgroundTask: Bool
+        public var delayedUntil: Date?
+        public var scheduledAt: Date
+        public var attempts: Int
+        
+        public init(
+            sequenceId: Int,
+            task: EncrytableTask,
+            isBackgroundTask: Bool,
+            delayedUntil: Date? = nil,
+            scheduledAt: Date,
+            attempts: Int
+        ) {
+            self.sequenceId = sequenceId
+            self.task = task
+            self.isBackgroundTask = isBackgroundTask
+            self.delayedUntil = delayedUntil
+            self.scheduledAt = scheduledAt
+            self.attempts = attempts
+        }
+        
     }
     
-    init(
+    public init(
         id: UUID,
         props: UnwrappedProps,
         symmetricKey: SymmetricKey
@@ -86,7 +164,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         let crypto = NeedleTailCrypto()
         guard let decrypted = try crypto.decrypt(data: self.data, symmetricKey: symmetricKey) else {
-            throw CryptoError.decryptionError
+            throw CryptoError.decryptionFailed
         }
         return try BSONDecoder().decodeData(UnwrappedProps.self, from: decrypted)
     }
@@ -110,7 +188,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
     
     public func makeDecryptedModel<T: Sendable & Codable>(of: T.Type, symmetricKey: SymmetricKey) async throws -> T {
         guard let props = await props(symmetricKey: symmetricKey) else {
-            throw CryptoSession.SessionErrors.propsError
+            throw Errors.propsError
         }
         return Job(
             id: id,
@@ -119,5 +197,9 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             task: props.task,
             scheduledAt: props.scheduledAt,
             attempts: props.attempts) as! T
+    }
+    
+    private enum Errors: Error {
+        case propsError
     }
 }

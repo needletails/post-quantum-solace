@@ -24,4 +24,15 @@ public struct SessionUser: Codable & Sendable {
     /// The User Specific Metadata
     public var metadata: ContactMetadata
     
+    public init(
+        secretName: String,
+        deviceId: UUID,
+        deviceKeys: DeviceKeys,
+        metadata: ContactMetadata
+    ) {
+        self.secretName = secretName
+        self.deviceId = deviceId
+        self.deviceKeys = deviceKeys
+        self.metadata = metadata
+    }
 }

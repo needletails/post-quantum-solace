@@ -8,6 +8,7 @@ import Foundation
 import NeedleTailCrypto
 import DoubleRatchetKit
 import Crypto
+import SessionModels
 
 public enum Ordering: Sendable {
     case ascending, descending
@@ -15,9 +16,9 @@ public enum Ordering: Sendable {
 
 public struct _WrappedPrivateMessage: Sendable {
     public let sharedCommunicationId: String
-    public let message: PrivateMessage
+    public let message: EncryptedMessage
     
-    public init(sharedCommunicationId: String, message: PrivateMessage) {
+    public init(sharedCommunicationId: String, message: EncryptedMessage) {
         self.sharedCommunicationId = sharedCommunicationId
         self.message = message
     }
@@ -70,12 +71,12 @@ public protocol CryptoSessionStore: Sendable {
     func removeCommunication(_ type: BaseCommunication) async throws
     
     func fetchMessages(sharedCommunicationId: UUID) async throws -> [_WrappedPrivateMessage]
-    func fetchMessage(byId messageId: UUID) async throws -> PrivateMessage
-    func fetchMessage(by sharedMessageId: String) async throws -> PrivateMessage
-    func createMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws
-    func updateMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws
-    func removeMessage(_ message: PrivateMessage) async throws
-    func streamMessages(sharedIdentifier: UUID) async throws -> (AsyncThrowingStream<PrivateMessage, Error>, AsyncThrowingStream<PrivateMessage, Error>.Continuation?)
+    func fetchMessage(byId messageId: UUID) async throws -> EncryptedMessage
+    func fetchMessage(by sharedMessageId: String) async throws -> EncryptedMessage
+    func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws
+    func updateMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws
+    func removeMessage(_ message: EncryptedMessage) async throws
+    func streamMessages(sharedIdentifier: UUID) async throws -> (AsyncThrowingStream<EncryptedMessage, Error>, AsyncThrowingStream<EncryptedMessage, Error>.Continuation?)
     func messageCount(for sharedIdentifier: UUID) async throws -> Int
     
     func readJobs() async throws -> [JobModel]

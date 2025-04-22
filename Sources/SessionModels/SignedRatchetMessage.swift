@@ -14,7 +14,7 @@ import DoubleRatchetKit
 public struct SignedRatchetMessage: Codable & Sendable {
     
     /// Optional signed representation of the configuration.
-    var signed: Signed?
+    public var signed: Signed?
     
     /// Coding keys for encoding and decoding the struct.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
@@ -25,8 +25,8 @@ public struct SignedRatchetMessage: Codable & Sendable {
     /// - Parameters:
     ///   - privateSigningIdentity: The private signing key used for signing the configuration.
     /// - Throws: An error if signing the configuration fails.
-    init(
-        message: EncryptedMessage,
+    public init(
+        message: RatchetMessage,
         privateSigningKey: Data
     ) throws {
         self.signed = try Signed(
@@ -39,7 +39,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
     public struct Signed: Codable & Sendable {
         
         /// The encoded encrypted data for the message
-        let data: Data
+        public let data: Data
         /// The generated signature.
         let signature: Data
         
@@ -56,7 +56,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
         ///   - privateSigningIdentity: The private signing key used for signing.
         /// - Throws: An error if the signature is invalid.
         init(
-            message: EncryptedMessage,
+            message: RatchetMessage,
             privateSigningIdentity: Curve25519SigningPrivateKey
         ) throws {
             self.data = try BSONEncoder().encodeData(message)

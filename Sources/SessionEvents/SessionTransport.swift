@@ -8,27 +8,37 @@ import Foundation
 import DoubleRatchetKit
 import Crypto
 import BSON
+import SessionModels
+
 /// This metadata needs to be handle with care Ideally none of it should be sent over the wire. It should just be used to prepare the message for sending.
 public struct SignedRatchetMessageMetadata: Sendable {
     /// Recipient secretName
     public let secretName: String
     /// Recipient deviceId
     public let deviceId: UUID
-    /// Push Notification Type
-    public let pushType: PushNotificationType
-    /// Shared Message Identifier
-    public let sharedMessageIdentifier: String
-    /// The message type
-    public var messageType: MessageType
-    /// A flag for the given message type
-    public var messageFlags: MessageFlags
     /// The recipeint type
     public let recipient: MessageRecipient
+    public let transportMetadata: Data?
+    public let sharedMessageIdentifier: String
+    
+    public init(
+        secretName: String,
+        deviceId: UUID,
+        recipient: MessageRecipient,
+        transportMetadata: Data?,
+        sharedMessageIdentifier: String
+    ) {
+        self.secretName = secretName
+        self.deviceId = deviceId
+        self.recipient = recipient
+        self.transportMetadata = transportMetadata
+        self.sharedMessageIdentifier = sharedMessageIdentifier
+    }
 }
 
 // Define a protocol for session transport
 public protocol SessionTransport: Sendable {
-    
+
     /// Sends a message to the network.
     /// - Parameter message: The message to be sent.
     /// - Throws: An error if the message could not be sent.

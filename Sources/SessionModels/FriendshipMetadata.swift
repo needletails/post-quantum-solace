@@ -27,7 +27,7 @@ public struct FriendshipMetadata: Sendable, Codable {
     public var ourState: State
     
     // Initializer
-    init(
+    public init(
         myState: State = .pending,
         theirState: State = .pending,
         ourState: State = .pending
@@ -38,41 +38,40 @@ public struct FriendshipMetadata: Sendable, Codable {
     }
     
     // Method to send a friend request
-    mutating func sendFriendRequest() {
+    public mutating func synchronizeRequestedState() {
         myState = .requested
         updateOurState()
     }
     
     // Method to accept a friend request
-    mutating func acceptFriendRequest() {
+    public mutating func synchronizeAcceptedState() {
         myState = .accepted
         theirState = .accepted
         updateOurState()
     }
     
-    // Method to reject a friend request
-    mutating func rejectFriendRequest() {
-        myState = .rejectedRequest
-        theirState = .rejected
-        updateOurState()
-    }
-    
     // Method to revoking friendship to original state
-    mutating func revokeFriendRequest() {
+    public mutating func synchronizePendingState() {
         myState = .pending
         theirState = .pending
         updateOurState()
     }
     
+    public mutating func rejectFriendRequest() {
+        myState = .rejectedRequest
+        theirState = .rejected
+        updateOurState()
+    }
+    
     // Method to block friend
-    mutating func blockFriend(receivedBlock: Bool) {
+    public mutating func synchronizeBlockState(receivedBlock: Bool) {
         myState = receivedBlock ? .blocked : .blockedUser
         theirState = receivedBlock ? .blockedUser : .blocked
         updateOurState()
     }
     
     // Method to unblock friend. If we unblock we must request friendship again.
-    mutating func unBlockFriend() {
+    public mutating func unBlockFriend() {
         myState = .pending
         theirState = .pending
         updateOurState()
@@ -80,7 +79,7 @@ public struct FriendshipMetadata: Sendable, Codable {
     
     
     // Method to update ourState based on individual states
-    mutating func updateOurState() {
+    public mutating func updateOurState() {
         if myState == .blocked {
             // If my state is blocked I cannot change out state
         } else if myState == .accepted && theirState == .accepted {
@@ -93,6 +92,10 @@ public struct FriendshipMetadata: Sendable, Codable {
             ourState = .pending // Both parties are pending
         } else if theirState == .blockedUser {
             ourState = .blocked
+        } else if myState == .friendshipRejected && theirState == .pending {
+            ourState = .friendshipRejected
+        } else if myState == .requested && theirState == .requested {
+            ourState = .requested
         } else {
             ourState = .pending // Default state if no other conditions are met
         }
@@ -105,7 +108,7 @@ public struct FriendshipMetadata: Sendable, Codable {
     /// making it easier to understand the context of the request.
     ///
     /// This method should be called before updating the contact metadata in response to friendship changes.
-    mutating func switchStates() {
+    public mutating func switchStates() {
         (myState, theirState) = (theirState, myState)
     }
 }

@@ -33,8 +33,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         self.publicSigningKey = publicSigningKey
         self.signed = try Signed(
             configuration: devices,
-            privateSigningKey: privateSigningKey
-        )
+            privateSigningKey: privateSigningKey)
     }
 
     /// A struct representing the signed version of the user device configuration.
@@ -56,7 +55,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         ///   - publicSigningKeyRepresentable: The public signing key representation.
         ///   - privateSigningIdentity: The private signing key used for signing.
         /// - Throws: An error if the signature is invalid.
-        init(
+        public init(
             configuration: [UserDeviceConfiguration],
             privateSigningKey: Curve25519SigningPrivateKey
         ) throws {

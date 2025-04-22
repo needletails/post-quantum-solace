@@ -9,6 +9,7 @@ import NeedleTailCrypto
 import DoubleRatchetKit
 import Crypto
 import BSON
+import SessionModels
 
 extension CryptoSession {
     
@@ -24,8 +25,7 @@ extension CryptoSession {
         associatedWith deviceId: UUID,
         new sessionContextId: Int
     ) async throws -> SessionIdentity {
-        guard let sessionContext = await sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
-        guard let cache = await cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
+        guard let cache = cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         
         let identity = try await SessionIdentity(
             id: UUID(),
@@ -36,7 +36,7 @@ extension CryptoSession {
                 publicKeyRepesentable: device.publicKey,
                 publicSigningRepresentable: device.publicSigningKey,
                 state: nil,
-                deviceName: device.deviceName ?? "Unknown Device Name",
+                deviceName: determinDeviceName(),
                 isMasterDevice: device.isMasterDevice
             ),
             symmetricKey: getDatabaseSymmetricKey()
@@ -46,14 +46,39 @@ extension CryptoSession {
     }
     
     
+    func determinDeviceName() async throws -> String {
+        guard let cache else { return "Unknown Device" }
+        var existingNames: [String] = []
+
+        // Fetch existing device names
+        for context in try await cache.fetchSessionIdentities() {
+            guard let props = try await context.props(symmetricKey: getDatabaseSymmetricKey()) else { continue }
+            existingNames.append(props.deviceName)
+        }
+
+        let baseName = getDeviceName() // e.g., "mac16"
+        var count = 1
+        var newDeviceName = baseName
+
+        // Check for existing names and increment the count if necessary
+        while existingNames.contains(newDeviceName) {
+            newDeviceName = "\(baseName) (\(count))"
+            count += 1
+        }
+
+        return newDeviceName.isEmpty ? "Unknown Device" : newDeviceName
+    }
+    
+    
     ///This is only used to get get recipient identites, none of our Device Configuration information.
     public func getSessionIdentities(with recipientName: String) async throws -> [SessionIdentity] {
         
-        guard let sessionContext = await sessionContext else { throw CryptoSession.SessionErrors.sessionNotInitialized }
-        guard let cache = await cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
+        guard let sessionContext = await sessionContext else {
+            throw CryptoSession.SessionErrors.sessionNotInitialized
+        }
+        guard let cache = cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         
         let identities = try await cache.fetchSessionIdentities()
-        let symmetricKey = try await getDatabaseSymmetricKey()
         return await identities.asyncFilter { identity in
             do {
                 let symmetricKey = try await getDatabaseSymmetricKey()
@@ -70,6 +95,7 @@ extension CryptoSession {
     
     
     func refreshSessionIdentities(for recipientName: String, from filtered: [SessionIdentity]) async throws -> [SessionIdentity] {
+        
         var filtered = filtered
         guard let transportDelegate = transportDelegate else {
             throw CryptoSession.SessionErrors.transportNotInitialized
@@ -80,13 +106,12 @@ extension CryptoSession {
         }
         // Get the user configuration for the recipient
         let configuration = try await transportDelegate.findConfiguration(for: recipientName)
-        let verifiedDevices = try await configuration.getVerifiedDevices()
+        var verifiedDevices = try configuration.getVerifiedDevices()
         var collected = [UserDeviceConfiguration]()
 
         // Create a set of existing device IDs from the filtered identities for quick lookup
         let existingDeviceIds = await Set(filtered.asyncCompactMap {
-            try? await $0.props(symmetricKey: getDatabaseSymmetricKey())?.deviceId }
-        )
+            try? await $0.props(symmetricKey: getDatabaseSymmetricKey())?.deviceId })
         
         for device in verifiedDevices {
             // Only collect devices that are not already in the filtered identities
@@ -118,6 +143,43 @@ extension CryptoSession {
                     associatedWith: device.deviceId,
                     new: sessionContextId)
                 filtered.append(identity)
+            }
+        }
+        
+        //This will get all identities that are the recipient name and a child device.
+        let newfilter = try await getSessionIdentities(with: recipientName)
+        let newDeviceIds = await Set(newfilter.asyncCompactMap {
+            try? await $0.props(symmetricKey: getDatabaseSymmetricKey())?.deviceId })
+        guard let myDevices = try await sessionContext?.lastUserConfiguration.getVerifiedDevices() else { return [] }
+   
+        verifiedDevices.append(contentsOf: myDevices)
+        
+        for deviceId in newDeviceIds {
+            let isVerified = verifiedDevices.contains { verifiedDevice in
+                verifiedDevice.deviceId == deviceId
+            }
+            
+            if !isVerified {
+                logger.log(level: .info, message: "Will remove stale session identity for recipient: \(recipientName)")
+                // If our current list on the DB contains a session identity that is not in the master list, we need to remove it.
+                if let identityToRemove = await filtered.asyncFirst(where: { element in
+                    // Try to get the properties for each element.
+                    guard let props = try? await element.props(symmetricKey: getDatabaseSymmetricKey()) else {
+                        return false
+                    }
+                    // Compare the deviceIds; make sure deviceId is available in this scope.
+                    return props.deviceId == deviceId
+                }) {
+                    try await cache?.removeSessionIdentity(identityToRemove.id)
+                    logger.log(level: .info, message: "Did remove stale session identity for recipient: \(recipientName)")
+                    
+                    // Remove the identity from the filtered array.
+                    if let index = filtered.firstIndex(where: { identity in
+                        identity.id == identityToRemove.id
+                    }) {
+                        filtered.remove(at: index)
+                    }
+                }
             }
         }
         return filtered

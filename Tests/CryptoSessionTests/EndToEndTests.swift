@@ -87,7 +87,7 @@ class EndToEndTests {
         await #expect(throws: Never.self, performing: {
             try await senderSession.writeTextMessage(
                 messageType: .text,
-                messageFlags: .none,
+                messageFlag: .none,
                 recipient: .nickname("secretName2"),
                 text: "Some Message",
                 metadata: [:],
@@ -166,7 +166,7 @@ class EndToEndTests {
                 case .success(let message):
                     try await senderSession.writeTextMessage(
                         messageType: .text,
-                        messageFlags: .none,
+                        messageFlag: .none,
                         recipient: .nickname("secretName2"),
                         text: message,
                         metadata: [:],
@@ -217,7 +217,7 @@ class EndToEndTests {
 }
 
 
-struct ReceiverDelegate: NTMessageReceiver {
+struct ReceiverDelegate: EventReceiver {
     func updateContact(_ contact: Contact) async throws {
         print("Update contact: \(contact)")
     }
@@ -517,7 +517,7 @@ struct MockUserData {
     let lid = UUID()
     let ntm = CryptoMessage(
         messageType: .text,
-        messageFlags: .none,
+        messageFlag: .none,
         recipient: .nickname("secretName2"),
         text: "Some Message",
         pushType: .message,

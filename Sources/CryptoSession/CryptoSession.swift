@@ -6,56 +6,31 @@
 //
 
 import Foundation
-import BSON
+import SessionModels
+import SessionEvents
 import NeedleTailCrypto
 import NeedleTailLogger
-@preconcurrency import Crypto
-#if os(iOS)
-import UIKit
-#elseif os(macOS)
-import AppKit
-#endif
-
-public enum RegistrationState: Codable, Sendable {
-    case registered, unregistered
-}
-
-public struct LinkDeviceInfo: Sendable {
-    public let secretName: String
-    public let devices: [UserDeviceConfiguration]
-    public let password: String
-    
-    public init(
-        secretName: String,
-        devices: [UserDeviceConfiguration],
-        password: String
-    ) {
-        self.secretName = secretName
-        self.devices = devices
-        self.password = password
-    }
-}
-
-public protocol DeviceLinkingDelegate: AnyObject, Sendable {
-    func generatedDeviceCryptographic(_ data: Data, password: String) async -> LinkDeviceInfo?
-}
+import Crypto
+import BSON
 
 public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     
     nonisolated let id = UUID()
     // Indicates if the session is viable for operations
     nonisolated(unsafe) public var isViable: Bool = false
-    
+   
     // Singleton instance of CryptoSession
     public static let shared = CryptoSession()
     init() {}
     
     private let crypto = NeedleTailCrypto()
-    let taskProcessor = TaskProcessor()
-    let logger = NeedleTailLogger(.init(label: "[CryptoSession]"))
+    internal var taskProcessor = TaskProcessor()
+    internal let logger = NeedleTailLogger(.init(label: "[CryptoSession]"))
     public var cache: SessionCache?
-    internal var transportDelegate: SessionTransport?
-    internal var receiverDelegate: NTMessageReceiver?
+    internal var transportDelegate: (any SessionTransport)?
+    internal var receiverDelegate: (any EventReceiver)?
+    internal var sessionDelegate: (any CryptoSessionDelegate)?
+    internal var eventDelegate: (any SessionEvents)?
     private(set) internal var _sessionContext: SessionContext?
     private var _appPassword = ""
     public var sessionContext: SessionContext? {
@@ -87,21 +62,33 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     
     /// Sets the transport delegate conforming to `SessionTransport`.
     /// - Parameter conformer: The conforming object to set as the transport delegate.
-    public func setTransportDelegate(conformer: SessionTransport?) {
+    public func setTransportDelegate(conformer: (any SessionTransport)?) {
         transportDelegate = conformer
     }
     
     /// Sets the database delegate conforming to `IdentityStore`.
     /// - Parameter conformer: The conforming object to set as the identity store.
-    public func setDatabaseDelegate(conformer: CryptoSessionStore?) async {
+    public func setDatabaseDelegate(conformer: (any CryptoSessionStore)?) async {
         if let conformer = conformer {
             cache = SessionCache(store: conformer)
             await cache?.setSynchronizer(self)
         }
     }
     
-    public func setReceiverDelegate(conformer: NTMessageReceiver?) {
+    public func setReceiverDelegate(conformer: (any EventReceiver)?) {
         receiverDelegate = conformer
+    }
+    
+    public func setCryptoSessionDelegate(conformer: (any CryptoSessionDelegate)?) async {
+        if let conformer = conformer {
+          sessionDelegate = conformer
+        }
+    }
+    
+    public func setSessionEventDelegate(conformer: (any SessionEvents)?) async {
+        if let conformer = conformer {
+          eventDelegate = conformer
+        }
     }
     
     public enum SessionErrors: String, Error {
@@ -132,6 +119,10 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         case accessDenied = "Denied Access to the requested resource"
         case userIsBlocked = "The User is Blocked, cannot request friendship changes"
         case missingMessage = "The Message cannot be processed because it is missing"
+        case missingMetadata = "The Metadata is missing"
+        case invalidDocument = "The Document is invalid"
+        case receiverDelegateNotSet = "The receiver delegate is not set"
+        case sessionDelegateNotSet = "The session delegate is not set"
     }
     
     public struct CryptographicBundle: Sendable {
@@ -153,7 +144,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             privateKey: privateKey.rawRepresentation)
         
         
-        let device = try await UserDeviceConfiguration(
+        let device = try UserDeviceConfiguration(
             deviceId: deviceKeys.deviceId,
             publicSigningKey: privateSigningKey.publicKey.rawRepresentation,
             publicKey: privateKey.publicKey.rawRepresentation,
@@ -260,7 +251,6 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 sessionContext.registrationState = .registered
                 await setSessionContext(sessionContext)
                 
-                
                 let encodedData = try BSONEncoder().encodeData(sessionContext)
                 guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: appSymmetricKey) else {
                     throw SessionErrors.sessionEncryptionError
@@ -269,11 +259,10 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 // Create local device configuration. Only locally cached and save. Private keys/info are stored. Use with care...
                 try await cache.createLocalSessionContext(encryptedConfig)
                 
-                
                 //Create Communication Model for personal messages
-                await self.logger.log(level: .debug, message: "Creating Communication Model")
+                self.logger.log(level: .debug, message: "Creating Communication Model")
                 
-                let communicationModel = try await taskProcessor.jobProcessor.createCommunicationModel(
+                let communicationModel = try await taskProcessor.createCommunicationModel(
                     recipients: [secretName],
                     communicationType: .personalMessage,
                     metadata: [:],
@@ -282,20 +271,20 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 guard var props = await communicationModel.props(symmetricKey: databaseEncryptionKey) else {
                     throw CryptoSession.SessionErrors.propsError
                 }
-                
+                //Used to communicated between personal messages in this case
                 props.sharedId = UUID()
                 
-                try await communicationModel.updateProps(symmetricKey: databaseEncryptionKey, props: props)
+                _ = try await communicationModel.updateProps(symmetricKey: databaseEncryptionKey, props: props)
                 
                 try await cache.createCommunication(communicationModel)
-                try await receiverDelegate?.updatedCommunication(communicationModel, members: [secretName])
-                await self.logger.log(level: .debug, message: "Created Communication Model")
+                await receiverDelegate?.updatedCommunication(communicationModel, members: [secretName])
+                self.logger.log(level: .debug, message: "Created Communication Model")
                 
             default:
                 throw sessionError
             }
         } catch {
-            await logger.log(level: .error, message: "Error Creating Session, \(error)")
+            logger.log(level: .error, message: "Error Creating Session, \(error)")
         }
         return CryptoSession.shared
     }
@@ -311,6 +300,11 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         // Create keys, we feed the SDK Consumer Keys in order to generate a QRCode for device linking
         let data = try BSONEncoder().encodeData(bundle.deviceConfiguration)
         if let credentials = await linkDelegate?.generatedDeviceCryptographic(data, password: password) {
+
+            guard let cache else {
+                throw SessionErrors.databaseNotInitialized
+            }
+            
             await setAppPassword(credentials.password)
             // Create a Session Identity
             let sessionUser = SessionUser(
@@ -336,14 +330,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 registrationState: .unregistered)
             await setSessionContext(sessionContext)
             
-            guard let cache else {
-                throw SessionErrors.databaseNotInitialized
-            }
-            
-            try? await cache.deleteLocalSessionContext()
-            try? await cache.deleteLocalDeviceSalt()
-            
-            guard let passwordData = await credentials.password.data(using: .utf8) else {
+            guard let passwordData = credentials.password.data(using: .utf8) else {
                 throw SessionErrors.appPasswordError
             }
             
@@ -366,9 +353,9 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             try await cache.createLocalSessionContext(encryptedConfig)
             
             //Create Communication Model for personal messages
-            await self.logger.log(level: .debug, message: "Creating Communication Model")
+            self.logger.log(level: .debug, message: "Creating Communication Model")
             let databaseSymmetricKey = try await getDatabaseSymmetricKey()
-            let communicationModel = try await taskProcessor.jobProcessor.createCommunicationModel(
+            let communicationModel = try await taskProcessor.createCommunicationModel(
                 recipients: [credentials.secretName],
                 communicationType: .personalMessage,
                 metadata: [:],
@@ -380,12 +367,11 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             
             props.sharedId = UUID()
             
-            try await communicationModel.updateProps(symmetricKey: databaseSymmetricKey, props: props)
+            _ = try await communicationModel.updateProps(symmetricKey: databaseSymmetricKey, props: props)
             
             try await cache.createCommunication(communicationModel)
-            try await receiverDelegate?.updatedCommunication(communicationModel, members: [credentials.secretName])
-            await self.logger.log(level: .debug, message: "Created Communication Model")
-            
+            await receiverDelegate?.updatedCommunication(communicationModel, members: [credentials.secretName])
+            self.logger.log(level: .debug, message: "Created Communication Model")
             return try await startSession(appPassword: credentials.password)
         } else {
             throw SessionErrors.registrationError
@@ -417,7 +403,11 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         try await cache?.updateLocalSessionContext(encryptedConfig)
     }
     
-    public func createNewUser(configuration: UserConfiguration, privateSigningKeyData: Data, devices: [UserDeviceConfiguration]) async throws -> UserConfiguration {
+    public func createNewUser(
+        configuration: UserConfiguration,
+        privateSigningKeyData: Data,
+        devices: [UserDeviceConfiguration]
+    ) async throws -> UserConfiguration {
         let privateSigningKey = try Curve25519SigningPrivateKey(rawRepresentation: privateSigningKeyData)
         guard configuration.publicSigningKey == privateSigningKey.publicKey.rawRepresentation else {
             throw CryptoSession.SessionErrors.invalidSignature
@@ -425,24 +415,11 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         
         // Verify the signature of the configuration
         guard try configuration.signed.verifySignature(publicKey: try Curve25519SigningPublicKey(rawRepresentation: configuration.publicSigningKey)) == true else { throw CryptoSession.SessionErrors.invalidSignature }
-        // Decode the existing devices from the signed data
-        var decoded = try BSONDecoder().decodeData([UserDeviceConfiguration].self, from: configuration.signed.data)
-        
-        
-        // Append the new device configuration
-        // Create a set of existing device IDs for quick lookup
-        let existingDeviceIds = Set(decoded.map { $0.deviceId })
-        
-        // Filter out duplicates from the new devices
-        let uniqueDevices = devices.filter { !existingDeviceIds.contains($0.deviceId) }
-        
-        // Append the unique devices to the decoded array
-        decoded.append(contentsOf: uniqueDevices)
-        
-        // Return a new UserConfiguration with the updated devices
+
+        // Return a new UserConfiguration with the fresh list of appoved devices according to the master device
         return try UserConfiguration(
             publicSigningKey: configuration.publicSigningKey,
-            devices: decoded,
+            devices: devices,
             privateSigningKey: privateSigningKey)
     }
     
@@ -496,7 +473,9 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     }
     
     public func getDatabaseSymmetricKey() async throws -> SymmetricKey {
-        guard let data = await sessionContext?.databaseEncryptionKey else { throw SessionErrors.sessionNotInitialized }
+        guard let data = await sessionContext?.databaseEncryptionKey else {
+            throw SessionErrors.sessionNotInitialized
+        }
         return SymmetricKey(data: data)
     }
     
@@ -515,8 +494,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     
     public func verifyAppPassword(_ appPassword: String) async -> Bool {
         do {
-            
-            guard let passwordData = await appPassword.data(using: .utf8) else {
+            guard let passwordData = appPassword.data(using: .utf8) else {
                 throw SessionErrors.invalidPassword
             }
             
@@ -525,6 +503,9 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             let appEncryptionKey = await crypto.deriveStrictSymmetricKey(
                 data: passwordData,
                 salt: saltData)
+            
+            await setAppPassword(appPassword)
+            
             guard let data = try await self.cache?.findLocalSessionContext() else { return false }
             let box = try AES.GCM.SealedBox(combined: data)
             _ = try AES.GCM.open(box, using: appEncryptionKey)
@@ -545,7 +526,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             throw SessionErrors.sessionDecryptionError
         }
         // Decode the session context from the decrypted data
-        var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+        let sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
         try await cache.deleteLocalDeviceSalt()
         
         guard let passwordData = newPassword.data(using: .utf8) else {
@@ -564,17 +545,17 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             throw SessionErrors.sessionEncryptionError
         }
         
+        await setAppPassword(newPassword)
+        
         // Create local device configuration. Only locally cached and save. Private keys/info are stored. Use with care...
         try await cache.updateLocalSessionContext(encryptedConfig)
-        
-        await setAppPassword(newPassword)
     }
     
     public func resumeJobQueue() async throws {
         guard let cache else {
             throw SessionErrors.databaseNotInitialized
         }
-        try await taskProcessor.jobProcessor.loadJobs(
+        try await taskProcessor.loadTasks(
             nil,
             cache: cache,
             symmetricKey: getDatabaseSymmetricKey(),
@@ -613,7 +594,8 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         var model = [CChar](repeating: 0, count: size)
         sysctlbyname("hw.model", &model, &size, nil, 0)
         
-        return String(cString: model)
+        let data = Data(bytes: model, count: size)
+        return String(data: data, encoding: .utf8) ?? "Uknown Model"
     }
     
 #endif

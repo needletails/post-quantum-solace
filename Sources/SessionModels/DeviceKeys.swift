@@ -21,4 +21,10 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     public let privateSigningKey: Data
     /// Data representing the private key of the device.
     public let privateKey: Data
+    
+    public init(deviceId: UUID, privateSigningKey: Data, privateKey: Data) {
+        self.deviceId = deviceId
+        self.privateSigningKey = privateSigningKey
+        self.privateKey = privateKey
+    }
 }

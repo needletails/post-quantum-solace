@@ -16,22 +16,33 @@ let package = Package(
             targets: ["CryptoSession"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-crypto.git", .upToNextMajor(from: "3.8.0")),
-//        .package(url: "git@github.com:needle-tail/double-ratchet-kit.git", branch: "main"),
-        .package(path: "../double-ratchet-kit"),
-        .package(path: "../needletail-crypto")
-//        .package(url: "git@github.com:needle-tail/needletail-crypto.git", branch: "main")
+        .package(url: "https://github.com/apple/swift-crypto.git", .upToNextMajor(from: "3.12.3")),
+        .package(url: "git@github.com:needle-tail/double-ratchet-kit.git", .upToNextMajor(from: "1.0.0")),
+        .package(url: "git@github.com:needle-tail/needletail-crypto.git", .upToNextMajor(from: "1.0.12")),
+        .package(url: "git@github.com:needle-tail/needletail-logger.git", .upToNextMajor(from: "3.0.0")),
+        .package(url: "git@github.com:needletails/needletail-algorithms.git", .upToNextMajor(from: "2.0.0")),
     ],
     targets: [
         // Targets are the basic building blocks of a package, defining a module or a test suite.
         // Targets can depend on other targets in this package and products from dependencies.
         .target(
             name: "CryptoSession", dependencies: [
+                "SessionEvents",
+                "SessionModels",
                 .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "DoubleRatchetKit", package: "double-ratchet-kit"),
-                .product(name: "NeedleTailCrypto", package: "needletail-crypto")
+                .product(name: "NeedleTailCrypto", package: "needletail-crypto"),
+                .product(name: "NeedleTailLogger", package: "needletail-logger"),
+                .product(name: "NeedleTailAlgorithms", package: "needletail-algorithms")
                 
             ]),
+        .target(name: "SessionEvents", dependencies: [
+            "SessionModels",
+            .product(name: "DoubleRatchetKit", package: "double-ratchet-kit")
+        ]),
+        .target(name: "SessionModels", dependencies: [
+            .product(name: "DoubleRatchetKit", package: "double-ratchet-kit")
+        ]),
         .testTarget(
             name: "CryptoSessionTests",
             dependencies: ["CryptoSession"]
