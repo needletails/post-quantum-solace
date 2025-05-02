@@ -14,3 +14,5 @@ DerivedData/
 *.swp
 *.lock
 *.DS_Store
+Package.resolved
+.swiftpm

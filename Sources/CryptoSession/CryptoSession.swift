@@ -6,78 +6,72 @@
 //
 
 import Foundation
-import BSON
+import SessionModels
+import SessionEvents
 import NeedleTailCrypto
 import NeedleTailLogger
-@preconcurrency import Crypto
-#if os(iOS)
-import UIKit
-#elseif os(macOS)
-import AppKit
-#endif
+import Crypto
+import BSON
+import DoubleRatchetKit
 
-public enum RegistrationState: Codable, Sendable {
-    case registered, unregistered
-}
-
-public struct LinkDeviceInfo: Sendable {
-    public let secretName: String
-    public let devices: [UserDeviceConfiguration]
-    public let password: String
-    
-    public init(
-        secretName: String,
-        devices: [UserDeviceConfiguration],
-        password: String
-    ) {
-        self.secretName = secretName
-        self.devices = devices
-        self.password = password
-    }
-}
-
-public protocol DeviceLinkingDelegate: AnyObject, Sendable {
-    func generatedDeviceCryptographic(_ data: Data, password: String) async -> LinkDeviceInfo?
-}
-
+/// The `CryptoSession` actor manages cryptographic sessions, including key management,
+/// session context, and communication with other components in the system. It conforms
+/// to `NetworkDelegate` and `SessionCacheSynchronizer` protocols, allowing it to handle
+/// network operations and synchronize session data with a cache.
+///
+/// This actor is designed to be a singleton, providing a centralized point for managing
+/// cryptographic operations and session states across the application.
 public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     
+    // Unique identifier for the session
     nonisolated let id = UUID()
+    
     // Indicates if the session is viable for operations
     nonisolated(unsafe) public var isViable: Bool = false
     
     // Singleton instance of CryptoSession
     public static let shared = CryptoSession()
+    
+    // Private initializer to enforce singleton usage
     init() {}
     
-    private let crypto = NeedleTailCrypto()
-    let taskProcessor = TaskProcessor()
-    let logger = NeedleTailLogger(.init(label: "[CryptoSession]"))
-    public var cache: SessionCache?
-    internal var transportDelegate: SessionTransport?
-    internal var receiverDelegate: NTMessageReceiver?
-    private(set) internal var _sessionContext: SessionContext?
-    private var _appPassword = ""
+    private let crypto = NeedleTailCrypto() // Instance of the cryptographic utility
+    private(set) var _sessionContext: SessionContext? // Current session context
+    private var _appPassword = "" // Application password
+    let logger = NeedleTailLogger(.init(label: "[CryptoSession]")) // Logger for the session
+    var taskProcessor = TaskProcessor() // Task processor for handling asynchronous tasks
+    var transportDelegate: (any SessionTransport)? // Delegate for transport operations
+    var receiverDelegate: (any EventReceiver)? // Delegate for receiving events
+    var sessionDelegate: (any CryptoSessionDelegate)? // Delegate for session-related events
+    var eventDelegate: (any SessionEvents)? // Delegate for session events
+    public nonisolated(unsafe) weak var linkDelegate: DeviceLinkingDelegate? // Delegate for device linking
+    public var cache: SessionCache? // Cache for session data
+    
+    // Asynchronously retrieves the current session context
     public var sessionContext: SessionContext? {
         get async {
             _sessionContext
         }
     }
-
+    
+    // Sets the session context
     public func setSessionContext(_ context: SessionContext) async {
         _sessionContext = context
     }
     
+    // Asynchronously retrieves the application password
     public var appPassword: String {
         get async {
             _appPassword
         }
     }
     
+    // Sets the application password
     func setAppPassword(_ password: String) async {
         _appPassword = password
     }
     
+    // Synchronizes the local configuration with the provided data
     func synchronizeLocalConfiguration(_ data: Data) async throws {
         let symmetricKey = try await self.getAppSymmetricKey()
         guard let decryptedData = try self.crypto.decrypt(data: data, symmetricKey: symmetricKey) else { return }
@@ -87,23 +81,40 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     
     /// Sets the transport delegate conforming to `SessionTransport`.
     /// - Parameter conformer: The conforming object to set as the transport delegate.
-    public func setTransportDelegate(conformer: SessionTransport?) {
+    public func setTransportDelegate(conformer: (any SessionTransport)?) async {
         transportDelegate = conformer
+        await taskProcessor.setDelegate(conformer)
     }
     
     /// Sets the database delegate conforming to `IdentityStore`.
     /// - Parameter conformer: The conforming object to set as the identity store.
-    public func setDatabaseDelegate(conformer: CryptoSessionStore?) async {
+    public func setDatabaseDelegate(conformer: (any CryptoSessionStore)?) async {
         if let conformer = conformer {
             cache = SessionCache(store: conformer)
             await cache?.setSynchronizer(self)
         }
     }
     
-    public func setReceiverDelegate(conformer: NTMessageReceiver?) {
+    // Sets the receiver delegate
+    public func setReceiverDelegate(conformer: (any EventReceiver)?) {
         receiverDelegate = conformer
     }
     
+    // Sets the crypto session delegate
+    public func setCryptoSessionDelegate(conformer: (any CryptoSessionDelegate)?) async {
+        if let conformer = conformer {
+            sessionDelegate = conformer
+        }
+    }
+    
+    // Sets the session event delegate
+    public func setSessionEventDelegate(conformer: (any SessionEvents)?) async {
+        if let conformer = conformer {
+            eventDelegate = conformer
+        }
+    }
+    
+    // Enum representing various session-related errors
     public enum SessionErrors: String, Error {
         case saltError = "Salt error occurred."
         case databaseNotInitialized = "Database is not initialized."
@@ -126,56 +137,137 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         case registrationError = "Registration error."
         case userExists = "User already exists."
         case cannotFindUserConfiguration = "Cannot find user configuration."
+        case cannotFindOneTimeKey = "Cannot find a one-time key for the user."
+        case oneTimeKeyUploadFailed = "Failed to upload one-time key for the user."
+        case oneTimeKeyDeletionFailed = "Failed to delete one-time key for the user."
         case unknownError = "An unknown error occurred."
-        case missingAuthInfo = "Missing authentication information in the payload"
-        case userNotFound = "Could not find the user requested"
-        case accessDenied = "Denied Access to the requested resource"
-        case userIsBlocked = "The User is Blocked, cannot request friendship changes"
-        case missingMessage = "The Message cannot be processed because it is missing"
+        case missingAuthInfo = "Missing authentication information in the payload."
+        case userNotFound = "Could not find the user requested."
+        case accessDenied = "Denied access to the requested resource."
+        case userIsBlocked = "The user is blocked; cannot request friendship changes."
+        case missingMessage = "The message cannot be processed because it is missing."
+        case missingMetadata = "The metadata is missing."
+        case invalidDocument = "The document is invalid."
+        case receiverDelegateNotSet = "The receiver delegate is not set."
+        case invalidKeyId = "The Key ID is invalid."
     }
     
+    /// A struct representing a bundle of cryptographic data for a device.
     public struct CryptographicBundle: Sendable {
-        public let deviceKeys: DeviceKeys
-        let deviceConfiguration: UserDeviceConfiguration
-        let userConfiguration: UserConfiguration
+        public let deviceKeys: DeviceKeys // Keys associated with the device
+        let deviceConfiguration: UserDeviceConfiguration // Configuration for the device
+        let userConfiguration: UserConfiguration // User configuration associated with the device
     }
     
-    // We only need UserDeviceConfiguration object which is nested into the user configuration of key publishing we send this info to the server with an identifier, in our case this is a secretName. We can generate these keys for child device creation and present the data as a QRCode that the master device scans along with the child devices' deviceId along with the secret name from the master device. Whe then publish it to the server. We then need to send a message to the child device to register their session identity and then start the session. Publishing Child Devices should happen from the master device if we publish keys this way.
+    /// A struct to represent a key pair with a UUID for both public and private keys.
+    public struct KeyPair {
+        public let id: UUID // Unique identifier for the key pair
+        public let publicKey: Curve25519PublicKeyRepresentable // Public key
+        public let privateKey: Curve25519PrivateKeyRepresentable // Private key
+    }
+    
+    /// Creates a cryptographic bundle for a device, including keys and configurations.
+    ///
+    /// This asynchronous function generates a set of cryptographic keys for a device,
+    /// either as a master device or a child device. It creates long-term and one-time
+    /// keys, signs the device configuration, and prepares the data for publishing to
+    /// the server. The generated keys can be presented as a QR code for easy scanning
+    /// by other devices.
+    ///
+    /// - Parameter isMaster: A boolean indicating whether the device being created is
+    ///                       a master device or a child device.
+    ///
+    /// - Throws:
+    ///   - `CryptoErrors`: If there is an error generating keys or creating configurations.
+    ///
+    /// - Returns: A `CryptographicBundle` containing the generated device keys, device
+    ///            configuration, and user configuration.
     public func createDeviceCryptographicBundle(isMaster: Bool) async throws -> CryptographicBundle {
+        // Generate a private long-term key for the device
+        let privateLongTermKey = crypto.generateCurve25519PrivateKey()
         
-        let privateKey = crypto.generateCurve25519PrivateKey()
+        // Generate 100 private one-time key pairs
+        let privateOneTimeKeyPairs: [KeyPair] = try (0..<100).map { _ in
+            let id = UUID()
+            let privateKey = crypto.generateCurve25519PrivateKey()
+            let privateKeyRep = try Curve25519PrivateKeyRepresentable(id: id, privateKey.rawRepresentation)
+            let publicKey = try Curve25519PublicKeyRepresentable(id: id, privateKey.publicKey.rawRepresentation)
+            return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+        }
+        
+        // Generate a private signing key
         let privateSigningKey = crypto.generateCurve25519SigningPrivateKey()
+        
+        // Generate a Kyber 1024 private signing key
+        let kyber1024PrivateKey = try crypto.generateKyber1024PrivateSigningKey()
+        
+        // Create a unique device ID
         let deviceId = UUID()
         
+        // Generate HMAC data for the device
+        let hmacData = SymmetricKey(size: .bits256).withUnsafeBytes({ Data($0) })
+        
+        // Create device keys object
         let deviceKeys = DeviceKeys(
             deviceId: deviceId,
             privateSigningKey: privateSigningKey.rawRepresentation,
-            privateKey: privateKey.rawRepresentation)
+            privateLongTermKey: privateLongTermKey.rawRepresentation,
+            privateOneTimeKeys: privateOneTimeKeyPairs.map { $0.privateKey },
+            kyber1024PrivateKey: kyber1024PrivateKey.encode()
+        )
         
-        
-        let device = try await UserDeviceConfiguration(
+        // Create a user device configuration
+        let device = try UserDeviceConfiguration(
             deviceId: deviceKeys.deviceId,
             publicSigningKey: privateSigningKey.publicKey.rawRepresentation,
-            publicKey: privateKey.publicKey.rawRepresentation,
+            publicLongTermKey: privateLongTermKey.publicKey.rawRepresentation,
+            kyber1024PublicKey: kyber1024PrivateKey.publicKey.rawRepresentation,
             deviceName: getDeviceName(),
-            isMasterDevice: isMaster)
+            hmacData: hmacData,
+            isMasterDevice: isMaster
+        )
         
-        let userConfiguration = try UserConfiguration(
+        // Sign the device configuration
+        let signedDeviceConfiguration = try UserConfiguration.SignedDeviceConfiguration(
+            device: device,
+            signingKey: privateSigningKey
+        )
+        
+        // Create signed public one-time keys for each one-time key pair
+        let signedPublicOneTimeKeys: [UserConfiguration.SignedPublicOneTimeKey] = try privateOneTimeKeyPairs.map { keyPair in
+            try UserConfiguration.SignedPublicOneTimeKey(
+                key: keyPair.publicKey,
+                deviceId: deviceId,
+                signingKey: privateSigningKey
+            )
+        }
+        
+        // Create the user configuration with the signed device and keys
+        let userConfiguration = UserConfiguration(
             publicSigningKey: privateSigningKey.publicKey.rawRepresentation,
-            devices: [device],
-            privateSigningKey: privateSigningKey)
+            signedDevices: [signedDeviceConfiguration],
+            signedPublicOneTimeKeys: signedPublicOneTimeKeys
+        )
         
+        // Return the complete cryptographic bundle
         return CryptographicBundle(
             deviceKeys: deviceKeys,
             deviceConfiguration: device,
-            userConfiguration: userConfiguration)
-        
+            userConfiguration: userConfiguration
+        )
     }
     
-    private func generateDatabasaeEncryptionKey() -> Data {
+    /// Generates a symmetric key for database encryption.
+    ///
+    /// This private function creates a symmetric key of 256 bits for encrypting
+    /// database models. The key is returned as a `Data` object.
+    ///
+    /// - Returns: A `Data` object representing the generated database encryption key.
+    private func generateDatabaseEncryptionKey() -> Data {
         let databaseSymmetricKey = SymmetricKey(size: .bits256)
         return databaseSymmetricKey.withUnsafeBytes { Data($0) }
     }
+    
     
     
     /// Creates a new session with the provided secret name and application password.
@@ -207,17 +299,16 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             secretName: secretName,
             deviceId: bundle.deviceKeys.deviceId,
             deviceKeys: bundle.deviceKeys,
-            metadata: .init()
-        )
+            metadata: .init())
         
         var sessionContext = SessionContext(
             sessionUser: sessionUser,
-            databaseEncryptionKey: generateDatabasaeEncryptionKey(),
+            databaseEncryptionKey: generateDatabaseEncryptionKey(),
             sessionContextId: .random(in: 1 ..< .max),
             lastUserConfiguration: bundle.userConfiguration,
             registrationState: .unregistered)
         await setSessionContext(sessionContext)
-
+        
         guard let passwordData = appPassword.data(using: .utf8) else {
             throw SessionErrors.appPasswordError
         }
@@ -248,7 +339,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             //SHOULD NEVER HAPPEN
             throw SessionErrors.unknownError
         } catch let sessionError as SessionErrors {
-
+            
             switch sessionError {
             case .userExists:
                 throw sessionError
@@ -260,7 +351,6 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 sessionContext.registrationState = .registered
                 await setSessionContext(sessionContext)
                 
-                
                 let encodedData = try BSONEncoder().encodeData(sessionContext)
                 guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: appSymmetricKey) else {
                     throw SessionErrors.sessionEncryptionError
@@ -269,11 +359,10 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 // Create local device configuration. Only locally cached and save. Private keys/info are stored. Use with care...
                 try await cache.createLocalSessionContext(encryptedConfig)
                 
-                
                 //Create Communication Model for personal messages
-                await self.logger.log(level: .debug, message: "Creating Communication Model")
+                self.logger.log(level: .debug, message: "Creating Communication Model")
                 
-                let communicationModel = try await taskProcessor.jobProcessor.createCommunicationModel(
+                let communicationModel = try await taskProcessor.createCommunicationModel(
                     recipients: [secretName],
                     communicationType: .personalMessage,
                     metadata: [:],
@@ -282,36 +371,65 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 guard var props = await communicationModel.props(symmetricKey: databaseEncryptionKey) else {
                     throw CryptoSession.SessionErrors.propsError
                 }
-                
+                //Used to communicated between personal messages in this case
                 props.sharedId = UUID()
                 
-                try await communicationModel.updateProps(symmetricKey: databaseEncryptionKey, props: props)
+                _ = try await communicationModel.updateProps(symmetricKey: databaseEncryptionKey, props: props)
                 
                 try await cache.createCommunication(communicationModel)
-                try await receiverDelegate?.updatedCommunication(communicationModel, members: [secretName])
-                await self.logger.log(level: .debug, message: "Created Communication Model")
+                await receiverDelegate?.updatedCommunication(communicationModel, members: [secretName])
+                self.logger.log(level: .debug, message: "Created Communication Model")
                 
             default:
                 throw sessionError
             }
         } catch {
-            await logger.log(level: .error, message: "Error Creating Session, \(error)")
+            logger.log(level: .error, message: "Error Creating Session, \(error)")
         }
         return CryptoSession.shared
     }
     
-    public nonisolated(unsafe) weak var linkDelegate: DeviceLinkingDelegate?
-    
-    // This call must be followed by start session.
+    /// This call must be followed by start session.
+    /// Links a device to the current session by generating cryptographic credentials.
+    ///
+    /// This asynchronous function links a new device to the current session by
+    /// generating cryptographic credentials based on the provided device configuration
+    /// and password. It creates a session identity, derives a symmetric key, and
+    /// sets up the session context. It also creates a communication model for personal
+    /// messages. This call must be followed by a call to `startSession`.
+    ///
+    /// - Parameters:
+    ///   - bundle: A `CryptographicBundle` containing the device configuration and keys.
+    ///   - password: A string representing the password used for cryptographic operations.
+    ///
+    /// - Throws:
+    ///   - `SessionErrors.databaseNotInitialized`: If the cache is not initialized.
+    ///   - `SessionErrors.appPasswordError`: If there is an error retrieving the password data.
+    ///   - `SessionErrors.sessionEncryptionError`: If the session context cannot be encrypted successfully.
+    ///   - `SessionErrors.registrationError`: If the device linking process fails.
+    ///   - `CryptoSession.SessionErrors.propsError`: If there is an error retrieving or updating properties in the communication model.
+    ///
+    /// - Returns: A `CryptoSession` object representing the newly created session.
     public func linkDevice(
         bundle: CryptographicBundle,
         password: String
     ) async throws -> CryptoSession {
+        // Set the application password
         await setAppPassword(password)
-        // Create keys, we feed the SDK Consumer Keys in order to generate a QRCode for device linking
+        
+        // Encode the device configuration to prepare for QR code generation
         let data = try BSONEncoder().encodeData(bundle.deviceConfiguration)
+        
+        // Generate cryptographic credentials for device linking
         if let credentials = await linkDelegate?.generatedDeviceCryptographic(data, password: password) {
+            
+            guard let cache else {
+                throw SessionErrors.databaseNotInitialized
+            }
+            
+            // Set the application password from the generated credentials
             await setAppPassword(credentials.password)
+            
             // Create a Session Identity
             let sessionUser = SessionUser(
                 secretName: credentials.secretName,
@@ -320,81 +438,112 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 metadata: .init()
             )
             
-            //Used as the name suggestion to encrypt the local db models, this is their SymmetricKey
-            let databaseEncryptionKey = generateDatabasaeEncryptionKey()
+            // Generate a symmetric key for encrypting local database models
+            let databaseEncryptionKey = generateDatabaseEncryptionKey()
             
+            // Create a new user configuration with the provided device keys and configurations
             let userConfiguration = try await createNewUser(
                 configuration: bundle.userConfiguration,
                 privateSigningKeyData: bundle.deviceKeys.privateSigningKey,
-                devices: credentials.devices)
+                devices: credentials.devices,
+                keys: bundle.userConfiguration.getVerifiedKeys(deviceId: bundle.deviceKeys.deviceId)
+            )
             
+            // Create a new session context with the session user and user configuration
             var sessionContext = SessionContext(
                 sessionUser: sessionUser,
                 databaseEncryptionKey: databaseEncryptionKey,
                 sessionContextId: .random(in: 1 ..< .max),
                 lastUserConfiguration: userConfiguration,
-                registrationState: .unregistered)
+                registrationState: .unregistered
+            )
+            
+            // Set the session context
             await setSessionContext(sessionContext)
             
-            guard let cache else {
-                throw SessionErrors.databaseNotInitialized
-            }
-            
-            try? await cache.deleteLocalSessionContext()
-            try? await cache.deleteLocalDeviceSalt()
-            
-            guard let passwordData = await credentials.password.data(using: .utf8) else {
+            // Convert the password to data for deriving the symmetric key
+            guard let passwordData = credentials.password.data(using: .utf8) else {
                 throw SessionErrors.appPasswordError
             }
             
-            // Retrieve salt and derive symmetric key
+            // Retrieve salt and derive the symmetric key
             let saltData = try await cache.findLocalDeviceSalt(keyData: passwordData)
-            
             let symmetricKey = await crypto.deriveStrictSymmetricKey(
                 data: passwordData,
-                salt: saltData)
+                salt: saltData
+            )
             
+            // Update the registration state to registered
             sessionContext.registrationState = .registered
             await setSessionContext(sessionContext)
             
+            // Encode the updated session context for encryption
             let encodedData = try BSONEncoder().encode(sessionContext).makeData()
+            
+            // Encrypt the session context using the derived symmetric key
             guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: symmetricKey) else {
                 throw SessionErrors.sessionEncryptionError
             }
             
-            // Create local device configuration. Only locally cached and save. Private keys/info are stored. Use with care...
+            // Create a local session context with the encrypted data
             try await cache.createLocalSessionContext(encryptedConfig)
             
-            //Create Communication Model for personal messages
-            await self.logger.log(level: .debug, message: "Creating Communication Model")
+            // Create a communication model for personal messages
+            self.logger.log(level: .debug, message: "Creating Communication Model")
             let databaseSymmetricKey = try await getDatabaseSymmetricKey()
-            let communicationModel = try await taskProcessor.jobProcessor.createCommunicationModel(
+            let communicationModel = try await taskProcessor.createCommunicationModel(
                 recipients: [credentials.secretName],
                 communicationType: .personalMessage,
                 metadata: [:],
-                symmetricKey: databaseSymmetricKey)
+                symmetricKey: databaseSymmetricKey
+            )
             
+            // Update properties of the communication model
             guard var props = await communicationModel.props(symmetricKey: databaseSymmetricKey) else {
                 throw CryptoSession.SessionErrors.propsError
             }
             
             props.sharedId = UUID()
             
-            try await communicationModel.updateProps(symmetricKey: databaseSymmetricKey, props: props)
+            // Update the communication model with the new properties
+            _ = try await communicationModel.updateProps(symmetricKey: databaseSymmetricKey, props: props)
             
+            // Create the communication in the cache
             try await cache.createCommunication(communicationModel)
-            try await receiverDelegate?.updatedCommunication(communicationModel, members: [credentials.secretName])
-            await self.logger.log(level: .debug, message: "Created Communication Model")
             
+            // Notify the receiver delegate about the updated communication model
+            await receiverDelegate?.updatedCommunication(communicationModel, members: [credentials.secretName])
+            self.logger.log(level: .debug, message: "Created Communication Model")
+            
+            // Start the session and return the CryptoSession
             return try await startSession(appPassword: credentials.password)
         } else {
             throw SessionErrors.registrationError
         }
     }
     
+    
+    
+    /// Updates the user's configuration with new device configurations.
+    ///
+    /// This asynchronous function updates the user's configuration by incorporating
+    /// new device configurations. It retrieves the current session context from the
+    /// cache, decrypts it, creates a new user configuration with the updated devices,
+    /// and then re-encrypts the session context before saving it back to the cache.
+    ///
+    /// - Parameter devices: An array of `UserDeviceConfiguration` objects representing
+    ///                     the new devices to be associated with the user's configuration.
+    ///
+    /// - Throws:
+    ///   - `SessionErrors.sessionDecryptionError`: If the session context cannot be
+    ///     decrypted successfully.
+    ///   - `CryptoSession.SessionErrors.sessionEncryptionError`: If the updated session
+    ///     context cannot be encrypted successfully.
     public func updateUserConfiguration(_ devices: [UserDeviceConfiguration]) async throws {
+        // Retrieve the current session context from the cache
         guard let data = try await cache?.findLocalSessionContext() else { return }
         
+        // Decrypt the session context data using the app's symmetric key
         guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
             throw SessionErrors.sessionDecryptionError
         }
@@ -402,49 +551,162 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         // Decode the session context from the decrypted data
         var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
         
+        // Create a new user configuration with the updated devices
         let userConfiguration = try await createNewUser(
             configuration: sessionContext.lastUserConfiguration,
             privateSigningKeyData: sessionContext.sessionUser.deviceKeys.privateSigningKey,
-            devices: devices)
+            devices: devices,
+            keys: sessionContext.lastUserConfiguration.getVerifiedKeys(deviceId: sessionContext.sessionUser.deviceId)
+        )
+        
+        // Update the last user configuration in the session context
         sessionContext.lastUserConfiguration = userConfiguration
+        
+        // Save the updated session context back to the cache
         await setSessionContext(sessionContext)
         
+        // Encode the updated session context to prepare for encryption
         let encodedData = try BSONEncoder().encode(sessionContext).makeData()
+        
+        // Encrypt the updated session context using the app's symmetric key
         guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
             throw CryptoSession.SessionErrors.sessionEncryptionError
         }
         
+        // Update the local session context in the cache with the encrypted data
         try await cache?.updateLocalSessionContext(encryptedConfig)
     }
     
-    public func createNewUser(configuration: UserConfiguration, privateSigningKeyData: Data, devices: [UserDeviceConfiguration]) async throws -> UserConfiguration {
-        let privateSigningKey = try Curve25519SigningPrivateKey(rawRepresentation: privateSigningKeyData)
-        guard configuration.publicSigningKey == privateSigningKey.publicKey.rawRepresentation else {
+    
+    /// Updates the user's public one-time keys in the session context.
+    ///
+    /// This asynchronous function updates the user's public one-time keys in the
+    /// existing session context. It retrieves the current session context from the
+    /// cache, decrypts it, updates the public one-time keys, and then re-encrypts
+    /// the session context before saving it back to the cache.
+    ///
+    /// - Parameter keys: An array of `UserConfiguration.SignedPublicOneTimeKey` objects
+    ///                   representing the new public one-time keys to be associated
+    ///                   with the user's configuration.
+    ///
+    /// - Throws:
+    ///   - `SessionErrors.sessionDecryptionError`: If the session context cannot be
+    ///     decrypted successfully.
+    ///   - `CryptoSession.SessionErrors.sessionEncryptionError`: If the updated session
+    ///     context cannot be encrypted successfully.
+    public func updateUserPublicOneTimeKeys(_ keys: [UserConfiguration.SignedPublicOneTimeKey]) async throws {
+        // Retrieve the current session context from the cache
+        guard let data = try await cache?.findLocalSessionContext() else { return }
+        
+        // Decrypt the session context data using the app's symmetric key
+        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
+            throw SessionErrors.sessionDecryptionError
+        }
+        
+        // Decode the session context from the decrypted data
+        var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+        
+        // Create a new UserConfiguration with the updated public one-time keys
+        let userConfiguration = UserConfiguration(
+            publicSigningKey: sessionContext.lastUserConfiguration.publicSigningKey,
+            signedDevices: sessionContext.lastUserConfiguration.signedDevices,
+            signedPublicOneTimeKeys: keys)
+        
+        // Update the last user configuration in the session context
+        sessionContext.lastUserConfiguration = userConfiguration
+        
+        // Save the updated session context back to the cache
+        await setSessionContext(sessionContext)
+        
+        // Encode the updated session context to prepare for encryption
+        let encodedData = try BSONEncoder().encode(sessionContext).makeData()
+        
+        // Encrypt the updated session context using the app's symmetric key
+        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
+            throw CryptoSession.SessionErrors.sessionEncryptionError
+        }
+        
+        // Update the local session context in the cache with the encrypted data
+        try await cache?.updateLocalSessionContext(encryptedConfig)
+    }
+    
+    
+    /// Creates a new user configuration by signing device configurations and public keys.
+    ///
+    /// This asynchronous function takes a user configuration, a private signing key,
+    /// a list of device configurations, and a list of public keys. It reconstructs the
+    /// signing key, verifies the public signing key against the provided configuration,
+    /// and signs each device configuration and public key with the private signing key.
+    /// If any verification fails, an error is thrown.
+    ///
+    /// - Parameters:
+    ///   - configuration: The initial user configuration containing the public signing key
+    ///                    and a list of signed devices.
+    ///   - privateSigningKeyData: The raw data representation of the private signing key
+    ///                            used for signing the device configurations and keys.
+    ///   - devices: An array of `UserDeviceConfiguration` objects representing the devices
+    ///              to be associated with the new user.
+    ///   - keys: An array of `Curve25519PublicKeyRepresentable` objects representing the
+    ///           public keys to be signed for the devices.
+    ///
+    /// - Throws:
+    ///   - `CryptoSession.SessionErrors.invalidSignature`: If the public signing key does
+    ///     not match the reconstructed private signing key or if any device's signature
+    ///     verification fails.
+    ///
+    /// - Returns: A new `UserConfiguration` object containing the public signing key,
+    ///            signed device configurations, and signed public one-time keys.
+    public func createNewUser(
+        configuration: UserConfiguration,
+        privateSigningKeyData: Data,
+        devices: [UserDeviceConfiguration],
+        keys: [Curve25519PublicKeyRepresentable]
+    ) async throws -> UserConfiguration {
+        // 1) Reconstruct your Curve25519 signing key
+        let privateSigningKey = try Curve25519SigningPrivateKey(
+            rawRepresentation: privateSigningKeyData
+        )
+        let publicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.publicSigningKey)
+        
+        // Verify that the public signing key matches the reconstructed private signing key
+        guard publicSigningKey.rawRepresentation == privateSigningKey.publicKey.rawRepresentation else {
             throw CryptoSession.SessionErrors.invalidSignature
         }
         
-        // Verify the signature of the configuration
-        guard try configuration.signed.verifySignature(publicKey: try Curve25519SigningPublicKey(rawRepresentation: configuration.publicSigningKey)) == true else { throw CryptoSession.SessionErrors.invalidSignature }
-        // Decode the existing devices from the signed data
-        var decoded = try BSONDecoder().decodeData([UserDeviceConfiguration].self, from: configuration.signed.data)
+        // 2) Verify each signed device using the public signing key
+        for device in configuration.signedDevices {
+            if try (device.verified(using: publicSigningKey) != nil) == false {
+                throw CryptoSession.SessionErrors.invalidSignature
+            }
+        }
         
+        // 3) For each device, build its SignedDeviceConfiguration
+        let signedDevices: [UserConfiguration.SignedDeviceConfiguration] = try devices.map { device in
+            try UserConfiguration.SignedDeviceConfiguration(
+                device: device,
+                signingKey: privateSigningKey)
+        }
         
-        // Append the new device configuration
-        // Create a set of existing device IDs for quick lookup
-        let existingDeviceIds = Set(decoded.map { $0.deviceId })
+        // Create signed public one-time keys for each device
+        let signedKeys: [UserConfiguration.SignedPublicOneTimeKey] = try devices.flatMap { device in
+            try keys.map { key in
+                try UserConfiguration.SignedPublicOneTimeKey(
+                    key: key,
+                    deviceId: device.deviceId,
+                    signingKey: privateSigningKey
+                )
+            }
+        }
         
-        // Filter out duplicates from the new devices
-        let uniqueDevices = devices.filter { !existingDeviceIds.contains($0.deviceId) }
-        
-        // Append the unique devices to the decoded array
-        decoded.append(contentsOf: uniqueDevices)
-        
-        // Return a new UserConfiguration with the updated devices
-        return try UserConfiguration(
-            publicSigningKey: configuration.publicSigningKey,
-            devices: decoded,
-            privateSigningKey: privateSigningKey)
+        // 4) Return the new per-device-signed UserConfiguration
+        return UserConfiguration(
+            publicSigningKey: publicSigningKey.rawRepresentation,
+            signedDevices: signedDevices,
+            signedPublicOneTimeKeys: signedKeys
+        )
     }
+    
+    
     
     /// Starts a session using the provided application password.
     ///
@@ -487,7 +749,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             
             // Decode the session context from the decrypted data
             let sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
-           
+            
             await setSessionContext(sessionContext)
             return CryptoSession.shared
         } catch {
@@ -495,11 +757,15 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
     
+    /// Retrieves the symmetric key for database encryption.
     public func getDatabaseSymmetricKey() async throws -> SymmetricKey {
-        guard let data = await sessionContext?.databaseEncryptionKey else { throw SessionErrors.sessionNotInitialized }
+        guard let data = await sessionContext?.databaseEncryptionKey else {
+            throw SessionErrors.sessionNotInitialized
+        }
         return SymmetricKey(data: data)
     }
     
+    /// Derives the symmetric key from the application password.
     public func getAppSymmetricKey() async throws -> SymmetricKey {
         guard let passwordData = await appPassword.data(using: .utf8) else {
             throw SessionErrors.invalidPassword
@@ -513,10 +779,10 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             salt: saltData)
     }
     
+    /// Verifies an input password against stored session context.
     public func verifyAppPassword(_ appPassword: String) async -> Bool {
         do {
-            
-            guard let passwordData = await appPassword.data(using: .utf8) else {
+            guard let passwordData = appPassword.data(using: .utf8) else {
                 throw SessionErrors.invalidPassword
             }
             
@@ -525,6 +791,9 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             let appEncryptionKey = await crypto.deriveStrictSymmetricKey(
                 data: passwordData,
                 salt: saltData)
+            
+            await setAppPassword(appPassword)
+            
             guard let data = try await self.cache?.findLocalSessionContext() else { return false }
             let box = try AES.GCM.SealedBox(combined: data)
             _ = try AES.GCM.open(box, using: appEncryptionKey)
@@ -534,6 +803,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
     
+    /// Changes the application password and re-encrypts the session context.
     public func changeAppPassword(_ newPassword: String) async throws {
         
         guard let cache else {
@@ -545,7 +815,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             throw SessionErrors.sessionDecryptionError
         }
         // Decode the session context from the decrypted data
-        var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+        let sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
         try await cache.deleteLocalDeviceSalt()
         
         guard let passwordData = newPassword.data(using: .utf8) else {
@@ -564,23 +834,25 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             throw SessionErrors.sessionEncryptionError
         }
         
+        await setAppPassword(newPassword)
+        
         // Create local device configuration. Only locally cached and save. Private keys/info are stored. Use with care...
         try await cache.updateLocalSessionContext(encryptedConfig)
-        
-        await setAppPassword(newPassword)
     }
     
+    /// Resumes processing of any pending tasks in the queue.
     public func resumeJobQueue() async throws {
         guard let cache else {
             throw SessionErrors.databaseNotInitialized
         }
-        try await taskProcessor.jobProcessor.loadJobs(
+        try await taskProcessor.loadTasks(
             nil,
             cache: cache,
             symmetricKey: getDatabaseSymmetricKey(),
             session: self)
     }
     
+    /// Shuts down the session, clearing sensitive state.
     public func shutdown() async {
         isViable = false
         cache = nil
@@ -613,7 +885,8 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         var model = [CChar](repeating: 0, count: size)
         sysctlbyname("hw.model", &model, &size, nil, 0)
         
-        return String(cString: model)
+        let data = Data(bytes: model, count: size)
+        return String(data: data, encoding: .utf8) ?? "Uknown Model"
     }
     
 #endif
@@ -721,6 +994,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             "MacBookPro18,2": "MacBook Pro (M1, 2020)",
             "Mac14,8": "MacBook Air/Pro (M2, 2023)",
             "Mac14,9": "MacBook Pro (M2, 2023)",
+            "Mac16,5": "MacBook Pro (M4 Max 2024)",
             
             // Mac Pro (2019 and later)
             "MacPro7,1": "Mac Pro (2019)",

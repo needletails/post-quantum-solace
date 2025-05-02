@@ -6,6 +6,8 @@
 //
 import Testing
 @testable import CryptoSession
+@testable import SessionEvents
+@testable import SessionModels
 
 struct FriendshipMetadataTests {
     
@@ -20,7 +22,7 @@ struct FriendshipMetadataTests {
     @Test
     func testSendFriendRequest() {
         var friendship = FriendshipMetadata()
-        friendship.sendFriendRequest()
+        friendship.synchronizeAcceptedState()
         
         #expect(friendship.myState == .requested)
         #expect(friendship.ourState == .pending)
@@ -29,7 +31,7 @@ struct FriendshipMetadataTests {
     @Test
     func testAcceptFriendRequest() {
         var friendship = FriendshipMetadata(myState: .requested, theirState: .requested)
-        friendship.acceptFriendRequest()
+        friendship.synchronizeAcceptedState()
         
         #expect(friendship.myState == .accepted)
         #expect(friendship.theirState == .accepted)
@@ -59,7 +61,7 @@ struct FriendshipMetadataTests {
     @Test
     func testRevokeFriendRequest() {
         var friendship = FriendshipMetadata(myState: .requested, theirState: .pending)
-        friendship.revokeFriendRequest()
+        friendship.rejectFriendRequest()
         
         #expect(friendship.myState == .pending)
         #expect(friendship.theirState == .pending)
@@ -69,7 +71,7 @@ struct FriendshipMetadataTests {
     @Test
     func testBlockFriend() {
         var friendship = FriendshipMetadata()
-        friendship.blockFriend()
+        friendship.rejectFriendRequest()
         
         #expect(friendship.myState == .blockedUser)
         #expect(friendship.theirState == .blocked)
@@ -79,7 +81,7 @@ struct FriendshipMetadataTests {
     @Test
     func testWasBlocked() {
         var friendship = FriendshipMetadata()
-        friendship.blockFriend()
+        friendship.rejectFriendRequest()
         friendship.switchStates()
         #expect(friendship.myState == .blocked)
         #expect(friendship.theirState == .blockedUser)

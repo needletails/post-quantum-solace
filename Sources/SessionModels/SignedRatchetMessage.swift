@@ -8,25 +8,27 @@ import Foundation
 import BSON
 import NeedleTailCrypto
 import DoubleRatchetKit
-@preconcurrency import Crypto
 
-/// A struct representing the configuration of a user device, including its identity, signing information, and whether it is a master device.
+/// A struct representing a signed ratchet message, including an optional signed representation
+/// of the configuration.
 public struct SignedRatchetMessage: Codable & Sendable {
     
     /// Optional signed representation of the configuration.
-    var signed: Signed?
+    public var signed: Signed?
     
     /// Coding keys for encoding and decoding the struct.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case signed = "a"
     }
     
-    /// Initializes a new `UserDeviceConfiguration` instance.
+    /// Initializes a new `SignedRatchetMessage` instance.
+    ///
     /// - Parameters:
-    ///   - privateSigningIdentity: The private signing key used for signing the configuration.
+    ///   - message: The `RatchetMessage` to be signed.
+    ///   - privateSigningKey: The private signing key used for signing the configuration.
     /// - Throws: An error if signing the configuration fails.
-    init(
-        message: EncryptedMessage,
+    public init(
+        message: RatchetMessage,
         privateSigningKey: Data
     ) throws {
         self.signed = try Signed(
@@ -35,11 +37,12 @@ public struct SignedRatchetMessage: Codable & Sendable {
         )
     }
     
-    /// A struct representing the signed version of the user device configuration.
+    /// A struct representing the signed version of the ratchet message.
     public struct Signed: Codable & Sendable {
         
-        /// The encoded encrypted data for the message
-        let data: Data
+        /// The encoded encrypted data for the message.
+        public let data: Data
+        
         /// The generated signature.
         let signature: Data
         
@@ -50,13 +53,13 @@ public struct SignedRatchetMessage: Codable & Sendable {
         }
         
         /// Initializes a new `Signed` instance.
+        ///
         /// - Parameters:
-        ///   - message: The Ratchet Encrypted Message
-        ///   - publicSigningKeyRepresentable: The public signing key representation.
+        ///   - message: The `RatchetMessage` to be signed.
         ///   - privateSigningIdentity: The private signing key used for signing.
-        /// - Throws: An error if the signature is invalid.
+        /// - Throws: An error if the signing process fails.
         init(
-            message: EncryptedMessage,
+            message: RatchetMessage,
             privateSigningIdentity: Curve25519SigningPrivateKey
         ) throws {
             self.data = try BSONEncoder().encodeData(message)
@@ -64,7 +67,8 @@ public struct SignedRatchetMessage: Codable & Sendable {
         }
 
         /// Verifies the signature of the configuration data.
-        /// - Parameter privateSigningIdentity: The private signing key used for verification.
+        ///
+        /// - Parameter publicKey: The public signing key used for verification.
         /// - Returns: A boolean indicating whether the signature is valid.
         /// - Throws: An error if verification fails.
         public func verifySignature(publicKey: Curve25519SigningPublicKey) throws -> Bool {

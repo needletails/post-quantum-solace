@@ -4,11 +4,11 @@
 //
 //  Created by Cole M on 9/15/24.
 //
-import Foundation
-import BSON
-import NeedleTailCrypto
+import Foundation 
 import DoubleRatchetKit
-@preconcurrency import Crypto
+import Crypto
+import SessionModels
+import SessionEvents
 
 /// A protocol defining the requirements for a cache synchronizer.
 protocol SessionCacheSynchronizer: Sendable {
@@ -20,11 +20,11 @@ public actor SessionCache: CryptoSessionStore {
     
     // MARK: - Properties
     
-    private let store: CryptoSessionStore
+    private let store: any CryptoSessionStore
     private var sessionIdentities = [SessionIdentity]()
-    private var messages = [PrivateMessage]()
+    private var messages = [EncryptedMessage]()
     private var contacts = [ContactModel]()
-    private var communicationTypes = [DoubleRatchetKit.BaseCommunication]()
+    private var communicationTypes = [BaseCommunication]()
     private var jobs = [JobModel]()
     private var mediaJobs = [DataPacket]()
     private var _localDeviceConfiguration: Data?
@@ -48,7 +48,7 @@ public actor SessionCache: CryptoSessionStore {
     
     // MARK: - Initializer
     
-    public init(store: CryptoSessionStore) {
+    public init(store: any CryptoSessionStore) {
         self.store = store
     }
     
@@ -155,7 +155,7 @@ public actor SessionCache: CryptoSessionStore {
     /// - Parameter messageId: The ID of the message to fetch.
     /// - Returns: The fetched message.
     /// - Throws: An error if fetching fails.
-    public func fetchMessage(byId messageId: UUID) async throws -> PrivateMessage {
+    public func fetchMessage(byId messageId: UUID) async throws -> EncryptedMessage {
         if let message = messages.first(where: { $0.id == messageId }) {
             return message
         } else {
@@ -170,7 +170,7 @@ public actor SessionCache: CryptoSessionStore {
     /// - Parameter sharedMessageId: The shared message ID of the message to fetch.
     /// - Returns: The fetched message.
     /// - Throws: An error if fetching fails.
-    public func fetchMessage(by sharedMessageId: String) async throws -> PrivateMessage {
+    public func fetchMessage(by sharedMessageId: String) async throws -> EncryptedMessage {
         if let message = messages.first(where: { $0.sharedId == sharedMessageId }) {
             return message
         } else {
@@ -183,8 +183,8 @@ public actor SessionCache: CryptoSessionStore {
     @Sendable
     public func fetchMessage(
         by callId: String,
-        work: @escaping @Sendable (PrivateMessage) async -> PrivateMessage?)
-    async throws -> PrivateMessage? {
+        work: @escaping @Sendable (EncryptedMessage) async -> EncryptedMessage?)
+    async throws -> EncryptedMessage? {
         for message in messages {
             if let found = await work(message) {
                 return found
@@ -200,7 +200,7 @@ public actor SessionCache: CryptoSessionStore {
     /// Creates a new message and caches it.
     /// - Parameter message: The message to be created.
     /// - Throws: An error if the creation fails.
-    public func createMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws {
+    public func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {
         try await store.createMessage(message, symmetricKey: symmetricKey)
         messages.append(message)
     }
@@ -209,42 +209,37 @@ public actor SessionCache: CryptoSessionStore {
         messages.filter({ $0.communicationId == communicationId }).count
     }
     
-    public func insertMessage(_ message: PrivateMessage) async throws {
+    public func insertMessage(_ message: EncryptedMessage) async throws {
         if !messages.contains(where: { $0.id == message.id }) {
             messages.append(message)
-            messages.sorted(by: { $0.sequenceNumber < $1.sequenceNumber })
+            messages.sort(by: { $0.sequenceNumber < $1.sequenceNumber })
         }
     }
     
-    public func fetchCachedMessages(from sharedId: String) async throws -> [PrivateMessage] {
+    public func fetchCachedMessages(from sharedId: String) async throws -> [EncryptedMessage] {
         messages.filter { $0.sharedId == sharedId }
     }
     
     /// Updates an existing message.
     /// - Parameter message: The message to be updated.
     /// - Throws: An error if the update fails.
-    public func updateMessage(_ message: PrivateMessage, symmetricKey: SymmetricKey) async throws {
+    public func updateMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {
         if let index = messages.firstIndex(where: { $0.id == message.id }) {
             messages[index] = message
-        } else {
-            do {
-                try await store.updateMessage(message, symmetricKey: symmetricKey)
-            } catch {
-                throw CacheErrors.messageNotFound
-            }
         }
+        try await store.updateMessage(message, symmetricKey: symmetricKey)
     }
     
     /// Removes a message from the cache and store.
     /// - Parameter message: The message to be removed.
     /// - Throws: An error if the removal fails.
-    public func removeMessage(_ message: PrivateMessage) async throws {
+    public func removeMessage(_ message: EncryptedMessage) async throws {
         messages.removeAll(where: { $0.id == message.id })
         try await store.removeMessage(message)
     }
     
     //The Cursor will keep track of or stream state
-    public func streamMessages(sharedIdentifier: UUID) async throws -> (AsyncThrowingStream<PrivateMessage, Error>, AsyncThrowingStream<PrivateMessage, Error>.Continuation?) {
+    public func streamMessages(sharedIdentifier: UUID) async throws -> (AsyncThrowingStream<EncryptedMessage, Error>, AsyncThrowingStream<EncryptedMessage, Error>.Continuation?) {
         try await store.streamMessages(sharedIdentifier: sharedIdentifier)
     }
     
@@ -352,7 +347,7 @@ extension SessionCache {
     /// Fetches all communication types from the cache or store.
     /// - Returns: An array of communication types.
     /// - Throws: An error if fetching fails.
-    public func fetchCommunications() async throws -> [DoubleRatchetKit.BaseCommunication] {
+    public func fetchCommunications() async throws -> [BaseCommunication] {
         if communicationTypes.isEmpty {
             communicationTypes = try await store.fetchCommunications()
         }
@@ -362,7 +357,7 @@ extension SessionCache {
     /// Creates a new communication type and caches it.
     /// - Parameter type: The communication type to be created.
     /// - Throws: An error if the creation fails.
-    public func createCommunication(_ type: DoubleRatchetKit.BaseCommunication) async throws {
+    public func createCommunication(_ type: BaseCommunication) async throws {
         try await store.createCommunication(type)
         communicationTypes.append(type) // Cache the new communication type
     }
@@ -370,7 +365,7 @@ extension SessionCache {
     /// Updates an existing communication type in the cache and store.
     /// - Parameter type: The communication type to be updated.
     /// - Throws: An error if the update fails.
-    public func updateCommunication(_ type: DoubleRatchetKit.BaseCommunication) async throws {
+    public func updateCommunication(_ type: BaseCommunication) async throws {
         if let index = communicationTypes.firstIndex(where: { $0.id == type.id }) {
             communicationTypes[index] = type
             try await store.updateCommunication(type)
@@ -382,7 +377,7 @@ extension SessionCache {
     /// Removes a communication type from the cache and store.
     /// - Parameter type: The communication type to be removed.
     /// - Throws: An error if the removal fails.
-    public func removeCommunication(_ type: DoubleRatchetKit.BaseCommunication) async throws {
+    public func removeCommunication(_ type: BaseCommunication) async throws {
         communicationTypes.removeAll(where: { $0.id == type.id })
         try await store.removeCommunication(type)
     }
@@ -438,5 +433,3 @@ extension SessionCache {
         try await store.deleteMediaJob(id) // Remove from the store
     }
 }
-
-extension SymmetricKey: @unchecked Sendable {}
