@@ -7,20 +7,113 @@
 
 import BSON
 import Foundation
-import NeedleTailLogger
-import NeedleTailAsyncSequence
 import NeedleTailCrypto
 import DoubleRatchetKit
-import Crypto
 import SessionModels
 import SessionEvents
 
-extension TaskProcessor {
-
+/// Extension of `TaskProcessor` conforming to `SessionIdentityDelegate`.
+/// This extension handles session identity management, including updating and fetching one-time keys,
+/// performing message ratcheting, and managing session contexts.
+extension TaskProcessor: SessionIdentityDelegate {
+    
+    /// Updates the session identity with the provided identity.
+    /// - Parameter identity: The new session identity to be updated.
+    /// - Throws: An error if the update fails.
+    func updateSessionIdentity(_ identity: DoubleRatchetKit.SessionIdentity) async throws {}
+    
+    /// Fetches a private one-time key by its identifier.
+    /// - Parameter id: The UUID of the one-time key to fetch.
+    /// - Returns: The corresponding private one-time key.
+    /// - Throws: `CryptoSession.SessionErrors.sessionNotInitialized` if the session is not initialized,
+    ///           or `CryptoSession.SessionErrors.invalidKeyId` if the key ID is invalid.
+    func fetchPrivateOneTimeKey(_ id: UUID) async throws -> DoubleRatchetKit.Curve25519PrivateKeyRepresentable {
+        guard let sessionContext = await session?.sessionContext else {
+            throw CryptoSession.SessionErrors.sessionNotInitialized
+        }
+        guard let key = sessionContext.sessionUser.deviceKeys.privateOneTimeKeys.first(where: { $0.id == id }) else {
+            throw CryptoSession.SessionErrors.invalidKeyId
+        }
+        return key
+    }
+    
+    /// Updates the one-time key for the current session.
+    /// - Throws: `CryptoSession.SessionErrors.sessionNotInitialized` if the session is not initialized.
+    ///           Logs an error if the update fails.
+    func updateOneTimeKey() async {
+        do {
+            guard let session = session else {
+                throw CryptoSession.SessionErrors.sessionNotInitialized
+            }
+            guard let secretName = await session.sessionContext?.sessionUser.secretName else {
+                throw CryptoSession.SessionErrors.sessionNotInitialized
+            }
+            try await session.transportDelegate?.updateOneTimeKeys(for: secretName)
+        } catch {
+            logger.log(level: .error, message: "Failed to update one time key: \(error)")
+        }
+    }
+    
+    /// Removes a private one-time key by its identifier.
+    /// - Parameter id: The UUID of the one-time key to remove.
+    /// - Throws: `CryptoSession.SessionErrors.sessionNotInitialized` if the session is not initialized.
+    ///           Logs an error if the removal fails.
+    func removePrivateOneTimeKey(_ id: UUID) async {
+        do {
+            guard let session = session else {
+                throw CryptoSession.SessionErrors.sessionNotInitialized
+            }
+            guard var sessionContext = await session.sessionContext else {
+                throw CryptoSession.SessionErrors.sessionNotInitialized
+            }
+            
+            var deviceKeys = sessionContext.sessionUser.deviceKeys
+            deviceKeys.privateOneTimeKeys.removeAll { $0.id == id }
+            
+            sessionContext.sessionUser.deviceKeys = deviceKeys
+            sessionContext.updateSessionUser(sessionContext.sessionUser)
+            await session.setSessionContext(sessionContext)
+            
+            // Encrypt and persist
+            let encodedData = try BSONEncoder().encode(sessionContext)
+            guard let encryptedConfig = try await crypto.encrypt(data: encodedData.makeData(), symmetricKey: session.getAppSymmetricKey()) else {
+                throw CryptoSession.SessionErrors.sessionEncryptionError
+            }
+            
+            try await session.cache?.updateLocalSessionContext(encryptedConfig)
+        } catch {
+            logger.log(level: .error, message: "Failed to remove private one time key: \(error)")
+        }
+    }
+    
+    /// Removes a public one-time key by its identifier.
+    /// - Parameter id: The UUID of the one-time key to remove.
+    /// - Throws: `CryptoSession.SessionErrors.sessionNotInitialized` if the session is not initialized.
+    ///           Logs an error if the removal fails.
+    func removePublicOneTimeKey(_ id: UUID) async {
+        do {
+            guard let session = session else {
+                throw CryptoSession.SessionErrors.sessionNotInitialized
+            }
+            guard let secretName = await session.sessionContext?.sessionUser.secretName else {
+                throw CryptoSession.SessionErrors.sessionNotInitialized
+            }
+            try await session.transportDelegate?.deleteOneTimeKey(for: secretName, with: id.uuidString)
+        } catch {
+            logger.log(level: .error, message: "Failed to remove public one time key: \(error)")
+        }
+    }
+    
+    /// Performs a ratchet operation based on the specified task.
+    /// - Parameters:
+    ///   - task: The task to perform, which can be either writing or streaming a message.
+    ///   - session: The current crypto session.
+    /// - Throws: An error if the ratchet operation fails.
     func performRatchet(
         task: TaskType,
         session: CryptoSession
     ) async throws {
+        await self.ratchetManager.setDelegate(self)
         switch task {
         case .writeMessage(let outboundTask):
             try await handleWriteMessage(
@@ -33,50 +126,64 @@ extension TaskProcessor {
             )
         }
     }
-
-    //Outbound
+    
+    // MARK: - Outbound Message Handling
+    
+    /// Handles writing a message and performing the necessary ratchet operations.
+    /// - Parameters:
+    ///   - outboundTask: The outbound task message to be processed.
+    ///   - session: The current crypto session.
+    /// - Throws: An error if the message handling fails.
     private func handleWriteMessage(
         outboundTask: OutboundTaskMessage,
         session: CryptoSession
     ) async throws {
+        self.session = session
         var outboundTask = outboundTask
         self.logger.log(level: .debug, message: "Performing Ratchet")
         
         guard let sessionContext = await session.sessionContext else {
             throw CryptoSession.SessionErrors.sessionNotInitialized
         }
-
+        
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
         guard let props = await outboundTask.recipientIdentity.props(symmetricKey: databaseSymmetricKey) else {
             throw CryptoSession.SessionErrors.propsError
         }
         
-        let recipientPublicKeyRepresentable = props.publicKeyRepesentable
-        let recipientPublicKey = try Curve25519PublicKey(rawRepresentation: recipientPublicKeyRepresentable)
-        let secretName = props.secretName
+        guard let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.privateOneTimeKeys.randomElement() else {
+            throw CryptoSession.SessionErrors.invalidKeyId
+        }
         
-        let symmetricKey = try await deriveSymmetricKey(
-            for: secretName,
-            my: sessionContext.sessionUser.deviceKeys.privateKey,
-            their: recipientPublicKey
-        )
+        guard let delegate else {
+            throw CryptoSession.SessionErrors.transportNotInitialized
+        }
+        
+        //Fetch the recipient's one time key
+        let remotePublicOneTimeKey = try await delegate.fetchOneTimeKey(for: props.secretName, deviceId: props.deviceId.uuidString)
         
         try await ratchetManager.senderInitialization(
             sessionIdentity: outboundTask.recipientIdentity,
-            secretKey: symmetricKey,
             sessionSymmetricKey: databaseSymmetricKey,
-            recipientPublicKey: recipientPublicKey)
-
+            remoteKeys: RemoteKeys(
+                longTerm: .init(props.publicLongTermKey),
+                oneTime: remotePublicOneTimeKey,
+                kyber: .init(props.kyber1024PublicKey)),
+            localKeys: LocalKeys(
+                longTerm: .init(sessionContext.sessionUser.deviceKeys.privateLongTermKey),
+                oneTime: privateOneTimeKey,
+                kyber: .init(sessionContext.sessionUser.deviceKeys.kyber1024PrivateKey)))
+        
         if let sessionDelegate = await session.sessionDelegate {
             outboundTask.message = try sessionDelegate.updateCryptoMessageMetadata(
                 outboundTask.message,
                 sharedMessageId: outboundTask.sharedId)
         }
-
+        
         let encodedData = try BSONEncoder().encodeData(outboundTask.message)
         let ratchetedMessage = try await ratchetManager.ratchetEncrypt(plainText: encodedData)
         let signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
-     
+        
         try await session.transportDelegate?.sendMessage(signedMessage, metadata: SignedRatchetMessageMetadata(
             secretName: props.secretName,
             deviceId: props.deviceId,
@@ -85,12 +192,18 @@ extension TaskProcessor {
             sharedMessageIdentifier: outboundTask.sharedId))
     }
     
-    //Inbound
+    // MARK: - Inbound Message Handling
+    
+    /// Handles streaming a message and performing the necessary ratchet operations.
+    /// - Parameters:
+    ///   - inboundTask: The inbound task message to be processed.
+    ///   - session: The current crypto session.
+    /// - Throws: An error if the message handling fails.
     private func handleStreamMessage(
         inboundTask: InboundTaskMessage,
         session: CryptoSession
     ) async throws {
-     
+        
         let (ratchetMessage, sessionIdentity) = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
         
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
@@ -118,78 +231,68 @@ extension TaskProcessor {
                 senderDeviceId: inboundTask.senderDeviceId)
         }
         /// Now we can handle the message
-            try await handleDecodedMessage(
-                decodedMessage,
-                inboundTask: inboundTask,
-                session: session,
-                sessionIdentity: sessionIdentity)
-    }
-
-    /// Derives a symmetric key for secure communication using the Curve25519 key agreement protocol.
-    ///
-    /// This method takes the private key of the current device and the public key of the session user
-    /// to compute a shared secret. The shared secret is then used to derive a symmetric key using
-    /// HKDF (HMAC-based Key Derivation Function) with a specified salt and shared info.
-    ///
-    /// - Parameters:
-    ///   - sessionUser: The `SessionUser` object containing the device's private key and other user-specific information.
-    ///   - publicKey: The `Curve25519PublicKey` of the other party (the other session user) with whom the symmetric key will be shared.
-    ///
-    /// - Throws:
-    ///   - An error of type `CryptoKitError` if the key agreement or key derivation fails. This can occur if the
-    ///     provided public key is invalid or if there are issues with the private key representation.
-    ///
-    /// - Returns:
-    ///   A `SymmetricKey` derived from the shared secret, which can be used for encryption and decryption
-    ///   in secure communication.
-    private func deriveSymmetricKey(
-        for secretName: String,
-        my privateKeyRespresentation: Data,
-        their publicKey: Curve25519PublicKey
-    ) async throws -> SymmetricKey {
-        let privateKey = try Curve25519PrivateKey(rawRepresentation: privateKeyRespresentation)
-        let sharedSecret = try privateKey.sharedSecretFromKeyAgreement(with: publicKey)
-        let salt = Data(SHA512.hash(data: secretName.data(using: .ascii)!))
-        
-        return sharedSecret.hkdfDerivedSymmetricKey(
-            using: SHA512.self,
-            salt: salt,
-            sharedInfo: "X3DHTemporaryReplacement".data(using: .ascii)!,
-            outputByteCount: 32
-        )
+        try await handleDecodedMessage(
+            decodedMessage,
+            inboundTask: inboundTask,
+            session: session,
+            sessionIdentity: sessionIdentity)
     }
     
+    /// Initializes the recipient for a session based on the provided ratchet message.
+    /// - Parameters:
+    ///   - sessionIdentity: The session identity of the recipient.
+    ///   - session: The current crypto session.
+    ///   - ratchetMessage: The ratchet message to initialize with.
+    /// - Returns: The decrypted data from the ratchet message.
+    /// - Throws: An error if the initialization fails.
     private func initializeRecipient(
         sessionIdentity: SessionIdentity,
         session: CryptoSession,
         ratchetMessage: RatchetMessage
     ) async throws -> Data {
-        guard let sessionUser = await session.sessionContext?.sessionUser else {
-            throw JobProcessorErrors.missingIdentity
+        self.session = session
+        guard let sessionContext = await session.sessionContext else {
+            throw CryptoSession.SessionErrors.sessionNotInitialized
         }
         
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
-        guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
         
-        let sendersPublicKeyRepresentable = props.publicKeyRepesentable
-        let symmetricKey = try await deriveSymmetricKey(
-            for: sessionUser.secretName,
-            my: sessionUser.deviceKeys.privateKey,
-            their: try Curve25519PublicKey(rawRepresentation: sendersPublicKeyRepresentable)
-        )
+        guard delegate != nil else {
+            throw CryptoSession.SessionErrors.transportNotInitialized
+        }
         
-        let localPrivateKey = try Curve25519PrivateKey(rawRepresentation: sessionUser.deviceKeys.privateKey)
+        //Fetch the recipient's one time key
+        let localPrivateOneTimeKey = try await fetchPrivateOneTimeKey(ratchetMessage.header.oneTimeId)
         
         return try await ratchetManager.recipientInitialization(
             sessionIdentity: sessionIdentity,
             sessionSymmetricKey: databaseSymmetricKey,
-            secretKey: symmetricKey,
-            localPrivateKey: localPrivateKey,
-            initialMessage: ratchetMessage
-        )
+            remoteKeys: RemoteKeys(
+                longTerm: .init(ratchetMessage.header.remotePublicLongTermKey),
+                oneTime: ratchetMessage.header.remotePublicOneTimeKey,
+                kyber: .init(ratchetMessage.header.remoteKyber1024PublicKey)),
+            localKeys: LocalKeys(
+                longTerm: .init(sessionContext.sessionUser.deviceKeys.privateLongTermKey),
+                oneTime: localPrivateOneTimeKey,
+                kyber: .init(sessionContext.sessionUser.deviceKeys.kyber1024PrivateKey)),
+            initialMessage: ratchetMessage)
     }
     
-    /// This only handles Private Messages desipite their Communication Type. The Recipient is for reference in looking up communication models, but is not actually persisted. On initial creation of the Communication Model we need to tell it the needed metadata. If it is not on the decoded recipient and the communicationModel is not already existing, then it should be in the message metadata. like the members, admin, organizers, etc.
+    /// Handles the processing of a decoded message, specifically for private messages,
+    /// regardless of their communication type. This method utilizes the recipient information
+    /// for reference when looking up communication models, but the recipient itself is not persisted.
+    ///
+    /// On the initial creation of the communication model, necessary metadata must be provided.
+    /// If the required metadata is not present in the decoded recipient and the communication model
+    /// does not already exist, it should be included in the message metadata (e.g., members, admin, organizers).
+    ///
+    /// - Parameters:
+    ///   - decodedMessage: The decoded `CryptoMessage` that needs to be processed.
+    ///   - inboundTask: The `InboundTaskMessage` associated with the incoming message.
+    ///   - session: The current `CryptoSession` in which the message is being processed.
+    ///   - sessionIdentity: The `SessionIdentity` associated with the recipient of the message.
+    /// - Throws: An error if the message processing fails due to issues such as missing metadata,
+    ///           session errors, or communication model errors.
     private func handleDecodedMessage(_
                                       decodedMessage: CryptoMessage,
                                       inboundTask: InboundTaskMessage,
@@ -198,7 +301,7 @@ extension TaskProcessor {
     ) async throws {
         guard let cache = await session.cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
-
+        
         switch decodedMessage.recipient {
         case .nickname(let recipient):
             var communicationModel: BaseCommunication
@@ -250,7 +353,7 @@ extension TaskProcessor {
                 communication: communicationModel,
                 sessionIdentity: sessionIdentity
             )
-
+            
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
                 if let members = await communicationModel.props(symmetricKey: databaseSymmetricKey)?.members {
@@ -259,7 +362,7 @@ extension TaskProcessor {
             }
             
             try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
-
+            
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
         case .personalMessage:
@@ -362,6 +465,16 @@ extension TaskProcessor {
         }
     }
     
+    /// Verifies and decrypts an encrypted message received in an inbound task.
+    /// This method extracts the ratchet message and the associated session identity
+    /// from the inbound task, ensuring that the message is valid and can be processed.
+    ///
+    /// - Parameters:
+    ///   - session: The current `CryptoSession` in which the message verification is taking place.
+    ///   - inboundTask: The `InboundTaskMessage` containing the encrypted message to be verified.
+    /// - Returns: A tuple containing the verified `RatchetMessage` and the associated `SessionIdentity`.
+    /// - Throws: An error if the verification or decryption fails due to issues such as invalid message format,
+    ///           session errors, or decryption errors.
     private func verifyEncryptedMessage(
         session: CryptoSession,
         inboundTask: InboundTaskMessage
@@ -380,7 +493,7 @@ extension TaskProcessor {
         
         // Unwrap properties and retrieve the public signing key
         guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else { throw JobProcessorErrors.missingIdentity }
-        let sendersPublicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: props.publicSigningRepresentable)
+        let sendersPublicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: props.publicSigningKey)
         
         // Verify the signature
         guard let signedMessage = inboundTask.message.signed else {
@@ -398,8 +511,15 @@ extension TaskProcessor {
         }
     }
     
-    
-    //TODO: Do we need to rekey? If a message fails to decrypted what does that indicate? Is rekeying really the proper option. Or do we have larger issues?
+    /// Signs a ratchet message using the cryptographic session's signing capabilities.
+    /// This method ensures the integrity and authenticity of the ratchet message by applying a digital signature.
+    ///
+    /// - Parameters:
+    ///   - message: The `RatchetMessage` that needs to be signed.
+    ///   - session: The current `CryptoSession` used to access the signing keys and perform the signing operation.
+    /// - Returns: A `SignedRatchetMessage` that contains the original ratchet message along with its digital signature.
+    /// - Throws: An error if the signing process fails due to issues such as missing signing keys,
+    ///           session errors, or cryptographic errors.
     func signRatchetMessage(message: RatchetMessage, session: CryptoSession) async throws -> SignedRatchetMessage {
         guard let deviceKeys = await session.sessionContext?.sessionUser.deviceKeys else {
             throw CryptoSession.SessionErrors.sessionNotInitialized

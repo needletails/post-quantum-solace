@@ -6,14 +6,10 @@
 //
 import Foundation
 import BSON
-import DoubleRatchetKit
-import NeedleTailCrypto
-import NeedleTailLogger
 import NeedleTailAsyncSequence
 import SessionModels
 import SessionEvents
 import Crypto
-
 
 //MARK: CryptoSession Events
 extension CryptoSession {
@@ -61,7 +57,15 @@ extension CryptoSession {
         }
     }
     
-    //MARK: Inbound
+    // MARK: Inbound
+    
+    /// Receives an inbound message and processes it asynchronously.
+    /// - Parameters:
+    ///   - message: The signed ratchet message to be received.
+    ///   - sender: The identifier of the sender.
+    ///   - deviceId: The unique identifier of the sender's device.
+    ///   - messageId: The unique identifier for the message.
+    /// - Throws: An error if the message processing fails.
     public func receiveMessage(
         message: SignedRatchetMessage,
         sender: String,
@@ -79,8 +83,14 @@ extension CryptoSession {
             session: CryptoSession.shared)
     }
     
-    //MARK: Outbound
-    /// This method will loop through each targets user device configuration and send 1 DoubleRatcheted message for each device per target.
+    // MARK: Outbound
+    
+    /// Processes the outbound message by sending it to the appropriate target devices.
+    /// This method loops through each target's device configuration and sends a DoubleRatcheted message.
+    /// - Parameters:
+    ///   - message: The cryptographic message to be sent.
+    ///   - session: The current cryptographic session.
+    /// - Throws: An error if the message processing fails.
     func processWrite(
         message: CryptoMessage,
         session: CryptoSession
@@ -108,11 +118,13 @@ extension CryptoSession {
     }
 }
 
+// MARK: - CryptoSession SessionEvents Protocol Conformance
 
-//MARK: CryptoSession SessionEvents Protocol Conformation
 extension CryptoSession: SessionEvents {
     
-    
+    /// Requires all necessary session parameters for processing.
+    /// - Returns: A tuple containing all required session parameters.
+    /// - Throws: An error if any of the required parameters are not initialized.
     private func requireAllSessionParameters() async throws -> (sessionContext: SessionContext,
                                                                 cache: CryptoSessionStore,
                                                                 transportDelegate: SessionTransport,
@@ -122,23 +134,26 @@ extension CryptoSession: SessionEvents {
         guard let sessionContext = await self.sessionContext else {
             throw SessionErrors.sessionNotInitialized
         }
-        guard let cache = self.cache else {
+        guard let cache else {
             throw SessionErrors.databaseNotInitialized
         }
-        guard let transportDelegate = self.transportDelegate else {
+        guard let transportDelegate else {
             throw SessionErrors.transportNotInitialized
         }
-        guard let receiverDelegate = self.receiverDelegate else {
+        guard let receiverDelegate else {
             throw SessionErrors.receiverDelegateNotSet
         }
-        guard let sessionDelegate = self.sessionDelegate else {
-            throw SessionErrors.sessionDelegateNotSet
+        guard let sessionDelegate else {
+            throw SessionErrors.sessionNotInitialized
         }
         let symmetricKey = try await getDatabaseSymmetricKey()
         
         return (sessionContext, cache, transportDelegate, receiverDelegate, sessionDelegate, symmetricKey)
     }
     
+    /// Requires session parameters excluding the transport delegate.
+    /// - Returns: A tuple containing the required session parameters.
+    /// - Throws: An error if any of the required parameters are not initialized.
     private func requireSessionParametersWithoutTransportDelegate() async throws -> (sessionContext: SessionContext,
                                                                                      cache: CryptoSessionStore,
                                                                                      receiverDelegate: EventReceiver,
@@ -147,20 +162,25 @@ extension CryptoSession: SessionEvents {
         guard let sessionContext = await self.sessionContext else {
             throw SessionErrors.sessionNotInitialized
         }
-        guard let cache = self.cache else {
+        guard let cache else {
             throw SessionErrors.databaseNotInitialized
         }
-        guard let receiverDelegate = self.receiverDelegate else {
+        guard let receiverDelegate else {
             throw SessionErrors.receiverDelegateNotSet
         }
-        guard let sessionDelegate = self.sessionDelegate else {
-            throw SessionErrors.sessionDelegateNotSet
+        guard let sessionDelegate else {
+            throw SessionErrors.sessionNotInitialized
         }
         let symmetricKey = try await getDatabaseSymmetricKey()
         
         return (sessionContext, cache, receiverDelegate, sessionDelegate, symmetricKey)
     }
     
+    // MARK: - Contact Management
+    
+    /// Adds a list of contacts to the session.
+    /// - Parameter infos: An array of shared contact information to be added.
+    /// - Throws: An error if the addition of contacts fails.
     public func addContacts(_ infos: [SharedContactInfo]) async throws {
         let params = try await requireAllSessionParameters()
         
@@ -187,6 +207,13 @@ extension CryptoSession: SessionEvents {
         }
     }
     
+    /// Updates or creates a contact with the specified secret name and metadata.
+    /// - Parameters:
+    ///   - secretName: The secret name of the contact to be updated or created.
+    ///   - metadata: Additional metadata associated with the contact.
+    ///   - requestFriendship: A boolean indicating whether to request friendship.
+    /// - Returns: A `ContactModel` representing the updated or created contact.
+    /// - Throws: An error if the operation fails.
     public func updateOrCreateContact(
         secretName: String,
         metadata: Document = [:],
@@ -219,6 +246,9 @@ extension CryptoSession: SessionEvents {
         }
     }
     
+    /// Sends a communication synchronization request for the specified contact.
+    /// - Parameter secretName: The secret name of the contact to synchronize with.
+    /// - Throws: An error if the synchronization request fails.
     public func sendCommunicationSynchronization(contact secretName: String) async throws {
         let params = try await requireSessionParametersWithoutTransportDelegate()
         
@@ -243,6 +273,11 @@ extension CryptoSession: SessionEvents {
         }
     }
     
+    /// Requests a change in the friendship state for a specified contact.
+    /// - Parameters:
+    ///   - state: The new friendship state to be set.
+    ///   - contact: The contact whose friendship state is to be changed.
+    /// - Throws: An error if the request fails.
     public func requestFriendshipStateChange(
         state: FriendshipMetadata.State,
         contact: Contact
@@ -270,11 +305,18 @@ extension CryptoSession: SessionEvents {
         }
     }
     
-    public func updateMessageDeliveryState(_
-                                           message: EncryptedMessage,
-                                           deliveryState: DeliveryState,
-                                           messageRecipient: MessageRecipient,
-                                           allowExternalUpdate: Bool = false
+    /// Updates the delivery state of a specified message.
+    /// - Parameters:
+    ///   - message: The encrypted message whose delivery state is to be updated.
+    ///   - deliveryState: The new delivery state to be set.
+    ///   - messageRecipient: The recipient of the message.
+    ///   - allowExternalUpdate: A boolean indicating whether to allow external updates.
+    /// - Throws: An error if the update fails.
+    public func updateMessageDeliveryState(
+        _ message: EncryptedMessage,
+        deliveryState: DeliveryState,
+        messageRecipient: MessageRecipient,
+        allowExternalUpdate: Bool = false
     ) async throws {
         let params = try await requireSessionParametersWithoutTransportDelegate()
         
@@ -301,8 +343,11 @@ extension CryptoSession: SessionEvents {
         }
     }
     
+    /// Sends an acknowledgment that a contact has been created to the specified recipient.
+    /// - Parameter secretName: The secret name of the recipient to acknowledge.
+    /// - Throws: An error if the acknowledgment fails.
     public func sendContactCreatedAcknowledgment(recipient secretName: String) async throws {
-        guard let sessionDelegate = sessionDelegate else { throw SessionErrors.sessionDelegateNotSet }
+        guard let sessionDelegate else { throw SessionErrors.sessionNotInitialized }
         if let eventDelegate {
             return try await eventDelegate.sendContactCreatedAcknowledgment(
                 recipient: secretName,
@@ -316,8 +361,11 @@ extension CryptoSession: SessionEvents {
         }
     }
     
+    /// Requests metadata from a specified contact.
+    /// - Parameter secretName: The secret name of the contact to request metadata from.
+    /// - Throws: An error if the request fails.
     public func requestMetadata(from secretName: String) async throws {
-        guard let sessionDelegate = sessionDelegate else { throw SessionErrors.sessionDelegateNotSet }
+        guard let sessionDelegate else { throw SessionErrors.sessionNotInitialized }
         if let eventDelegate {
             return try await eventDelegate.requestMetadata(
                 from: secretName,
@@ -331,8 +379,10 @@ extension CryptoSession: SessionEvents {
         }
     }
     
+    /// Requests the metadata of the current user.
+    /// - Throws: An error if the request fails.
     public func requestMyMetadata() async throws {
-        guard let sessionDelegate = sessionDelegate else { throw SessionErrors.sessionDelegateNotSet }
+        guard let sessionDelegate else { throw SessionErrors.sessionNotInitialized }
         if let eventDelegate {
             return try await eventDelegate.requestMyMetadata(
                 sessionDelegate: sessionDelegate,
@@ -344,10 +394,15 @@ extension CryptoSession: SessionEvents {
         }
     }
     
+    /// Edits the current message with new text.
+    /// - Parameters:
+    ///   - message: The encrypted message to be edited.
+    ///   - newText: The new text to replace the current message text.
+    /// - Throws: An error if the editing fails.
     public func editCurrentMessage(_ message: EncryptedMessage, newText: String) async throws {
         guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
-        guard let receiverDelegate = receiverDelegate else { throw SessionErrors.receiverDelegateNotSet }
-        guard let sessionDelegate = sessionDelegate else { throw SessionErrors.sessionDelegateNotSet }
+        guard let receiverDelegate else { throw SessionErrors.receiverDelegateNotSet }
+        guard let sessionDelegate else { throw SessionErrors.sessionNotInitialized }
         let symmetricKey = try await getDatabaseSymmetricKey()
         
         if let eventDelegate {
@@ -371,6 +426,10 @@ extension CryptoSession: SessionEvents {
         }
     }
     
+    /// Finds the communication associated with a specified message recipient.
+    /// - Parameter messageRecipient: The recipient of the message to find communication for.
+    /// - Returns: A `BaseCommunication` object representing the found communication.
+    /// - Throws: An error if the communication cannot be found.
     public func findCommunication(for messageRecipient: MessageRecipient) async throws -> BaseCommunication {
         guard let cache = cache else { throw SessionErrors.databaseNotInitialized }
         let symmetricKey = try await getDatabaseSymmetricKey()

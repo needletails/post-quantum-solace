@@ -7,18 +7,31 @@
 import Foundation
 import NeedleTailCrypto
 import DoubleRatchetKit
-import Crypto
-import BSON
 import SessionModels
+
+// MARK: - CryptoSession Extension for Identity Management
 
 extension CryptoSession {
     
+    /// Refreshes the session identities associated with a given secret name.
+    /// This method ensures that the identities are up to date by filtering and refreshing them.
+    /// - Parameter secretName: The secret name for which to refresh identities.
+    /// - Returns: An array of updated `SessionIdentity` objects.
+    /// - Throws: An error if the identity refresh fails.
     public func refreshIdentities(secretName: String) async throws -> [SessionIdentity] {
         let filtered = try await getSessionIdentities(with: secretName)
-        //Allways make sure the identities are up to date
+        // Always make sure the identities are up to date
         return try await refreshSessionIdentities(for: secretName, from: filtered)
     }
     
+    /// Creates a new encryptable session identity model.
+    /// - Parameters:
+    ///   - device: The user device configuration for the new identity.
+    ///   - secretName: The secret name associated with the identity.
+    ///   - deviceId: The unique identifier of the device.
+    ///   - sessionContextId: A new session context identifier.
+    /// - Returns: A newly created `SessionIdentity` object.
+    /// - Throws: An error if the identity creation fails.
     public func createEncryptableSessionIdentityModel(
         with device: UserDeviceConfiguration,
         for secretName: String,
@@ -33,8 +46,9 @@ extension CryptoSession {
                 secretName: secretName,
                 deviceId: deviceId,
                 sessionContextId: sessionContextId,
-                publicKeyRepesentable: device.publicKey,
-                publicSigningRepresentable: device.publicSigningKey,
+                publicLongTermKey: device.publicLongTermKey,
+                publicSigningKey: device.publicSigningKey,
+                kyber1024PublicKey: device.kyber1024PublicKey,
                 state: nil,
                 deviceName: determinDeviceName(),
                 isMasterDevice: device.isMasterDevice
@@ -45,34 +59,39 @@ extension CryptoSession {
         return identity
     }
     
-    
+    /// Determines a unique device name for the current device.
+    /// This method checks existing device names and increments a count if necessary to ensure uniqueness.
+    /// - Returns: A unique device name as a `String`.
+    /// - Throws: An error if the device name determination fails.
     func determinDeviceName() async throws -> String {
         guard let cache else { return "Unknown Device" }
         var existingNames: [String] = []
-
+        
         // Fetch existing device names
         for context in try await cache.fetchSessionIdentities() {
             guard let props = try await context.props(symmetricKey: getDatabaseSymmetricKey()) else { continue }
             existingNames.append(props.deviceName)
         }
-
+        
         let baseName = getDeviceName() // e.g., "mac16"
         var count = 1
         var newDeviceName = baseName
-
+        
         // Check for existing names and increment the count if necessary
         while existingNames.contains(newDeviceName) {
             newDeviceName = "\(baseName) (\(count))"
             count += 1
         }
-
+        
         return newDeviceName.isEmpty ? "Unknown Device" : newDeviceName
     }
     
-    
-    ///This is only used to get get recipient identites, none of our Device Configuration information.
+    /// Retrieves session identities associated with a specified recipient name.
+    /// This method filters out identities that do not match the recipient name or are the current user's identities.
+    /// - Parameter recipientName: The name of the recipient for which to retrieve identities.
+    /// - Returns: An array of `SessionIdentity` objects associated with the recipient.
+    /// - Throws: An error if the retrieval fails.
     public func getSessionIdentities(with recipientName: String) async throws -> [SessionIdentity] {
-        
         guard let sessionContext = await sessionContext else {
             throw CryptoSession.SessionErrors.sessionNotInitialized
         }
@@ -93,7 +112,13 @@ extension CryptoSession {
         }
     }
     
-    
+    /// Refreshes the session identities for a specified recipient name based on the provided filtered identities.
+    /// This method verifies the devices and removes any stale identities that are no longer valid.
+    /// - Parameters:
+    ///   - recipientName: The name of the recipient for whom to refresh identities.
+    ///   - filtered: An array of previously filtered `SessionIdentity` objects.
+    /// - Returns: An updated array of `SessionIdentity` objects.
+    /// - Throws: An error if the refresh operation fails.
     func refreshSessionIdentities(for recipientName: String, from filtered: [SessionIdentity]) async throws -> [SessionIdentity] {
         
         var filtered = filtered
@@ -104,11 +129,12 @@ extension CryptoSession {
         guard let currentDeviceId = await sessionContext?.sessionUser.deviceId else {
             throw CryptoSession.SessionErrors.sessionNotInitialized
         }
+        
         // Get the user configuration for the recipient
         let configuration = try await transportDelegate.findConfiguration(for: recipientName)
         var verifiedDevices = try configuration.getVerifiedDevices()
         var collected = [UserDeviceConfiguration]()
-
+        
         // Create a set of existing device IDs from the filtered identities for quick lookup
         let existingDeviceIds = await Set(filtered.asyncCompactMap {
             try? await $0.props(symmetricKey: getDatabaseSymmetricKey())?.deviceId })
@@ -120,10 +146,13 @@ extension CryptoSession {
             }
         }
         
-        // Make sure that the identities of the user configuration are legit
+        // Ensure that the identities of the user configuration are legitimate
         let publicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.publicSigningKey)
-        if try configuration.signed.verifySignature(publicKey: publicSigningKey) == false {
-            throw CryptoSession.SessionErrors.invalidSignature
+        
+        for device in configuration.signedDevices {
+            if try (device.verified(using: publicSigningKey) != nil) == false {
+                throw CryptoSession.SessionErrors.invalidSignature
+            }
         }
         
         var generatedSessionContextIds = Set<Int>()
@@ -146,12 +175,13 @@ extension CryptoSession {
             }
         }
         
-        //This will get all identities that are the recipient name and a child device.
+        // This will get all identities that are the recipient name and a child device.
         let newfilter = try await getSessionIdentities(with: recipientName)
         let newDeviceIds = await Set(newfilter.asyncCompactMap {
             try? await $0.props(symmetricKey: getDatabaseSymmetricKey())?.deviceId })
+        
         guard let myDevices = try await sessionContext?.lastUserConfiguration.getVerifiedDevices() else { return [] }
-   
+        
         verifiedDevices.append(contentsOf: myDevices)
         
         for deviceId in newDeviceIds {
@@ -161,7 +191,7 @@ extension CryptoSession {
             
             if !isVerified {
                 logger.log(level: .info, message: "Will remove stale session identity for recipient: \(recipientName)")
-                // If our current list on the DB contains a session identity that is not in the master list, we need to remove it.
+                // If our current list in the DB contains a session identity that is not in the master list, we need to remove it.
                 if let identityToRemove = await filtered.asyncFirst(where: { element in
                     // Try to get the properties for each element.
                     guard let props = try? await element.props(symmetricKey: getDatabaseSymmetricKey()) else {
@@ -184,5 +214,4 @@ extension CryptoSession {
         }
         return filtered
     }
-    
 }

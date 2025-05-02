@@ -17,7 +17,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", .upToNextMajor(from: "3.12.3")),
-        .package(url: "git@github.com:needle-tail/double-ratchet-kit.git", .upToNextMajor(from: "1.0.0")),
+        .package(url: "git@github.com:needle-tail/double-ratchet-kit.git", .upToNextMajor(from: "1.0.1")),
         .package(url: "git@github.com:needle-tail/needletail-crypto.git", .upToNextMajor(from: "1.0.12")),
         .package(url: "git@github.com:needle-tail/needletail-logger.git", .upToNextMajor(from: "3.0.0")),
         .package(url: "git@github.com:needletails/needletail-algorithms.git", .upToNextMajor(from: "2.0.0")),

@@ -6,6 +6,26 @@
 //
 import Foundation
 
+/// An enumeration representing various time intervals for destructive messages.
+///
+/// This enum defines different time intervals that can be used to specify how long a message should remain
+/// before it is considered destructive (i.e., deleted or no longer accessible).
+///
+/// ## Cases
+/// - `off`: Indicates that the destructive message feature is turned off.
+/// - `custom(TimeInterval)`: A custom time interval specified by the user.
+/// - `thirtyseconds`: A predefined interval of 30 seconds.
+/// - `fiveMinutes`: A predefined interval of 5 minutes.
+/// - `oneHour`: A predefined interval of 1 hour.
+/// - `eightHours`: A predefined interval of 8 hours.
+/// - `oneDay`: A predefined interval of 1 day.
+/// - `oneWeek`: A predefined interval of 1 week.
+/// - `fourWeeks`: A predefined interval of 4 weeks.
+///
+/// ## Properties
+/// - `id`: A unique identifier for the enum case, generated as a new `UUID`.
+/// - `description`: A string representation of the enum case, providing a human-readable description.
+/// - `timeInterval`: An optional `TimeInterval` representing the duration associated with the enum case.
 public enum DestructiveMessageTimes: Codable, CustomStringConvertible, Identifiable, Hashable, Sendable {
     
     public var id: UUID {
@@ -22,50 +42,51 @@ public enum DestructiveMessageTimes: Codable, CustomStringConvertible, Identifia
     case oneWeek
     case fourWeeks
     
+    /// A textual representation of the enum case.
     public var description: String {
         switch self {
         case .off:
-            "Off"
+            return "Off"
         case .custom(_):
-            "Custom Interval"
+            return "Custom Interval"
         case .thirtyseconds:
-            "30 Seconds"
+            return "30 Seconds"
         case .fiveMinutes:
-            "5 Minutes"
+            return "5 Minutes"
         case .oneHour:
-            "1 Hour"
+            return "1 Hour"
         case .eightHours:
-            "8 Hours"
+            return "8 Hours"
         case .oneDay:
-            "1 Day"
+            return "1 Day"
         case .oneWeek:
-            "1 Week"
+            return "1 Week"
         case .fourWeeks:
-            "4 Weeks"
+            return "4 Weeks"
         }
     }
     
+    /// The time interval associated with the enum case, if applicable.
     public var timeInterval: TimeInterval? {
         switch self {
         case .off:
-            nil
+            return nil
         case .custom(let interval):
-            interval
+            return interval
         case .thirtyseconds:
-            30
+            return 30
         case .fiveMinutes:
-            300
+            return 300
         case .oneHour:
-            3600
+            return 3600
         case .eightHours:
-            3600*8
+            return 3600 * 8
         case .oneDay:
-            86400
+            return 86400
         case .oneWeek:
-            86400*7
+            return 86400 * 7
         case .fourWeeks:
-            604800*4
+            return 604800 * 4
         }
     }
-    
 }

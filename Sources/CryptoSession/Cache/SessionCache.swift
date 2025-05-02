@@ -4,9 +4,7 @@
 //
 //  Created by Cole M on 9/15/24.
 //
-import Foundation
-import BSON
-import NeedleTailCrypto
+import Foundation 
 import DoubleRatchetKit
 import Crypto
 import SessionModels
@@ -435,5 +433,3 @@ extension SessionCache {
         try await store.deleteMediaJob(id) // Remove from the store
     }
 }
-
-extension SymmetricKey: @unchecked Sendable {}

@@ -6,7 +6,6 @@
 //
 import Foundation
 import DoubleRatchetKit
-import Crypto
 import BSON
 import SessionModels
 
@@ -55,6 +54,10 @@ public protocol SessionTransport: Sendable {
     /// - Parameter configuration: The user configuration to be published.
     /// - Throws: An error if the configuration could not be published.
     func publishUserConfiguration(_ configuration: UserConfiguration, updateKeyBundle: Bool) async throws
+    
+    func fetchOneTimeKey(for secretName: String, deviceId: String) async throws -> Curve25519PublicKeyRepresentable
+    func updateOneTimeKeys(for secretName: String) async throws
+    func deleteOneTimeKey(for secretName: String, with id: String) async throws
     
     func createUploadPacket(
         secretName: String,
