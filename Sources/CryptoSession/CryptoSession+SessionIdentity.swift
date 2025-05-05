@@ -21,7 +21,11 @@ extension CryptoSession {
     public func refreshIdentities(secretName: String) async throws -> [SessionIdentity] {
         let filtered = try await getSessionIdentities(with: secretName)
         // Always make sure the identities are up to date
-        return try await refreshSessionIdentities(for: secretName, from: filtered)
+        do {
+            return try await refreshSessionIdentities(for: secretName, from: filtered)
+        } catch {
+            return filtered
+        }
     }
     
     /// Creates a new encryptable session identity model.

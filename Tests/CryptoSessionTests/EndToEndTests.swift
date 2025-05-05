@@ -15,7 +15,7 @@ import NeedleTailAsyncSequence
 import NeedleTailCrypto
 import DoubleRatchetKit
 
-class EndToEndTests {
+class EndToEndTests: @unchecked Sendable {
     
     let crypto = NeedleTailCrypto()
     var _session = CryptoSession.shared
@@ -28,116 +28,83 @@ class EndToEndTests {
     }
     init() {
         self.mockUserData = MockUserData(session: _session)
+    
     }
     
     func senderSession() async throws -> CryptoSession {
         let store = mockUserData.identityStore(isSender: true)
-        store.localDeviceSalt = "testSalt"
+        store.localDeviceSalt = "testSalt1"
         await _session.setDatabaseDelegate(conformer: store)
         await _session.setTransportDelegate(conformer: transport)
+        await _session.setCryptoSessionDelegate(conformer: SessionDelegate())
         
         _session.isViable = true
         await _session.setReceiverDelegate(conformer: ReceiverDelegate())
         let session = try! await _session.createSession(secretName: mockUserData.ssn, appPassword: mockUserData.sap) {
             
         }
+        let config = try await session.sessionContext!.lastUserConfiguration.getVerifiedDevices().last!
+        let identity = try await session.createEncryptableSessionIdentityModel(
+            with: config,
+            for: session.sessionContext!.sessionUser.secretName,
+            associatedWith: session.sessionContext!.sessionUser.deviceId,
+            new: Int.random(in: 0...100))
+        
+        try await transport.publishUserConfiguration(session.sessionContext!.lastUserConfiguration, updateKeyBundle: false)
+        try await store.createSessionIdentity(identity)
+        
         mockUserData.senderPublicIdentity = await session.sessionContext?.sessionUser.deviceId
         return session
     }
     
     func recipentSession() async throws -> CryptoSession {
         let store = mockUserData.identityStore(isSender: false)
-        store.localDeviceSalt = "testSalt"
+        store.localDeviceSalt = "testSalt2"
+     
         await _session.setDatabaseDelegate(conformer: store)
         await _session.setTransportDelegate(conformer: transport)
+        await _session.setCryptoSessionDelegate(conformer: SessionDelegate())
         
         _session.isViable = true
         await _session.setReceiverDelegate(conformer: ReceiverDelegate())
         let session = try! await _session.createSession(secretName: mockUserData.rsn, appPassword: mockUserData.sap) {
-            
+           //Create Transport
+          
         }
-        //            mockUserData.receiverPublicIdentity = await session.sessionContext?.sessionUser.deviceId
         return session
     }
     
     @Test
     func testWriteAndStreamMessage() async throws {
+        
         let stream = AsyncStream<ReceivedMessage> { continuation in
             self.streamContinuation = continuation
         }
-        
-        // Generate 100 private one-time key pairs
-        let privateOneTimeKeyPairs: [CryptoSession.KeyPair] = try (0..<100).map { _ in
-            let id = UUID()
-            let privateKey = crypto.generateCurve25519PrivateKey()
-            let privateKeyRep = try Curve25519PrivateKeyRepresentable(id: id, privateKey.rawRepresentation)
-            let publicKey = try Curve25519PublicKeyRepresentable(id: id, privateKey.publicKey.rawRepresentation)
-            return CryptoSession.KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
-        }
-        
-        let privateSigningKey = MockUserData.getPrivateSigningKey()
-        let privateKey = MockUserData.getPrivateKey()
         let senderSession = try await senderSession()
-        let kyber1024PrivateKey = try crypto.generateKyber1024PrivateSigningKey()
-        
-        let keys1 = await DeviceKeys(
-            deviceId: senderSession.sessionContext!.sessionUser.deviceKeys.deviceId,
-            privateSigningKey: privateSigningKey!.rawRepresentation,
-            privateLongTermKey: privateKey!.rawRepresentation,
-            privateOneTimeKeys: privateOneTimeKeyPairs.map { $0.privateKey },
-            kyber1024PrivateKey: kyber1024PrivateKey.encode())
-        
-        let user1 = await SessionUser(
-            secretName: senderSession.sessionContext!.sessionUser.secretName,
-            deviceId: senderSession.sessionContext!.sessionUser.deviceId,
-            deviceKeys: keys1,
-            metadata: .init())
-        
-        let context1 = await SessionContext(
-            sessionUser: user1,
-            databaseEncryptionKey: senderSession.sessionContext!.databaseEncryptionKey,
-            sessionContextId: senderSession.sessionContext!.sessionContextId,
-            lastUserConfiguration: senderSession.sessionContext!.lastUserConfiguration,
-            registrationState: senderSession.sessionContext!.registrationState)
-        await senderSession.setSessionContext(context1)
+        let recipentSession = try await recipentSession()
         
         //        OUT
         await #expect(throws: Never.self, performing: {
-            try await senderSession.writeTextMessage(recipient: .nickname("secretName2"),  text: "Some Message", metadata: [:])
+            let writeClock = ContinuousClock()
+            let duration = try await writeClock.measure {
+                try await senderSession.writeTextMessage(recipient: .nickname("secretname1"),  text: "Some Message", metadata: [:])
+            }
+            print("WRITE TOOK", duration.components.seconds)
         })
-        
-        let recipentSession = try await recipentSession()
-        
-        let keys = DeviceKeys(
-            deviceId: mockUserData.receiverPublicIdentity,
-            privateSigningKey: privateSigningKey!.rawRepresentation,
-            privateLongTermKey: privateKey!.rawRepresentation,
-            privateOneTimeKeys: privateOneTimeKeyPairs.map { $0.privateKey },
-            kyber1024PrivateKey: kyber1024PrivateKey.encode())
-        
-        let user = await SessionUser(
-            secretName:  recipentSession.sessionContext!.sessionUser.secretName,
-            deviceId: mockUserData.receiverPublicIdentity,
-            deviceKeys: keys,
-            metadata: .init())
-        
-        let context = await SessionContext(
-            sessionUser: user,
-            databaseEncryptionKey: recipentSession.sessionContext!.databaseEncryptionKey,
-            sessionContextId: recipentSession.sessionContext!.sessionContextId,
-            lastUserConfiguration: recipentSession.sessionContext!.lastUserConfiguration,
-            registrationState: recipentSession.sessionContext!.registrationState)
-        await recipentSession.setSessionContext(context)
         
         //        IN
         for await received in stream {
             await #expect(throws: Never.self, performing: {
-                try await recipentSession.receiveMessage(
-                    message: received.message,
-                    sender: received.sender,
-                    deviceId: received.deviceId,
-                    messageId: received.messageId)
-            })
+                let readClock = ContinuousClock()
+                let duration = try await readClock.measure {
+                    try await recipentSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId)
+                }
+                                print("READ TOOK", duration.components.seconds)
+                })
             return
         }
     }
@@ -243,6 +210,57 @@ class EndToEndTests {
     }
 }
 
+struct SessionDelegate: CryptoSessionDelegate {
+    func communicationSynchonization(recipient: SessionModels.MessageRecipient, sharedIdentifier: String) async throws {
+        
+    }
+    
+    func blockUnblock(recipient: SessionModels.MessageRecipient, data: Data?, metadata: BSON.Document, myState: SessionModels.FriendshipMetadata.State) async throws {
+        
+    }
+    
+    func deliveryStateChanged(recipient: SessionModels.MessageRecipient, metadata: BSON.Document) async throws {
+        
+    }
+    
+    func contactCreated(recipient: SessionModels.MessageRecipient) async throws {
+        
+    }
+    
+    func requestMetadata(recipient: SessionModels.MessageRecipient) async throws {
+        
+    }
+    
+    func editMessage(recipient: SessionModels.MessageRecipient, metadata: BSON.Document) async throws {
+        
+    }
+    
+    func shouldPersist(transportInfo: Data?) -> Bool {
+        true
+    }
+    
+    func getUserInfo(_ transportInfo: Data?) async throws -> (secretName: String, deviceId: String)? {
+        ("", "")
+    }
+    
+    func updateCryptoMessageMetadata(_ message: SessionModels.CryptoMessage, sharedMessageId: String) throws -> SessionModels.CryptoMessage {
+        message
+    }
+    
+    func updateEncryptableMessageMetadata(_ message: SessionModels.EncryptedMessage, transportInfo: Data?, identity: DoubleRatchetKit.SessionIdentity, recipient: SessionModels.MessageRecipient) async throws -> SessionModels.EncryptedMessage {
+        message
+    }
+    
+    func shouldFinishCommunicationSynchronization(_ transportInfo: Data?) -> Bool {
+        false
+    }
+    
+    func processUnpersistedMessage(_ message: SessionModels.CryptoMessage, senderSecretName: String, senderDeviceId: UUID) async throws -> Bool {
+        true
+    }
+    
+    
+}
 
 struct ReceiverDelegate: EventReceiver {
     func createdMessage(_ message: SessionModels.EncryptedMessage) async {
@@ -300,7 +318,7 @@ struct ReceivedMessage {
 final class MockTransportDelegate: SessionTransport, @unchecked Sendable {
     let crypto = NeedleTailCrypto()
     func publishUserConfiguration(_ configuration: SessionModels.UserConfiguration, updateKeyBundle: Bool) async throws {
-        self.userConfiguration = configuration
+        self.userConfigurations.append(.init(secretName: "secretname1", config: configuration))
     }
     
     func fetchOneTimeKey(for secretName: String, deviceId: String) async throws -> DoubleRatchetKit.Curve25519PublicKeyRepresentable {
@@ -324,9 +342,11 @@ final class MockTransportDelegate: SessionTransport, @unchecked Sendable {
     var streamContinuation: AsyncStream<ReceivedMessage>.Continuation?
     
     
-    func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
-//        let received = ReceivedMessage(message: message, sender: secretName, deviceId: deviceId, messageId: remoteId)
-//        streamContinuation!.yield(received)
+    func sendMessage(_
+                     message: SignedRatchetMessage,
+                     metadata: SignedRatchetMessageMetadata) async throws {
+        let received = ReceivedMessage(message: message, sender: metadata.secretName, deviceId: metadata.deviceId, messageId: metadata.sharedMessageIdentifier)
+        streamContinuation!.yield(received)
     }
     
     func receiveMessage() async throws -> String {
@@ -336,18 +356,22 @@ final class MockTransportDelegate: SessionTransport, @unchecked Sendable {
         case noConfig
     }
     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
-        guard let userConfiguration = userConfiguration else { throw MockTransportError.noConfig }
+
+        guard let userConfiguration =  userConfigurations.first(where: { $0.secretName == secretName })?.config else {
+            throw CryptoSession.SessionErrors.userNotFound
+        }
+        print(secretName)
         return userConfiguration
     }
 
     var shouldReturnConfiguration: Bool = true
-    var userConfiguration: UserConfiguration?
+    var userConfigurations = [User]()
     
-    func findUserConfiguration() async throws -> UserConfiguration {
-        if userConfiguration == nil {
+    func findUserConfiguration(secretName: String) async throws -> UserConfiguration {
+        if userConfigurations.isEmpty {
             throw CryptoSession.SessionErrors.configurationError
         } else {
-            return userConfiguration.unsafelyUnwrapped
+            return userConfigurations.first(where: { $0.secretName == secretName })!.config
         }
     }
 }
@@ -614,4 +638,10 @@ extension Data {
     var hexString: String {
         return map { String(format: "%02hhx", $0) }.joined()
     }
+}
+
+
+struct User {
+    let secretName: String
+    let config: UserConfiguration
 }

@@ -139,11 +139,17 @@ extension TaskProcessor {
                     try await cache.removeJob(job)
                     
                 } catch let jobError as JobProcessorErrors where jobError == .missingIdentity {
+                    logger.log(level: .error, message: "Removing Job due to: \(jobError)")
                     try await cache.removeJob(job)
                     
                 } catch let cryptoError as CryptoKitError where cryptoError == .authenticationFailure {
+                    logger.log(level: .error, message: "Removing Job due to: \(cryptoError)")
                     try await cache.removeJob(job)
                     
+                } catch let sessionError as CryptoSession.SessionErrors where sessionError == .invalidKeyId {
+                    //TODO: If we are invalid due to a race condition between the server and client we can optionally resend
+                    logger.log(level: .error, message: "Removing Job due to: \(sessionError)")
+                    try await cache.removeJob(job)
                 } catch {
                     logger.log(level: .error, message: "Job error \(error)")
                     
