@@ -41,49 +41,29 @@ extension TaskProcessor: SessionIdentityDelegate {
     /// - Throws: `CryptoSession.SessionErrors.sessionNotInitialized` if the session is not initialized.
     ///           Logs an error if the update fails.
     func updateOneTimeKey() async {
-        do {
-            guard let session = session else {
-                throw CryptoSession.SessionErrors.sessionNotInitialized
+        //If we do not detach then the ratchet encrypt takes too long due to the network
+        updateKeyTasks.append(Task(executorPreference: keyTransportExecutor) { [weak self] in
+            guard let self else { return }
+            do {
+                guard let session = await self.session else {
+                    throw CryptoSession.SessionErrors.sessionNotInitialized
+                }
+                guard let secretName = await session.sessionContext?.sessionUser.secretName else {
+                    throw CryptoSession.SessionErrors.sessionNotInitialized
+                }
+                try await session.transportDelegate?.updateOneTimeKeys(for: secretName)
+                await cancelAndRemoveUpdateKeyTasks()
+            } catch {
+                await cancelAndRemoveUpdateKeyTasks()
+                self.logger.log(level: .error, message: "Failed to update one time key: \(error)")
             }
-            guard let secretName = await session.sessionContext?.sessionUser.secretName else {
-                throw CryptoSession.SessionErrors.sessionNotInitialized
-            }
-            try await session.transportDelegate?.updateOneTimeKeys(for: secretName)
-        } catch {
-            logger.log(level: .error, message: "Failed to update one time key: \(error)")
-        }
+        })
     }
     
-    /// Removes a private one-time key by its identifier.
-    /// - Parameter id: The UUID of the one-time key to remove.
-    /// - Throws: `CryptoSession.SessionErrors.sessionNotInitialized` if the session is not initialized.
-    ///           Logs an error if the removal fails.
-    func removePrivateOneTimeKey(_ id: UUID) async {
-        do {
-            guard let session = session else {
-                throw CryptoSession.SessionErrors.sessionNotInitialized
-            }
-            guard var sessionContext = await session.sessionContext else {
-                throw CryptoSession.SessionErrors.sessionNotInitialized
-            }
-            
-            var deviceKeys = sessionContext.sessionUser.deviceKeys
-            deviceKeys.privateOneTimeKeys.removeAll { $0.id == id }
-            
-            sessionContext.sessionUser.deviceKeys = deviceKeys
-            sessionContext.updateSessionUser(sessionContext.sessionUser)
-            await session.setSessionContext(sessionContext)
-            
-            // Encrypt and persist
-            let encodedData = try BSONEncoder().encode(sessionContext)
-            guard let encryptedConfig = try await crypto.encrypt(data: encodedData.makeData(), symmetricKey: session.getAppSymmetricKey()) else {
-                throw CryptoSession.SessionErrors.sessionEncryptionError
-            }
-            
-            try await session.cache?.updateLocalSessionContext(encryptedConfig)
-        } catch {
-            logger.log(level: .error, message: "Failed to remove private one time key: \(error)")
-        }
+    private func cancelAndRemoveUpdateKeyTasks() async {
+        guard !updateKeyTasks.isEmpty else { return }
+        let item = await updateKeyTasks.removeFirst()
+        item.cancel()
     }
     
     /// Removes a public one-time key by its identifier.
@@ -91,17 +71,61 @@ extension TaskProcessor: SessionIdentityDelegate {
     /// - Throws: `CryptoSession.SessionErrors.sessionNotInitialized` if the session is not initialized.
     ///           Logs an error if the removal fails.
     func removePublicOneTimeKey(_ id: UUID) async {
-        do {
-            guard let session = session else {
-                throw CryptoSession.SessionErrors.sessionNotInitialized
+        //If we do not detach then the ratchet encrypt takes too long due to the network
+        deleteKeyTasks.append(Task(executorPreference: keyTransportExecutor) { [weak self] in
+            guard let self else { return }
+            do {
+                guard let session = await self.session else {
+                    throw CryptoSession.SessionErrors.sessionNotInitialized
+                }
+                guard let secretName = await session.sessionContext?.sessionUser.secretName else {
+                    throw CryptoSession.SessionErrors.sessionNotInitialized
+                }
+                try await session.transportDelegate?.deleteOneTimeKey(for: secretName, with: id.uuidString)
+                await cancelAndRemoveDeleteKeyTasks()
+            } catch {
+                await cancelAndRemoveDeleteKeyTasks()
+                self.logger.log(level: .error, message: "Failed to remove public one time key: \(error)")
             }
-            guard let secretName = await session.sessionContext?.sessionUser.secretName else {
-                throw CryptoSession.SessionErrors.sessionNotInitialized
+        })
+    }
+    
+    private func cancelAndRemoveDeleteKeyTasks() async {
+        guard !deleteKeyTasks.isEmpty else { return }
+        let item = await deleteKeyTasks.removeFirst()
+        item.cancel()
+    }
+    
+    /// Removes a private one-time key by its identifier.
+    /// - Parameter id: The UUID of the one-time key to remove.
+    /// - Throws: `CryptoSession.SessionErrors.sessionNotInitialized` if the session is not initialized.
+    ///           Logs an error if the removal fails.
+    func removePrivateOneTimeKey(_ id: UUID) async {
+            do {
+                guard let session = await self.session else {
+                    throw CryptoSession.SessionErrors.sessionNotInitialized
+                }
+                guard var sessionContext = await session.sessionContext else {
+                    throw CryptoSession.SessionErrors.sessionNotInitialized
+                }
+                
+                var deviceKeys = sessionContext.sessionUser.deviceKeys
+                deviceKeys.privateOneTimeKeys.removeAll { $0.id == id }
+                
+                sessionContext.sessionUser.deviceKeys = deviceKeys
+                sessionContext.updateSessionUser(sessionContext.sessionUser)
+                await session.setSessionContext(sessionContext)
+                
+                // Encrypt and persist
+                let encodedData = try BSONEncoder().encode(sessionContext)
+                guard let encryptedConfig = try await self.crypto.encrypt(data: encodedData.makeData(), symmetricKey: session.getAppSymmetricKey()) else {
+                    throw CryptoSession.SessionErrors.sessionEncryptionError
+                }
+                
+                try await session.cache?.updateLocalSessionContext(encryptedConfig)
+            } catch {
+                self.logger.log(level: .error, message: "Failed to remove private one time key: \(error)")
             }
-            try await session.transportDelegate?.deleteOneTimeKey(for: secretName, with: id.uuidString)
-        } catch {
-            logger.log(level: .error, message: "Failed to remove public one time key: \(error)")
-        }
     }
     
     /// Performs a ratchet operation based on the specified task.
@@ -223,19 +247,23 @@ extension TaskProcessor: SessionIdentityDelegate {
         }
         
         let decodedMessage = try BSONDecoder().decode(CryptoMessage.self, from: Document(data: decryptedData))
+        var canSaveMessage = true
         
         if let sessionDelegate = await session.sessionDelegate {
-            try await sessionDelegate.processUnpersistedMessage(
+            canSaveMessage = try await sessionDelegate.processUnpersistedMessage(
                 decodedMessage,
                 senderSecretName: inboundTask.senderSecretName,
                 senderDeviceId: inboundTask.senderDeviceId)
         }
-        /// Now we can handle the message
-        try await handleDecodedMessage(
-            decodedMessage,
-            inboundTask: inboundTask,
-            session: session,
-            sessionIdentity: sessionIdentity)
+
+        if canSaveMessage {
+            /// Now we can handle the message
+            try await handleDecodedMessage(
+                decodedMessage,
+                inboundTask: inboundTask,
+                session: session,
+                sessionIdentity: sessionIdentity)
+        }
     }
     
     /// Initializes the recipient for a session based on the provided ratchet message.

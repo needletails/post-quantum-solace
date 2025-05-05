@@ -153,5 +153,5 @@ public protocol CryptoSessionDelegate: Sendable {
         _ message: CryptoMessage,
         senderSecretName: String,
         senderDeviceId: UUID
-    ) async throws
+    ) async throws -> Bool
 }

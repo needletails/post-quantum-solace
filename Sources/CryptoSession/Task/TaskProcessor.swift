@@ -13,6 +13,7 @@ import NeedleTailCrypto
 import DoubleRatchetKit
 import SessionEvents
 import SessionModels
+import DequeModule
 
 /// `TaskProcessor` manages the asynchronous execution of encryption and decryption tasks
 /// using Double Ratchet and other cryptographic mechanisms. It handles inbound and outbound
@@ -23,9 +24,16 @@ actor TaskProcessor {
 
     /// Executor for running cryptographic tasks on a serial queue.
     private let cryptoExecutor = CryptoExecutor(
-        queue: DispatchQueue(label: "crypto-executor-queue"),
+        queue: DispatchQueue(label: "com.needletails.crypto-executor-queue"),
         shouldExecuteAsTask: false
     )
+    
+    let keyTransportExecutor = CryptoExecutor(
+        queue: DispatchQueue(label: "com.needletails.key-transport-executor-queue"),
+        shouldExecuteAsTask: false
+    )
+    var updateKeyTasks: Deque<Task<Void, Never>> = []
+    var deleteKeyTasks: Deque<Task<Void, Never>> = []
 
     /// The serial executor exposed to allow `Sendable` access to async work.
     nonisolated var unownedExecutor: UnownedSerialExecutor {
@@ -270,8 +278,7 @@ actor TaskProcessor {
                     unwrappedEncryptableMessage,
                     transportInfo: message.transportInfo,
                     identity: identity,
-                    recipient: message.recipient
-                )
+                    recipient: message.recipient)
             }
 
             if shouldPersist {
