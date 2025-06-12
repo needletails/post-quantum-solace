@@ -1,6 +1,6 @@
 //
 //  FriendshipStateTests.swift
-//  crypto-session
+//  post-quantum-solace
 //
 //  Created by Cole M on 10/19/24.
 //
@@ -24,8 +24,8 @@ struct FriendshipMetadataTests {
         var friendship = FriendshipMetadata()
         friendship.synchronizeAcceptedState()
         
-        #expect(friendship.myState == .requested)
-        #expect(friendship.ourState == .pending)
+        #expect(friendship.myState == .accepted)
+        #expect(friendship.ourState == .accepted)
     }
     
     @Test
@@ -63,9 +63,9 @@ struct FriendshipMetadataTests {
         var friendship = FriendshipMetadata(myState: .requested, theirState: .pending)
         friendship.rejectFriendRequest()
         
-        #expect(friendship.myState == .pending)
-        #expect(friendship.theirState == .pending)
-        #expect(friendship.ourState == .pending)
+        #expect(friendship.myState == .rejectedRequest)
+        #expect(friendship.theirState == .rejected)
+        #expect(friendship.ourState == .friendshipRejected)
     }
     
     @Test
@@ -73,9 +73,9 @@ struct FriendshipMetadataTests {
         var friendship = FriendshipMetadata()
         friendship.rejectFriendRequest()
         
-        #expect(friendship.myState == .blockedUser)
-        #expect(friendship.theirState == .blocked)
-        #expect(friendship.ourState == .pending)
+        #expect(friendship.myState == .rejectedRequest)
+        #expect(friendship.theirState == .rejected)
+        #expect(friendship.ourState == .friendshipRejected)
     }
     
     @Test
@@ -83,9 +83,9 @@ struct FriendshipMetadataTests {
         var friendship = FriendshipMetadata()
         friendship.rejectFriendRequest()
         friendship.switchStates()
-        #expect(friendship.myState == .blocked)
-        #expect(friendship.theirState == .blockedUser)
-        #expect(friendship.ourState == .pending)
+        #expect(friendship.myState == .rejected)
+        #expect(friendship.theirState == .rejectedRequest)
+        #expect(friendship.ourState == .friendshipRejected)
     }
     
     @Test

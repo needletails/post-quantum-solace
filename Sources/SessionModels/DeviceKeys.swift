@@ -1,10 +1,11 @@
 //
 //  DeviceKeys.swift
-//  needletail-crypto
+//  post-quantum-solace
 //
 //  Created by Cole M on 9/14/24.
 //
 import Foundation
+import SwiftKyber
 import DoubleRatchetKit
 
 /// A struct representing the cryptographic keys associated with a device.
@@ -15,7 +16,9 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
         case privateSigningKey = "b"    // Key for the private signing key
         case privateLongTermKey = "c"   // Key for the long term private key
         case privateOneTimeKeys = "d"   // Key for the one time private key
-        case kyber1024PrivateKey = "e"  //Post Quatum Private Key
+        case privateKyberOneTimeKeys = "e" //Post Quatum Private Keys
+        case finalKyberPrivateKey = "f"  //Final Post Quatum Private Key
+        case rotateKeyDate = "g" // Date to rotate long term keys
     }
     
     /// Unique identifier for the device.
@@ -23,22 +26,31 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     /// Data representing the private signing identity of the device.
     public let privateSigningKey: Data
     /// Data representing the private key of the device.
-    public let privateLongTermKey: Data
+    public var privateLongTermKey: Data
     
     public var privateOneTimeKeys: [Curve25519PrivateKeyRepresentable]
     
-    public let kyber1024PrivateKey: Data
+    public var privateKyberOneTimeKeys: [Kyber1024PrivateKeyRepresentable]
+    
+    public var finalKyberPrivateKey: Kyber1024PrivateKeyRepresentable
+    
+    public var rotateKeyDate: Date?
     
     public init(
         deviceId: UUID,
         privateSigningKey: Data,
         privateLongTermKey: Data,
         privateOneTimeKeys: [Curve25519PrivateKeyRepresentable],
-        kyber1024PrivateKey: Data) {
+        privateKyberOneTimeKeys: [Kyber1024PrivateKeyRepresentable],
+        finalKyberPrivateKey: Kyber1024PrivateKeyRepresentable,
+        rotateKeyDate: Date? = nil
+    ) {
         self.deviceId = deviceId
         self.privateSigningKey = privateSigningKey
         self.privateLongTermKey = privateLongTermKey
         self.privateOneTimeKeys = privateOneTimeKeys
-        self.kyber1024PrivateKey = kyber1024PrivateKey
+        self.privateKyberOneTimeKeys = privateKyberOneTimeKeys
+        self.finalKyberPrivateKey = finalKyberPrivateKey
+        self.rotateKeyDate = rotateKeyDate
     }
 }

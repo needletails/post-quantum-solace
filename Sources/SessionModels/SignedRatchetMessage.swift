@@ -1,6 +1,6 @@
 //
 //  SignedRatchetMessage.swift
-//  needletail-crypto
+//  post-quantum-solace
 //
 //  Created by Cole M on 9/15/24.
 //

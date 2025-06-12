@@ -1,6 +1,6 @@
 //
 //  TaskProcessor.swift
-//  crypto-session
+//  post-quantum-solace
 //
 //  Created by Cole M on 4/8/25.
 //
@@ -63,6 +63,21 @@ actor TaskProcessor {
 
     /// Delegate responsible for transport-level session communication.
     var delegate: (any SessionTransport)?
+    
+    struct StashedTask: Hashable, Sendable {
+        let id = UUID()
+        let task: InboundTaskMessage
+        
+        static func == (lhs: TaskProcessor.StashedTask, rhs: TaskProcessor.StashedTask) -> Bool {
+            lhs.id == rhs.id
+        }
+        
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(id)
+        }
+    }
+    
+    var stashedMessages = Set<StashedTask>()
 
     // MARK: - Initialization
 

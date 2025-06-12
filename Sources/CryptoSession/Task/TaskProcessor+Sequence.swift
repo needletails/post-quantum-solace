@@ -1,6 +1,6 @@
 //
 //  TaskProcessor+Sequence.swift
-//  crypto-session
+//  post-quantum-solace
 //
 //  Created by Cole M on 4/8/25.
 //
@@ -136,20 +136,20 @@ extension TaskProcessor {
                 do {
                     logger.log(level: .debug, message: "Executing Job \(props.sequenceId)")
                     try await performRatchet(task: props.task.task, session: session)
-                    try await cache.removeJob(job)
+                    try? await cache.removeJob(job)
                     
                 } catch let jobError as JobProcessorErrors where jobError == .missingIdentity {
                     logger.log(level: .error, message: "Removing Job due to: \(jobError)")
-                    try await cache.removeJob(job)
+                    try? await cache.removeJob(job)
                     
                 } catch let cryptoError as CryptoKitError where cryptoError == .authenticationFailure {
                     logger.log(level: .error, message: "Removing Job due to: \(cryptoError)")
-                    try await cache.removeJob(job)
+                    try? await cache.removeJob(job)
                     
-                } catch let sessionError as CryptoSession.SessionErrors where sessionError == .invalidKeyId {
+                } catch let sessionError as CryptoSession.SessionErrors where sessionError == .invalidKeyId || sessionError == .cannotFindOneTimeKey {
                     //TODO: If we are invalid due to a race condition between the server and client we can optionally resend
                     logger.log(level: .error, message: "Removing Job due to: \(sessionError)")
-                    try await cache.removeJob(job)
+                    try? await cache.removeJob(job)
                 } catch {
                     logger.log(level: .error, message: "Job error \(error)")
                     

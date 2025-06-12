@@ -1,6 +1,6 @@
 //
 //  SessionUser.swift
-//  needletail-crypto
+//  post-quantum-solace
 //
 //  Created by Cole M on 9/14/24.
 //

@@ -1,6 +1,6 @@
 //
 //  SessionCache.swift
-//  crypto-session
+//  post-quantum-solace
 //
 //  Created by Cole M on 9/15/24.
 //
@@ -69,15 +69,20 @@ public actor SessionCache: CryptoSessionStore {
     /// - Returns: The cached or fetched configuration data.
     /// - Throws: An error if the configuration cannot be found.
     public func findLocalSessionContext() async throws -> Data {
-        let data = try await store.findLocalSessionContext()
-        try await setLocalDeviceConfiguration(data)
-        return data
+        if let _localDeviceConfiguration {
+            return _localDeviceConfiguration
+        } else {
+            let data = try await store.findLocalSessionContext()
+            try await setLocalDeviceConfiguration(data)
+            return data
+        }
     }
     
     /// Updates the local device configuration and refreshes the cache.
     /// - Parameter data: The new configuration data.
     /// - Throws: An error if the update fails.
     public func updateLocalSessionContext(_ data: Data) async throws {
+        try await setLocalDeviceConfiguration(data)
         try await store.deleteLocalSessionContext()
         try await self.createLocalSessionContext(data)
     }
@@ -116,23 +121,31 @@ public actor SessionCache: CryptoSessionStore {
     /// - Parameter session: The session identity to be created.
     /// - Throws: An error if the creation fails.
     public func createSessionIdentity(_ session: SessionIdentity) async throws {
-        try await store.createSessionIdentity(session)
         sessionIdentities.append(session)
+        try await store.createSessionIdentity(session)
     }
     
     /// Fetches all session identities from the store and updates the cache.
     /// - Returns: An array of session identities.
     /// - Throws: An error if fetching fails.
     public func fetchSessionIdentities() async throws -> [SessionIdentity] {
-        let identities = try await store.fetchSessionIdentities()
-        sessionIdentities = identities // Update the cache
-        return sessionIdentities
+        if !sessionIdentities.isEmpty {
+            return sessionIdentities
+        } else {
+            let identities = try await store.fetchSessionIdentities()
+            self.sessionIdentities = identities // Update the cache
+            return identities
+        }
     }
     
     /// Updates an existing session identity.
     /// - Parameter session: The session identity to be updated.
     /// - Throws: An error if the update fails.
     public func updateSessionIdentity(_ session: SessionIdentity) async throws {
+        if sessionIdentities.isEmpty {
+            let identities = try await store.fetchSessionIdentities()
+            self.sessionIdentities = identities // Update the cache
+        }
         if let index = sessionIdentities.firstIndex(where: { $0.id == session.id }) {
             sessionIdentities[index] = session
             try await store.updateSessionIdentity(session)

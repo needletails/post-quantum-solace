@@ -1,6 +1,6 @@
 //
 //  SessionTransport.swift
-//  needletail-crypto
+//  post-quantum-solace
 //
 //  Created by Cole M on 9/14/24.
 //
@@ -53,16 +53,20 @@ public protocol SessionTransport: Sendable {
     /// Publishes the user configuration to the network. We call this for the master device and updating its bundle with new devices
     /// - Parameter configuration: The user configuration to be published.
     /// - Throws: An error if the configuration could not be published.
-    func publishUserConfiguration(_ configuration: UserConfiguration, updateKeyBundle: Bool) async throws
+    func publishUserConfiguration(_ configuration: UserConfiguration, recipient identity: UUID) async throws
     
-    func fetchOneTimeKey(for secretName: String, deviceId: String) async throws -> Curve25519PublicKeyRepresentable
-    func updateOneTimeKeys(for secretName: String) async throws
-    func deleteOneTimeKey(for secretName: String, with id: String) async throws
-    
+    func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys
+    func fetchOneTimeKeyIdentites(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID]
+    func updateOneTimeKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedPublicOneTimeKey]) async throws
+    func updateOneTimeKyberKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedKyberOneTimeKey]) async throws
+    func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
+    func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
+    func rotateLongTermKeys(for secretName: String, deviceId: String, keys: LongTermKeys) async throws
     func createUploadPacket(
         secretName: String,
         deviceId: UUID,
         recipient: MessageRecipient,
         metadata: Document
     ) async throws
+    func notifyIdentityCreation(for secretName: String, keys: OneTimeKeys) async throws
 }

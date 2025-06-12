@@ -1,6 +1,6 @@
 //
 //  SessionEvents.swift
-//  crypto-session
+//  post-quantum-solace
 //
 //  Created by Cole M on 4/19/25.
 //
@@ -312,7 +312,7 @@ extension SessionEvents {
             _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
             try await cache.createCommunication(communicationModel)
             await receiver.updatedCommunication(communicationModel, members: [info.secretName])
-            logger.log(level: .debug, message: "Created Communication Model")
+            logger.log(level: .debug, message: "Created Communication Model for \(info.secretName)")
             
             try await requestMetadata(
                 from: contact.secretName,
@@ -388,8 +388,7 @@ extension SessionEvents {
                 symmetricKey: symmetricKey,
                 metadata: friendshipMetadata,
                 with: "friendshipMetadata")
-            
-            try await cache.updateContact(foundContact)
+        
             
             guard let updatedMetadata = updatedProps?.metadata else {
                 throw EventErrors.propsError
@@ -402,10 +401,24 @@ extension SessionEvents {
                 metadata: updatedMetadata)
             
             try await receiver.updateContact(updatedContact)
+            
+            let contactModel = try ContactModel(
+                id: updatedContact.id, // Use the same UUID
+                props: .init(
+                    secretName: updatedContact.secretName,
+                    configuration: updatedContact.configuration,
+                    metadata: updatedContact.metadata
+                ),
+                symmetricKey: symmetricKey)
+            
+            try await cache.updateContact(contactModel)
             return foundContact
         } else {
             
-            let userConfiguration = try await transport.findConfiguration(for: newContactSecretName)
+            var userConfiguration = try await transport.findConfiguration(for: newContactSecretName)
+            //Not needed on the contact level
+            userConfiguration.signedPublicKyberOneTimeKeys.removeAll()
+            userConfiguration.signedPublicOneTimeKeys.removeAll()
             
             let contact = Contact(
                 id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
@@ -420,8 +433,7 @@ extension SessionEvents {
                     configuration: contact.configuration,
                     metadata: contact.metadata
                 ),
-                symmetricKey: symmetricKey
-            )
+                symmetricKey: symmetricKey)
             
             try await cache.createContact(contactModel)
             try await receiver.createdContact(contact)
@@ -559,7 +571,10 @@ extension SessionEvents {
             cache: cache,
             receiver: receiver,
             symmetricKey: symmetricKey,
-            logger: logger) else { return }
+            logger: logger
+        ) else {
+            return
+        }
         
         try await sessionDelegate.communicationSynchonization(recipient: .nickname(secretName), sharedIdentifier: sharedIdentifier)
         logger.log(level: .debug, message: "Sent communication synchronization")

@@ -1,10 +1,11 @@
 //
 //  UserDeviceConfiguration.swift
-//  needletail-crypto
+//  post-quantum-solace
 //
 //  Created by Cole M on 9/14/24.
 //
 import Foundation
+import DoubleRatchetKit
 
 /// Errors that can occur during signing operations.
 enum SigningErrors: Error {
@@ -27,7 +28,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     public let publicLongTermKey: Data
     
     /// Public key associated with the device.
-    public let kyber1024PublicKey: Data
+    public var finalKyber1024PublicKey: Kyber1024PublicKeyRepresentable
     
     /// An optional device name to identify what device this actually is.
     public let deviceName: String?
@@ -43,7 +44,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         case deviceId = "a"               // Key for the device identifier
         case publicSigningKey = "b"       // Key for the public signing key
         case publicLongTermKey = "c"      // Key for the public long-term key
-        case kyber1024PublicKey = "d"     // Key for the Kyber 1024 public key
+        case finalKyber1024PublicKey = "d"     // Key for the Kyber 1024 public key
         case deviceName = "e"              // Key for the device name
         case hmacData = "f"                // Key for the HMAC data
         case isMasterDevice = "g"          // Key for the master device flag
@@ -64,7 +65,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         deviceId: UUID,
         publicSigningKey: Data,
         publicLongTermKey: Data,
-        kyber1024PublicKey: Data,
+        finalKyber1024PublicKey: Kyber1024PublicKeyRepresentable,
         deviceName: String?,
         hmacData: Data,
         isMasterDevice: Bool
@@ -72,7 +73,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         self.deviceId = deviceId
         self.publicSigningKey = publicSigningKey
         self.publicLongTermKey = publicLongTermKey
-        self.kyber1024PublicKey = kyber1024PublicKey
+        self.finalKyber1024PublicKey = finalKyber1024PublicKey
         self.deviceName = deviceName
         self.hmacData = hmacData
         self.isMasterDevice = isMasterDevice
@@ -126,5 +127,28 @@ public struct UserSession: Identifiable, Codable, Sendable, Hashable {
     /// - Parameter hasher: The hasher to use for hashing the `UserSession`.
     public func hash(into hasher: inout Hasher) {
         hasher.combine(id)
+    }
+}
+
+
+public struct OneTimeKeys: Codable, Sendable {
+    public let curve: DoubleRatchetKit.Curve25519PublicKeyRepresentable?
+    public let kyber: DoubleRatchetKit.Kyber1024PublicKeyRepresentable?
+    
+    public init(curve: DoubleRatchetKit.Curve25519PublicKeyRepresentable? = nil,
+                kyber: DoubleRatchetKit.Kyber1024PublicKeyRepresentable? = nil) {
+        self.curve = curve
+        self.kyber = kyber
+    }
+}
+
+public struct LongTermKeys: Codable, Sendable {
+    public let curve: DoubleRatchetKit.Curve25519PublicKeyRepresentable?
+    public let kyber: DoubleRatchetKit.Kyber1024PublicKeyRepresentable?
+    
+    public init(curve: DoubleRatchetKit.Curve25519PublicKeyRepresentable? = nil,
+                kyber: DoubleRatchetKit.Kyber1024PublicKeyRepresentable? = nil) {
+        self.curve = curve
+        self.kyber = kyber
     }
 }
