@@ -1,6 +1,6 @@
 //
 //  MessageMetadata.swift
-//  crypto-session
+//  post-quantum-solace
 //
 //  Created by Cole M on 9/29/24.
 //

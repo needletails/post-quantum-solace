@@ -1,6 +1,6 @@
 //
 //  NeedleTailSession.swift
-//  needletail-crypto
+//  post-quantum-solace
 //
 //  Created by Cole M on 9/12/24.
 //
@@ -13,6 +13,7 @@ import NeedleTailLogger
 import Crypto
 import BSON
 import DoubleRatchetKit
+import SwiftKyber
 
 /// The `CryptoSession` actor manages cryptographic sessions, including key management,
 /// session context, and communication with other components in the system. It conforms
@@ -39,13 +40,18 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     private(set) var _sessionContext: SessionContext? // Current session context
     private var _appPassword = "" // Application password
     let logger = NeedleTailLogger(.init(label: "[CryptoSession]")) // Logger for the session
-    var taskProcessor = TaskProcessor() // Task processor for handling asynchronous tasks
-    var transportDelegate: (any SessionTransport)? // Delegate for transport operations
-    var receiverDelegate: (any EventReceiver)? // Delegate for receiving events
-    var sessionDelegate: (any CryptoSessionDelegate)? // Delegate for session-related events
-    var eventDelegate: (any SessionEvents)? // Delegate for session events
+    private(set) var taskProcessor = TaskProcessor() // Task processor for handling asynchronous tasks
+    private(set) var transportDelegate: (any SessionTransport)? // Delegate for transport operations
+    private(set) var receiverDelegate: (any EventReceiver)? // Delegate for receiving events
+    private(set) var sessionDelegate: (any CryptoSessionDelegate)? // Delegate for session-related events
+    private(set) var eventDelegate: (any SessionEvents)? // Delegate for session events
     public nonisolated(unsafe) weak var linkDelegate: DeviceLinkingDelegate? // Delegate for device linking
     public var cache: SessionCache? // Cache for session data
+    private var refreshOTKeysTask: Task<Void, Never>?
+    private var refreshKyberOTKeysTask: Task<Void, Never>?
+    
+    
+    var sessionIdentities = Set<String>()
     
     // Asynchronously retrieves the current session context
     public var sessionContext: SessionContext? {
@@ -150,20 +156,28 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         case invalidDocument = "The document is invalid."
         case receiverDelegateNotSet = "The receiver delegate is not set."
         case invalidKeyId = "The Key ID is invalid."
+        case drainedKeys = "The Local Keys are drained."
+        case longTermKeyRotationFailed = "Failed to rotate the long-term key."
     }
     
     /// A struct representing a bundle of cryptographic data for a device.
     public struct CryptographicBundle: Sendable {
         public let deviceKeys: DeviceKeys // Keys associated with the device
-        let deviceConfiguration: UserDeviceConfiguration // Configuration for the device
-        let userConfiguration: UserConfiguration // User configuration associated with the device
+        public let deviceConfiguration: UserDeviceConfiguration // Configuration for the device
+        public let userConfiguration: UserConfiguration // User configuration associated with the device
     }
     
     /// A struct to represent a key pair with a UUID for both public and private keys.
-    public struct KeyPair {
+    public struct KeyPair<Public, Private> {
         public let id: UUID // Unique identifier for the key pair
-        public let publicKey: Curve25519PublicKeyRepresentable // Public key
-        public let privateKey: Curve25519PrivateKeyRepresentable // Private key
+        public let publicKey: Public // Public key
+        public let privateKey: Private // Private key
+        
+        public init(id: UUID, publicKey: Public, privateKey: Private) {
+            self.id = id
+            self.publicKey = publicKey
+            self.privateKey = privateKey
+        }
     }
     
     /// Creates a cryptographic bundle for a device, including keys and configurations.
@@ -187,7 +201,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         let privateLongTermKey = crypto.generateCurve25519PrivateKey()
         
         // Generate 100 private one-time key pairs
-        let privateOneTimeKeyPairs: [KeyPair] = try (0..<100).map { _ in
+        let curveOneTimeKeyPairs: [KeyPair] = try (0..<100).map { _ in
             let id = UUID()
             let privateKey = crypto.generateCurve25519PrivateKey()
             let privateKeyRep = try Curve25519PrivateKeyRepresentable(id: id, privateKey.rawRepresentation)
@@ -195,11 +209,18 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
         }
         
+        let kyberOneTimeKeyPairs: [KeyPair] = try (0..<100).map { _ in
+            let id = UUID()
+            let privateKey = try crypto.generateKyber1024PrivateSigningKey()
+            let privateKeyRep = try Kyber1024PrivateKeyRepresentable(id: id, privateKey.encode())
+            let publicKey = try Kyber1024PublicKeyRepresentable(id: id, privateKey.publicKey.rawRepresentation)
+            return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+        }
+
+        let finalKyber1024Key =  try crypto.generateKyber1024PrivateSigningKey()
+        
         // Generate a private signing key
         let privateSigningKey = crypto.generateCurve25519SigningPrivateKey()
-        
-        // Generate a Kyber 1024 private signing key
-        let kyber1024PrivateKey = try crypto.generateKyber1024PrivateSigningKey()
         
         // Create a unique device ID
         let deviceId = UUID()
@@ -212,16 +233,17 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             deviceId: deviceId,
             privateSigningKey: privateSigningKey.rawRepresentation,
             privateLongTermKey: privateLongTermKey.rawRepresentation,
-            privateOneTimeKeys: privateOneTimeKeyPairs.map { $0.privateKey },
-            kyber1024PrivateKey: kyber1024PrivateKey.encode()
-        )
+            privateOneTimeKeys: curveOneTimeKeyPairs.map { $0.privateKey },
+            privateKyberOneTimeKeys: kyberOneTimeKeyPairs.map { $0.privateKey },
+            finalKyberPrivateKey: try .init(finalKyber1024Key.encode()),
+            rotateKeyDate: Calendar.current.date(byAdding: .weekOfYear, value: 1, to: Date()))
         
         // Create a user device configuration
         let device = try UserDeviceConfiguration(
             deviceId: deviceKeys.deviceId,
             publicSigningKey: privateSigningKey.publicKey.rawRepresentation,
             publicLongTermKey: privateLongTermKey.publicKey.rawRepresentation,
-            kyber1024PublicKey: kyber1024PrivateKey.publicKey.rawRepresentation,
+            finalKyber1024PublicKey: .init(finalKyber1024Key.publicKey.rawRepresentation),
             deviceName: getDeviceName(),
             hmacData: hmacData,
             isMasterDevice: isMaster
@@ -234,20 +256,26 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         )
         
         // Create signed public one-time keys for each one-time key pair
-        let signedPublicOneTimeKeys: [UserConfiguration.SignedPublicOneTimeKey] = try privateOneTimeKeyPairs.map { keyPair in
+        let signedPublicOneTimeKeys: [UserConfiguration.SignedPublicOneTimeKey] = try curveOneTimeKeyPairs.map { keyPair in
             try UserConfiguration.SignedPublicOneTimeKey(
                 key: keyPair.publicKey,
                 deviceId: deviceId,
-                signingKey: privateSigningKey
-            )
+                signingKey: privateSigningKey)
+        }
+        
+        let signedPublicKyberOneTimeKeys: [UserConfiguration.SignedKyberOneTimeKey] = try kyberOneTimeKeyPairs.map { keyPair in
+            try UserConfiguration.SignedKyberOneTimeKey(
+                key: keyPair.publicKey,
+                deviceId: deviceId,
+                signingKey: privateSigningKey)
         }
         
         // Create the user configuration with the signed device and keys
         let userConfiguration = UserConfiguration(
             publicSigningKey: privateSigningKey.publicKey.rawRepresentation,
             signedDevices: [signedDeviceConfiguration],
-            signedPublicOneTimeKeys: signedPublicOneTimeKeys
-        )
+            signedPublicOneTimeKeys: signedPublicOneTimeKeys,
+            signedPublicKyberOneTimeKeys: signedPublicKyberOneTimeKeys)
         
         // Return the complete cryptographic bundle
         return CryptographicBundle(
@@ -267,8 +295,6 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         let databaseSymmetricKey = SymmetricKey(size: .bits256)
         return databaseSymmetricKey.withUnsafeBytes { Data($0) }
     }
-    
-    
     
     /// Creates a new session with the provided secret name and application password.
     ///
@@ -346,7 +372,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 
             case .userNotFound:
                 // UserConfiguration does not contain Private keys/info... so it should be safe to store publicly.
-                try await transportDelegate?.publishUserConfiguration(bundle.userConfiguration, updateKeyBundle: false)
+                try await transportDelegate?.publishUserConfiguration(bundle.userConfiguration, recipient: bundle.deviceKeys.deviceId)
                 
                 sessionContext.registrationState = .registered
                 await setSessionContext(sessionContext)
@@ -416,9 +442,18 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     ) async throws -> CryptoSession {
         // Set the application password
         await setAppPassword(password)
-        
+
+        let linkConfig = try UserDeviceConfiguration(
+            deviceId: bundle.deviceConfiguration.deviceId,
+            publicSigningKey:  Data(),
+            publicLongTermKey:  Data(),
+            finalKyber1024PublicKey: .init(Data()),
+            deviceName: bundle.deviceConfiguration.deviceName,
+            hmacData: bundle.deviceConfiguration.hmacData,
+            isMasterDevice: bundle.deviceConfiguration.isMasterDevice)
+
         // Encode the device configuration to prepare for QR code generation
-        let data = try BSONEncoder().encodeData(bundle.deviceConfiguration)
+        let data = try BSONEncoder().encodeData(linkConfig)
         
         // Generate cryptographic credentials for device linking
         if let credentials = await linkDelegate?.generatedDeviceCryptographic(data, password: password) {
@@ -446,8 +481,8 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 configuration: bundle.userConfiguration,
                 privateSigningKeyData: bundle.deviceKeys.privateSigningKey,
                 devices: credentials.devices,
-                keys: bundle.userConfiguration.getVerifiedKeys(deviceId: bundle.deviceKeys.deviceId)
-            )
+                keys: bundle.userConfiguration.getVerifiedKeys(deviceId: bundle.deviceKeys.deviceId),
+                kyberKeys: bundle.userConfiguration.getVerifiedKyberKeys(deviceId: bundle.deviceKeys.deviceId))
             
             // Create a new session context with the session user and user configuration
             var sessionContext = SessionContext(
@@ -455,8 +490,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 databaseEncryptionKey: databaseEncryptionKey,
                 sessionContextId: .random(in: 1 ..< .max),
                 lastUserConfiguration: userConfiguration,
-                registrationState: .unregistered
-            )
+                registrationState: .unregistered)
             
             // Set the session context
             await setSessionContext(sessionContext)
@@ -476,7 +510,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             // Update the registration state to registered
             sessionContext.registrationState = .registered
             await setSessionContext(sessionContext)
-            
+
             // Encode the updated session context for encryption
             let encodedData = try BSONEncoder().encode(sessionContext).makeData()
             
@@ -556,8 +590,8 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             configuration: sessionContext.lastUserConfiguration,
             privateSigningKeyData: sessionContext.sessionUser.deviceKeys.privateSigningKey,
             devices: devices,
-            keys: sessionContext.lastUserConfiguration.getVerifiedKeys(deviceId: sessionContext.sessionUser.deviceId)
-        )
+            keys: sessionContext.lastUserConfiguration.getVerifiedKeys(deviceId: sessionContext.sessionUser.deviceId),
+            kyberKeys: sessionContext.lastUserConfiguration.getVerifiedKyberKeys(deviceId: sessionContext.sessionUser.deviceId))
         
         // Update the last user configuration in the session context
         sessionContext.lastUserConfiguration = userConfiguration
@@ -610,7 +644,8 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         let userConfiguration = UserConfiguration(
             publicSigningKey: sessionContext.lastUserConfiguration.publicSigningKey,
             signedDevices: sessionContext.lastUserConfiguration.signedDevices,
-            signedPublicOneTimeKeys: keys)
+            signedPublicOneTimeKeys: keys,
+            signedPublicKyberOneTimeKeys: sessionContext.lastUserConfiguration.signedPublicKyberOneTimeKeys)
         
         // Update the last user configuration in the session context
         sessionContext.lastUserConfiguration = userConfiguration
@@ -660,7 +695,8 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         configuration: UserConfiguration,
         privateSigningKeyData: Data,
         devices: [UserDeviceConfiguration],
-        keys: [Curve25519PublicKeyRepresentable]
+        keys: [Curve25519PublicKeyRepresentable],
+        kyberKeys: [Kyber1024PublicKeyRepresentable]
     ) async throws -> UserConfiguration {
         // 1) Reconstruct your Curve25519 signing key
         let privateSigningKey = try Curve25519SigningPrivateKey(
@@ -693,8 +729,17 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
                 try UserConfiguration.SignedPublicOneTimeKey(
                     key: key,
                     deviceId: device.deviceId,
-                    signingKey: privateSigningKey
-                )
+                    signingKey: privateSigningKey)
+            }
+        }
+        
+        // Create signed public one-time keys for each device
+        let signedKyberKeys: [UserConfiguration.SignedKyberOneTimeKey] = try devices.flatMap { device in
+            try kyberKeys.map { key in
+                try UserConfiguration.SignedKyberOneTimeKey(
+                    key: key,
+                    deviceId: device.deviceId,
+                    signingKey: privateSigningKey)
             }
         }
         
@@ -702,11 +747,9 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         return UserConfiguration(
             publicSigningKey: publicSigningKey.rawRepresentation,
             signedDevices: signedDevices,
-            signedPublicOneTimeKeys: signedKeys
-        )
+            signedPublicOneTimeKeys: signedKeys,
+        signedPublicKyberOneTimeKeys: signedKyberKeys)
     }
-    
-    
     
     /// Starts a session using the provided application password.
     ///
@@ -736,7 +779,7 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         // Retrieve salt and derive symmetric key
         let saltData = try await cache.findLocalDeviceSalt(keyData: passwordData)
         
-        // Derive the symmetric key from the password and salt
+        // Derive the symmetric key from the password and salt - This is the AppSymmetricKey
         let symmetricKey = await crypto.deriveStrictSymmetricKey(
             data: passwordData,
             salt: saltData)
@@ -749,13 +792,310 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
             
             // Decode the session context from the decrypted data
             let sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
-            
             await setSessionContext(sessionContext)
+
             return CryptoSession.shared
         } catch {
             throw error
         }
     }
+    
+    public func rotateKeysIfNeeded() async throws {
+        guard let cache else {
+            throw SessionErrors.databaseNotInitialized
+        }
+        let data = try await cache.findLocalSessionContext()
+        
+        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
+            throw SessionErrors.sessionDecryptionError
+        }
+        
+        // Decode the session context from the decrypted data
+        var sessionContext = try BSONDecoder().decodeData(SessionContext.self, from: configurationData)
+        
+        if let rotateKeyDate = sessionContext.sessionUser.deviceKeys.rotateKeyDate {
+            // Get the current date
+            let currentDate = Date()
+            
+            // Create a Calendar instance
+            let calendar = Calendar.current
+            
+            // Calculate the date one week ago from the current date
+            if let oneWeekAgo = calendar.date(byAdding: .weekOfYear, value: -1, to: currentDate) {
+                // Check if rotateKeyDate is older than or equal to one week ago
+                if rotateKeyDate <= oneWeekAgo {
+               
+                    let privateCurveKey = crypto.generateCurve25519PrivateKey()
+                    let privateKyberKey = try crypto.generateKyber1024PrivateSigningKey()
+                    
+                    sessionContext.sessionUser.deviceKeys.privateLongTermKey = privateCurveKey.rawRepresentation
+                    sessionContext.sessionUser.deviceKeys.finalKyberPrivateKey = try Kyber1024PrivateKeyRepresentable(privateKyberKey.encode())
+                    
+                    let encodedData = try BSONEncoder().encode(sessionContext)
+                    guard let encryptedConfig = try await self.crypto.encrypt(data: encodedData.makeData(), symmetricKey: getAppSymmetricKey()) else {
+                        throw CryptoSession.SessionErrors.sessionEncryptionError
+                    }
+                    
+                    try await cache.updateLocalSessionContext(encryptedConfig)
+                    
+                    //Send Public Keys to server
+                    try await transportDelegate?.rotateLongTermKeys(
+                        for: sessionContext.sessionUser.secretName,
+                        deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                        keys: LongTermKeys(curve: .init(privateCurveKey.publicKey.rawRepresentation),
+                                           kyber: .init(privateKyberKey.publicKey.rawRepresentation)))
+                    
+                } else {
+                    logger.log(level: .trace, message: "Not time to rotate keys")
+                }
+            }
+        }
+        
+        await setSessionContext(sessionContext)
+    }
+
+    private func removeExpiredOTKeys() {
+        refreshOTKeysTask = nil
+    }
+    private func removeExpiredKyberOTKeys() {
+        refreshKyberOTKeysTask = nil
+    }
+    public func refreshOneTimeKeysTask() async {
+        // Cancel any existing task before creating a new one
+        refreshOTKeysTask?.cancel()
+        
+        refreshOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
+            guard let self = self else { return }
+            
+            do {
+                try await self.refreshOneTimeKeys(refreshType: .curve)
+            } catch {
+                // Handle any errors that may occur during the refresh
+                logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
+            }
+            
+            // Clean up the task reference after completion
+            await removeExpiredOTKeys()
+        }
+    }
+    
+    public func refreshKyberOneTimeKeysTask() async {
+        // Cancel any existing task before creating a new one
+        refreshKyberOTKeysTask?.cancel()
+        
+        refreshKyberOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
+            guard let self = self else { return }
+            
+            do {
+                try await self.refreshOneTimeKeys(refreshType: .kyber)
+            } catch {
+                // Handle any errors that may occur during the refresh
+                logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
+            }
+            
+            // Clean up the task reference after completion
+            await removeExpiredKyberOTKeys()
+        }
+    }
+    
+    func refreshOneTimeKeys(refreshType: KeysType) async throws {
+        guard let sessionContext = await sessionContext else { return }
+        guard let cache else { return }
+        var keys = [UUID]()
+        
+            if let fetched = try await transportDelegate?.fetchOneTimeKeyIdentites(for: sessionContext.sessionUser.secretName, deviceId:  sessionContext.sessionUser.deviceId.uuidString, type: refreshType) {
+                keys = fetched
+            }
+        
+        if !keys.isEmpty {
+            let publicKeysCount = try await synchronizeLocalKeys(cache: cache, keys: keys, type: refreshType)
+            if publicKeysCount <= 10 {
+                //1. Delete all local keys that are not on the server
+                let config = try await cache.findLocalSessionContext()
+                
+                // Decrypt the session context data using the app's symmetric key
+                guard let configurationData = try await crypto.decrypt(data: config, symmetricKey: getAppSymmetricKey()) else {
+                    throw SessionErrors.sessionDecryptionError
+                }
+                
+                // Decode the session context from the decrypted data
+                var sessionContext = try BSONDecoder().decodeData(SessionContext.self, from: configurationData)
+
+                logger.log(level: .info, message: "Creating Key Pairs, count: \(100 - publicKeysCount)")
+                switch refreshType {
+                case .curve:
+                    // Create needed key pairs
+                    let privateOneTimeKeyPairs: [KeyPair] = try (0..<100 - publicKeysCount).map { _ in
+                        let id = UUID()
+                        let privateKey = crypto.generateCurve25519PrivateKey()
+                        let privateKeyRep = try Curve25519PrivateKeyRepresentable(id: id, privateKey.rawRepresentation)
+                        let publicKey = try Curve25519PublicKeyRepresentable(id: id, privateKey.publicKey.rawRepresentation)
+                        return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+                    }
+                    
+                    sessionContext.sessionUser.deviceKeys.privateOneTimeKeys.append(contentsOf: privateOneTimeKeyPairs.map { $0.privateKey })
+                    let signedPublicOneTimeKeys: [UserConfiguration.SignedPublicOneTimeKey] = try privateOneTimeKeyPairs.map { keyPair in
+                        try UserConfiguration.SignedPublicOneTimeKey(
+                            key: keyPair.publicKey,
+                            deviceId: sessionContext.sessionUser.deviceId,
+                            signingKey: try Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.privateSigningKey))
+                    }
+                    
+                    sessionContext.lastUserConfiguration.signedPublicOneTimeKeys.append(contentsOf: signedPublicOneTimeKeys)
+                    
+                    try await transportDelegate?.updateOneTimeKeys(
+                        for: sessionContext.sessionUser.secretName,
+                        deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                        keys: signedPublicOneTimeKeys)
+                    
+                case .kyber:
+                    // Create needed key pairs
+                    let kyberOneTimeKeyPairs: [KeyPair] = try (0..<100).map { _ in
+                        let id = UUID()
+                        let privateKey = try crypto.generateKyber1024PrivateSigningKey()
+                        let privateKeyRep = try Kyber1024PrivateKeyRepresentable(id: id, privateKey.encode())
+                        let publicKey = try Kyber1024PublicKeyRepresentable(id: id, privateKey.publicKey.rawRepresentation)
+                        return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+                    }
+                    
+                    sessionContext.sessionUser.deviceKeys.privateKyberOneTimeKeys.append(contentsOf: kyberOneTimeKeyPairs.map { $0.privateKey })
+                    let signedKyberOneTimeKeys: [UserConfiguration.SignedKyberOneTimeKey] = try kyberOneTimeKeyPairs.map { keyPair in
+                        try UserConfiguration.SignedKyberOneTimeKey(
+                            key: keyPair.publicKey,
+                            deviceId: sessionContext.sessionUser.deviceId,
+                            signingKey: try Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.privateSigningKey))
+                    }
+                    
+                    sessionContext.lastUserConfiguration.signedPublicKyberOneTimeKeys.append(contentsOf: signedKyberOneTimeKeys)
+                    
+                    try await transportDelegate?.updateOneTimeKyberKeys(
+                        for: sessionContext.sessionUser.secretName,
+                        deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                        keys: signedKyberOneTimeKeys)
+                }
+
+                
+                sessionContext.updateSessionUser(sessionContext.sessionUser)
+                await setSessionContext(sessionContext)
+                
+                // Encrypt and persist
+                let encodedData = try BSONEncoder().encode(sessionContext)
+                guard let encryptedConfig = try await self.crypto.encrypt(data: encodedData.makeData(), symmetricKey: getAppSymmetricKey()) else {
+                    throw CryptoSession.SessionErrors.sessionEncryptionError
+                }
+                
+                try await cache.updateLocalSessionContext(encryptedConfig)
+            }
+        }
+    }
+    
+    func synchronizeLocalKeys(cache: SessionCache, keys: [UUID], type: KeysType) async throws -> Int {
+        let data = try await cache.findLocalSessionContext()
+        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
+            throw SessionErrors.sessionDecryptionError
+        }
+
+        var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+        var didUpdate = false
+        
+        switch type {
+        case .curve:
+            let privateKeys = sessionContext.sessionUser.deviceKeys.privateOneTimeKeys
+            let publicKeys = sessionContext.lastUserConfiguration.signedPublicOneTimeKeys
+            let privateKeyIDs = Set(privateKeys.map(\.id))
+            let publicKeyIDs = Set(publicKeys.map(\.id))
+            let remoteKeySet = Set(keys)
+
+            let privateIntersection = privateKeyIDs.intersection(remoteKeySet)
+            let publicIntersection = publicKeyIDs.intersection(remoteKeySet)
+
+            if privateIntersection.isEmpty && publicIntersection.isEmpty {
+                // No shared keys — remove all
+                sessionContext.sessionUser.deviceKeys.privateOneTimeKeys.removeAll()
+                sessionContext.lastUserConfiguration.signedPublicOneTimeKeys.removeAll()
+                didUpdate = true
+            } else {
+                // Remove only keys not in remote list
+                let filteredPrivate = privateKeys.filter { remoteKeySet.contains($0.id) }
+                if filteredPrivate.count != privateKeys.count {
+                    sessionContext.sessionUser.deviceKeys.privateOneTimeKeys = filteredPrivate
+                    didUpdate = true
+                }
+
+                let filteredPublic = publicKeys.filter { remoteKeySet.contains($0.id) }
+                if filteredPublic.count != publicKeys.count {
+                    sessionContext.lastUserConfiguration.signedPublicOneTimeKeys = filteredPublic
+                    didUpdate = true
+                }
+            }
+            
+            if didUpdate {
+                sessionContext.updateSessionUser(sessionContext.sessionUser)
+                await setSessionContext(sessionContext)
+
+                let encodedData = try BSONEncoder().encode(sessionContext)
+                guard let encryptedConfig = try await self.crypto.encrypt(data: encodedData.makeData(), symmetricKey: getAppSymmetricKey()) else {
+                    throw CryptoSession.SessionErrors.sessionEncryptionError
+                }
+
+                try await cache.updateLocalSessionContext(encryptedConfig)
+                
+                //if we have no keys delete all public keys on the server so we can regenerated a fresh batch
+                if sessionContext.sessionUser.deviceKeys.privateOneTimeKeys.isEmpty || sessionContext.lastUserConfiguration.signedPublicOneTimeKeys.isEmpty {
+                    try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
+                }
+            }
+            return sessionContext.lastUserConfiguration.signedPublicOneTimeKeys.count
+        case .kyber:
+            let privateKeys = sessionContext.sessionUser.deviceKeys.privateKyberOneTimeKeys
+            let publicKeys = sessionContext.lastUserConfiguration.signedPublicKyberOneTimeKeys
+            let privateKeyIDs = Set(privateKeys.map(\.id))
+            let publicKeyIDs = Set(publicKeys.map(\.id))
+            let remoteKeySet = Set(keys)
+
+            let privateIntersection = privateKeyIDs.intersection(remoteKeySet)
+            let publicIntersection = publicKeyIDs.intersection(remoteKeySet)
+
+            if privateIntersection.isEmpty && publicIntersection.isEmpty {
+                // No shared keys — remove all
+                sessionContext.sessionUser.deviceKeys.privateKyberOneTimeKeys.removeAll()
+                sessionContext.lastUserConfiguration.signedPublicKyberOneTimeKeys.removeAll()
+                didUpdate = true
+            } else {
+                // Remove only keys not in remote list
+                let filteredPrivate = privateKeys.filter { remoteKeySet.contains($0.id) }
+                if filteredPrivate.count != privateKeys.count {
+                    sessionContext.sessionUser.deviceKeys.privateKyberOneTimeKeys = filteredPrivate
+                    didUpdate = true
+                }
+
+                let filteredPublic = publicKeys.filter { remoteKeySet.contains($0.id) }
+                if filteredPublic.count != publicKeys.count {
+                    sessionContext.lastUserConfiguration.signedPublicKyberOneTimeKeys = filteredPublic
+                    didUpdate = true
+                }
+            }
+            
+            if didUpdate {
+                sessionContext.updateSessionUser(sessionContext.sessionUser)
+                await setSessionContext(sessionContext)
+
+                let encodedData = try BSONEncoder().encode(sessionContext)
+                guard let encryptedConfig = try await self.crypto.encrypt(data: encodedData.makeData(), symmetricKey: getAppSymmetricKey()) else {
+                    throw CryptoSession.SessionErrors.sessionEncryptionError
+                }
+
+                try await cache.updateLocalSessionContext(encryptedConfig)
+                
+                //if we have no keys delete all public keys on the server so we can regenerated a fresh batch
+                if sessionContext.sessionUser.deviceKeys.privateKyberOneTimeKeys.isEmpty || sessionContext.lastUserConfiguration.signedPublicKyberOneTimeKeys.isEmpty {
+                    try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
+                }
+            }
+            return sessionContext.lastUserConfiguration.signedPublicKyberOneTimeKeys.count
+        }
+    }
+
     
     /// Retrieves the symmetric key for database encryption.
     public func getDatabaseSymmetricKey() async throws -> SymmetricKey {
@@ -854,6 +1194,11 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
     
     /// Shuts down the session, clearing sensitive state.
     public func shutdown() async {
+        do {
+            try await taskProcessor.ratchetManager.shutdown()
+        } catch {
+            fatalError("Could not shutdown ratchet manager: \(error)")
+        }
         isViable = false
         cache = nil
         transportDelegate = nil
@@ -861,6 +1206,13 @@ public actor CryptoSession: NetworkDelegate, SessionCacheSynchronizer {
         linkDelegate = nil
         _sessionContext = nil
         _appPassword = ""
+        await setDatabaseDelegate(conformer: nil)
+        await setTransportDelegate(conformer: nil)
+        setReceiverDelegate(conformer: nil)
+        await setCryptoSessionDelegate(conformer: nil)
+        await setCryptoSessionDelegate(conformer: nil)
+        await setSessionEventDelegate(conformer: nil)
+        sessionIdentities.removeAll()
     }
     
 #if os(iOS)

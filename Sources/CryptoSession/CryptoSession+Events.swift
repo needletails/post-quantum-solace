@@ -1,6 +1,6 @@
 //
 //  SessionEvents.swift
-//  needletail-crypto
+//  post-quantum-solace
 //
 //  Created by Cole M on 9/14/24.
 //
@@ -42,6 +42,12 @@ extension CryptoSession {
         destructionTime: TimeInterval? = nil
     ) async throws {
         do {
+            if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.publicSigningKey.count <= 10 {
+                async let _ = await self.refreshOneTimeKeysTask()
+            }
+            if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedPublicKyberOneTimeKeys.count <= 10 {
+                async let _ = await self.refreshOneTimeKeysTask()
+            }
             let message = CryptoMessage(
                 text: text,
                 metadata: metadata,
@@ -50,7 +56,7 @@ extension CryptoSession {
                 sentDate: Date(),
                 destructionTime: destructionTime)
             
-            try await processWrite(message: message, session: CryptoSession.shared)
+            try await processWrite(message: message, session: self)
         } catch {
             self.logger.log(level: .error, message: "\(error)")
             throw error
@@ -72,6 +78,15 @@ extension CryptoSession {
         deviceId: UUID,
         messageId: String
     ) async throws {
+
+        //We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less that 10 local keys.
+        if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.publicSigningKey.count <= 10 {
+            async let _ = await self.refreshOneTimeKeysTask()
+        }
+        if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedPublicKyberOneTimeKeys.count <= 10 {
+            async let _ = await self.refreshOneTimeKeysTask()
+        }
+        
         let message = InboundTaskMessage(
             message: message,
             senderSecretName: sender,
@@ -80,7 +95,7 @@ extension CryptoSession {
         )
         try await taskProcessor.inboundTask(
             message,
-            session: CryptoSession.shared)
+            session: self)
     }
     
     // MARK: Outbound
@@ -220,7 +235,7 @@ extension CryptoSession: SessionEvents {
         requestFriendship: Bool
     ) async throws -> ContactModel {
         let params = try await requireAllSessionParameters()
-        
+        _ = try await refreshIdentities(secretName: secretName, forceRefresh: true)
         if let eventDelegate {
             return try await eventDelegate.updateOrCreateContact(
                 secretName: secretName,
@@ -251,7 +266,8 @@ extension CryptoSession: SessionEvents {
     /// - Throws: An error if the synchronization request fails.
     public func sendCommunicationSynchronization(contact secretName: String) async throws {
         let params = try await requireSessionParametersWithoutTransportDelegate()
-        
+        //On Contact Created attempt to create session identities
+        _ = try await refreshIdentities(secretName: secretName, forceRefresh: true)
         if let eventDelegate {
             return try await eventDelegate.sendCommunicationSynchronization(
                 contact: secretName,

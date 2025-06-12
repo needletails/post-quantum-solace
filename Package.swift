@@ -4,7 +4,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "crypto-session",
+    name: "post-quantum-solace",
     platforms: [
         .macOS(.v15),
         .iOS(.v18),
@@ -12,19 +12,17 @@ let package = Package(
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
-            name: "CryptoSession",
+            name: "PostQuantumSolace",
             targets: ["CryptoSession"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", .upToNextMajor(from: "3.12.3")),
-        .package(url: "git@github.com:needle-tail/double-ratchet-kit.git", .upToNextMajor(from: "1.0.1")),
+        .package(url: "git@github.com:needle-tail/double-ratchet-kit.git", .upToNextMajor(from: "1.0.2")),
         .package(url: "git@github.com:needle-tail/needletail-crypto.git", .upToNextMajor(from: "1.0.12")),
         .package(url: "git@github.com:needle-tail/needletail-logger.git", .upToNextMajor(from: "3.0.0")),
         .package(url: "git@github.com:needletails/needletail-algorithms.git", .upToNextMajor(from: "2.0.0")),
     ],
     targets: [
-        // Targets are the basic building blocks of a package, defining a module or a test suite.
-        // Targets can depend on other targets in this package and products from dependencies.
         .target(
             name: "CryptoSession", dependencies: [
                 "SessionEvents",
@@ -44,7 +42,7 @@ let package = Package(
             .product(name: "DoubleRatchetKit", package: "double-ratchet-kit")
         ]),
         .testTarget(
-            name: "CryptoSessionTests",
+            name: "PostQuantumSolaceTests",
             dependencies: ["CryptoSession"]
         ),
     ]
