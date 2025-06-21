@@ -8,6 +8,7 @@ import Foundation
 import DoubleRatchetKit
 import BSON
 import SessionModels
+import Crypto
 
 /// This metadata needs to be handle with care Ideally none of it should be sent over the wire. It should just be used to prepare the message for sending.
 public struct SignedRatchetMessageMetadata: Sendable {
@@ -61,7 +62,12 @@ public protocol SessionTransport: Sendable {
     func updateOneTimeKyberKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedKyberOneTimeKey]) async throws
     func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
     func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
-    func rotateLongTermKeys(for secretName: String, deviceId: String, keys: LongTermKeys) async throws
+    func rotateLongTermKeys(
+        for secretName: String,
+        deviceId: String,
+        pskData: Data,
+        signedDevice: UserConfiguration.SignedDeviceConfiguration
+    ) async throws
     func createUploadPacket(
         secretName: String,
         deviceId: UUID,

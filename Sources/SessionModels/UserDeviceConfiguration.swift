@@ -22,10 +22,10 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     public let deviceId: UUID
     
     /// Data representing the signing identity of the device.
-    public let publicSigningKey: Data
+    public var publicSigningKey: Data
     
     /// Public key associated with the device.
-    public let publicLongTermKey: Data
+    public var publicLongTermKey: Data
     
     /// Public key associated with the device.
     public var finalKyber1024PublicKey: Kyber1024PublicKeyRepresentable
@@ -77,6 +77,18 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         self.deviceName = deviceName
         self.hmacData = hmacData
         self.isMasterDevice = isMasterDevice
+    }
+    
+    public mutating func updatePublicSigningKey(_ data: Data) async {
+        self.publicSigningKey = data
+    }
+    
+    public mutating func updatePublicLongTermKey(_ data: Data) async {
+        self.publicLongTermKey = data
+    }
+    
+    public mutating func updateFinalKyberTermKey(_ represetable: Kyber1024PublicKeyRepresentable) async {
+        self.finalKyber1024PublicKey = represetable
     }
 }
 
@@ -144,11 +156,14 @@ public struct OneTimeKeys: Codable, Sendable {
 
 public struct LongTermKeys: Codable, Sendable {
     public let curve: DoubleRatchetKit.Curve25519PublicKeyRepresentable?
+    public let signing:  DoubleRatchetKit.Curve25519PublicKeySigningRepresentable?
     public let kyber: DoubleRatchetKit.Kyber1024PublicKeyRepresentable?
     
     public init(curve: DoubleRatchetKit.Curve25519PublicKeyRepresentable? = nil,
+                signing: DoubleRatchetKit.Curve25519PublicKeySigningRepresentable? = nil,
                 kyber: DoubleRatchetKit.Kyber1024PublicKeyRepresentable? = nil) {
         self.curve = curve
+        self.signing = signing
         self.kyber = kyber
     }
 }

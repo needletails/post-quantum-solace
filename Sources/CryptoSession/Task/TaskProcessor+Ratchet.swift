@@ -169,6 +169,7 @@ extension TaskProcessor: SessionIdentityDelegate {
         var localPrivateOneTimeKey: Curve25519PrivateKeyRepresentable?
         var remotePublicOneTimeKey: Curve25519PublicKeyRepresentable?
         var localPrivateKyberKey: Kyber1024PrivateKeyRepresentable
+        var needsRemoteDeletion = false
         
         if props.state == nil {
             if let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.privateOneTimeKeys.last {
@@ -188,10 +189,34 @@ extension TaskProcessor: SessionIdentityDelegate {
             guard let state = props.state else {
                 throw CryptoError.propsError
             }
-            remotePublicOneTimeKey = state.remotePublicOneTimeKey
+            
+            if await session.rotatingKeys {
+                needsRemoteDeletion = true
+                if let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.privateOneTimeKeys.last {
+                    localPrivateOneTimeKey = privateOneTimeKey
+                }
+                if let privateKyberOneTimeKey = sessionContext.sessionUser.deviceKeys.privateKyberOneTimeKeys.last {
+                    localPrivateKyberKey = privateKyberOneTimeKey
+                } else {
+                    localPrivateKyberKey = sessionContext.sessionUser.deviceKeys.finalKyberPrivateKey
+                }
+                await session.setRotatingKeys(false)
+            }
+            
+            if try await session.rotatePQKemKeysIfNeeded() {
+                needsRemoteDeletion = true
+                if let privateKyberOneTimeKey = sessionContext.sessionUser.deviceKeys.privateKyberOneTimeKeys.last {
+                    localPrivateKyberKey = privateKyberOneTimeKey
+                } else {
+                    localPrivateKyberKey = sessionContext.sessionUser.deviceKeys.finalKyberPrivateKey
+                }
+            } else {
+                localPrivateKyberKey = state.localKyber1024PrivateKey
+            }
             localPrivateOneTimeKey = state.localPrivateOneTimeKey
-            localPrivateKyberKey = state.localKyber1024PrivateKey
+            remotePublicOneTimeKey = state.remotePublicOneTimeKey
         }
+        
         try await ratchetManager.senderInitialization(
             sessionIdentity: sessionIdentity,
             sessionSymmetricKey: databaseSymmetricKey,
@@ -204,12 +229,13 @@ extension TaskProcessor: SessionIdentityDelegate {
                 oneTime: localPrivateOneTimeKey,
                 kyber: localPrivateKyberKey))
         
-        if props.state == nil {
+        if props.state == nil || needsRemoteDeletion {
             try await removeUsedKeys(
                 session: session,
                 sessionContext: sessionContext,
                 localPrivateOneTimeKey: localPrivateOneTimeKey,
                 localPrivateKyberKey: localPrivateKyberKey)
+            needsRemoteDeletion = false
         }
         
         if let sessionDelegate = await session.sessionDelegate {
@@ -219,7 +245,6 @@ extension TaskProcessor: SessionIdentityDelegate {
         }
         
         let encodedData = try BSONEncoder().encodeData(outboundTask.message)
-        
         let ratchetedMessage = try await ratchetManager.ratchetEncrypt(plainText: encodedData)
         let signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
         
@@ -243,90 +268,32 @@ extension TaskProcessor: SessionIdentityDelegate {
         session: CryptoSession
     ) async throws {
         
-        for stashed in stashedMessages {
-
-            let (ratchetMessage, sessionIdentity) = try await verifyEncryptedMessage(session: session, inboundTask: stashed.task)
-            
-            guard let sessionIdentity = try await session.cache?.fetchSessionIdentities().first(where: { $0.id == sessionIdentity.id }) else {
-                throw CryptoSession.SessionErrors.missingSessionIdentity
-            }
-            
-            try await initializeRecipient(
-                sessionIdentity: sessionIdentity,
-                session: session,
-                ratchetMessage: ratchetMessage)
-            
-            
-            guard let decryptedData = try? await ratchetManager.ratchetDecrypt(ratchetMessage) else {
-                continue
-            }
-            
-            
-            let decodedMessage = try BSONDecoder().decode(CryptoMessage.self, from: Document(data: decryptedData))
-            var canSaveMessage = true
-            
-            if let sessionDelegate = await session.sessionDelegate {
-                canSaveMessage = try await sessionDelegate.processUnpersistedMessage(
-                    decodedMessage,
-                    senderSecretName: inboundTask.senderSecretName,
-                    senderDeviceId: inboundTask.senderDeviceId)
-            }
-            
-            if canSaveMessage {
-                /// Now we can handle the message
-                try await handleDecodedMessage(
-                    decodedMessage,
-                    inboundTask: inboundTask,
-                    session: session,
-                    sessionIdentity: sessionIdentity)
-            }
-            stashedMessages.remove(stashed)
-        }
-        
         let (ratchetMessage, sessionIdentity) = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
         
-        do {
-            guard let sessionIdentity = try await session.cache?.fetchSessionIdentities().first(where: { $0.id == sessionIdentity.id }) else {
-                throw CryptoSession.SessionErrors.missingSessionIdentity
-            }
-            
-            try await initializeRecipient(
-                sessionIdentity: sessionIdentity,
+        try await initializeRecipient(
+            sessionIdentity: sessionIdentity,
+            session: session,
+            ratchetMessage: ratchetMessage)
+        
+        let decryptedData = try await ratchetManager.ratchetDecrypt(ratchetMessage)
+        let decodedMessage = try BSONDecoder().decode(CryptoMessage.self, from: Document(data: decryptedData))
+        
+        var canSaveMessage = true
+        
+        if let sessionDelegate = await session.sessionDelegate {
+            canSaveMessage = try await sessionDelegate.processUnpersistedMessage(
+                decodedMessage,
+                senderSecretName: inboundTask.senderSecretName,
+                senderDeviceId: inboundTask.senderDeviceId)
+        }
+        
+        if canSaveMessage {
+            /// Now we can handle the message
+            try await handleDecodedMessage(
+                decodedMessage,
+                inboundTask: inboundTask,
                 session: session,
-                ratchetMessage: ratchetMessage)
-            
-            let decryptedData = try await ratchetManager.ratchetDecrypt(ratchetMessage)
-            
-            
-            let decodedMessage = try BSONDecoder().decode(CryptoMessage.self, from: Document(data: decryptedData))
-            var canSaveMessage = true
-            
-            if let sessionDelegate = await session.sessionDelegate {
-                canSaveMessage = try await sessionDelegate.processUnpersistedMessage(
-                    decodedMessage,
-                    senderSecretName: inboundTask.senderSecretName,
-                    senderDeviceId: inboundTask.senderDeviceId)
-            }
-            
-            if canSaveMessage {
-                /// Now we can handle the message
-                try await handleDecodedMessage(
-                    decodedMessage,
-                    inboundTask: inboundTask,
-                    session: session,
-                    sessionIdentity: sessionIdentity)
-            }
-        } catch {
-            if let ratchetError = error as? RatchetError {
-                switch ratchetError {
-                case .initialMessageNotReceived:
-                    stashedMessages.insert(StashedTask(task: inboundTask))
-                default:
-                    throw ratchetError
-                }
-            } else {
-                throw error
-            }
+                sessionIdentity: sessionIdentity)
         }
     }
     
@@ -355,10 +322,12 @@ extension TaskProcessor: SessionIdentityDelegate {
         guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else {
             throw CryptoError.propsError
         }
+        
         if props.state == nil {
             if let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.privateOneTimeKeys.first(where: { $0.id == ratchetMessage.header.curveOneTimeKeyId }) {
                 localPrivateOneTimeKey = privateOneTimeKey
             }
+            
             if let privateKyberOneTimeKey = sessionContext.sessionUser.deviceKeys.privateKyberOneTimeKeys.first(where: { $0.id == ratchetMessage.header.kyberOneTimeKeyId}) {
                 localPrivateKyberKey = privateKyberOneTimeKey
             } else {
@@ -406,11 +375,11 @@ extension TaskProcessor: SessionIdentityDelegate {
         try await delegate?.deleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: localPrivateKyberKey.id.uuidString, type: .kyber)
         
         guard let localIdentityData = try await session.cache?.findLocalSessionContext() else {
-            fatalError()
+            throw CryptoSession.SessionErrors.sessionNotInitialized
         }
         
         guard let configurationData = try await crypto.decrypt(data: localIdentityData, symmetricKey: session.getAppSymmetricKey()) else {
-            fatalError()
+            throw CryptoSession.SessionErrors.sessionDecryptionError
         }
         
         // Decode the session context from the decrypted data
@@ -426,7 +395,7 @@ extension TaskProcessor: SessionIdentityDelegate {
         
         let encodedContext = try BSONEncoder().encodeData(fetchedContext)
         guard let encryptedData = try await crypto.encrypt(data: encodedContext, symmetricKey: session.getAppSymmetricKey()) else {
-            fatalError()
+            throw CryptoSession.SessionErrors.sessionEncryptionError
         }
         
         try await session.cache?.updateLocalSessionContext(encryptedData)
@@ -649,21 +618,33 @@ extension TaskProcessor: SessionIdentityDelegate {
         guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else {
             throw JobProcessorErrors.missingIdentity
         }
-        let sendersPublicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: props.publicSigningKey)
+        let currentKey = try Curve25519SigningPublicKey(rawRepresentation: props.publicSigningKey)
         
         // Verify the signature
         guard let signedMessage = inboundTask.message.signed else {
             throw CryptoSession.SessionErrors.missingSignature
         }
         
-        let isSignatureValid = try signedMessage.verifySignature(publicKey: sendersPublicSigningKey)
-        // If the signature is valid, decode and return the EncryptedMessage
-        if isSignatureValid {
-            let document = Document(data: signedMessage.data)
-            return (try BSONDecoder().decode(RatchetMessage.self, from: document), sessionIdentity)
+        if try signedMessage.verifySignature(using: currentKey) {
+            return try decode(signedMessage)
         } else {
-            //If this happens the public key is not the same as the one that signed it or the data has been tampered with
-            throw CryptoSession.SessionErrors.invalidSignature
+            guard let config = try await session.transportDelegate?.findConfiguration(for: inboundTask.senderSecretName) else {
+                throw CryptoSession.SessionErrors.cannotFindUserConfiguration
+            }
+            
+            let rotatedKey = try Curve25519SigningPublicKey(rawRepresentation: config.publicSigningKey)
+            
+            guard try signedMessage.verifySignature(using: rotatedKey) else {
+                throw CryptoSession.SessionErrors.invalidSignature
+            }
+            
+            return try decode(signedMessage)
+        }
+        func decode(_ signedMessage: SignedRatchetMessage.Signed) throws -> (RatchetMessage, SessionIdentity) {
+            let document = Document(data: signedMessage.data)
+            let message = try BSONDecoder().decode(RatchetMessage.self, from: document)
+            let identity = sessionIdentity  // assume this is in scope or injected
+            return (message, identity)
         }
     }
     

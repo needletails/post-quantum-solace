@@ -9,6 +9,7 @@ import Testing
 @testable import SessionEvents
 @testable import SessionModels
 
+@Suite(.serialized)
 struct FriendshipMetadataTests {
     
     @Test

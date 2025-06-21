@@ -22,7 +22,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
     }
     
     /// The public signing key used for signing device configurations.
-    public let publicSigningKey: Data
+    public var publicSigningKey: Data
     
     /// An array of signed device configurations associated with the user.
     public var signedDevices: [SignedDeviceConfiguration]

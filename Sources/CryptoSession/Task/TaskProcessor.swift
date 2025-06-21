@@ -76,8 +76,6 @@ actor TaskProcessor {
             hasher.combine(id)
         }
     }
-    
-    var stashedMessages = Set<StashedTask>()
 
     // MARK: - Initialization
 

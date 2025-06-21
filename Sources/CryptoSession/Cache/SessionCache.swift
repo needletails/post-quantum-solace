@@ -84,7 +84,7 @@ public actor SessionCache: CryptoSessionStore {
     public func updateLocalSessionContext(_ data: Data) async throws {
         try await setLocalDeviceConfiguration(data)
         try await store.deleteLocalSessionContext()
-        try await self.createLocalSessionContext(data)
+        try await createLocalSessionContext(data)
     }
     
     /// Deletes the local device configuration and clears the cache.

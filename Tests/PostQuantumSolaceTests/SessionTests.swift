@@ -14,6 +14,7 @@ import SessionEvents
 import DoubleRatchetKit
 @testable import CryptoSession
 
+@Suite(.serialized)
 actor SessionTests {
     
     let session = CryptoSession.shared
@@ -67,7 +68,6 @@ actor SessionTests {
         let did = UUID()
         let senderltpk = crypto.generateCurve25519PrivateKey()
         let senderspk = crypto.generateCurve25519SigningPrivateKey()
-        let senderKEM = try crypto.generateKyber1024PrivateSigningKey()
         let senderDBSK = SymmetricKey(size: .bits256)
 
         // Generate 100 valid sender keys
@@ -400,6 +400,7 @@ actor MockCache: CryptoSessionStore {
 }
 
 actor MockTransport: SessionTransport {
+   
     func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: SessionModels.KeysType) async throws {
         
     }
@@ -499,8 +500,9 @@ actor MockTransport: SessionTransport {
         
     }
     
-    func rotateLongTermKeys(for secretName: String, deviceId: String, keys: SessionModels.LongTermKeys) async throws {
+    func rotateLongTermKeys(for secretName: String, deviceId: String, pskData: Data, signedDevice: SessionModels.UserConfiguration.SignedDeviceConfiguration) async throws {
         
     }
+    
     
 }

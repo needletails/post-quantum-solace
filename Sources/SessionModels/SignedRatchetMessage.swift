@@ -71,7 +71,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
         /// - Parameter publicKey: The public signing key used for verification.
         /// - Returns: A boolean indicating whether the signature is valid.
         /// - Throws: An error if verification fails.
-        public func verifySignature(publicKey: Curve25519SigningPublicKey) throws -> Bool {
+        public func verifySignature(using publicKey: Curve25519SigningPublicKey) throws -> Bool {
             return publicKey.isValidSignature(signature, for: data)
         }
     }

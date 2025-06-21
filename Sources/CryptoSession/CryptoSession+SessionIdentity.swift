@@ -16,12 +16,18 @@ extension CryptoSession {
     
     /// Creates a new encryptable session identity model.
     /// - Parameters:
-    ///   - device: The user device configuration for the new identity.
+    ///   - device: The user’s device configuration, containing public keys.
+    ///   - publicOneTimeKey: The Curve25519 one-time pre‑key (`OPKBₙ`) if available.
+    ///   - publicKyber1024Key: The Kyber 1024 post‑quantum signed pre‑key (`PQSPKB`).
     ///   - secretName: The secret name associated with the identity.
-    ///   - deviceId: The unique identifier of the device.
-    ///   - sessionContextId: A new session context identifier.
-    /// - Returns: A newly created `SessionIdentity` object.
-    /// - Throws: An error if the identity creation fails.
+    ///   - deviceId: The UUID of this device.
+    ///   - sessionContextId: A unique context identifier for this session.
+    /// - Returns: A newly created `SessionIdentity` object with the following protocol-mapped fields:
+    ///   - `publicLongTermKey` → **IKB** (Signed Pre-Key,  long-term Curve25519).
+    ///   - `publicSigningKey` → **SPKB** (Identity Key,  medium-term).
+    ///   - `kyber1024PublicKey` → **PQSPKB** (PQ Signed Pre-Key, Kyber 1024).
+    ///   - `publicOneTimeKey` → **OPKBₙ** (Curve25519 One-Time Pre-Key, single-use).
+    /// - Throws: An error if cache initialization or identity creation fails.
     public func createEncryptableSessionIdentityModel(
         with device: UserDeviceConfiguration,
         publicOneTimeKey: Curve25519PublicKeyRepresentable?,
@@ -31,18 +37,19 @@ extension CryptoSession {
         new sessionContextId: Int
     ) async throws -> SessionIdentity {
         guard let cache = cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
-        let determindedDeviceName = try await determineDeviceName()
-        let deviceName = device.deviceName ?? determindedDeviceName
+        let determinedDeviceName = try await determineDeviceName()
+        let deviceName = device.deviceName ?? determinedDeviceName
+
         let identity = try await SessionIdentity(
             id: UUID(),
             props: .init(
                 secretName: secretName,
                 deviceId: deviceId,
                 sessionContextId: sessionContextId,
-                publicLongTermKey: device.publicLongTermKey,
-                publicSigningKey: device.publicSigningKey,
-                kyber1024PublicKey: publicKyber1024Key,
-                publicOneTimeKey: publicOneTimeKey,
+                publicLongTermKey: device.publicLongTermKey,    // → SPKB
+                publicSigningKey: device.publicSigningKey,      // → IKB
+                kyber1024PublicKey: publicKyber1024Key,        // → PQSPKB
+                publicOneTimeKey: publicOneTimeKey,            // → OPKBₙ
                 state: nil,
                 deviceName: deviceName,
                 isMasterDevice: device.isMasterDevice
@@ -51,6 +58,7 @@ extension CryptoSession {
         try await cache.createSessionIdentity(identity)
         return identity
     }
+
     
     /// Determines a unique device name for the current device.
     /// This method checks existing device names and increments a count if necessary to ensure uniqueness.
@@ -110,7 +118,7 @@ extension CryptoSession {
         guard let cache = cache else {
             throw CryptoSession.SessionErrors.databaseNotInitialized
         }
-        
+
         let identities = try await cache.fetchSessionIdentities()
         return await identities.asyncFilter { identity in
             do {
@@ -209,7 +217,7 @@ extension CryptoSession {
                     } else {
                         throw CryptoSession.SessionErrors.drainedKeys
                     }
-                    
+
                     let identity = try await createEncryptableSessionIdentityModel(
                         with: device,
                         publicOneTimeKey: signedPublicOneTimeKey,
