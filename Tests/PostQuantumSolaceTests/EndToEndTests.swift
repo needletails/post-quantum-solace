@@ -88,7 +88,7 @@ class EndToEndTests: @unchecked Sendable {
             self.bobStreamContinuation = continuation
         }
         
-        await #expect(throws: Never.self, "shouldn't throw") {
+        await #expect(throws: Never.self, "Session initialization and first message should complete without errors") {
             let senderStore = self.createSenderStore()
             let recipientStore = self.createRecipientStore()
             
@@ -100,7 +100,7 @@ class EndToEndTests: @unchecked Sendable {
             try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Message One", metadata: [:])
         }
         Task {
-            await #expect(throws: Never.self, "shouldn't throw") {
+            await #expect(throws: Never.self, "Alice's message processing loop should handle received messages without errors") {
                 var aliceIterations = 0
                 for await received in aliceStream {
                     aliceIterations += 1
@@ -118,7 +118,7 @@ class EndToEndTests: @unchecked Sendable {
             }
         }
         
-        await #expect(throws: Never.self, "shouldn't throw") {
+        await #expect(throws: Never.self, "Bob's message processing loop should handle received messages and send replies without errors") {
             var bobIterations = 0
             for await received in bobStream {
                 bobIterations += 1
@@ -157,7 +157,7 @@ class EndToEndTests: @unchecked Sendable {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             self.bobStreamContinuation = continuation
         }
-        await #expect(throws: Never.self, "shouldn't throw") {
+        await #expect(throws: Never.self, "Sessions should initialize and Alice should send the first message without errors") {
             // 2) Initialize sessions (PQXDH handshake)
             try await self.createSenderSession(store: senderStore)
             try await self.createRecipientSession(store: recipientStore)
@@ -171,7 +171,7 @@ class EndToEndTests: @unchecked Sendable {
         }
         // 4) Bob's receive‑and‑reply loop
         Task {
-            await #expect(throws: Never.self, "shouldn't throw") {
+            await #expect(throws: Never.self, "Bob's receive-and-reply loop should process and respond to messages without errors") {
                 var bobReceivedCount = 0
                 for await received in bobStream {
                     bobReceivedCount += 1
@@ -205,7 +205,7 @@ class EndToEndTests: @unchecked Sendable {
         var aliceReceivedCount = 0
         for await received in aliceStream {
             aliceReceivedCount += 1
-            await #expect(throws: Never.self, "shouldn't throw") {
+            await #expect(throws: Never.self, "Alice's receive-and-reply loop should process and respond to messages without errors") {
                 // Process incoming
                 try await self._senderSession.receiveMessage(
                     message: received.message,
@@ -233,7 +233,7 @@ class EndToEndTests: @unchecked Sendable {
     
     @Test
     func testOutOfOrderMessagesHandledCorrectly() async throws {
-        await #expect(throws: Never.self, "shouldn't throw") {
+        await #expect(throws: Never.self, "Out-of-order test: session setup, message send, and out-of-order receive should not throw") {
             let senderStore = self.createSenderStore()
             let recipientStore = self.createRecipientStore()
             
@@ -302,14 +302,14 @@ class EndToEndTests: @unchecked Sendable {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             self.bobStreamContinuation = continuation
         }
-        await #expect(throws: Never.self, "shouldn't throw") {
+        await #expect(throws: Never.self, "Session initialization and first message should complete without errors (rekey test)") {
             try await self.createSenderSession(store: senderStore)
             try await self.createRecipientSession(store: recipientStore)
             
             try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Message One", metadata: [:])
         }
         Task {
-            await #expect(throws: Never.self, "shouldn't throw") {
+            await #expect(throws: Never.self, "Alice's message processing loop should handle received messages and key rotation without errors") {
                 var aliceIterations = 0
                 for await received in aliceStream {
                     aliceIterations += 1
@@ -339,7 +339,7 @@ class EndToEndTests: @unchecked Sendable {
         var bobIterations = 0
         for await received in bobStream {
             bobIterations += 1
-            await #expect(throws: Never.self, "shouldn't throw") {
+            await #expect(throws: Never.self, "Bob's message processing loop should handle received messages, replies, and key rotation without errors") {
                 try await self._recipientSession.receiveMessage(
                     message: received.message,
                     sender: received.sender,

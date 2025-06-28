@@ -63,7 +63,7 @@ actor SessionTests {
     // MARK: - Tests
     @Test
     func testLocalKeySynchronization() async throws {
-        await #expect(throws: Never.self, "shouldn't throw") {
+        await #expect(throws: Never.self, "Local key synchronization should complete without throwing any errors") {
             let store = MockIdentityStore(
                 mockUserData: .init(session: self.session),
                 session: self.session,
@@ -158,7 +158,7 @@ actor SessionTests {
     
     @Test
     func test_refreshOneTimeKeys_createsKeys_whenBelowThreshold() async throws {
-        await #expect(throws: Never.self, "shouldn't throw") {
+        await #expect(throws: Never.self, "One-time key refresh should complete without throwing any errors when keys are below threshold") {
             let mockCache = MockCache()
             let appSymmetricKey = await self.crypto.deriveStrictSymmetricKey(
                 data: "secret".data(using: .utf8)!,
