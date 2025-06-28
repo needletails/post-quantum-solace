@@ -39,10 +39,10 @@ public struct _WrappedPrivateMessage: Sendable {
     }
 }
 
-// MARK: - CryptoSessionStore Protocol
+// MARK: - PQSSessionStore Protocol
 
 /// A protocol that defines CRUD (Create, Read, Update, Delete) operations for managing device configurations in a database store.
-public protocol CryptoSessionStore: Sendable {
+public protocol PQSSessionStore: Sendable {
     
     /// Creates a local device configuration with the provided data.
     /// - Parameter data: The configuration data to be stored.

@@ -18,14 +18,14 @@ extension TaskProcessor {
     ///
     /// - Parameters:
     ///   - task: The task to be encrypted and queued.
-    ///   - session: The `CryptoSession` context for processing.
+    ///   - session: The `PQSSession` context for processing.
     /// - Throws: An error if the cache is unavailable or task setup fails.
     public func feedTask(
         _ task: EncrytableTask,
-        session: CryptoSession
+        session: PQSSession
     ) async throws {
         guard let cache = await session.cache else {
-            throw CryptoSession.SessionErrors.databaseNotInitialized
+            throw PQSSession.SessionErrors.databaseNotInitialized
         }
         
         let sequenceId = await incrementId()
@@ -43,12 +43,12 @@ extension TaskProcessor {
     ///   - job: An optional specific `JobModel` to load; if `nil`, all cached jobs will be loaded.
     ///   - cache: The session's job cache.
     ///   - symmetricKey: The symmetric key for decrypting job properties.
-    ///   - session: The optional `CryptoSession` used to process the jobs after loading.
+    ///   - session: The optional `PQSSession` used to process the jobs after loading.
     func loadTasks(
         _ job: JobModel? = nil,
         cache: SessionCache,
         symmetricKey: SymmetricKey,
-        session: CryptoSession? = nil
+        session: PQSSession? = nil
     ) async throws {
         if let job = job {
             try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
@@ -85,11 +85,11 @@ extension TaskProcessor {
     /// This function leverages `NeedleTailAsyncSequence` to manage job execution order and cancellation.
     /// It handles error cases such as missing identities and authentication failures, and removes corrupted or outdated jobs.
     ///
-    /// - Parameter session: The `CryptoSession` context for executing jobs.
+    /// - Parameter session: The `PQSSession` context for executing jobs.
     /// - Throws: Any error that occurs during task processing or session access.
-    func attemptTaskSequence(session: CryptoSession) async throws {
+    func attemptTaskSequence(session: PQSSession) async throws {
         guard let cache = await session.cache else {
-            throw CryptoSession.SessionErrors.databaseNotInitialized
+            throw PQSSession.SessionErrors.databaseNotInitialized
         }
         
         guard !isRunning else {
@@ -108,7 +108,7 @@ extension TaskProcessor {
             switch result {
             case .success(let job):
                 guard let props = await job.props(symmetricKey: symmetricKey) else {
-                    throw CryptoSession.SessionErrors.propsError
+                    throw PQSSession.SessionErrors.propsError
                 }
                 
                 logger.log(level: .debug, message: "Running job \(props.sequenceId)")
@@ -146,7 +146,7 @@ extension TaskProcessor {
                     logger.log(level: .error, message: "Removing Job due to: \(cryptoError)")
                     try? await cache.removeJob(job)
                     
-                } catch let sessionError as CryptoSession.SessionErrors where sessionError == .invalidKeyId || sessionError == .cannotFindOneTimeKey {
+                } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidKeyId || sessionError == .cannotFindOneTimeKey {
                     //TODO: If we are invalid due to a race condition between the server and client we can optionally resend
                     logger.log(level: .error, message: "Removing Job due to: \(sessionError)")
                     try? await cache.removeJob(job)

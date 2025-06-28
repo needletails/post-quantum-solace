@@ -11,7 +11,7 @@ import SessionModels
 extension NeedleTailAsyncConsumer{
     
     func loadAndOrganizeTasks(_ job: JobModel, symmetricKey: SymmetricKey) async throws {
-        guard let props = await job.props(symmetricKey: symmetricKey) else { throw CryptoSession.SessionErrors.propsError }
+        guard let props = await job.props(symmetricKey: symmetricKey) else { throw PQSSession.SessionErrors.propsError }
         // We are an empty deque and are not a background or delayed task
         if self.deque.isEmpty {
             await feedConsumer(job as! T, priority: .standard)

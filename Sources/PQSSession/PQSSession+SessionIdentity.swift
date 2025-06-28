@@ -1,5 +1,5 @@
 //
-//  CryptoSession+SessionIdentity.swift
+//  PQSSession+SessionIdentity.swift
 //  post-quantum-solace
 //
 //  Created by Cole M on 2/9/25.
@@ -10,33 +10,30 @@ import DoubleRatchetKit
 import SessionModels
 import BSON
 
-// MARK: - CryptoSession Extension for Identity Management
+// MARK: - PQSSession Extension for Identity Management
 
-extension CryptoSession {
+extension PQSSession {
     
     /// Creates a new encryptable session identity model.
     /// - Parameters:
     ///   - device: The user’s device configuration, containing public keys.
-    ///   - publicOneTimeKey: The Curve25519 one-time pre‑key (`OPKBₙ`) if available.
-    ///   - publicKyber1024Key: The Kyber 1024 post‑quantum signed pre‑key (`PQSPKB`).
+    ///   - oneTimePublicKey: The Curve25519 one-time pre‑key (`OPKBₙ`) if available.
+    ///   - pqKemPublicKey: The Kyber 1024 post‑quantum signed pre‑key (`PQSPKB`).
     ///   - secretName: The secret name associated with the identity.
     ///   - deviceId: The UUID of this device.
     ///   - sessionContextId: A unique context identifier for this session.
     /// - Returns: A newly created `SessionIdentity` object with the following protocol-mapped fields:
-    ///   - `publicLongTermKey` → **IKB** (Signed Pre-Key,  long-term Curve25519).
-    ///   - `publicSigningKey` → **SPKB** (Identity Key,  medium-term).
-    ///   - `kyber1024PublicKey` → **PQSPKB** (PQ Signed Pre-Key, Kyber 1024).
-    ///   - `publicOneTimeKey` → **OPKBₙ** (Curve25519 One-Time Pre-Key, single-use).
+    ///   - `SessionIdentity` → **IKB** (Signed Pre-Key,  long-term Curve25519).
     /// - Throws: An error if cache initialization or identity creation fails.
     public func createEncryptableSessionIdentityModel(
         with device: UserDeviceConfiguration,
-        publicOneTimeKey: Curve25519PublicKeyRepresentable?,
-        publicKyber1024Key: Kyber1024PublicKeyRepresentable,
+        oneTimePublicKey: CurvePublicKey?,
+        pqKemPublicKey: PQKemPublicKey,
         for secretName: String,
         associatedWith deviceId: UUID,
         new sessionContextId: Int
     ) async throws -> SessionIdentity {
-        guard let cache = cache else { throw CryptoSession.SessionErrors.databaseNotInitialized }
+        guard let cache = cache else { throw PQSSession.SessionErrors.databaseNotInitialized }
         let determinedDeviceName = try await determineDeviceName()
         let deviceName = device.deviceName ?? determinedDeviceName
 
@@ -46,10 +43,10 @@ extension CryptoSession {
                 secretName: secretName,
                 deviceId: deviceId,
                 sessionContextId: sessionContextId,
-                publicLongTermKey: device.publicLongTermKey,    // → SPKB
-                publicSigningKey: device.publicSigningKey,      // → IKB
-                kyber1024PublicKey: publicKyber1024Key,        // → PQSPKB
-                publicOneTimeKey: publicOneTimeKey,            // → OPKBₙ
+                longTermPublicKey: device.longTermPublicKey,    // → SPKB
+                signingPublicKey: device.signingPublicKey,      // → IKB
+                pqKemPublicKey: pqKemPublicKey,                 // → PQSPKB
+                oneTimePublicKey: oneTimePublicKey,             // → OPKBₙ
                 state: nil,
                 deviceName: deviceName,
                 isMasterDevice: device.isMasterDevice
@@ -113,10 +110,10 @@ extension CryptoSession {
     /// - Throws: An error if the retrieval fails.
     public func getSessionIdentities(with recipientName: String) async throws -> [SessionIdentity] {
         guard let sessionContext = await sessionContext else {
-            throw CryptoSession.SessionErrors.sessionNotInitialized
+            throw PQSSession.SessionErrors.sessionNotInitialized
         }
         guard let cache = cache else {
-            throw CryptoSession.SessionErrors.databaseNotInitialized
+            throw PQSSession.SessionErrors.databaseNotInitialized
         }
 
         let identities = try await cache.fetchSessionIdentities()
@@ -153,15 +150,16 @@ extension CryptoSession {
     func refreshSessionIdentities(
         for recipientName: String,
         from filtered: [SessionIdentity],
-        forceRefresh: Bool) async throws -> [SessionIdentity] {
+        forceRefresh: Bool
+    ) async throws -> [SessionIdentity] {
         
         var filtered = filtered
-        guard let transportDelegate = transportDelegate else {
-            throw CryptoSession.SessionErrors.transportNotInitialized
+        guard let transportDelegate else {
+            throw PQSSession.SessionErrors.transportNotInitialized
         }
         
         guard let sessionUser = await sessionContext?.sessionUser else {
-            throw CryptoSession.SessionErrors.sessionNotInitialized
+            throw PQSSession.SessionErrors.sessionNotInitialized
         }
 
         if await refreshIdentities(secretName: recipientName, forceRefresh: forceRefresh) {
@@ -181,11 +179,11 @@ extension CryptoSession {
             }
             
             // Ensure that the identities of the user configuration are legitimate
-            let publicSigningKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.publicSigningKey)
+            let signingPublicKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.signingPublicKey)
             
             for device in configuration.signedDevices {
-                if try (device.verified(using: publicSigningKey) != nil) == false {
-                    throw CryptoSession.SessionErrors.invalidSignature
+                if try (device.verified(using: signingPublicKey) != nil) == false {
+                    throw PQSSession.SessionErrors.invalidSignature
                 }
             }
             
@@ -204,24 +202,24 @@ extension CryptoSession {
                     
                     let keys = try await transportDelegate.fetchOneTimeKeys(for: recipientName, deviceId: device.deviceId.uuidString)
 
-                    let signedPublicOneTimeKey = try configuration.signedPublicOneTimeKeys.first(where: { $0.id == keys.curve?.id })?.verified(using: publicSigningKey)
+                    let signedoneTimePublicKey = try configuration.signedOneTimePublicKeys.first(where: { $0.id == keys.curve?.id })?.verified(using: signingPublicKey)
                     
-                    var publicKyber1024Key: Kyber1024PublicKeyRepresentable
-                    if let signedKey = try configuration.signedPublicKyberOneTimeKeys.first(where: { $0.id == keys.kyber?.id })?.kyberVerified(using: publicSigningKey) {
-                        publicKyber1024Key = signedKey
+                    var pqKemPublicKey: PQKemPublicKey
+                    if let signedKey = try configuration.signedPQKemOneTimePublicKeys.first(where: { $0.id == keys.kyber?.id })?.pqKemVerified(using: signingPublicKey) {
+                        pqKemPublicKey = signedKey
                     } else if let verifiedDevice = configuration.signedDevices.first(where: {
-                        (try? $0.verified(using: publicSigningKey))?.deviceId == device.deviceId
+                        (try? $0.verified(using: signingPublicKey))?.deviceId == device.deviceId
                     }),
-                    let finalKey = try? verifiedDevice.verified(using: publicSigningKey)?.finalKyber1024PublicKey {
-                        publicKyber1024Key = finalKey
+                    let finalKey = try? verifiedDevice.verified(using: signingPublicKey)?.finalPQKemPublicKey {
+                        pqKemPublicKey = finalKey
                     } else {
-                        throw CryptoSession.SessionErrors.drainedKeys
+                        throw PQSSession.SessionErrors.drainedKeys
                     }
 
                     let identity = try await createEncryptableSessionIdentityModel(
                         with: device,
-                        publicOneTimeKey: signedPublicOneTimeKey,
-                        publicKyber1024Key: publicKyber1024Key,
+                        oneTimePublicKey: signedoneTimePublicKey,
+                        pqKemPublicKey: pqKemPublicKey,
                         for: recipientName,
                         associatedWith: device.deviceId,
                         new: sessionContextId)

@@ -16,11 +16,11 @@ protocol SessionCacheSynchronizer: Sendable {
 }
 
 /// An actor that manages session caching and synchronization.
-public actor SessionCache: CryptoSessionStore {
+public actor SessionCache: PQSSessionStore {
     
     // MARK: - Properties
     
-    private let store: any CryptoSessionStore
+    private let store: any PQSSessionStore
     private var sessionIdentities = [SessionIdentity]()
     private var messages = [EncryptedMessage]()
     private var contacts = [ContactModel]()
@@ -48,7 +48,7 @@ public actor SessionCache: CryptoSessionStore {
     
     // MARK: - Initializer
     
-    public init(store: any CryptoSessionStore) {
+    public init(store: any PQSSessionStore) {
         self.store = store
     }
     
@@ -129,29 +129,29 @@ public actor SessionCache: CryptoSessionStore {
     /// - Returns: An array of session identities.
     /// - Throws: An error if fetching fails.
     public func fetchSessionIdentities() async throws -> [SessionIdentity] {
-        if !sessionIdentities.isEmpty {
-            return sessionIdentities
-        } else {
+//        if !sessionIdentities.isEmpty {
+//            return sessionIdentities
+//        } else {
             let identities = try await store.fetchSessionIdentities()
-            self.sessionIdentities = identities // Update the cache
+//            self.sessionIdentities = identities // Update the cache
             return identities
-        }
+//        }
     }
     
     /// Updates an existing session identity.
     /// - Parameter session: The session identity to be updated.
     /// - Throws: An error if the update fails.
     public func updateSessionIdentity(_ session: SessionIdentity) async throws {
-        if sessionIdentities.isEmpty {
-            let identities = try await store.fetchSessionIdentities()
-            self.sessionIdentities = identities // Update the cache
-        }
-        if let index = sessionIdentities.firstIndex(where: { $0.id == session.id }) {
-            sessionIdentities[index] = session
+//        if sessionIdentities.isEmpty {
+//            let identities = try await store.fetchSessionIdentities()
+//            self.sessionIdentities = identities // Update the cache
+//        }
+//        if let index = sessionIdentities.firstIndex(where: { $0.id == session.id }) {
+//            sessionIdentities[index] = session
             try await store.updateSessionIdentity(session)
-        } else {
-            throw CacheErrors.sessionIdentityNotFound
-        }
+//        } else {
+//            throw CacheErrors.sessionIdentityNotFound
+//        }
     }
     
     /// Removes a session identity from the cache and store.

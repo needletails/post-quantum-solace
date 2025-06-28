@@ -25,15 +25,15 @@ public struct SignedRatchetMessage: Codable & Sendable {
     ///
     /// - Parameters:
     ///   - message: The `RatchetMessage` to be signed.
-    ///   - privateSigningKey: The private signing key used for signing the configuration.
+    ///   - signingPrivateKey: The private signing key used for signing the configuration.
     /// - Throws: An error if signing the configuration fails.
     public init(
         message: RatchetMessage,
-        privateSigningKey: Data
+        signingPrivateKey: Data
     ) throws {
         self.signed = try Signed(
             message: message,
-            privateSigningIdentity: try Curve25519SigningPrivateKey(rawRepresentation: privateSigningKey)
+            privateSigningIdentity: try Curve25519SigningPrivateKey(rawRepresentation: signingPrivateKey)
         )
     }
     

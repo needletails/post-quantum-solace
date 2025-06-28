@@ -59,7 +59,7 @@ extension TaskProcessor {
         inboundTask: InboundTaskMessage,
         sendersSecretName: String,
         senderDeviceId: UUID,
-        session: CryptoSession,
+        session: PQSSession,
         communication: BaseCommunication,
         sessionIdentity: SessionIdentity
     ) async throws -> EncryptedMessage {
@@ -70,7 +70,7 @@ extension TaskProcessor {
         }
 
         guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else {
-            throw CryptoSession.SessionErrors.propsError
+            throw PQSSession.SessionErrors.propsError
         }
 
         let newMessageCount = communicationProps.messageCount + 1
@@ -114,20 +114,20 @@ extension TaskProcessor {
     func createOutboundMessageModel(
         message: CryptoMessage,
         communication: BaseCommunication,
-        session: CryptoSession,
+        session: PQSSession,
         symmetricKey: SymmetricKey,
         members: Set<String>,
         sharedId: String,
         shouldUpdateCommunication: Bool = false
     ) async throws -> EncryptedMessage {
         guard let sessionContext = await session.sessionContext else {
-            throw CryptoSession.SessionErrors.sessionNotInitialized
+            throw PQSSession.SessionErrors.sessionNotInitialized
         }
 
         let sessionUser = sessionContext.sessionUser
 
         guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else {
-            throw CryptoSession.SessionErrors.propsError
+            throw PQSSession.SessionErrors.propsError
         }
 
         let messageModel = try EncryptedMessage(
@@ -148,7 +148,7 @@ extension TaskProcessor {
         )
 
         guard let cache = await session.cache else {
-            throw CryptoSession.SessionErrors.databaseNotInitialized
+            throw PQSSession.SessionErrors.databaseNotInitialized
         }
 
         if shouldUpdateCommunication {
@@ -195,7 +195,7 @@ extension TaskProcessor {
     func findCommunicationType(
         cache: SessionCache,
         communicationType: MessageRecipient,
-        session: CryptoSession
+        session: PQSSession
     ) async throws -> BaseCommunication {
         let communications = try await cache.fetchCommunications()
         let symmetricKey = try await session.getDatabaseSymmetricKey()
@@ -208,7 +208,7 @@ extension TaskProcessor {
                 return false
             }
         }) else {
-            throw CryptoSession.SessionErrors.cannotFindCommunication
+            throw PQSSession.SessionErrors.cannotFindCommunication
         }
 
         return foundCommunication

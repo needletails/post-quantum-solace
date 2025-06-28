@@ -47,20 +47,20 @@ public protocol SessionEvents: Sendable {
     /// - Parameters:
     ///   - infos: An array of `SharedContactInfo` containing the contact information.
     ///   - sessionContext: The context of the current session.
-    ///   - cache: The `CryptoSessionStore` used for caching.
+    ///   - cache: The `PQSSessionStore` used for caching.
     ///   - transport: The `SessionTransport` used for communication.
     ///   - receiver: The `EventReceiver` that will handle events.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for session management.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
     ///   - symmetricKey: The symmetric key used for encryption.
     ///   - logger: The logger for logging events.
     /// - Throws: An error if the operation fails.
     func addContacts(
         _ infos: [SharedContactInfo],
         sessionContext: SessionContext,
-        cache: CryptoSessionStore,
+        cache: PQSSessionStore,
         transport: SessionTransport,
         receiver: EventReceiver,
-        sessionDelegate: CryptoSessionDelegate,
+        sessionDelegate: PQSSessionDelegate,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws
@@ -71,7 +71,7 @@ public protocol SessionEvents: Sendable {
     ///   - metadata: The metadata associated with the contact.
     ///   - requestFriendship: A boolean indicating whether to request friendship.
     ///   - sessionContext: The context of the current session.
-    ///   - cache: The `CryptoSessionStore` used for caching.
+    ///   - cache: The `PQSSessionStore` used for caching.
     ///   - transport: The `SessionTransport` used for communication.
     ///   - receiver: The `EventReceiver` that will handle events.
     ///   - symmetricKey: The symmetric key used for encryption.
@@ -83,7 +83,7 @@ public protocol SessionEvents: Sendable {
         metadata: Document,
         requestFriendship: Bool,
         sessionContext: SessionContext,
-        cache: CryptoSessionStore,
+        cache: PQSSessionStore,
         transport: SessionTransport,
         receiver: EventReceiver,
         symmetricKey: SymmetricKey,
@@ -94,8 +94,8 @@ public protocol SessionEvents: Sendable {
     /// - Parameters:
     ///   - secretName: The secret name of the contact.
     ///   - sessionContext: The context of the current session.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for session management.
-    ///   - cache: The `CryptoSessionStore` used for caching.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
+    ///   - cache: The `PQSSessionStore` used for caching.
     ///   - receiver: The `EventReceiver` that will handle events.
     ///   - symmetricKey: The symmetric key used for encryption.
     ///   - logger: The logger for logging events.
@@ -103,8 +103,8 @@ public protocol SessionEvents: Sendable {
     func sendCommunicationSynchronization(
         contact secretName: String,
         sessionContext: SessionContext,
-        sessionDelegate: CryptoSessionDelegate,
-        cache: CryptoSessionStore,
+        sessionDelegate: PQSSessionDelegate,
+        cache: PQSSessionStore,
         receiver: EventReceiver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
@@ -114,18 +114,18 @@ public protocol SessionEvents: Sendable {
     /// - Parameters:
     ///   - state: The new friendship state.
     ///   - contact: The `Contact` instance associated with the request.
-    ///   - cache: The `CryptoSessionStore` used for caching.
+    ///   - cache: The `PQSSessionStore` used for caching.
     ///   - receiver: The `EventReceiver` that will handle events.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for session management.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
     ///   - symmetricKey: The symmetric key used for encryption.
     ///   - logger: The logger for logging events.
     /// - Throws: An error if the operation fails.
     func requestFriendshipStateChange(
         state: FriendshipMetadata.State,
         contact: Contact,
-        cache: CryptoSessionStore,
+        cache: PQSSessionStore,
         receiver: EventReceiver,
-        sessionDelegate: CryptoSessionDelegate,
+        sessionDelegate: PQSSessionDelegate,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws
@@ -136,8 +136,8 @@ public protocol SessionEvents: Sendable {
     ///   - deliveryState: The new delivery state of the message.
     ///   - messageRecipient: The recipient of the message.
     ///   - allowExternalUpdate: A boolean indicating whether external updates are allowed.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for session management.
-    ///   - cache: The `CryptoSessionStore` used for caching.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
+    ///   - cache: The `PQSSessionStore` used for caching.
     ///   - receiver: The `EventReceiver` that will handle events.
     ///   - symmetricKey: The symmetric key used for encryption.
     /// - Throws: An error if the operation fails.
@@ -146,8 +146,8 @@ public protocol SessionEvents: Sendable {
         deliveryState: DeliveryState,
         messageRecipient: MessageRecipient,
         allowExternalUpdate: Bool,
-        sessionDelegate: CryptoSessionDelegate,
-        cache: CryptoSessionStore,
+        sessionDelegate: PQSSessionDelegate,
+        cache: PQSSessionStore,
         receiver: EventReceiver,
         symmetricKey: SymmetricKey
     ) async throws
@@ -155,34 +155,34 @@ public protocol SessionEvents: Sendable {
     /// Sends an acknowledgment that a contact was created.
     /// - Parameters:
     ///   - secretName: The secret name of the recipient contact.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for session management.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
     ///   - logger: The logger for logging events.
     /// - Throws: An error if the operation fails.
     func sendContactCreatedAcknowledgment(
         recipient secretName: String,
-        sessionDelegate: CryptoSessionDelegate,
+        sessionDelegate: PQSSessionDelegate,
         logger: NeedleTailLogger
     ) async throws
     
     /// Requests metadata from a contact.
     /// - Parameters:
     ///   - secretName: The secret name of the contact from whom to request metadata.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for session management.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
     ///   - logger: The logger for logging events.
     /// - Throws: An error if the operation fails.
     func requestMetadata(
         from secretName: String,
-        sessionDelegate: CryptoSessionDelegate,
+        sessionDelegate: PQSSessionDelegate,
         logger: NeedleTailLogger
     ) async throws
     
     /// Requests the metadata for the current user.
     /// - Parameters:
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for session management.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
     ///   - logger: The logger for logging events.
     /// - Throws: An error if the operation fails.
     func requestMyMetadata(
-        sessionDelegate: CryptoSessionDelegate,
+        sessionDelegate: PQSSessionDelegate,
         logger: NeedleTailLogger
     ) async throws
     
@@ -190,8 +190,8 @@ public protocol SessionEvents: Sendable {
     /// - Parameters:
     ///   - message: The `EncryptedMessage` to be edited.
     ///   - newText: The new text for the message.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for session management.
-    ///   - cache: The `CryptoSessionStore` used for caching.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
+    ///   - cache: The `PQSSessionStore` used for caching.
     ///   - receiver: The `EventReceiver` that will handle events.
     ///   - symmetricKey: The symmetric key used for encryption.
     ///   - logger: The logger for logging events.
@@ -199,8 +199,8 @@ public protocol SessionEvents: Sendable {
     func editCurrentMessage(
         _ message: EncryptedMessage,
         newText: String,
-        sessionDelegate: CryptoSessionDelegate,
-        cache: CryptoSessionStore,
+        sessionDelegate: PQSSessionDelegate,
+        cache: PQSSessionStore,
         receiver: EventReceiver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
@@ -209,13 +209,13 @@ public protocol SessionEvents: Sendable {
     /// Finds a communication for a specific message recipient.
     /// - Parameters:
     ///   - messageRecipient: The recipient of the message.
-    ///   - cache: The `CryptoSessionStore` used for caching.
+    ///   - cache: The `PQSSessionStore` used for caching.
     ///   - symmetricKey: The symmetric key used for encryption.
     /// - Returns: A `BaseCommunication` instance associated with the recipient.
     /// - Throws: An error if the operation fails.
     func findCommunication(
         for messageRecipient: MessageRecipient,
-        cache: CryptoSessionStore,
+        cache: PQSSessionStore,
         symmetricKey: SymmetricKey
     ) async throws -> BaseCommunication
 }
@@ -235,10 +235,10 @@ extension SessionEvents {
     /// - Parameters:
     ///   - infos: An array of `SharedContactInfo` containing the contact information to be added.
     ///   - sessionContext: The context of the current session, providing user-specific information.
-    ///   - cache: The `CryptoSessionStore` used for caching contacts and communications.
+    ///   - cache: The `PQSSessionStore` used for caching contacts and communications.
     ///   - transport: The `SessionTransport` used for communication with other devices.
     ///   - receiver: The `EventReceiver` that will handle events related to contact creation.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for managing session-related tasks.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///   - logger: The logger for logging events and debugging information.
     ///
@@ -251,10 +251,10 @@ extension SessionEvents {
     public func addContacts(
         _ infos: [SharedContactInfo],
         sessionContext: SessionContext,
-        cache: CryptoSessionStore,
+        cache: PQSSessionStore,
         transport: SessionTransport,
         receiver: EventReceiver,
-        sessionDelegate: CryptoSessionDelegate,
+        sessionDelegate: PQSSessionDelegate,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws {
@@ -358,7 +358,7 @@ extension SessionEvents {
         metadata: Document = [:],
         requestFriendship: Bool,
         sessionContext: SessionContext,
-        cache: CryptoSessionStore,
+        cache: PQSSessionStore,
         transport: SessionTransport,
         receiver: EventReceiver,
         symmetricKey: SymmetricKey,
@@ -417,8 +417,8 @@ extension SessionEvents {
             
             var userConfiguration = try await transport.findConfiguration(for: newContactSecretName)
             //Not needed on the contact level
-            userConfiguration.signedPublicKyberOneTimeKeys.removeAll()
-            userConfiguration.signedPublicOneTimeKeys.removeAll()
+            userConfiguration.signedPQKemOneTimePublicKeys.removeAll()
+            userConfiguration.signedOneTimePublicKeys.removeAll()
             
             let contact = Contact(
                 id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
@@ -426,7 +426,7 @@ extension SessionEvents {
                 configuration: userConfiguration,
                 metadata: metadata)
             
-            let contactModel = try ContactModel(
+            let contactModel = try! ContactModel(
                 id: contact.id, // Use the same UUID
                 props: .init(
                     secretName: contact.secretName,
@@ -437,9 +437,6 @@ extension SessionEvents {
             
             try await cache.createContact(contactModel)
             try await receiver.createdContact(contact)
-            try await receiver.synchronize(
-                contact: contact,
-                requestFriendship: requestFriendship)
             
             _ = try await updateOrCreateCommunication(
                 mySecretName: mySecretName,
@@ -449,6 +446,9 @@ extension SessionEvents {
                 symmetricKey: symmetricKey,
                 logger: logger)
             
+            try! await receiver.synchronize(
+                contact: contact,
+                requestFriendship: requestFriendship)
             return contactModel
         }
     }
@@ -464,7 +464,7 @@ extension SessionEvents {
     /// - Parameters:
     ///   - mySecretName: The secret name of the current user.
     ///   - theirSecretName: The secret name of the contact with whom to synchronize communication.
-    ///   - cache: The `CryptoSessionStore` used for caching communication models.
+    ///   - cache: The `PQSSessionStore` used for caching communication models.
     ///   - receiver: The `EventReceiver` that will handle events related to communication updates.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///   - logger: The logger for logging events and debugging information.
@@ -476,7 +476,7 @@ extension SessionEvents {
     private func updateOrCreateCommunication(
         mySecretName: String,
         theirSecretName: String,
-        cache: CryptoSessionStore,
+        cache: PQSSessionStore,
         receiver: EventReceiver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
@@ -540,8 +540,8 @@ extension SessionEvents {
     /// - Parameters:
     ///   - secretName: The secret name of the contact to synchronize communication with.
     ///   - sessionContext: The context of the current session, providing user-specific information.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for managing session-related tasks.
-    ///   - cache: The `CryptoSessionStore` used for caching communication models.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
+    ///   - cache: The `PQSSessionStore` used for caching communication models.
     ///   - receiver: The `EventReceiver` that will handle events related to communication updates.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///   - logger: The logger for logging events and debugging information.
@@ -552,8 +552,8 @@ extension SessionEvents {
     public func sendCommunicationSynchronization(
         contact secretName: String,
         sessionContext: SessionContext,
-        sessionDelegate: CryptoSessionDelegate,
-        cache: CryptoSessionStore,
+        sessionDelegate: PQSSessionDelegate,
+        cache: PQSSessionStore,
         receiver: EventReceiver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
@@ -616,9 +616,9 @@ extension SessionEvents {
     public func requestFriendshipStateChange(
         state: FriendshipMetadata.State,
         contact: Contact,
-        cache: CryptoSessionStore,
+        cache: PQSSessionStore,
         receiver: EventReceiver,
-        sessionDelegate: CryptoSessionDelegate,
+        sessionDelegate: PQSSessionDelegate,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws {
@@ -639,7 +639,7 @@ extension SessionEvents {
             throw EventErrors.userIsBlocked
         }
         
-        guard var currentMetadata = currentMetadata else { return }
+        guard var currentMetadata else { return }
         
         //Do not allow state changes that are not different, i.e. my state is .accepted cannot acceptFriendRequest() again
         if currentMetadata.ourState == .accepted && state == .accepted { return }
@@ -711,8 +711,8 @@ extension SessionEvents {
     ///   - deliveryState: The new delivery state to be set for the message.
     ///   - messageRecipient: The recipient of the message.
     ///   - allowExternalUpdate: A boolean indicating whether external updates are allowed (default is `false`).
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for managing session-related tasks.
-    ///   - cache: The `CryptoSessionStore` used for caching messages.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
+    ///   - cache: The `PQSSessionStore` used for caching messages.
     ///   - receiver: The `EventReceiver` that will handle events related to message updates.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///
@@ -723,8 +723,8 @@ extension SessionEvents {
         deliveryState: DeliveryState,
         messageRecipient: MessageRecipient,
         allowExternalUpdate: Bool = false,
-        sessionDelegate: CryptoSessionDelegate,
-        cache: CryptoSessionStore,
+        sessionDelegate: PQSSessionDelegate,
+        cache: PQSSessionStore,
         receiver: EventReceiver,
         symmetricKey: SymmetricKey
     ) async throws {
@@ -746,13 +746,13 @@ extension SessionEvents {
     ///
     /// - Parameters:
     ///   - secretName: The secret name of the recipient contact.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for managing session-related tasks.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
     ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Throws: Any error that may occur during the process of sending the acknowledgment.
     public func sendContactCreatedAcknowledgment(
         recipient secretName: String,
-        sessionDelegate: CryptoSessionDelegate,
+        sessionDelegate: PQSSessionDelegate,
         logger: NeedleTailLogger
     ) async throws {
         logger.log(level: .debug, message: "Sending Contact Created Acknowledgment")
@@ -766,13 +766,13 @@ extension SessionEvents {
     ///
     /// - Parameters:
     ///   - secretName: The secret name of the contact from whom to request metadata.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for managing session-related tasks.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
     ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Throws: Any error that may occur during the process of requesting metadata.
     public func requestMetadata(
         from secretName: String,
-        sessionDelegate: CryptoSessionDelegate,
+        sessionDelegate: PQSSessionDelegate,
         logger: NeedleTailLogger
     ) async throws {
         logger.log(level: .debug, message: "Requesting metadata from \(secretName)")
@@ -785,12 +785,12 @@ extension SessionEvents {
     /// This method sends a request for the current user's metadata.
     ///
     /// - Parameters:
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for managing session-related tasks.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
     ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Throws: Any error that may occur during the process of requesting metadata.
     public func requestMyMetadata(
-        sessionDelegate: CryptoSessionDelegate,
+        sessionDelegate: PQSSessionDelegate,
         logger: NeedleTailLogger
     ) async throws {
         logger.log(level: .debug, message: "Requesting my metadata")
@@ -805,8 +805,8 @@ extension SessionEvents {
     /// - Parameters:
     ///   - message: The `EncryptedMessage` to be edited.
     ///   - newText: The new text to set for the message.
-    ///   - sessionDelegate: The `CryptoSessionDelegate` for managing session-related tasks.
-    ///   - cache: The `CryptoSessionStore` used for caching messages.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
+    ///   - cache: The `PQSSessionStore` used for caching messages.
     ///   - receiver: The `EventReceiver` that will handle events related to message updates.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///   - logger: The logger for logging events and debugging information.
@@ -816,8 +816,8 @@ extension SessionEvents {
     public func editCurrentMessage(
         _ message: EncryptedMessage,
         newText: String,
-        sessionDelegate: CryptoSessionDelegate,
-        cache: CryptoSessionStore,
+        sessionDelegate: PQSSessionDelegate,
+        cache: PQSSessionStore,
         receiver: EventReceiver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
@@ -842,7 +842,7 @@ extension SessionEvents {
     ///
     /// - Parameters:
     ///   - messageRecipient: The recipient of the message for which to find the communication model.
-    ///   - cache: The `CryptoSessionStore` used for caching communication models.
+    ///   - cache: The `PQSSessionStore` used for caching communication models.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///
     /// - Returns: A `BaseCommunication` instance associated with the specified message recipient.
@@ -850,7 +850,7 @@ extension SessionEvents {
     ///   - Any error that may occur during the process, such as issues with fetching the communication model.
     public func findCommunication(
         for messageRecipient: MessageRecipient,
-        cache: CryptoSessionStore,
+        cache: PQSSessionStore,
         symmetricKey: SymmetricKey
     ) async throws -> BaseCommunication {
         return try await findCommunicationType(
@@ -864,7 +864,7 @@ extension SessionEvents {
     /// This method retrieves the communication model associated with the specified communication type from the cache.
     ///
     /// - Parameters:
-    ///   - cache: The `CryptoSessionStore` used for caching communication models.
+    ///   - cache: The `PQSSessionStore` used for caching communication models.
     ///   - communicationType: The type of communication to find (e.g., nickname).
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///
@@ -872,7 +872,7 @@ extension SessionEvents {
     /// - Throws:
     ///   - `EventErrors.cannotFindCommunication` if no communication model of the specified type is found.
     public func findCommunicationType(
-        cache: CryptoSessionStore,
+        cache: PQSSessionStore,
         communicationType: MessageRecipient,
         symmetricKey: SymmetricKey
     ) async throws -> BaseCommunication {

@@ -58,15 +58,14 @@ public protocol SessionTransport: Sendable {
     
     func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys
     func fetchOneTimeKeyIdentites(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID]
-    func updateOneTimeKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedPublicOneTimeKey]) async throws
-    func updateOneTimeKyberKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedKyberOneTimeKey]) async throws
+    func updateOneTimeKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedOneTimePublicKey]) async throws
+    func updateOneTimeKyberKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedPQKemOneTimeKey]) async throws
     func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
     func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
-    func rotateLongTermKeys(
+    func publishRotatedKeys(
         for secretName: String,
         deviceId: String,
-        pskData: Data,
-        signedDevice: UserConfiguration.SignedDeviceConfiguration
+        rotated keys: RotatedPublicKeys
     ) async throws
     func createUploadPacket(
         secretName: String,

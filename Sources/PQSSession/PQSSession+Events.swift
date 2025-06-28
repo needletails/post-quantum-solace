@@ -11,15 +11,15 @@ import SessionModels
 import SessionEvents
 import Crypto
 
-//MARK: CryptoSession Events
-extension CryptoSession {
+//MARK: PQSSession Events
+extension PQSSession {
     
     /// Sends a text message to a specified recipient with optional metadata and destruction settings.
     ///
     /// This method constructs a `CryptoMessage` object with the provided parameters and sends it asynchronously.
     /// It performs the following actions:
     /// 1. Creates a `CryptoMessage` instance with the specified message type, flags, recipient, text, and metadata.
-    /// 2. Sends the message using the `processWrite` method of the `CryptoSession`.
+    /// 2. Sends the message using the `processWrite` method of the `PQSSession`.
     ///
     /// - Parameters:
     ///   - messageType: The type of the message being sent. This determines how the message is processed and displayed.
@@ -42,10 +42,10 @@ extension CryptoSession {
         destructionTime: TimeInterval? = nil
     ) async throws {
         do {
-            if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.publicSigningKey.count <= 10 {
+            if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedOneTimePublicKeys.count <= 10 {
                 async let _ = await self.refreshOneTimeKeysTask()
             }
-            if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedPublicKyberOneTimeKeys.count <= 10 {
+            if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedPQKemOneTimePublicKeys.count <= 10 {
                 async let _ = await self.refreshOneTimeKeysTask()
             }
             let message = CryptoMessage(
@@ -80,10 +80,10 @@ extension CryptoSession {
     ) async throws {
 
         //We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less that 10 local keys.
-        if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.publicSigningKey.count <= 10 {
+        if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedOneTimePublicKeys.count <= 10 {
             async let _ = await self.refreshOneTimeKeysTask()
         }
-        if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedPublicKyberOneTimeKeys.count <= 10 {
+        if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedPQKemOneTimePublicKeys.count <= 10 {
             async let _ = await self.refreshOneTimeKeysTask()
         }
         
@@ -108,7 +108,7 @@ extension CryptoSession {
     /// - Throws: An error if the message processing fails.
     func processWrite(
         message: CryptoMessage,
-        session: CryptoSession
+        session: PQSSession
     ) async throws {
         guard let sessionContext = await session.sessionContext else {
             throw SessionErrors.sessionNotInitialized
@@ -133,18 +133,18 @@ extension CryptoSession {
     }
 }
 
-// MARK: - CryptoSession SessionEvents Protocol Conformance
+// MARK: - PQSSession SessionEvents Protocol Conformance
 
-extension CryptoSession: SessionEvents {
+extension PQSSession: SessionEvents {
     
     /// Requires all necessary session parameters for processing.
     /// - Returns: A tuple containing all required session parameters.
     /// - Throws: An error if any of the required parameters are not initialized.
     private func requireAllSessionParameters() async throws -> (sessionContext: SessionContext,
-                                                                cache: CryptoSessionStore,
+                                                                cache: PQSSessionStore,
                                                                 transportDelegate: SessionTransport,
                                                                 receiverDelegate: EventReceiver,
-                                                                sessionDelegate: CryptoSessionDelegate,
+                                                                sessionDelegate: PQSSessionDelegate,
                                                                 symmetricKey: SymmetricKey) {
         guard let sessionContext = await self.sessionContext else {
             throw SessionErrors.sessionNotInitialized
@@ -170,9 +170,9 @@ extension CryptoSession: SessionEvents {
     /// - Returns: A tuple containing the required session parameters.
     /// - Throws: An error if any of the required parameters are not initialized.
     private func requireSessionParametersWithoutTransportDelegate() async throws -> (sessionContext: SessionContext,
-                                                                                     cache: CryptoSessionStore,
+                                                                                     cache: PQSSessionStore,
                                                                                      receiverDelegate: EventReceiver,
-                                                                                     sessionDelegate: CryptoSessionDelegate,
+                                                                                     sessionDelegate: PQSSessionDelegate,
                                                                                      symmetricKey: SymmetricKey) {
         guard let sessionContext = await self.sessionContext else {
             throw SessionErrors.sessionNotInitialized

@@ -1,5 +1,5 @@
 //
-//  CryptoSessionDelegate.swift
+//  PQSSessionDelegate.swift
 //  post-quantum-solace
 //
 //  Created by Cole M on 4/19/25.
@@ -14,10 +14,10 @@ import class DoubleRatchetKit.SessionIdentity
 /// A delegate protocol that provides hooks for integrating application-specific
 /// logic with the lifecycle of a cryptographic messaging session.
 ///
-/// Conforming to `CryptoSessionDelegate` allows the implementer to manage transport-level
+/// Conforming to `PQSSessionDelegate` allows the implementer to manage transport-level
 /// metadata, synchronize communication, handle delivery state changes, and manage contacts.
 /// This protocol is `Sendable` to support concurrent contexts such as Swift concurrency (async/await).
-public protocol CryptoSessionDelegate: Sendable {
+public protocol PQSSessionDelegate: Sendable {
     
     /// Called to synchronize communication state between two users.
     ///

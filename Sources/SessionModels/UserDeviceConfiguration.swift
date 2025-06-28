@@ -22,13 +22,13 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     public let deviceId: UUID
     
     /// Data representing the signing identity of the device.
-    public var publicSigningKey: Data
+    public var signingPublicKey: Data
     
     /// Public key associated with the device.
-    public var publicLongTermKey: Data
+    public var longTermPublicKey: Data
     
     /// Public key associated with the device.
-    public var finalKyber1024PublicKey: Kyber1024PublicKeyRepresentable
+    public var finalPQKemPublicKey: PQKemPublicKey
     
     /// An optional device name to identify what device this actually is.
     public let deviceName: String?
@@ -42,9 +42,9 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     /// Coding keys for encoding and decoding the struct.
     enum CodingKeys: String, CodingKey, Codable, Sendable {
         case deviceId = "a"               // Key for the device identifier
-        case publicSigningKey = "b"       // Key for the public signing key
-        case publicLongTermKey = "c"      // Key for the public long-term key
-        case finalKyber1024PublicKey = "d"     // Key for the Kyber 1024 public key
+        case signingPublicKey = "b"       // Key for the public signing key
+        case longTermPublicKey = "c"      // Key for the public long-term key
+        case finalPQKemPublicKey = "d"     // Key for the Kyber 1024 public key
         case deviceName = "e"              // Key for the device name
         case hmacData = "f"                // Key for the HMAC data
         case isMasterDevice = "g"          // Key for the master device flag
@@ -54,41 +54,41 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     ///
     /// - Parameters:
     ///   - deviceId: The unique identifier for the device.
-    ///   - publicSigningKey: The signing identity data.
-    ///   - publicLongTermKey: The public long-term key data.
-    ///   - kyber1024PublicKey: The Kyber 1024 public key data.
+    ///   - signingPublicKey: The signing identity data.
+    ///   - longTermPublicKey: The public long-term key data.
+    ///   - finalPQKemPublicKey: The PQKem public key data.
     ///   - deviceName: An optional name for the device.
     ///   - hmacData: The HMAC data for JWT authentication.
     ///   - isMasterDevice: A flag indicating if this is the master device.
     /// - Throws: An error if signing the configuration fails.
     public init(
         deviceId: UUID,
-        publicSigningKey: Data,
-        publicLongTermKey: Data,
-        finalKyber1024PublicKey: Kyber1024PublicKeyRepresentable,
+        signingPublicKey: Data,
+        longTermPublicKey: Data,
+        finalPQKemPublicKey: PQKemPublicKey,
         deviceName: String?,
         hmacData: Data,
         isMasterDevice: Bool
     ) throws {
         self.deviceId = deviceId
-        self.publicSigningKey = publicSigningKey
-        self.publicLongTermKey = publicLongTermKey
-        self.finalKyber1024PublicKey = finalKyber1024PublicKey
+        self.signingPublicKey = signingPublicKey
+        self.longTermPublicKey = longTermPublicKey
+        self.finalPQKemPublicKey = finalPQKemPublicKey
         self.deviceName = deviceName
         self.hmacData = hmacData
         self.isMasterDevice = isMasterDevice
     }
     
-    public mutating func updatePublicSigningKey(_ data: Data) async {
-        self.publicSigningKey = data
+    public mutating func updateSigningPublicKey(_ data: Data) async {
+        self.signingPublicKey = data
     }
     
-    public mutating func updatePublicLongTermKey(_ data: Data) async {
-        self.publicLongTermKey = data
+    public mutating func updateLongTermPublicKey(_ data: Data) async {
+        self.longTermPublicKey = data
     }
     
-    public mutating func updateFinalKyberTermKey(_ represetable: Kyber1024PublicKeyRepresentable) async {
-        self.finalKyber1024PublicKey = represetable
+    public mutating func updateFinalPQKemPublicKey(_ represetable: PQKemPublicKey) async {
+        self.finalPQKemPublicKey = represetable
     }
 }
 
@@ -144,26 +144,43 @@ public struct UserSession: Identifiable, Codable, Sendable, Hashable {
 
 
 public struct OneTimeKeys: Codable, Sendable {
-    public let curve: DoubleRatchetKit.Curve25519PublicKeyRepresentable?
-    public let kyber: DoubleRatchetKit.Kyber1024PublicKeyRepresentable?
+    public let curve: DoubleRatchetKit.CurvePublicKey?
+    public let kyber: DoubleRatchetKit.PQKemPublicKey?
     
-    public init(curve: DoubleRatchetKit.Curve25519PublicKeyRepresentable? = nil,
-                kyber: DoubleRatchetKit.Kyber1024PublicKeyRepresentable? = nil) {
+    public init(
+        curve: DoubleRatchetKit.CurvePublicKey? = nil,
+        kyber: DoubleRatchetKit.PQKemPublicKey? = nil
+    ) {
         self.curve = curve
         self.kyber = kyber
     }
 }
 
 public struct LongTermKeys: Codable, Sendable {
-    public let curve: DoubleRatchetKit.Curve25519PublicKeyRepresentable?
-    public let signing:  DoubleRatchetKit.Curve25519PublicKeySigningRepresentable?
-    public let kyber: DoubleRatchetKit.Kyber1024PublicKeyRepresentable?
+    public let curve: DoubleRatchetKit.CurvePublicKey?
+    public let signing:  DoubleRatchetKit.CurvePublicKey?
+    public let kyber: DoubleRatchetKit.PQKemPublicKey?
     
-    public init(curve: DoubleRatchetKit.Curve25519PublicKeyRepresentable? = nil,
-                signing: DoubleRatchetKit.Curve25519PublicKeySigningRepresentable? = nil,
-                kyber: DoubleRatchetKit.Kyber1024PublicKeyRepresentable? = nil) {
+    public init(
+        curve: DoubleRatchetKit.CurvePublicKey? = nil,
+        signing: DoubleRatchetKit.CurvePublicKey? = nil,
+        kyber: DoubleRatchetKit.PQKemPublicKey? = nil
+    ) {
         self.curve = curve
         self.signing = signing
         self.kyber = kyber
+    }
+}
+
+public struct RotatedPublicKeys: Codable, Sendable {
+    public let pskData: Data
+    public let signedDevice: UserConfiguration.SignedDeviceConfiguration
+    
+    public init(
+        pskData: Data,
+        signedDevice: UserConfiguration.SignedDeviceConfiguration
+    ) {
+        self.pskData = pskData
+        self.signedDevice = signedDevice
     }
 }

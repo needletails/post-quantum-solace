@@ -5,12 +5,14 @@
 //  Created by Cole M on 10/19/24.
 //
 import Testing
-@testable import CryptoSession
+@testable import PQSSession
 @testable import SessionEvents
 @testable import SessionModels
 
 @Suite(.serialized)
 struct FriendshipMetadataTests {
+    
+    // MARK: - Initial State Tests
     
     @Test
     func testInitialState() {
@@ -20,13 +22,15 @@ struct FriendshipMetadataTests {
         #expect(friendship.ourState == .pending)
     }
     
+    // MARK: - Friend Request Tests
+    
     @Test
     func testSendFriendRequest() {
         var friendship = FriendshipMetadata()
-        friendship.synchronizeAcceptedState()
+        friendship.synchronizeRequestedState()
         
-        #expect(friendship.myState == .accepted)
-        #expect(friendship.ourState == .accepted)
+        #expect(friendship.myState == .requested)
+        #expect(friendship.ourState == .pending)
     }
     
     @Test
@@ -43,26 +47,6 @@ struct FriendshipMetadataTests {
     func testRejectFriendRequest() {
         var friendship = FriendshipMetadata(myState: .requested, theirState: .pending)
         friendship.rejectFriendRequest()
-
-        #expect(friendship.myState == .rejectedRequest)
-        #expect(friendship.theirState == .rejected)
-        #expect(friendship.ourState == .friendshipRejected)
-    }
-    
-    @Test
-    func testFriendRejection() {
-        var friendship = FriendshipMetadata(myState: .requested, theirState: .pending)
-        friendship.rejectFriendRequest()
-        friendship.switchStates()
-        #expect(friendship.myState == .rejected)
-        #expect(friendship.theirState == .rejectedRequest)
-        #expect(friendship.ourState == .friendshipRejected)
-    }
-    
-    @Test
-    func testRevokeFriendRequest() {
-        var friendship = FriendshipMetadata(myState: .requested, theirState: .pending)
-        friendship.rejectFriendRequest()
         
         #expect(friendship.myState == .rejectedRequest)
         #expect(friendship.theirState == .rejected)
@@ -70,34 +54,38 @@ struct FriendshipMetadataTests {
     }
     
     @Test
-    func testBlockFriend() {
-        var friendship = FriendshipMetadata()
-        friendship.rejectFriendRequest()
+    func testResetToPendingState() {
+        var friendship = FriendshipMetadata(myState: .requested, theirState: .pending)
+        friendship.synchronizePendingState()
         
-        #expect(friendship.myState == .rejectedRequest)
-        #expect(friendship.theirState == .rejected)
-        #expect(friendship.ourState == .friendshipRejected)
-    }
-    
-    @Test
-    func testWasBlocked() {
-        var friendship = FriendshipMetadata()
-        friendship.rejectFriendRequest()
-        friendship.switchStates()
-        #expect(friendship.myState == .rejected)
-        #expect(friendship.theirState == .rejectedRequest)
-        #expect(friendship.ourState == .friendshipRejected)
-    }
-    
-    @Test
-    func testUnblockFriend() {
-        var friendship = FriendshipMetadata(myState: .blockedUser, theirState: .blocked)
-        friendship.unBlockFriend()
-
         #expect(friendship.myState == .pending)
         #expect(friendship.theirState == .pending)
         #expect(friendship.ourState == .pending)
     }
+    
+    // MARK: - Block/Unblock Tests
+    
+    @Test
+    func testBlockUser() {
+        var friendship = FriendshipMetadata()
+        friendship.synchronizeBlockState(receivedBlock: false)
+        
+        #expect(friendship.myState == .blockedUser)
+        #expect(friendship.theirState == .blocked)
+        #expect(friendship.ourState == .pending)
+    }
+    
+    @Test
+    func testUnblockUser() {
+        var friendship = FriendshipMetadata(myState: .blockedUser, theirState: .blocked)
+        friendship.unBlockFriend()
+        
+        #expect(friendship.myState == .pending)
+        #expect(friendship.theirState == .pending)
+        #expect(friendship.ourState == .pending)
+    }
+    
+    // MARK: - State Management Tests
     
     @Test
     func testSwitchStates() {
@@ -110,19 +98,24 @@ struct FriendshipMetadataTests {
     
     @Test
     func testUpdateOurState() {
+        // Test accepted state
         var friendship = FriendshipMetadata(myState: .accepted, theirState: .accepted)
         friendship.updateOurState()
-        
         #expect(friendship.ourState == .accepted)
         
+        // Test pending state
         friendship = FriendshipMetadata(myState: .requested, theirState: .pending)
         friendship.updateOurState()
-        
         #expect(friendship.ourState == .pending)
         
+        // Test rejected state
         friendship = FriendshipMetadata(myState: .rejected, theirState: .rejectedRequest)
         friendship.updateOurState()
-        
         #expect(friendship.ourState == .friendshipRejected)
+        
+        // Test both requested state
+        friendship = FriendshipMetadata(myState: .requested, theirState: .requested)
+        friendship.updateOurState()
+        #expect(friendship.ourState == .requested)
     }
 }

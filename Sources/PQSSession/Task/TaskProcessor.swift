@@ -41,7 +41,7 @@ actor TaskProcessor {
     }
 
     /// The currently active session.
-    var session: CryptoSession?
+    var session: PQSSession?
 
     /// Handles cryptographic operations (e.g. encryption/decryption).
     let crypto = NeedleTailCrypto()
@@ -115,7 +115,7 @@ actor TaskProcessor {
         message: CryptoMessage,
         cache: SessionCache,
         symmetricKey: SymmetricKey,
-        session: CryptoSession,
+        session: PQSSession,
         sender: String,
         type: MessageRecipient,
         shouldPersist: Bool,
@@ -193,14 +193,14 @@ actor TaskProcessor {
     // MARK: - Identity Resolution
 
     /// Fetches personal identities for the sender.
-    private func gatherPersonalIdentities(session: CryptoSession, sender: String, logger: NeedleTailLogger) async throws -> [SessionIdentity] {
+    private func gatherPersonalIdentities(session: PQSSession, sender: String, logger: NeedleTailLogger) async throws -> [SessionIdentity] {
         let identities = try await session.refreshIdentities(secretName: sender)
         logger.log(level: .info, message: "Gathered \(identities.count) Personal Session Identities")
         return identities
     }
 
     /// Fetches identities for private (1:1) messages.
-    private func gatherPrivateMessageIdentities(session: CryptoSession, target: String, logger: NeedleTailLogger) async throws -> [SessionIdentity] {
+    private func gatherPrivateMessageIdentities(session: PQSSession, target: String, logger: NeedleTailLogger) async throws -> [SessionIdentity] {
         let identities = try await session.refreshIdentities(secretName: target)
         logger.log(level: .info, message: "Gathered \(identities.count) Private Message Session Identities")
         return identities
@@ -209,14 +209,14 @@ actor TaskProcessor {
     /// Fetches all identities for channel messages.
     private func gatherChannelIdentities(
         cache: SessionCache,
-        session: CryptoSession,
+        session: PQSSession,
         symmetricKey: SymmetricKey,
         type: MessageRecipient,
         logger: NeedleTailLogger
     ) async throws -> ([SessionIdentity], Set<String>) {
         let communicationModel = try await findCommunicationType(cache: cache, communicationType: type, session: session)
         guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
-            throw CryptoSession.SessionErrors.propsError
+            throw PQSSession.SessionErrors.propsError
         }
 
         props.messageCount += 1
@@ -239,7 +239,7 @@ actor TaskProcessor {
         for sessionIdentities: [SessionIdentity],
         message: CryptoMessage,
         cache: SessionCache,
-        session: CryptoSession,
+        session: PQSSession,
         symmetricKey: SymmetricKey,
         sender: String,
         recipients: Set<String>,
@@ -256,7 +256,7 @@ actor TaskProcessor {
             do {
                 communicationModel = try await findCommunicationType(cache: cache, communicationType: message.recipient, session: session)
                 guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
-                    throw CryptoSession.SessionErrors.propsError
+                    throw PQSSession.SessionErrors.propsError
                 }
                 props.messageCount += 1
                 _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
@@ -297,7 +297,7 @@ actor TaskProcessor {
             if shouldPersist {
                 guard let encryptableMessage else { return }
                 guard let messageProps = await encryptableMessage.props(symmetricKey: symmetricKey) else {
-                    throw CryptoSession.SessionErrors.propsError
+                    throw PQSSession.SessionErrors.propsError
                 }
 
                 task = EncrytableTask(
@@ -348,7 +348,7 @@ actor TaskProcessor {
     /// - Parameters:
     ///   - message: The message received from the transport layer.
     ///   - session: The current crypto session used to decrypt and dispatch.
-    func inboundTask(_ message: InboundTaskMessage, session: CryptoSession) async throws {
+    func inboundTask(_ message: InboundTaskMessage, session: PQSSession) async throws {
         try await feedTask(
             EncrytableTask(task: .streamMessage(message)),
             session: session
