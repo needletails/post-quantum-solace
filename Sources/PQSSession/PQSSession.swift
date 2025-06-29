@@ -4,6 +4,15 @@
 //
 //  Created by Cole M on 9/12/24.
 //
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
+//
 
 import Foundation
 import SessionModels
@@ -16,25 +25,121 @@ import BSON
 import DoubleRatchetKit
 import SwiftKyber
 
-/// The `PQSSession` actor manages cryptographic sessions, including key management,
-/// session context, and communication with other components in the system. It conforms
-/// to `NetworkDelegate` and `SessionCacheSynchronizer` protocols, allowing it to handle
-/// network operations and synchronize session data with a cache.
+/// A secure, post-quantum cryptographic session manager for end-to-end encrypted messaging.
 ///
-/// This actor is designed to be a singleton, providing a centralized point for managing
-/// cryptographic operations and session states across the application.
+/// `PQSSession` is the central actor responsible for managing cryptographic sessions, key management,
+/// and secure communication channels. It implements both classical (Curve25519) and post-quantum
+/// (Kyber1024) cryptography to ensure long-term security against quantum attacks.
+///
+/// ## Overview
+///
+/// The session manager provides:
+/// - **Post-quantum secure key exchange** using Kyber1024
+/// - **Forward secrecy** through Double Ratchet protocol
+/// - **Device management** with master/child device support
+/// - **Automatic key rotation** and compromise recovery
+/// - **End-to-end encryption** for all communications
+///
+/// ## Architecture
+///
+/// `PQSSession` follows a singleton pattern and uses Swift's actor model for thread-safe
+/// concurrent access. It delegates specific responsibilities to protocol-conforming objects:
+///
+/// - `SessionTransport` - Network communication and key distribution
+/// - `PQSSessionStore` - Persistent storage and caching
+/// - `EventReceiver` - Event handling and UI updates
+/// - `PQSSessionDelegate` - Application-specific session logic
+///
+/// ## Usage Example
+///
+/// ```swift
+/// // Initialize the session
+/// let session = PQSSession.shared
+/// 
+/// // Set up delegates
+/// await session.setTransportDelegate(conformer: myTransport)
+/// await session.setDatabaseDelegate(conformer: myStore)
+/// session.setReceiverDelegate(conformer: myReceiver)
+/// 
+/// // Create a new session
+/// try await session.createSession(
+///     secretName: "alice",
+///     appPassword: "securePassword",
+///     createInitialTransport: setupTransport
+/// )
+/// 
+/// // Start the session
+/// try await session.startSession(appPassword: "securePassword")
+/// 
+/// // Send a message
+/// try await session.writeTextMessage(
+///     recipient: .nickname("bob"),
+///     text: "Hello, world!",
+///     metadata: ["timestamp": Date()],
+///     destructionTime: 3600
+/// )
+/// ```
+///
+/// ## Security Features
+///
+/// - **Post-quantum cryptography**: Kyber1024 for key exchange
+/// - **Forward secrecy**: Double Ratchet protocol with automatic key rotation
+/// - **Compromise recovery**: Key rotation on potential compromise
+/// - **Device verification**: Signed device configurations
+/// - **One-time keys**: Pre-generated keys for immediate communication
+/// - **Perfect forward secrecy**: Keys are rotated after each message
+///
+/// ## Thread Safety
+///
+/// This actor is designed for concurrent access and all public methods are thread-safe.
+/// The singleton pattern ensures consistent state across your application.
+///
+/// ## Error Handling
+///
+/// All methods throw specific `SessionErrors` that provide clear information about
+/// what went wrong and how to recover. Common errors include:
+///
+/// - `SessionErrors.sessionNotInitialized` - Session not properly set up
+/// - `SessionErrors.databaseNotInitialized` - Storage not configured
+/// - `SessionErrors.transportNotInitialized` - Network layer not ready
+/// - `SessionErrors.invalidSignature` - Cryptographic verification failed
+///
+/// ## Performance Considerations
+///
+/// - Key generation is performed asynchronously
+/// - One-time keys are pre-generated in batches of 100
+/// - Automatic key refresh when supply is low
+/// - Efficient caching of session identities
+///
+/// - Important: This actor is designed as a singleton. Always use `PQSSession.shared`
+///   rather than creating new instances.
 public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     
-    // Unique identifier for the session
+    /// Unique identifier for the session instance.
+    /// This ID is generated once and remains constant for the lifetime of the session.
     nonisolated let id = UUID()
     
-    // Indicates if the session is viable for operations
+    /// Indicates whether the session is viable for cryptographic operations.
+    /// 
+    /// This property is set to `true` when the session is properly initialized
+    /// with all required delegates and cryptographic keys. It becomes `false`
+    /// when the session is shut down or encounters critical errors.
+    /// 
+    /// - Important: Always check this property before performing cryptographic operations.
     nonisolated(unsafe) public var isViable: Bool = false
     
-    // Singleton instance of PQSSession
+    /// The shared singleton instance of `PQSSession`.
+    /// 
+    /// Use this instance throughout your application to ensure consistent
+    /// session state and avoid conflicts between multiple session managers.
+    /// 
+    /// - Important: Never create new instances of `PQSSession`. Always use this shared instance.
     public static let shared = PQSSession()
     
-    //Public initializer to enforce singleton usage
+    /// Public initializer to enforce singleton usage.
+    /// 
+    /// This initializer is provided to support the singleton pattern.
+    /// In practice, you should always use `PQSSession.shared` instead.
     public init() {}
     
     private(set) var _sessionContext: SessionContext?
@@ -259,7 +364,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             rotateKeysDate: Calendar.current.date(byAdding: .weekOfYear, value: 1, to: Date()))
         
         // Create a user device configuration
-        let device = try UserDeviceConfiguration(
+        let device = UserDeviceConfiguration(
             deviceId: deviceKeys.deviceId,
             signingPublicKey: longTerm.signing.publicKey.rawRepresentation,
             longTermPublicKey: longTerm.curve.publicKey.rawRepresentation,
@@ -294,8 +399,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let userConfiguration = UserConfiguration(
             signingPublicKey: longTerm.signing.publicKey.rawRepresentation,
             signedDevices: [signedDeviceConfiguration],
-            signedoneTimePublicKeys: signedoneTimePublicKeys,
-            signedPublicKyberOneTimeKeys: signedPublicKyberOneTimeKeys)
+            signedOneTimePublicKeys: signedoneTimePublicKeys,
+            signedPQKemOneTimePublicKeys: signedPublicKyberOneTimeKeys)
         
         // Return the complete cryptographic bundle
         return CryptographicBundle(
@@ -351,7 +456,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             sessionUser: sessionUser,
             databaseEncryptionKey: generateDatabaseEncryptionKey(),
             sessionContextId: .random(in: 1 ..< .max),
-            lastUserConfiguration: bundle.userConfiguration,
+            activeUserConfiguration: bundle.userConfiguration,
             registrationState: .unregistered)
         await setSessionContext(sessionContext)
         
@@ -360,7 +465,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         
         // Retrieve salt and derive symmetric key
-        let saltData = try await cache.findLocalDeviceSalt(keyData: passwordData)
+        let saltData = try await cache.fetchLocalDeviceSalt(keyData: passwordData)
         
         let appSymmetricKey = await crypto.deriveStrictSymmetricKey(
             data: passwordData,
@@ -478,7 +583,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let data = try BSONEncoder().encodeData(linkConfig)
         
         // Generate cryptographic credentials for device linking
-        if let credentials = await linkDelegate?.generatedDeviceCryptographic(data, password: password) {
+        if let credentials = await linkDelegate?.generateDeviceCryptographic(data, password: password) {
             
             guard let cache else {
                 throw SessionErrors.databaseNotInitialized
@@ -503,7 +608,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 configuration: bundle.userConfiguration,
                 signingPrivateKeyData: bundle.deviceKeys.signingPrivateKey,
                 devices: credentials.devices,
-                keys: bundle.userConfiguration.getVerifiedKeys(deviceId: bundle.deviceKeys.deviceId),
+                keys: bundle.userConfiguration.getVerifiedCurveKeys(deviceId: bundle.deviceKeys.deviceId),
                 pqKemKeys: bundle.userConfiguration.getVerifiedPQKemKeys(deviceId: bundle.deviceKeys.deviceId))
             
             // Create a new session context with the session user and user configuration
@@ -511,7 +616,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 sessionUser: sessionUser,
                 databaseEncryptionKey: databaseEncryptionKey,
                 sessionContextId: .random(in: 1 ..< .max),
-                lastUserConfiguration: userConfiguration,
+                activeUserConfiguration: userConfiguration,
                 registrationState: .unregistered)
             
             // Set the session context
@@ -523,7 +628,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             }
             
             // Retrieve salt and derive the symmetric key
-            let saltData = try await cache.findLocalDeviceSalt(keyData: passwordData)
+            let saltData = try await cache.fetchLocalDeviceSalt(keyData: passwordData)
             let symmetricKey = await crypto.deriveStrictSymmetricKey(
                 data: passwordData,
                 salt: saltData
@@ -597,7 +702,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     ///     context cannot be encrypted successfully.
     public func updateUserConfiguration(_ devices: [UserDeviceConfiguration]) async throws {
         // Retrieve the current session context from the cache
-        guard let data = try await cache?.findLocalSessionContext() else { return }
+        guard let data = try await cache?.fetchLocalSessionContext() else { return }
         
         // Decrypt the session context data using the app's symmetric key
         guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
@@ -609,14 +714,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         
         // Create a new user configuration with the updated devices
         let userConfiguration = try await createNewUser(
-            configuration: sessionContext.lastUserConfiguration,
+            configuration: sessionContext.activeUserConfiguration,
             signingPrivateKeyData: sessionContext.sessionUser.deviceKeys.signingPrivateKey,
             devices: devices,
-            keys: sessionContext.lastUserConfiguration.getVerifiedKeys(deviceId: sessionContext.sessionUser.deviceId),
-            pqKemKeys: sessionContext.lastUserConfiguration.getVerifiedPQKemKeys(deviceId: sessionContext.sessionUser.deviceId))
+            keys: sessionContext.activeUserConfiguration.getVerifiedCurveKeys(deviceId: sessionContext.sessionUser.deviceId),
+            pqKemKeys: sessionContext.activeUserConfiguration.getVerifiedPQKemKeys(deviceId: sessionContext.sessionUser.deviceId))
         
         // Update the last user configuration in the session context
-        sessionContext.lastUserConfiguration = userConfiguration
+        sessionContext.activeUserConfiguration = userConfiguration
         
         // Save the updated session context back to the cache
         await setSessionContext(sessionContext)
@@ -652,7 +757,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     ///     context cannot be encrypted successfully.
     public func updateUseroneTimePublicKeys(_ keys: [UserConfiguration.SignedOneTimePublicKey]) async throws {
         // Retrieve the current session context from the cache
-        guard let data = try await cache?.findLocalSessionContext() else { return }
+        guard let data = try await cache?.fetchLocalSessionContext() else { return }
         
         // Decrypt the session context data using the app's symmetric key
         guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
@@ -664,13 +769,13 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         
         // Create a new UserConfiguration with the updated public one-time keys
         let userConfiguration = UserConfiguration(
-            signingPublicKey: sessionContext.lastUserConfiguration.signingPublicKey,
-            signedDevices: sessionContext.lastUserConfiguration.signedDevices,
-            signedoneTimePublicKeys: keys,
-            signedPublicKyberOneTimeKeys: sessionContext.lastUserConfiguration.signedPQKemOneTimePublicKeys)
+            signingPublicKey: sessionContext.activeUserConfiguration.signingPublicKey,
+            signedDevices: sessionContext.activeUserConfiguration.signedDevices,
+            signedOneTimePublicKeys: keys,
+            signedPQKemOneTimePublicKeys: sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys)
         
         // Update the last user configuration in the session context
-        sessionContext.lastUserConfiguration = userConfiguration
+        sessionContext.activeUserConfiguration = userConfiguration
         
         // Save the updated session context back to the cache
         await setSessionContext(sessionContext)
@@ -769,8 +874,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         return UserConfiguration(
             signingPublicKey: signingPublicKey.rawRepresentation,
             signedDevices: signedDevices,
-            signedoneTimePublicKeys: signedKeys,
-        signedPublicKyberOneTimeKeys: signedKyberKeys)
+            signedOneTimePublicKeys: signedKeys,
+            signedPQKemOneTimePublicKeys: signedKyberKeys)
     }
     
     /// Starts a session using the provided application password.
@@ -791,7 +896,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         
         // Retrieve the local device configuration
-        let data = try await cache.findLocalSessionContext()
+        let data = try await cache.fetchLocalSessionContext()
         
         // Convert the application password to Data
         guard let passwordData = appPassword.data(using: .utf8) else {
@@ -799,7 +904,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         
         // Retrieve salt and derive symmetric key
-        let saltData = try await cache.findLocalDeviceSalt(keyData: passwordData)
+        let saltData = try await cache.fetchLocalDeviceSalt(keyData: passwordData)
         
         // Derive the symmetric key from the password and salt - This is the AppSymmetricKey
         let symmetricKey = await crypto.deriveStrictSymmetricKey(
@@ -870,7 +975,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         guard let cache else { return }
         var keys = [UUID]()
         
-            if let fetched = try await transportDelegate?.fetchOneTimeKeyIdentites(for: sessionContext.sessionUser.secretName, deviceId:  sessionContext.sessionUser.deviceId.uuidString, type: refreshType) {
+            if let fetched = try await transportDelegate?.fetchOneTimeKeyIdentities(for: sessionContext.sessionUser.secretName, deviceId:  sessionContext.sessionUser.deviceId.uuidString, type: refreshType) {
                 keys = fetched
             }
         
@@ -878,7 +983,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             let publicKeysCount = try await synchronizeLocalKeys(cache: cache, keys: keys, type: refreshType)
             if publicKeysCount <= 10 {
                 //1. Delete all local keys that are not on the server
-                let config = try await cache.findLocalSessionContext()
+                let config = try await cache.fetchLocalSessionContext()
                 
                 // Decrypt the session context data using the app's symmetric key
                 guard let configurationData = try await crypto.decrypt(data: config, symmetricKey: getAppSymmetricKey()) else {
@@ -908,7 +1013,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                             signingKey: try Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey))
                     }
                     
-                    sessionContext.lastUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedoneTimePublicKeys)
+                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedoneTimePublicKeys)
                     
                     try await transportDelegate?.updateOneTimeKeys(
                         for: sessionContext.sessionUser.secretName,
@@ -933,9 +1038,9 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                             signingKey: try Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey))
                     }
                     
-                    sessionContext.lastUserConfiguration.signedPQKemOneTimePublicKeys.append(contentsOf: signedKyberOneTimeKeys)
+                    sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.append(contentsOf: signedKyberOneTimeKeys)
                     
-                    try await transportDelegate?.updateOneTimeKyberKeys(
+                    try await transportDelegate?.updateOneTimePQKemKeys(
                         for: sessionContext.sessionUser.secretName,
                         deviceId: sessionContext.sessionUser.deviceId.uuidString,
                         keys: signedKyberOneTimeKeys)
@@ -957,7 +1062,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
     
     func synchronizeLocalKeys(cache: SessionCache, keys: [UUID], type: KeysType) async throws -> Int {
-        let data = try await cache.findLocalSessionContext()
+        let data = try await cache.fetchLocalSessionContext()
         guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
             throw SessionErrors.sessionDecryptionError
         }
@@ -968,7 +1073,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         switch type {
         case .curve:
             let privateKeys = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys
-            let publicKeys = sessionContext.lastUserConfiguration.signedOneTimePublicKeys
+            let publicKeys = sessionContext.activeUserConfiguration.signedOneTimePublicKeys
             let privateKeyIDs = Set(privateKeys.map(\.id))
             let publicKeyIDs = Set(publicKeys.map(\.id))
             let remoteKeySet = Set(keys)
@@ -979,7 +1084,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             if privateIntersection.isEmpty && publicIntersection.isEmpty {
                 // No shared keys — remove all
                 sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
-                sessionContext.lastUserConfiguration.signedOneTimePublicKeys.removeAll()
+                sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll()
                 didUpdate = true
             } else {
                 // Remove only keys not in remote list
@@ -991,7 +1096,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
                 let filteredPublic = publicKeys.filter { remoteKeySet.contains($0.id) }
                 if filteredPublic.count != publicKeys.count {
-                    sessionContext.lastUserConfiguration.signedOneTimePublicKeys = filteredPublic
+                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys = filteredPublic
                     didUpdate = true
                 }
             }
@@ -1008,14 +1113,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 try await cache.updateLocalSessionContext(encryptedConfig)
                 
                 //if we have no keys delete all public keys on the server so we can regenerated a fresh batch
-                if sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.isEmpty || sessionContext.lastUserConfiguration.signedOneTimePublicKeys.isEmpty {
+                if sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.isEmpty || sessionContext.activeUserConfiguration.signedOneTimePublicKeys.isEmpty {
                     try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
                 }
             }
-            return sessionContext.lastUserConfiguration.signedOneTimePublicKeys.count
+            return sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count
         case .kyber:
             let privateKeys = sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys
-            let publicKeys = sessionContext.lastUserConfiguration.signedPQKemOneTimePublicKeys
+            let publicKeys = sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys
             let privateKeyIDs = Set(privateKeys.map(\.id))
             let publicKeyIDs = Set(publicKeys.map(\.id))
             let remoteKeySet = Set(keys)
@@ -1026,7 +1131,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             if privateIntersection.isEmpty && publicIntersection.isEmpty {
                 // No shared keys — remove all
                 sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.removeAll()
-                sessionContext.lastUserConfiguration.signedPQKemOneTimePublicKeys.removeAll()
+                sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.removeAll()
                 didUpdate = true
             } else {
                 // Remove only keys not in remote list
@@ -1038,7 +1143,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
                 let filteredPublic = publicKeys.filter { remoteKeySet.contains($0.id) }
                 if filteredPublic.count != publicKeys.count {
-                    sessionContext.lastUserConfiguration.signedPQKemOneTimePublicKeys = filteredPublic
+                    sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys = filteredPublic
                     didUpdate = true
                 }
             }
@@ -1055,11 +1160,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 try await cache.updateLocalSessionContext(encryptedConfig)
                 
                 //if we have no keys delete all public keys on the server so we can regenerated a fresh batch
-                if sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.isEmpty || sessionContext.lastUserConfiguration.signedPQKemOneTimePublicKeys.isEmpty {
+                if sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.isEmpty || sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.isEmpty {
                     try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
                 }
             }
-            return sessionContext.lastUserConfiguration.signedPQKemOneTimePublicKeys.count
+            return sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.count
         }
     }
 
@@ -1079,7 +1184,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         
         // Retrieve salt and derive symmetric key
-        guard let saltData = try await cache?.findLocalDeviceSalt(keyData: passwordData) else { throw SessionErrors.saltError }
+        guard let saltData = try await cache?.fetchLocalDeviceSalt(keyData: passwordData) else { throw SessionErrors.saltError }
         
         return await crypto.deriveStrictSymmetricKey(
             data: passwordData,
@@ -1093,7 +1198,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 throw SessionErrors.invalidPassword
             }
             
-            guard let saltData = try await cache?.findLocalDeviceSalt(keyData: passwordData) else { throw SessionErrors.saltError }
+            guard let saltData = try await cache?.fetchLocalDeviceSalt(keyData: passwordData) else { throw SessionErrors.saltError }
             
             let appEncryptionKey = await crypto.deriveStrictSymmetricKey(
                 data: passwordData,
@@ -1101,7 +1206,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             
             await setAppPassword(appPassword)
             
-            guard let data = try await self.cache?.findLocalSessionContext() else { return false }
+            guard let data = try await self.cache?.fetchLocalSessionContext() else { return false }
             let box = try AES.GCM.SealedBox(combined: data)
             _ = try AES.GCM.open(box, using: appEncryptionKey)
             return true
@@ -1117,7 +1222,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             throw SessionErrors.databaseNotInitialized
         }
         
-        let data = try await cache.findLocalSessionContext()
+        let data = try await cache.fetchLocalSessionContext()
         guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
             throw SessionErrors.sessionDecryptionError
         }
@@ -1130,7 +1235,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         
         // Retrieve salt and derive symmetric key
-        let saltData = try await cache.findLocalDeviceSalt(keyData: passwordData)
+        let saltData = try await cache.fetchLocalDeviceSalt(keyData: passwordData)
         
         let symmetricKey = await crypto.deriveStrictSymmetricKey(
             data: passwordData,

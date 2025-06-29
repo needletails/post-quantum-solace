@@ -377,14 +377,14 @@ class EndToEndTests: @unchecked Sendable {
 // MARK: - Supporting Types
 
 struct SessionDelegate: PQSSessionDelegate {
-    func communicationSynchonization(recipient: SessionModels.MessageRecipient, sharedIdentifier: String) async throws {}
-    func blockUnblock(recipient: SessionModels.MessageRecipient, data: Data?, metadata: BSON.Document, myState: SessionModels.FriendshipMetadata.State) async throws {}
+    func synchronizeCommunication(recipient: SessionModels.MessageRecipient, sharedIdentifier: String) async throws {}
+    func handleBlockUnblock(recipient: SessionModels.MessageRecipient, blockData: Data?, metadata: BSON.Document, currentState: SessionModels.FriendshipMetadata.State) async throws {}
     func deliveryStateChanged(recipient: SessionModels.MessageRecipient, metadata: BSON.Document) async throws {}
     func contactCreated(recipient: SessionModels.MessageRecipient) async throws {}
     func requestMetadata(recipient: SessionModels.MessageRecipient) async throws {}
     func editMessage(recipient: SessionModels.MessageRecipient, metadata: BSON.Document) async throws {}
     func shouldPersist(transportInfo: Data?) -> Bool { true }
-    func getUserInfo(_ transportInfo: Data?) async throws -> (secretName: String, deviceId: String)? { nil }
+    func retrieveUserInfo(_ transportInfo: Data?) async throws -> (secretName: String, deviceId: String)? { nil }
     func updateCryptoMessageMetadata(_ message: SessionModels.CryptoMessage, sharedMessageId: String) throws -> SessionModels.CryptoMessage { message }
     func updateEncryptableMessageMetadata(_ message: SessionModels.EncryptedMessage, transportInfo: Data?, identity: DoubleRatchetKit.SessionIdentity, recipient: SessionModels.MessageRecipient) async throws -> SessionModels.EncryptedMessage { message }
     func shouldFinishCommunicationSynchronization(_ transportInfo: Data?) -> Bool { false }
@@ -444,13 +444,13 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
         
         guard let kyberKeyPairIndex = kyberOneTimeKeyPairs.firstIndex(where: { $0.id == secretName }) else { fatalError() }
         let kyberKeyPair = kyberOneTimeKeyPairs[kyberKeyPairIndex]
-        guard let kyberKey = try kyberKeyPair.keys.last?.pqKemVerified(using: signingKey) else { fatalError() }
+        guard let kyberKey = try kyberKeyPair.keys.last?.verified(using: signingKey) else { fatalError() }
         kyberOneTimeKeyPairs.remove(at: kyberKeyPairIndex)
         
         return SessionModels.OneTimeKeys(curve: publicKey, kyber: kyberKey)
     }
     
-    func fetchOneTimeKeyIdentites(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] {
+    func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] {
         let config = userConfigurations.first(where: { $0.secretName == secretName })
         guard let signingKeyData = config?.config.signingPublicKey else { fatalError() }
         let signingKey = try Curve25519SigningPublicKey(rawRepresentation: signingKeyData)
@@ -474,7 +474,7 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     
     func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
         guard let sender = userConfigurations.first(where: { $0.secretName != metadata.secretName }) else { return }
-        let received = ReceivedMessage(message: message, sender: sender.secretName, deviceId: sender.deviceId, messageId: metadata.sharedMessageIdentifier)
+        let received = ReceivedMessage(message: message, sender: sender.secretName, deviceId: sender.deviceId, messageId: metadata.sharedMessageId)
         if sender.secretName == "alice" {
             bobStreamContinuation?.yield(received)
         } else {
@@ -512,7 +512,7 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     // MARK: - Unused Methods (Stubs)
     func receiveMessage() async throws -> String { "" }
     func updateOneTimeKeys(for secretName: String, deviceId: String, keys: [SessionModels.UserConfiguration.SignedOneTimePublicKey]) async throws {}
-    func updateOneTimeKyberKeys(for secretName: String, deviceId: String, keys: [SessionModels.UserConfiguration.SignedPQKemOneTimeKey]) async throws {}
+    func updateOneTimePQKemKeys(for secretName: String, deviceId: String, keys: [SessionModels.UserConfiguration.SignedPQKemOneTimeKey]) async throws {}
     func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: SessionModels.KeysType) async throws {}
     func deleteOneTimeKeys(for secretName: String, with id: String, type: SessionModels.KeysType) async throws {}
     func createUploadPacket(secretName: String, deviceId: UUID, recipient: SessionModels.MessageRecipient, metadata: BSON.Document) async throws {}
@@ -520,7 +520,7 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
 }
 
 final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
-    
+
     // MARK: - Properties
     var sessionContext: Data?
     var identities = [SessionIdentity]()
@@ -539,10 +539,10 @@ final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
     
     // MARK: - Used Methods
     func createLocalSessionContext(_ data: Data) async throws { sessionContext = data }
-    func findLocalSessionContext() async throws -> Data { return sessionContext! }
+    func fetchLocalSessionContext() async throws -> Data { return sessionContext! }
     func updateLocalSessionContext(_ data: Data) async throws { sessionContext = data }
     func deleteLocalSessionContext() async throws { sessionContext = nil }
-    func findLocalDeviceSalt(keyData: Data) async throws -> Data { keyData + "salt".data(using: .utf8)! }
+    func fetchLocalDeviceSalt(keyData: Data) async throws -> Data { keyData + "salt".data(using: .utf8)! }
     func deleteLocalDeviceSalt() async throws {}
     func fetchSessionIdentities() async throws -> [DoubleRatchetKit.SessionIdentity] { return identities }
     func updateSessionIdentity(_ session: DoubleRatchetKit.SessionIdentity) async throws {
@@ -550,7 +550,7 @@ final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
         identities.append(session)
     }
     func createSessionIdentity(_ session: SessionIdentity) async throws { identities.append(session) }
-    func findLocalDeviceSalt() async throws -> String {
+    func fetchLocalDeviceSalt() async throws -> String {
         guard let salt = localDeviceSalt else { throw PQSSession.SessionErrors.saltError }
         return salt
     }
@@ -559,11 +559,12 @@ final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
     
     // MARK: - Unused Methods (Stubs)
     func removeContact(_ id: UUID) async throws {}
+    func deleteContact(_ id: UUID) async throws {}
+    func deleteSessionIdentity(_ id: UUID) async throws {}
     func createMediaJob(_ packet: SessionModels.DataPacket) async throws {}
-    func findAllMediaJobs() async throws -> [SessionModels.DataPacket] { [] }
-    func findMediaJob(_ id: UUID) async throws -> SessionModels.DataPacket? { nil }
+    func fetchAllMediaJobs() async throws -> [SessionModels.DataPacket] { [] }
+    func fetchMediaJob(id: UUID) async throws -> SessionModels.DataPacket? { nil }
     func deleteMediaJob(_ id: UUID) async throws {}
-    func removeSessionIdentity(_ id: UUID) async throws {}
     func fetchContacts() async throws -> [SessionModels.ContactModel] { [] }
     func createContact(_ contact: SessionModels.ContactModel) async throws {}
     func updateContact(_ contact: SessionModels.ContactModel) async throws {}
@@ -571,16 +572,18 @@ final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
     func createCommunication(_ type: SessionModels.BaseCommunication) async throws {}
     func updateCommunication(_ type: SessionModels.BaseCommunication) async throws {}
     func removeCommunication(_ type: SessionModels.BaseCommunication) async throws {}
-    func fetchMessages(sharedCommunicationId: UUID) async throws -> [_WrappedPrivateMessage] { [] }
-    func fetchMessage(byId messageId: UUID) async throws -> SessionModels.EncryptedMessage {
+    func deleteCommunication(_ communication: SessionModels.BaseCommunication) async throws {}
+    func fetchMessages(sharedCommunicationId: UUID) async throws -> [MessageRecord] { [] }
+    func fetchMessage(id: UUID) async throws -> SessionModels.EncryptedMessage {
         try .init(id: UUID(), communicationId: UUID(), sessionContextId: 1, sharedId: "123", sequenceNumber: 1, data: Data())
     }
-    func fetchMessage(by sharedMessageId: String) async throws -> SessionModels.EncryptedMessage {
+    func fetchMessage(sharedId: String) async throws -> SessionModels.EncryptedMessage {
         try .init(id: UUID(), communicationId: UUID(), sessionContextId: 1, sharedId: "123", sequenceNumber: 1, data: Data())
     }
     func createMessage(_ message: SessionModels.EncryptedMessage, symmetricKey: SymmetricKey) async throws {}
     func updateMessage(_ message: SessionModels.EncryptedMessage, symmetricKey: SymmetricKey) async throws {}
     func removeMessage(_ message: SessionModels.EncryptedMessage) async throws {}
+    func deleteMessage(_ message: SessionModels.EncryptedMessage) async throws {}
     func streamMessages(sharedIdentifier: UUID) async throws -> (AsyncThrowingStream<SessionModels.EncryptedMessage, any Error>, AsyncThrowingStream<SessionModels.EncryptedMessage, any Error>.Continuation?) {
         let stream = AsyncThrowingStream<SessionModels.EncryptedMessage, any Error> { continuation in
             for i in 1...5 {
@@ -592,13 +595,17 @@ final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
         }
         return (stream, nil)
     }
-    func messageCount(for sharedIdentifier: UUID) async throws -> Int { 1 }
+    func messageCount(sharedIdentifier: UUID) async throws -> Int { 1 }
     func readJobs() async throws -> [SessionModels.JobModel] { [] }
+    func fetchJobs() async throws -> [SessionModels.JobModel] { [] }
     func createJob(_ job: SessionModels.JobModel) async throws {}
     func updateJob(_ job: SessionModels.JobModel) async throws {}
     func removeJob(_ job: SessionModels.JobModel) async throws {}
+    func deleteJob(_ job: SessionModels.JobModel) async throws {}
     func findMediaJobs(for recipient: String, symmetricKey: SymmetricKey) async throws -> [SessionModels.DataPacket] { [] }
+    func fetchMediaJobs(recipient: String, symmetricKey: SymmetricKey) async throws -> [SessionModels.DataPacket] { [] }
     func findMediaJob(for synchronizationIdentifier: String, symmetricKey: SymmetricKey) async throws -> SessionModels.DataPacket? { nil }
+    func fetchMediaJob(synchronizationIdentifier: String, symmetricKey: SymmetricKey) async throws -> SessionModels.DataPacket? { nil }
 }
 
 struct MockUserData {

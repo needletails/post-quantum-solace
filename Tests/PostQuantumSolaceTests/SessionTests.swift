@@ -117,16 +117,16 @@ actor SessionTests {
                 sessionUser: sessionUser,
                 databaseEncryptionKey: senderDBSK.withUnsafeBytes({ Data($0) }),
                 sessionContextId: 123,
-                lastUserConfiguration: .init(
+                activeUserConfiguration: .init(
                     signingPublicKey: senderspk.publicKey.rawRepresentation,
                     signedDevices: [],
-                    signedoneTimePublicKeys: signedoneTimePublicKeys,
-                    signedPublicKyberOneTimeKeys: signedPublicKyberOneTimeKeys),
+                    signedOneTimePublicKeys: signedoneTimePublicKeys,
+                    signedPQKemOneTimePublicKeys: signedPublicKyberOneTimeKeys),
                 registrationState: .registered)
             
             await self.session.setAppPassword("123")
             let passwordData = await self.session.appPassword.data(using: .utf8)!
-            let saltData = try await store.findLocalDeviceSalt(keyData: passwordData)
+            let saltData = try await store.fetchLocalDeviceSalt(keyData: passwordData)
             let symmetricKey = await self.crypto.deriveStrictSymmetricKey(data: passwordData, salt: saltData)
             
             let data = try BSONEncoder().encodeData(context)
@@ -139,20 +139,20 @@ actor SessionTests {
             _ = try await self.session.synchronizeLocalKeys(cache: self.session.cache!, keys: partialKeys, type: .curve)
             
             
-            let updatedData = try await store.findLocalSessionContext()
+            let updatedData = try await store.fetchLocalSessionContext()
             let decrypted = try self.crypto.decrypt(data: updatedData, symmetricKey: symmetricKey)
             let decoded = try BSONDecoder().decode(SessionContext.self, from: Document(data: decrypted!))
             #expect(decoded.sessionUser.deviceKeys.oneTimePrivateKeys.count == 10, "Should keep only the matching private keys.")
-            #expect(decoded.lastUserConfiguration.signedOneTimePublicKeys.count == 10, "Should keep only the matching public keys.")
+            #expect(decoded.activeUserConfiguration.signedOneTimePublicKeys.count == 10, "Should keep only the matching public keys.")
             
             // ✅ Second Test Case: Remote list has *no* matching keys
             _ = try await self.session.synchronizeLocalKeys(cache: self.session.cache!, keys: badKeys.map(\.id), type: .curve)
             
-            let updatedDataFinal = try await store.findLocalSessionContext()
+            let updatedDataFinal = try await store.fetchLocalSessionContext()
             let decryptedFinal = try self.crypto.decrypt(data: updatedDataFinal, symmetricKey: symmetricKey)
             let decodedFinal = try BSONDecoder().decode(SessionContext.self, from: Document(data: decryptedFinal!))
             #expect(decodedFinal.sessionUser.deviceKeys.oneTimePrivateKeys.count == 0, "All private keys should be removed.")
-            #expect(decodedFinal.lastUserConfiguration.signedOneTimePublicKeys.count == 0, "All public keys should be removed.")
+            #expect(decodedFinal.activeUserConfiguration.signedOneTimePublicKeys.count == 0, "All public keys should be removed.")
         }
     }
     
@@ -179,7 +179,7 @@ actor SessionTests {
                 sessionUser: sessionUser,
                 databaseEncryptionKey: generateDatabaseEncryptionKey(),
                 sessionContextId: .random(in: 1 ..< .max),
-                lastUserConfiguration: bundle.userConfiguration,
+                activeUserConfiguration: bundle.userConfiguration,
                 registrationState: .unregistered)
             let mockTransport = MockTransport(
                 cache: mockCache,
@@ -195,7 +195,7 @@ actor SessionTests {
             await PQSSession.shared.setAppPassword("secret")
             
             
-            let config = try await mockCache.findLocalSessionContext()
+            let config = try await mockCache.fetchLocalSessionContext()
             let configurationData = try self.crypto.decrypt(data: config, symmetricKey: appSymmetricKey)!
             
             // Decode the session context from the decrypted data
@@ -205,7 +205,7 @@ actor SessionTests {
             try await PQSSession.shared.refreshOneTimeKeys(refreshType: .curve)
             
             #expect(foundContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == 100)
-            #expect(foundContext.lastUserConfiguration.signedOneTimePublicKeys.count == 100)
+            #expect(foundContext.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
             
             for _ in (0..<100) {
                 let prvSgnKey = try Curve25519.Signing.PrivateKey(rawRepresentation: foundContext.sessionUser.deviceKeys.signingPrivateKey)
@@ -217,7 +217,7 @@ actor SessionTests {
                 _ = try await mockTransport.updateOneTimeKeys(for: "u1", deviceId:  sessionUser.deviceId.uuidString, keys: [newOneTimeKey])
                 
             }
-            #expect(foundContext.lastUserConfiguration.signedOneTimePublicKeys.count == 100)
+            #expect(foundContext.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
             for _ in (0..<95) {
                 _ = try await mockTransport.fetchOneTimeKey(
                     for: "",
@@ -226,26 +226,27 @@ actor SessionTests {
                     sender: "")
             }
             
-            #expect(foundContext.lastUserConfiguration.signedOneTimePublicKeys.count == 100)
+            #expect(foundContext.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
             await #expect(mockTransport.publicKeys.count == 105)
             
             try await PQSSession.shared.refreshOneTimeKeys(refreshType: .curve)
-            #expect(foundContext.lastUserConfiguration.signedOneTimePublicKeys.count == 100)
+            #expect(foundContext.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
             
-            let config2 = try await mockCache.findLocalSessionContext()
+            let config2 = try await mockCache.fetchLocalSessionContext()
             let configurationData2 = try self.crypto.decrypt(data: config2, symmetricKey: appSymmetricKey)!
             
             // Decode the session context from the decrypted data
             let foundContext3 = try BSONDecoder().decodeData(SessionContext.self, from: configurationData2)
             
             await #expect(mockTransport.publicKeys.count == 205)
-            #expect(foundContext3.lastUserConfiguration.signedOneTimePublicKeys.count == 100)
+            #expect(foundContext3.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
         }
     }
 }
 
 // MARK: - Mock Classes
 actor MockCache: PQSSessionStore {
+    
     var localSessionData: Data = Data()
     
     // MARK: - Session Context Methods
@@ -253,7 +254,7 @@ actor MockCache: PQSSessionStore {
         self.localSessionData = data
     }
     
-    func findLocalSessionContext() async throws -> Data {
+    func fetchLocalSessionContext() async throws -> Data {
         localSessionData
     }
     
@@ -264,7 +265,7 @@ actor MockCache: PQSSessionStore {
     func deleteLocalSessionContext() async throws {}
     
     // MARK: - Device Salt Methods
-    func findLocalDeviceSalt(keyData: Data) async throws -> Data {
+    func fetchLocalDeviceSalt(keyData: Data) async throws -> Data {
         Data()
     }
     
@@ -274,34 +275,34 @@ actor MockCache: PQSSessionStore {
     func createSessionIdentity(_ session: DoubleRatchetKit.SessionIdentity) async throws {}
     func fetchSessionIdentities() async throws -> [DoubleRatchetKit.SessionIdentity] { [] }
     func updateSessionIdentity(_ session: DoubleRatchetKit.SessionIdentity) async throws {}
-    func removeSessionIdentity(_ id: UUID) async throws {}
+    func deleteSessionIdentity(_ id: UUID) async throws {}
     
     // MARK: - Contact Methods
     func fetchContacts() async throws -> [SessionModels.ContactModel] { [] }
     func createContact(_ contact: SessionModels.ContactModel) async throws {}
     func updateContact(_ contact: SessionModels.ContactModel) async throws {}
-    func removeContact(_ id: UUID) async throws {}
+    func deleteContact(_ id: UUID) async throws {}
     
     // MARK: - Communication Methods
     func fetchCommunications() async throws -> [SessionModels.BaseCommunication] { [] }
     func createCommunication(_ type: SessionModels.BaseCommunication) async throws {}
     func updateCommunication(_ type: SessionModels.BaseCommunication) async throws {}
-    func removeCommunication(_ type: SessionModels.BaseCommunication) async throws {}
+    func deleteCommunication(_ type: SessionModels.BaseCommunication) async throws {}
     
     // MARK: - Message Methods
-    func fetchMessages(sharedCommunicationId: UUID) async throws -> [_WrappedPrivateMessage] { [] }
+    func fetchMessages(sharedCommunicationId: UUID) async throws -> [MessageRecord] { [] }
     
-    func fetchMessage(byId messageId: UUID) async throws -> SessionModels.EncryptedMessage {
+    func fetchMessage(id messageId: UUID) async throws -> SessionModels.EncryptedMessage {
         try .init(id: UUID(), communicationId: UUID(), sessionContextId: 0, sharedId: "", sequenceNumber: 0, data: Data())
     }
     
-    func fetchMessage(by sharedMessageId: String) async throws -> SessionModels.EncryptedMessage {
+    func fetchMessage(sharedId sharedMessageId: String) async throws -> SessionModels.EncryptedMessage {
         try .init(id: UUID(), communicationId: UUID(), sessionContextId: 0, sharedId: "", sequenceNumber: 0, data: Data())
     }
     
     func createMessage(_ message: SessionModels.EncryptedMessage, symmetricKey: SymmetricKey) async throws {}
     func updateMessage(_ message: SessionModels.EncryptedMessage, symmetricKey: SymmetricKey) async throws {}
-    func removeMessage(_ message: SessionModels.EncryptedMessage) async throws {}
+    func deleteMessage(_ message: SessionModels.EncryptedMessage) async throws {}
     
     func streamMessages(sharedIdentifier: UUID) async throws -> (AsyncThrowingStream<SessionModels.EncryptedMessage, any Error>, AsyncThrowingStream<SessionModels.EncryptedMessage, any Error>.Continuation?) {
         let stream = AsyncThrowingStream<SessionModels.EncryptedMessage, Error> { continuation in
@@ -310,20 +311,20 @@ actor MockCache: PQSSessionStore {
         return (stream, nil)
     }
     
-    func messageCount(for sharedIdentifier: UUID) async throws -> Int { 0 }
+    func messageCount(sharedIdentifier: UUID) async throws -> Int { 0 }
     
     // MARK: - Job Methods
-    func readJobs() async throws -> [SessionModels.JobModel] { [] }
+    func fetchJobs() async throws -> [SessionModels.JobModel] { [] }
     func createJob(_ job: SessionModels.JobModel) async throws {}
     func updateJob(_ job: SessionModels.JobModel) async throws {}
-    func removeJob(_ job: SessionModels.JobModel) async throws {}
+    func deleteJob(_ job: SessionModels.JobModel) async throws {}
     
     // MARK: - Media Job Methods
     func createMediaJob(_ packet: SessionModels.DataPacket) async throws {}
-    func findAllMediaJobs() async throws -> [SessionModels.DataPacket] { [] }
-    func findMediaJobs(for recipient: String, symmetricKey: SymmetricKey) async throws -> [SessionModels.DataPacket] { [] }
-    func findMediaJob(for synchronizationIdentifier: String, symmetricKey: SymmetricKey) async throws -> SessionModels.DataPacket? { nil }
-    func findMediaJob(_ id: UUID) async throws -> SessionModels.DataPacket? { nil }
+    func fetchAllMediaJobs() async throws -> [SessionModels.DataPacket] { [] }
+    func fetchMediaJobs(recipient: String, symmetricKey: SymmetricKey) async throws -> [SessionModels.DataPacket] { [] }
+    func fetchMediaJob(synchronizationIdentifier: String, symmetricKey: SymmetricKey) async throws -> SessionModels.DataPacket? { nil }
+    func fetchMediaJob(id: UUID) async throws -> SessionModels.DataPacket? { nil }
     func deleteMediaJob(_ id: UUID) async throws {}
 }
 
@@ -364,10 +365,10 @@ actor MockTransport: SessionTransport {
     // MARK: - Transport Methods
     func sendMessage(_ message: SessionModels.SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {}
     func findConfiguration(for secretName: String) async throws -> SessionModels.UserConfiguration {
-        let context = try await cache.findLocalSessionContext()
+        let context = try await cache.fetchLocalSessionContext()
         let decrypted = try crypto.decrypt(data: context, symmetricKey: appKey)
         let decoded = try BSONDecoder().decode(SessionContext.self, from: Document(data: decrypted!))
-        return decoded.lastUserConfiguration
+        return decoded.activeUserConfiguration
     }
     func publishUserConfiguration(_ configuration: SessionModels.UserConfiguration, recipient identity: UUID) async throws {}
     func createUploadPacket(secretName: String, deviceId: UUID, recipient: SessionModels.MessageRecipient, metadata: BSON.Document) async throws {}
@@ -380,10 +381,10 @@ actor MockTransport: SessionTransport {
     }
     
     func fetchOneTimeKey(for secretName: String, deviceId: String, senderSecretName: String, sender keyId: String) async throws -> DoubleRatchetKit.CurvePublicKey {
-        let context = try await cache.findLocalSessionContext()
+        let context = try await cache.fetchLocalSessionContext()
         let decrypted = try crypto.decrypt(data: context, symmetricKey: appKey)
         let decoded = try BSONDecoder().decode(SessionContext.self, from: Document(data: decrypted!))
-        let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: decoded.lastUserConfiguration.signingPublicKey)
+        let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: decoded.activeUserConfiguration.signingPublicKey)
         return try publicKeys.removeLast().verified(using: publicKey)!
     }
     
@@ -400,10 +401,10 @@ actor MockTransport: SessionTransport {
         return SessionModels.OneTimeKeys(curve: privateKey.publicKey, kyber: privateKyberKey.publicKey)
     }
     
-    func fetchOneTimeKeyIdentites(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] {
+    func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] {
         privateOneTimeKeyPairs.map { $0.publicKey.id }
     }
     
-    func updateOneTimeKyberKeys(for secretName: String, deviceId: String, keys: [SessionModels.UserConfiguration.SignedPQKemOneTimeKey]) async throws {}
+    func updateOneTimePQKemKeys(for secretName: String, deviceId: String, keys: [SessionModels.UserConfiguration.SignedPQKemOneTimeKey]) async throws {}
     func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
 }

@@ -4,6 +4,15 @@
 //
 //  Created by Cole M on 4/19/25.
 //
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
+//
 import BSON
 import Foundation
 import SessionModels
@@ -40,22 +49,96 @@ enum EventErrors: Error {
     case userIsBlocked
 }
 
-/// A protocol that defines methods for handling session events.
+/// A protocol that defines methods for handling session events in a post-quantum secure messaging system.
+///
+/// The `SessionEvents` protocol provides a comprehensive interface for managing session-related operations
+/// including contact management, friendship state changes, message delivery tracking, and communication
+/// synchronization. This protocol is designed to work with encrypted, secure messaging systems that
+/// implement post-quantum cryptography.
+///
+/// ## Key Features
+/// - **Contact Management**: Add, update, and manage contacts with metadata
+/// - **Friendship States**: Handle complex friendship state transitions (pending, requested, accepted, blocked, etc.)
+/// - **Message Operations**: Edit messages and track delivery states
+/// - **Communication Sync**: Synchronize communication channels between contacts
+/// - **Metadata Management**: Request and handle contact metadata
+///
+/// ## Usage
+/// ```swift
+/// // Example: Adding contacts to a session
+/// try await sessionEvents.addContacts(
+///     contactInfos,
+///     sessionContext: context,
+///     cache: store,
+///     transport: transport,
+///     receiver: receiver,
+///     sessionDelegate: delegate,
+///     symmetricKey: key,
+///     logger: logger
+/// )
+///
+/// // Example: Requesting friendship state change
+/// try await sessionEvents.requestFriendshipStateChange(
+///     state: .requested,
+///     contact: contact,
+///     cache: store,
+///     receiver: receiver,
+///     sessionDelegate: delegate,
+///     symmetricKey: key,
+///     logger: logger
+/// )
+/// ```
+///
+/// ## Thread Safety
+/// This protocol is marked as `Sendable`, ensuring thread-safe usage across concurrent contexts.
+///
+/// ## Error Handling
+/// All methods in this protocol can throw errors. Implement proper error handling to manage
+/// failures gracefully. Common errors include initialization failures, missing data, and network issues.
 public protocol SessionEvents: Sendable {
     
-    /// Adds contacts to the session.
+    /// Adds contacts to the session and establishes communication channels.
+    ///
+    /// This method processes an array of contact information, filters out existing contacts,
+    /// creates new contact records, establishes communication models, and synchronizes
+    /// with the network layer.
+    ///
+    /// ## Process Flow
+    /// 1. Filters out contacts that already exist in the cache
+    /// 2. Retrieves user configuration for each new contact
+    /// 3. Creates `Contact` and `ContactModel` instances
+    /// 4. Establishes communication models with shared identifiers
+    /// 5. Requests metadata from new contacts
+    /// 6. Sends communication synchronization requests
+    /// 7. Requests current user's metadata
+    ///
     /// - Parameters:
-    ///   - infos: An array of `SharedContactInfo` containing the contact information.
-    ///   - sessionContext: The context of the current session.
-    ///   - cache: The `PQSSessionStore` used for caching.
-    ///   - transport: The `SessionTransport` used for communication.
-    ///   - receiver: The `EventReceiver` that will handle events.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
-    ///   - symmetricKey: The symmetric key used for encryption.
-    ///   - logger: The logger for logging events.
-    /// - Throws: An error if the operation fails.
+    ///   - contactInfos: An array of `SharedContactInfo` containing contact information to be added.
+    ///     Each contact info should include a unique secret name and metadata.
+    ///   - sessionContext: The context of the current session, providing user-specific information
+    ///     including the current user's secret name and session configuration.
+    ///   - cache: The `PQSSessionStore` used for caching contacts and communications.
+    ///     This provides persistent storage for contact and communication data.
+    ///   - transport: The `SessionTransport` used for communication with other devices.
+    ///     This handles network operations and user configuration retrieval.
+    ///   - receiver: The `EventReceiver` that will handle events related to contact creation
+    ///     and updates. This notifies the UI layer of changes.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks
+    ///     such as metadata requests and communication synchronization.
+    ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
+    ///     This ensures all stored data is properly encrypted.
+    ///   - logger: The logger for logging events and debugging information.
+    ///     This helps with troubleshooting and monitoring.
+    ///
+    /// - Throws:
+    ///   - `EventErrors.propsError` if there is an issue with the properties of the communication model.
+    ///   - `EventErrors.invalidSecretName` if any contact has an invalid secret name.
+    ///   - Any other error that may occur during the process, such as network issues or database errors.
+    ///
+    /// - Note: This method automatically requests the current user's metadata after adding new contacts.
+    /// - Important: Ensure all dependencies are properly initialized before calling this method.
     func addContacts(
-        _ infos: [SharedContactInfo],
+        _ contactInfos: [SharedContactInfo],
         sessionContext: SessionContext,
         cache: PQSSessionStore,
         transport: SessionTransport,
@@ -110,16 +193,55 @@ public protocol SessionEvents: Sendable {
         logger: NeedleTailLogger
     ) async throws
     
-    /// Requests a change in friendship state.
+    /// Requests a change in the friendship state for a specific contact.
+    ///
+    /// This method manages the complete lifecycle of friendship state changes, including:
+    /// 1. Validates the current friendship state and prevents invalid transitions.
+    /// 2. Updates the friendship metadata using the appropriate state management methods.
+    /// 3. Retrieves the symmetric key for encryption.
+    /// 4. Updates the friendship metadata based on the requested state.
+    /// 5. Notifies the receiver delegate of the metadata change.
+    /// 6. Updates the contact in the local cache.
+    /// 7. Sends a message to the recipient regarding the friendship state change.
+    ///
+    /// ## State Transitions
+    /// The method maps each requested state to the appropriate `FriendshipMetadata` method:
+    /// - `.pending` → `resetToPendingState()` - Resets the friendship to initial state
+    /// - `.requested` → `setRequestedState()` - Initiates a friendship request
+    /// - `.accepted` → `setAcceptedState()` - Accepts a friendship request
+    /// - `.blocked`/`.blockedByOther` → `setBlockState(isBlocking: false)` - Blocks the contact
+    /// - `.unblocked` → `setAcceptedState()` - Unblocks the contact (resets to accepted)
+    /// - `.rejected`/`.rejectedByOther`/`.mutuallyRejected` → `rejectRequest()` - Rejects the request
+    ///
     /// - Parameters:
-    ///   - state: The new friendship state.
-    ///   - contact: The `Contact` instance associated with the request.
-    ///   - cache: The `PQSSessionStore` used for caching.
-    ///   - receiver: The `EventReceiver` that will handle events.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
-    ///   - symmetricKey: The symmetric key used for encryption.
-    ///   - logger: The logger for logging events.
-    /// - Throws: An error if the operation fails.
+    ///   - state: The desired friendship state to be set for the contact. This can be one of the following:
+    ///     - `.pending`: Indicates that a friend request should be revoked or reset.
+    ///     - `.requested`: Indicates that a friend request should be sent.
+    ///     - `.accepted`: Indicates that a friend request should be accepted.
+    ///     - `.rejected`: Indicates that a friend request should be rejected.
+    ///     - `.blocked`: Indicates that the contact should be blocked.
+    ///     - `.unblocked`: Indicates that the contact should be unblocked.
+    ///   - contact: The `Contact` object representing the contact whose friendship state is being changed.
+    ///   - cache: The `PQSSessionStore` used for caching contact data.
+    ///   - receiver: The `EventReceiver` that will handle contact update events.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
+    ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
+    ///   - logger: The logger for logging events and debugging information.
+    ///
+    /// - Throws:
+    ///   - `EventErrors.databaseNotInitialized`: If the cache is not initialized.
+    ///   - `EventErrors.sessionNotInitialized`: If the session context is not initialized.
+    ///   - `EventErrors.cannotFindContact`: If the specified contact cannot be found in the cache.
+    ///   - `EventErrors.propsError`: If there is an error updating the contact's properties.
+    ///   - `EventErrors.userIsBlocked`: If the current user is blocked and cannot perform the action.
+    ///   - Any other errors that may occur during the process, such as encoding errors or network issues.
+    ///
+    /// - Important: 
+    ///   - Ensure that the session and cache are properly initialized before calling this method.
+    ///   - The method prevents redundant state changes (e.g., accepting an already accepted friendship).
+    ///   - Blocked users cannot perform friendship state changes.
+    ///
+    /// - Note: This method is asynchronous and should be awaited.
     func requestFriendshipStateChange(
         state: FriendshipMetadata.State,
         contact: Contact,
@@ -233,7 +355,7 @@ extension SessionEvents {
     /// sends a communication synchronization request.
     ///
     /// - Parameters:
-    ///   - infos: An array of `SharedContactInfo` containing the contact information to be added.
+    ///   - contactInfos: An array of `SharedContactInfo` containing the contact information to be added.
     ///   - sessionContext: The context of the current session, providing user-specific information.
     ///   - cache: The `PQSSessionStore` used for caching contacts and communications.
     ///   - transport: The `SessionTransport` used for communication with other devices.
@@ -249,7 +371,7 @@ extension SessionEvents {
     ///
     /// - Note: This method also requests the current user's metadata after adding the new contacts.
     public func addContacts(
-        _ infos: [SharedContactInfo],
+        _ contactInfos: [SharedContactInfo],
         sessionContext: SessionContext,
         cache: PQSSessionStore,
         transport: SessionTransport,
@@ -261,27 +383,27 @@ extension SessionEvents {
         let mySecretName = sessionContext.sessionUser.secretName
         let contacts = try await cache.fetchContacts()
         
-        let filteredInfos = await infos.asyncFilter { info in
+        let filteredContactInfos = await contactInfos.asyncFilter { contactInfo in
             // Check if contacts is not nil and does not contain the secretName
             let containsSecretName = await contacts.asyncContains { contact in
                 if let secretName = await contact.props(symmetricKey: symmetricKey)?.secretName {
-                    return info.secretName == secretName
+                    return contactInfo.secretName == secretName
                 }
                 return false
             }
             
-            // We want to include `info` only if `containsSecretName` is false
+            // We want to include `contactInfo` only if `containsSecretName` is false
             return !containsSecretName
         }
         
-        for info in filteredInfos {
-            let userConfiguration = try await transport.findConfiguration(for: info.secretName)
+        for contactInfo in filteredContactInfos {
+            let userConfiguration = try await transport.findConfiguration(for: contactInfo.secretName)
             
             let contact = Contact(
                 id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
-                secretName: info.secretName,
+                secretName: contactInfo.secretName,
                 configuration: userConfiguration,
-                metadata: info.metadata)
+                metadata: contactInfo.metadata)
             
             let contactModel = try ContactModel(
                 id: contact.id, // Use the same UUID
@@ -297,8 +419,8 @@ extension SessionEvents {
             logger.log(level: .debug, message: "Creating Communication Model")
             // Create communication model
             let communicationModel = try await createCommunicationModel(
-                recipients: [mySecretName, info.secretName],
-                communicationType: .nickname(info.secretName),
+                recipients: [mySecretName, contactInfo.secretName],
+                communicationType: .nickname(contactInfo.secretName),
                 metadata: [:],
                 symmetricKey: symmetricKey
             )
@@ -307,12 +429,12 @@ extension SessionEvents {
                 throw EventErrors.propsError
             }
             
-            props.sharedId = info.sharedCommunicationId
+            props.sharedId = contactInfo.sharedCommunicationId
             
             _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
             try await cache.createCommunication(communicationModel)
-            await receiver.updatedCommunication(communicationModel, members: [info.secretName])
-            logger.log(level: .debug, message: "Created Communication Model for \(info.secretName)")
+            await receiver.updatedCommunication(communicationModel, members: [contactInfo.secretName])
+            logger.log(level: .debug, message: "Created Communication Model for \(contactInfo.secretName)")
             
             try await requestMetadata(
                 from: contact.secretName,
@@ -320,7 +442,7 @@ extension SessionEvents {
                 logger: logger)
             
             try await sendCommunicationSynchronization(
-                contact: info.secretName,
+                contact: contactInfo.secretName,
                 sessionContext: sessionContext,
                 sessionDelegate: sessionDelegate,
                 cache: cache,
@@ -576,41 +698,58 @@ extension SessionEvents {
             return
         }
         
-        try await sessionDelegate.communicationSynchonization(recipient: .nickname(secretName), sharedIdentifier: sharedIdentifier)
+        try await sessionDelegate.synchronizeCommunication(recipient: .nickname(secretName), sharedIdentifier: sharedIdentifier)
         logger.log(level: .debug, message: "Sent communication synchronization")
     }
     
     
-    /// Requests a change in the friendship state for a specified contact.
+    /// Requests a change in the friendship state for a specific contact.
     ///
-    /// This method allows the user to request a change in the friendship state with a contact.
-    /// It performs the following actions:
-    /// 1. Validates the session and cache state.
-    /// 2. Fetches the specified contact from the local cache.
+    /// This method manages the complete lifecycle of friendship state changes, including:
+    /// 1. Validates the current friendship state and prevents invalid transitions.
+    /// 2. Updates the friendship metadata using the appropriate state management methods.
     /// 3. Retrieves the symmetric key for encryption.
     /// 4. Updates the friendship metadata based on the requested state.
     /// 5. Notifies the receiver delegate of the metadata change.
     /// 6. Updates the contact in the local cache.
     /// 7. Sends a message to the recipient regarding the friendship state change.
     ///
+    /// ## State Transitions
+    /// The method maps each requested state to the appropriate `FriendshipMetadata` method:
+    /// - `.pending` → `resetToPendingState()` - Resets the friendship to initial state
+    /// - `.requested` → `setRequestedState()` - Initiates a friendship request
+    /// - `.accepted` → `setAcceptedState()` - Accepts a friendship request
+    /// - `.blocked`/`.blockedByOther` → `setBlockState(isBlocking: false)` - Blocks the contact
+    /// - `.unblocked` → `setAcceptedState()` - Unblocks the contact (resets to accepted)
+    /// - `.rejected`/`.rejectedByOther`/`.mutuallyRejected` → `rejectRequest()` - Rejects the request
+    ///
     /// - Parameters:
     ///   - state: The desired friendship state to be set for the contact. This can be one of the following:
-    ///     - `.pending`: Indicates that a friend request should be revoked.
+    ///     - `.pending`: Indicates that a friend request should be revoked or reset.
     ///     - `.requested`: Indicates that a friend request should be sent.
     ///     - `.accepted`: Indicates that a friend request should be accepted.
     ///     - `.rejected`: Indicates that a friend request should be rejected.
     ///     - `.blocked`: Indicates that the contact should be blocked.
-    ///     - `.unblock`: Indicates that the contact should be unblocked.
+    ///     - `.unblocked`: Indicates that the contact should be unblocked.
     ///   - contact: The `Contact` object representing the contact whose friendship state is being changed.
+    ///   - cache: The `PQSSessionStore` used for caching contact data.
+    ///   - receiver: The `EventReceiver` that will handle contact update events.
+    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
+    ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
+    ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Throws:
     ///   - `EventErrors.databaseNotInitialized`: If the cache is not initialized.
     ///   - `EventErrors.sessionNotInitialized`: If the session context is not initialized.
     ///   - `EventErrors.cannotFindContact`: If the specified contact cannot be found in the cache.
     ///   - `EventErrors.propsError`: If there is an error updating the contact's properties.
+    ///   - `EventErrors.userIsBlocked`: If the current user is blocked and cannot perform the action.
     ///   - Any other errors that may occur during the process, such as encoding errors or network issues.
     ///
-    /// - Important: Ensure that the session and cache are properly initialized before calling this method.
+    /// - Important: 
+    ///   - Ensure that the session and cache are properly initialized before calling this method.
+    ///   - The method prevents redundant state changes (e.g., accepting an already accepted friendship).
+    ///   - Blocked users cannot perform friendship state changes.
     ///
     /// - Note: This method is asynchronous and should be awaited.
     public func requestFriendshipStateChange(
@@ -646,17 +785,17 @@ extension SessionEvents {
         if currentMetadata.myState == .rejected { return }
         switch state {
         case .pending:
-            currentMetadata.synchronizePendingState()
+            currentMetadata.resetToPendingState()
         case .requested:
-            currentMetadata.synchronizeRequestedState()
+            currentMetadata.setRequestedState()
         case .accepted:
-            currentMetadata.synchronizeAcceptedState()
-        case .blocked, .blockedUser:
-            currentMetadata.synchronizeBlockState(receivedBlock: false)
-        case .unblock:
-            currentMetadata.synchronizeAcceptedState()
-        case .rejectedRequest, .friendshipRejected, .rejected:
-            currentMetadata.rejectFriendRequest()
+            currentMetadata.setAcceptedState()
+        case .blocked, .blockedByOther:
+            currentMetadata.setBlockState(isBlocking: false)
+        case .unblocked:
+            currentMetadata.setAcceptedState()
+        case .rejectedByOther, .mutuallyRejected, .rejected:
+            currentMetadata.rejectRequest()
         }
         
         let metadata = try BSONEncoder().encode(currentMetadata)
@@ -679,7 +818,7 @@ extension SessionEvents {
         
         try await receiver.updateContact(updatedContact)
         
-        func dataFromBool(_ value: Bool) -> Data {
+        func convertBoolToData(_ value: Bool) -> Data {
             // Convert Bool to UInt8 (0 for false, 1 for true)
             let byte: UInt8 = value ? 1 : 0
             // Create Data from the byte
@@ -687,16 +826,20 @@ extension SessionEvents {
         }
         
         var blockUnblockData: Data?
-        if currentMetadata.theirState == .blocked || currentMetadata.theirState == .blockedUser {
-            blockUnblockData = dataFromBool(true)
+        if currentMetadata.theirState == .blocked || currentMetadata.theirState == .blockedByOther {
+            blockUnblockData = convertBoolToData(true)
         }
         
-        if currentMetadata.theirState == .unblock {
-            blockUnblockData = dataFromBool(false)
+        if currentMetadata.theirState == .unblocked {
+            blockUnblockData = convertBoolToData(false)
         }
         
         //Transport
-        try await sessionDelegate.blockUnblock(recipient: .nickname(contact.secretName), data: blockUnblockData, metadata: ["friendshipMetadata": metadata], myState: currentMetadata.myState)
+        try await sessionDelegate.handleBlockUnblock(
+            recipient: .nickname(contact.secretName),
+            blockData: blockUnblockData,
+            metadata:["friendshipMetadata": metadata],
+            currentState: currentMetadata.myState)
         logger.log(level: .info, message: "Sent Friendship State Change Request")
     }
     

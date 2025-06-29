@@ -4,6 +4,15 @@
 //
 //  Created by Cole M on 9/14/24.
 //
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
+//
 import Foundation
 import BSON
 import NeedleTailAsyncSequence
@@ -11,29 +20,61 @@ import SessionModels
 import SessionEvents
 import Crypto
 
+/// Extension to `PQSSession` providing all event-driven messaging, contact management, and protocol conformance for session events.
+///
+/// This extension implements the core logic for sending and receiving messages, managing contacts, updating delivery states, and handling
+/// communication synchronization. It also provides the concrete implementation for the `SessionEvents` protocol, allowing the session to
+/// interact with the rest of the system in a modular, event-driven fashion.
+///
+/// - Handles outbound and inbound message flows, including encryption, key refresh, and persistence decisions.
+/// - Manages contact creation, updates, and friendship state changes.
+/// - Provides hooks for delivery state updates, metadata requests, and message editing.
+/// - Ensures all operations are performed securely and asynchronously, leveraging the actor model for thread safety.
+
 //MARK: PQSSession Events
 extension PQSSession {
     
-    /// Sends a text message to a specified recipient with optional metadata and destruction settings.
+    /// Sends an encrypted text message to a specified recipient with optional metadata and destruction settings.
     ///
-    /// This method constructs a `CryptoMessage` object with the provided parameters and sends it asynchronously.
-    /// It performs the following actions:
-    /// 1. Creates a `CryptoMessage` instance with the specified message type, flags, recipient, text, and metadata.
-    /// 2. Sends the message using the `processWrite` method of the `PQSSession`.
+    /// This method handles the complete message lifecycle including automatic key refresh, message encryption,
+    /// and delivery through the transport layer. It automatically refreshes one-time keys if the supply is low
+    /// (≤10 keys) to ensure continuous communication capability.
+    ///
+    /// ## Message Flow
+    /// 1. **Key Refresh**: Automatically refreshes one-time keys if supply is low
+    /// 2. **Message Creation**: Constructs a `CryptoMessage` with provided parameters
+    /// 3. **Encryption**: Encrypts the message using Double Ratchet protocol
+    /// 4. **Delivery**: Sends the encrypted message through the transport layer
+    ///
+    /// ## Usage Example
+    /// ```swift
+    /// try await session.writeTextMessage(
+    ///     recipient: .nickname("alice"),
+    ///     text: "Hello, how are you?",
+    ///     metadata: ["timestamp": Date(), "priority": "high"],
+    ///     destructionTime: 3600 // Message self-destructs in 1 hour
+    /// )
+    /// ```
     ///
     /// - Parameters:
-    ///   - messageType: The type of the message being sent. This determines how the message is processed and displayed.
-    ///   - messageFlag: Flags that provide additional information about the message, such as whether it is urgent or requires acknowledgment.
-    ///   - recipient: The recipient of the message, specified as a `MessageRecipient` object. This can include user identifiers or other recipient details.
-    ///   - text: The text content of the message. This is an optional parameter and defaults to an empty string if not provided.
-    ///   - metadata: A dictionary containing additional metadata associated with the message. This can include information such as timestamps, message IDs, or other relevant data.
-    ///   - pushType: The type of push notification to be sent along with the message. This determines how the recipient is notified of the message.
-    ///   - destructionTime: An optional time interval after which the message should be destroyed. If provided, the message will be deleted after this duration. Defaults to `nil` if not specified.
+    ///   - recipient: The intended recipient of the message. Can be a nickname, group, or other recipient type.
+    ///   - text: The text content of the message. Defaults to an empty string.
+    ///   - transportInfo: Optional transport-specific data for routing or delivery context.
+    ///   - metadata: Additional metadata associated with the message (timestamps, flags, etc.).
+    ///   - destructionTime: Optional time interval in seconds after which the message should be automatically destroyed.
+    ///     If `nil`, the message persists indefinitely.
     ///
     /// - Throws:
-    ///   - Any errors that may occur during the message creation or sending process, such as encryption errors or network issues.
+    ///   - `SessionErrors.sessionNotInitialized` if the session is not properly initialized
+    ///   - `SessionErrors.databaseNotInitialized` if the database delegate is not set
+    ///   - `SessionErrors.transportNotInitialized` if the transport delegate is not set
+    ///   - `SessionErrors.invalidSignature` if cryptographic operations fail
+    ///   - `SessionErrors.drainedKeys` if key refresh fails due to insufficient keys
     ///
-    /// - Important: This method is asynchronous and should be awaited. Ensure that the session is properly initialized before calling this method.
+    /// - Important: This method automatically handles key refresh when needed. Ensure your transport delegate
+    ///   is properly configured to handle key upload/download operations.
+    /// - Note: Messages with `destructionTime` set will be automatically deleted after the specified duration.
+    ///   This deletion happens on both sender and recipient devices.
     public func writeTextMessage(
         recipient: MessageRecipient,
         text: String = "",
@@ -42,10 +83,10 @@ extension PQSSession {
         destructionTime: TimeInterval? = nil
     ) async throws {
         do {
-            if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedOneTimePublicKeys.count <= 10 {
+            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= 10 {
                 async let _ = await self.refreshOneTimeKeysTask()
             }
-            if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedPQKemOneTimePublicKeys.count <= 10 {
+            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.count <= 10 {
                 async let _ = await self.refreshOneTimeKeysTask()
             }
             let message = CryptoMessage(
@@ -63,15 +104,47 @@ extension PQSSession {
         }
     }
     
-    // MARK: Inbound
-    
-    /// Receives an inbound message and processes it asynchronously.
+    /// Receives and processes an inbound encrypted message from another user.
+    ///
+    /// This method handles the complete inbound message lifecycle including automatic key refresh,
+    /// message decryption, and processing through the task processor. It automatically refreshes
+    /// one-time keys if the supply is low (≤10 keys) to ensure continuous communication capability.
+    ///
+    /// ## Message Processing Flow
+    /// 1. **Key Refresh**: Automatically refreshes one-time keys if supply is low
+    /// 2. **Message Validation**: Verifies the signed ratchet message authenticity
+    /// 3. **Decryption**: Decrypts the message using Double Ratchet protocol
+    /// 4. **Processing**: Handles the message through the task processor
+    /// 5. **Persistence**: Stores the message if required by the session delegate
+    ///
+    /// ## Usage Example
+    /// ```swift
+    /// // Called by your transport layer when receiving a message
+    /// try await session.receiveMessage(
+    ///     message: signedRatchetMessage,
+    ///     sender: "alice",
+    ///     deviceId: UUID(),
+    ///     messageId: "msg_123"
+    /// )
+    /// ```
+    ///
     /// - Parameters:
-    ///   - message: The signed ratchet message to be received.
-    ///   - sender: The identifier of the sender.
-    ///   - deviceId: The unique identifier of the sender's device.
-    ///   - messageId: The unique identifier for the message.
-    /// - Throws: An error if the message processing fails.
+    ///   - message: The signed ratchet message containing the encrypted payload and cryptographic metadata.
+    ///   - sender: The secret name of the message sender for authentication and routing.
+    ///   - deviceId: The unique identifier of the sender's device for multi-device support.
+    ///   - messageId: A unique identifier for the message used for deduplication and tracking.
+    ///
+    /// - Throws:
+    ///   - `SessionErrors.sessionNotInitialized` if the session is not properly initialized
+    ///   - `SessionErrors.databaseNotInitialized` if the database delegate is not set
+    ///   - `SessionErrors.invalidSignature` if message signature verification fails
+    ///   - `SessionErrors.drainedKeys` if key refresh fails due to insufficient keys
+    ///   - `SessionErrors.sessionDecryptionError` if message decryption fails
+    ///
+    /// - Important: This method should be called by your transport layer implementation when
+    ///   receiving messages from the network. It handles all the cryptographic processing automatically.
+    /// - Note: The method automatically refreshes keys when needed, ensuring continuous communication
+    ///   capability without manual intervention.
     public func receiveMessage(
         message: SignedRatchetMessage,
         sender: String,
@@ -80,10 +153,10 @@ extension PQSSession {
     ) async throws {
 
         //We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less that 10 local keys.
-        if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedOneTimePublicKeys.count <= 10 {
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= 10 {
             async let _ = await self.refreshOneTimeKeysTask()
         }
-        if let sessionContext = await sessionContext, sessionContext.lastUserConfiguration.signedPQKemOneTimePublicKeys.count <= 10 {
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.count <= 10 {
             async let _ = await self.refreshOneTimeKeysTask()
         }
         
@@ -100,12 +173,33 @@ extension PQSSession {
     
     // MARK: Outbound
     
-    /// Processes the outbound message by sending it to the appropriate target devices.
-    /// This method loops through each target's device configuration and sends a DoubleRatcheted message.
+    /// Processes an outbound message by encrypting and sending it to all target devices.
+    ///
+    /// This internal method handles the outbound message processing pipeline, including session validation,
+    /// message encryption using the Double Ratchet protocol, and delivery to all devices associated with
+    /// the recipient. It determines whether messages should be persisted based on the session delegate's
+    /// `shouldPersist` method.
+    ///
+    /// ## Processing Flow
+    /// 1. **Session Validation**: Ensures session context and cache are available
+    /// 2. **Key Retrieval**: Gets the database symmetric key for encryption
+    /// 3. **Persistence Decision**: Determines if the message should be stored locally
+    /// 4. **Encryption & Delivery**: Encrypts and sends to all recipient devices
+    ///
     /// - Parameters:
-    ///   - message: The cryptographic message to be sent.
-    ///   - session: The current cryptographic session.
-    /// - Throws: An error if the message processing fails.
+    ///   - message: The cryptographic message to be processed and sent.
+    ///   - session: The current cryptographic session instance.
+    ///
+    /// - Throws:
+    ///   - `SessionErrors.sessionNotInitialized` if the session context is not available
+    ///   - `SessionErrors.databaseNotInitialized` if the cache is not available
+    ///   - `SessionErrors.invalidSignature` if cryptographic operations fail
+    ///   - `SessionErrors.transportNotInitialized` if the transport delegate is not set
+    ///
+    /// - Important: This method is called internally by `writeTextMessage`. It handles the complex
+    ///   logic of multi-device delivery and persistence decisions.
+    /// - Note: The method automatically handles device discovery and ensures messages are delivered
+    ///   to all devices associated with the recipient.
     func processWrite(
         message: CryptoMessage,
         session: PQSSession

@@ -11,52 +11,50 @@ import NeedleTailCrypto
 import Crypto
 import BSON
 
-/// A structure representing an encrypted message in a communication system.
-///
-/// This struct encapsulates the details of an encrypted message, including its identifiers, communication base,
-/// delivery state, and associated metadata.
-///
-/// ## Properties
-/// - `id`: A unique identifier for the encrypted message, represented as a `UUID`.
-/// - `base`: The base communication context in which the message is sent, represented as a `BaseCommunication`.
-/// - `sendDate`: The date and time when the message was sent.
-/// - `receiveDate`: An optional date and time when the message was received.
-/// - `deliveryState`: The current delivery state of the message, represented as a `DeliveryState`.
-/// - `message`: The encrypted message content, represented as a `CryptoMessage`.
-/// - `sendersSecretName`: The secret name of the sender of the message.
-/// - `sendersDeviceId`: The device ID of the sender, represented as a `UUID`.
-///
-/// ## Equatable Conformance
-/// This struct conforms to the `Equatable` protocol, allowing for comparison of two `_EncryptedMessage` instances
-/// based on their unique identifiers.
-///
-/// ## Initializer
-/// - `init(id:base:sendDate:receiveDate:deliveryState:message:sendersSecretName:sendersDeviceId:)`: Initializes a new instance of `_EncryptedMessage` with the specified values.
-public struct _EncryptedMessage: Sendable, Codable, Equatable {
-    public let id: UUID
-    public var base: BaseCommunication
-    public let sendDate: Date
-    public let receiveDate: Date?
-    public var deliveryState: DeliveryState
-    public var message: CryptoMessage
-    public let sendersSecretName: String
-    public let sendersDeviceId: UUID
-    
-    /// Compares two `_EncryptedMessage` instances for equality based on their unique identifiers.
-    ///
-    /// - Parameters:
-    ///   - lhs: The left-hand side instance to compare.
-    ///   - rhs: The right-hand side instance to compare.
-    /// - Returns: A boolean indicating whether the two instances are equal.
-    public static func == (lhs: _EncryptedMessage, rhs: _EncryptedMessage) -> Bool {
-        return lhs.id == rhs.id
-    }
-}
 
-
-/// A model representing an encrypted message and providing an interface for working with encrypted data.
+/// A model representing an encrypted message stored locally on a device.
 ///
-/// This class allows for the creation of local models that can be saved to a database as encrypted data.
+/// This class provides an interface for working with encrypted message data that is persisted
+/// to a local database. The actual message content is encrypted and stored in the `data` property,
+/// while metadata like IDs and sequence numbers are stored in plain text for efficient querying.
+///
+/// ## Key Features
+/// - **Local Storage**: Designed for device-local persistence, not network transmission
+/// - **Encrypted Content**: Message payload is encrypted using symmetric encryption with BSON serialization
+/// - **Thread-Safe**: Uses locks to ensure thread safety during encryption/decryption operations
+/// - **Metadata Preservation**: Keeps essential metadata unencrypted for database operations
+/// - **Concurrency Support**: Implements `@unchecked Sendable` for safe concurrent access
+///
+/// ## Security Considerations
+/// - All sensitive message content is encrypted using the provided symmetric key
+/// - Only metadata required for database operations remains unencrypted
+/// - Thread-safe operations prevent race conditions during encryption/decryption
+/// - Keys should be managed securely and not persisted alongside encrypted data
+///
+/// ## Usage
+/// ```swift
+/// // Create a new encrypted message
+/// let message = try EncryptedMessage(
+///     id: UUID(),
+///     communicationId: commId,
+///     sessionContextId: contextId,
+///     sharedId: "shared-123",
+///     sequenceNumber: 1,
+///     props: messageProps,
+///     symmetricKey: key
+/// )
+///
+/// // Decrypt and access message content
+/// if let decryptedProps = await message.props(symmetricKey: key) {
+///     print(decryptedProps.message.text)
+/// }
+/// ```
+///
+/// ## Error Handling
+/// The class throws `CryptoError` instances for encryption/decryption failures:
+/// - `CryptoError.encryptionFailed`: When message encryption fails
+/// - `CryptoError.decryptionFailed`: When message decryption fails
+/// - `CryptoError.propsError`: When property access fails
 public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, Hashable {
     
     /// The unique identifier for the message.
@@ -68,18 +66,22 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     /// The session context identifier associated with the message.
     public let sessionContextId: Int
     
-    /// A shared identifier for the message.
+    /// A shared identifier for the message, typically used for grouping related messages.
     public let sharedId: String
     
-    /// The sequence number of the message in the communication.
+    /// The sequence number of the message in the communication, used for ordering.
     public let sequenceNumber: Int
     
-    /// The encrypted data of the message.
+    /// The encrypted data of the message containing the serialized `UnwrappedProps`.
     public var data: Data
     
+    /// Thread-safe lock for protecting encryption/decryption operations.
     private let lock = NIOLock()
+    
+    /// Cryptographic operations handler.
     private let crypto = NeedleTailCrypto()
     
+    /// Coding keys for BSON serialization with obfuscated field names.
     enum CodingKeys: String, CodingKey, Codable, Sendable {
         case id
         case communicationId = "a"
@@ -89,9 +91,16 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
         case data = "e"
     }
     
-    /// Asynchronously retrieves the decrypted properties of the message, if available.
+    /// Asynchronously retrieves the decrypted properties of the message.
+    ///
+    /// This method decrypts the encrypted message data and returns the structured properties
+    /// containing the message content, metadata, and delivery information. The method is
+    /// thread-safe and handles decryption errors gracefully by returning `nil`.
+    ///
     /// - Parameter symmetricKey: The symmetric key used for decryption.
-    /// - Returns: An optional `UnwrappedProps` containing the decrypted properties.
+    /// - Returns: The decrypted message properties, or `nil` if decryption fails or the data is corrupted.
+    /// - Note: This method is thread-safe and may suspend the current task during decryption.
+    /// - Important: The symmetric key must be the same one used for encryption.
     public func props(symmetricKey: SymmetricKey) async -> UnwrappedProps? {
         do {
             return try await decryptProps(symmetricKey: symmetricKey)
@@ -100,79 +109,107 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
         }
     }
     
-    /// A struct representing the unwrapped properties of the message.
-    /// This includes details such as delivery state, timestamps, and message content.
+    /// A struct representing the decrypted properties of an encrypted message.
+    ///
+    /// This struct contains all the message data that was encrypted and stored in the `EncryptedMessage.data`
+    /// property. It includes the message content, delivery state, timestamps, and sender information.
+    /// This is the primary interface for accessing message content after decryption.
+    ///
+    /// ## Properties
+    /// - `id`: The unique identifier for the message
+    /// - `base`: The base communication context this message belongs to
+    /// - `sentDate`: When the message was sent
+    /// - `receiveDate`: When the message was received (if applicable)
+    /// - `deliveryState`: Current delivery status (sent, delivered, read, etc.)
+    /// - `message`: The actual message content and metadata
+    /// - `senderSecretName`: The sender's secret identifier for privacy
+    /// - `senderDeviceId`: The sender's device identifier
+    ///
+    /// ## Thread Safety
+    /// This struct is `Sendable` and can be safely passed between concurrent contexts.
     public struct UnwrappedProps: Codable, Sendable, CommunicationProtocol {
+        
+        /// The unique identifier for the message.
+        public let id: UUID
+        
         /// The base object for all communication types.
         public var base: BaseCommunication
         
         /// The date and time when the message was sent.
-        public let sendDate: Date
+        public let sentDate: Date
         
-        /// The date and time when the message was received.
+        /// The date and time when the message was received, if applicable.
         public let receiveDate: Date?
         
         /// The current delivery state of the message.
         public var deliveryState: DeliveryState
         
-        /// The content of the message.
+        /// The content of the message including text, metadata, and recipient information.
         public var message: CryptoMessage
         
-        /// The sender's secret name, which may be used for privacy.
-        public let sendersSecretName: String
+        /// The sender's secret name, which may be used for privacy and anonymity.
+        public let senderSecretName: String
         
-        /// The unique identifier for the sender's identity.
-        public let sendersDeviceId: UUID
+        /// The unique identifier for the sender's device identity.
+        public let senderDeviceId: UUID
         
-        // MARK: - Coding Keys
+        /// Coding keys for BSON serialization with obfuscated field names.
         private enum CodingKeys: String, CodingKey, Codable, Sendable {
-            case base = "a"
-            case sendDate = "b"
-            case receiveDate = "c"
-            case deliveryState = "d"
-            case message = "e"
-            case sendersSecretName = "f"
-            case sendersDeviceId = "g"
+            case id = "a"
+            case base = "b"
+            case sentDate = "c"
+            case receiveDate = "d"
+            case deliveryState = "e"
+            case message = "f"
+            case senderSecretName = "g"
+            case senderDeviceId = "h"
         }
         
         /// Initializes a new instance of `UnwrappedProps`.
         /// - Parameters:
+        ///   - id: The unique identifier for the message.
         ///   - base: The base communication object.
-        ///   - sendDate: The date and time when the message was sent.
-        ///   - receiveDate: The date and time when the message was received.
+        ///   - sentDate: The date and time when the message was sent.
+        ///   - receiveDate: The date and time when the message was received, optional.
         ///   - deliveryState: The current delivery state of the message.
         ///   - message: The content of the message.
-        ///   - sendersSecretName: The sender's secret name.
-        ///   - sendersDeviceId: The unique identifier for the sender's identity.
+        ///   - senderSecretName: The sender's secret name for privacy.
+        ///   - senderDeviceId: The unique identifier for the sender's device identity.
         public init(
+            id: UUID,
             base: BaseCommunication,
-            sendDate: Date,
+            sentDate: Date,
             receiveDate: Date? = nil,
             deliveryState: DeliveryState,
             message: CryptoMessage,
-            sendersSecretName: String,
-            sendersDeviceId: UUID
+            senderSecretName: String,
+            senderDeviceId: UUID
         ) {
+            self.id = id
             self.base = base
-            self.sendDate = sendDate
+            self.sentDate = sentDate
             self.receiveDate = receiveDate
             self.deliveryState = deliveryState
             self.message = message
-            self.sendersSecretName = sendersSecretName
-            self.sendersDeviceId = sendersDeviceId
+            self.senderSecretName = senderSecretName
+            self.senderDeviceId = senderDeviceId
         }
     }
     
-    /// Initializes a new `EncryptedMessage` instance.
+    /// Initializes a new `EncryptedMessage` instance with properties to be encrypted.
+    ///
+    /// This initializer creates a new encrypted message by serializing the provided properties
+    /// to BSON format and then encrypting them using the specified symmetric key.
+    ///
     /// - Parameters:
     ///   - id: The unique identifier for the message.
-    ///   - communicationId: The ID of the communication.
+    ///   - communicationId: The ID of the communication this message belongs to.
     ///   - sessionContextId: The session context identifier.
     ///   - sharedId: The shared identifier for the message.
-    ///   - sequenceNumber: The sequence number of the message.
-    ///   - props: The unwrapped properties of the message.
+    ///   - sequenceNumber: The sequence number of the message in the communication.
+    ///   - props: The unwrapped properties of the message to be encrypted.
     ///   - symmetricKey: The symmetric key used for encryption.
-    /// - Throws: An error if encryption fails.
+    /// - Throws: `CryptoError.encryptionFailed` if encryption fails.
     public init(
         id: UUID,
         communicationId: UUID,
@@ -196,14 +233,18 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     }
     
     /// Initializes a new `EncryptedMessage` instance with existing encrypted data.
+    ///
+    /// This initializer is typically used when loading encrypted messages from persistent storage.
+    /// The encrypted data should have been created using the other initializer.
+    ///
     /// - Parameters:
     ///   - id: The unique identifier for the message.
-    ///   - communicationId: The ID of the communication.
+    ///   - communicationId: The ID of the communication this message belongs to.
     ///   - sessionContextId: The session context identifier.
     ///   - sharedId: The shared identifier for the message.
-    ///   - sequenceNumber: The sequence number of the message.
-    ///   - data: The encrypted data of the message.
-    /// - Throws: An error if the data is invalid.
+    ///   - sequenceNumber: The sequence number of the message in the communication.
+    ///   - data: The pre-encrypted data of the message.
+    /// - Throws: An error if the data is invalid or corrupted.
     public init(
         id: UUID,
         communicationId: UUID,
@@ -221,9 +262,14 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     }
     
     /// Asynchronously decrypts the properties of the message using the provided symmetric key.
+    ///
+    /// This method performs the actual decryption operation in a thread-safe manner. It decrypts
+    /// the BSON-serialized data and deserializes it back into `UnwrappedProps`.
+    ///
     /// - Parameter symmetricKey: The symmetric key used for decryption.
     /// - Returns: The decrypted properties of the message.
-    /// - Throws: An error if decryption fails.
+    /// - Throws: `CryptoError.decryptionFailed` if decryption fails.
+    /// - Note: This method is thread-safe and uses locks to prevent concurrent access issues.
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         lock.lock()
         defer {
@@ -236,11 +282,16 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     }
     
     /// Asynchronously updates the properties of the model using the provided symmetric key.
+    ///
+    /// This method re-encrypts the message with new properties. It's thread-safe and handles
+    /// the complete encryption cycle including BSON serialization.
+    ///
     /// - Parameters:
     ///   - symmetricKey: The symmetric key used for encryption.
     ///   - props: The new unwrapped properties to be set.
-    /// - Returns: The updated decrypted properties.
-    /// - Throws: An error if encryption fails.
+    /// - Returns: The updated decrypted properties, or `nil` if the operation fails.
+    /// - Throws: `CryptoError.encryptionFailed` if encryption fails.
+    /// - Note: This method is thread-safe and uses locks to prevent concurrent access issues.
     public func updateProps(symmetricKey: SymmetricKey, props: UnwrappedProps) async throws -> UnwrappedProps? {
         lock.lock()
         do {
@@ -258,11 +309,16 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     }
     
     /// Updates the message with new properties and returns the updated `EncryptedMessage`.
+    ///
+    /// This method re-encrypts the message with new properties and returns the updated instance.
+    /// Unlike `updateProps`, this method returns the `EncryptedMessage` itself rather than the decrypted properties.
+    ///
     /// - Parameters:
     ///   - props: The new unwrapped properties to be set.
     ///   - symmetricKey: The symmetric key used for encryption.
-    /// - Returns: The updated `EncryptedMessage`.
-    /// - Throws: An error if encryption fails.
+    /// - Returns: The updated `EncryptedMessage` instance.
+    /// - Throws: `CryptoError.encryptionFailed` if encryption fails.
+    /// - Note: This method is thread-safe and uses locks to prevent concurrent access issues.
     public func updateMessage(with props: UnwrappedProps, symmetricKey: SymmetricKey) async throws -> EncryptedMessage {
         lock.lock()
         defer {
@@ -277,33 +333,43 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     }
     
     /// Creates a decrypted model of the specified type from the encrypted message.
+    ///
+    /// This method attempts to create a model of the specified generic type from the decrypted
+    /// properties. It's primarily used for type conversion and casting operations.
+    ///
     /// - Parameters:
     ///   - of: The type of the model to create.
     ///   - symmetricKey: The symmetric key used for decryption.
     /// - Returns: An instance of the specified type containing the decrypted properties.
-    /// - Throws: An error if decryption fails or if the properties cannot be cast to the specified type.
+    /// - Throws: `CryptoError.propsError` if decryption fails or if the properties cannot be cast to the specified type.
+    /// - Warning: This method uses force casting (`as!`) which may crash if the type conversion fails.
     public func makeDecryptedModel<T: Sendable & Codable>(of: T.Type, symmetricKey: SymmetricKey) async throws -> T {
         guard let props = await props(symmetricKey: symmetricKey) else {
             throw CryptoError.propsError
         }
-        return _EncryptedMessage(
+        return EncryptedMessage.UnwrappedProps(
             id: id,
             base: props.base,
-            sendDate: props.sendDate,
+            sentDate: props.sentDate,
             receiveDate: props.receiveDate,
             deliveryState: props.deliveryState,
             message: props.message,
-            sendersSecretName: props.sendersSecretName,
-            sendersDeviceId: props.sendersDeviceId) as! T
+            senderSecretName: props.senderSecretName,
+            senderDeviceId: props.senderDeviceId) as! T
     }
     
     /// Asynchronously updates the metadata of the message properties using the provided symmetric key.
+    ///
+    /// This method allows updating specific metadata within the message without needing to
+    /// reconstruct the entire `UnwrappedProps` object. It decrypts the current message,
+    /// updates the specified metadata, and re-encrypts the message.
+    ///
     /// - Parameters:
     ///   - symmetricKey: The symmetric key used for decryption and encryption.
     ///   - metadata: The new metadata to be added.
-    ///   - key: The key under which the metadata will be stored.
-    /// - Returns: The updated decrypted properties.
-    /// - Throws: An error if decryption or encryption fails.
+    ///   - key: The key under which the metadata will be stored in the message's metadata dictionary.
+    /// - Returns: The updated decrypted properties, or `nil` if the operation fails.
+    /// - Throws: `CryptoError.decryptionFailed` or `CryptoError.encryptionFailed` if the operation fails.
     public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Data, with key: String) async throws -> UnwrappedProps? {
         var props = try await decryptProps(symmetricKey: symmetricKey)
         props.message.metadata[key] = metadata
@@ -311,12 +377,16 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     }
     
     /// Asynchronously updates the metadata of the message properties and returns the updated `EncryptedMessage`.
+    ///
+    /// This method is similar to `updatePropsMetadata` but returns the updated `EncryptedMessage`
+    /// instance rather than the decrypted properties.
+    ///
     /// - Parameters:
     ///   - symmetricKey: The symmetric key used for decryption and encryption.
     ///   - metadata: The new metadata to be added.
-    ///   - key: The key under which the metadata will be stored.
-    /// - Returns: The updated `EncryptedMessage`.
-    /// - Throws: An error if decryption or encryption fails.
+    ///   - key: The key under which the metadata will be stored in the message's metadata dictionary.
+    /// - Returns: The updated `EncryptedMessage` instance.
+    /// - Throws: `CryptoError.decryptionFailed` or `CryptoError.encryptionFailed` if the operation fails.
     public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Data, with key: String) async throws -> EncryptedMessage {
         var props = try await decryptProps(symmetricKey: symmetricKey)
         props.message.metadata[key] = metadata
@@ -324,6 +394,10 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     }
     
     /// Compares two `EncryptedMessage` instances for equality.
+    ///
+    /// Two `EncryptedMessage` instances are considered equal if they have the same `id`.
+    /// This comparison does not consider the encrypted content or other properties.
+    ///
     /// - Parameters:
     ///   - lhs: The first `EncryptedMessage` instance.
     ///   - rhs: The second `EncryptedMessage` instance.
@@ -333,6 +407,9 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     }
     
     /// Computes the hash value for the `EncryptedMessage`.
+    ///
+    /// The hash value is based solely on the message's `id` property.
+    ///
     /// - Parameter hasher: The hasher to use for hashing.
     public func hash(into hasher: inout Hasher) {
         hasher.combine(id)
@@ -340,8 +417,11 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
 }
 
 /// An enumeration representing the delivery state of a message in a communication.
+///
+/// This enum provides a comprehensive set of states that a message can be in during its
+/// lifecycle from creation to final delivery confirmation.
 public enum DeliveryState: Codable, Sendable, Equatable {
-    /// The message has been successfully delivered to the recipient.
+    /// The message has been successfully delivered to the recipient's device.
     case delivered
     
     /// The message has been read by the recipient.
@@ -350,16 +430,16 @@ public enum DeliveryState: Codable, Sendable, Equatable {
     /// The message has been received by the recipient's device but not yet read.
     case received
     
-    /// The message is currently waiting to be delivered (e.g., due to network issues).
+    /// The message is currently waiting to be delivered (e.g., due to network issues or recipient unavailability).
     case waitingDelivery
     
     /// The message has not been sent or is in an undefined state.
     case none
     
-    /// The message has been blocked from being delivered (e.g., by the recipient's settings).
+    /// The message has been blocked from being delivered (e.g., by the recipient's privacy settings or spam filters).
     case blocked
     
-    /// The message failed to be delivered due to an error (e.g., network failure).
+    /// The message failed to be delivered due to an error (e.g., network failure, invalid recipient).
     case failed(String)
     
     /// The message is in the process of being sent but has not yet been delivered.
@@ -371,29 +451,40 @@ public enum DeliveryState: Codable, Sendable, Equatable {
 
 /// A struct representing a cryptographically secure message.
 ///
-/// This struct contains the message content, metadata, recipient information, and additional properties related to the message.
+/// This struct contains the message content, metadata, recipient information, and additional
+/// properties related to the message. It's designed to be serialized and encrypted as part
+/// of the `EncryptedMessage` data payload.
+///
+/// ## Security Features
+/// - Supports self-destructing messages via `destructionTime`
+/// - Includes transport information for secure delivery
+/// - Maintains metadata for extensibility
+/// - Tracks message lifecycle with timestamps
 public struct CryptoMessage: Codable, Sendable {
     /// The text content of the message.
     public var text: String
     
-    /// Metadata associated with the message.
+    /// Metadata associated with the message, stored as a BSON document for flexibility.
     public var metadata: Document
     
     /// The recipient of the message.
     public var recipient: MessageRecipient
     
     /// Transport information related to the message, if any.
+    /// This may include routing information, encryption parameters, or delivery instructions.
     public var transportInfo: Data?
     
     /// The date and time when the message was sent.
     public let sentDate: Date
     
     /// The time interval after which the message should be destroyed, if applicable.
+    /// If set, the message should be automatically deleted after this interval.
     public let destructionTime: TimeInterval?
     
     /// The date and time when the message was last updated.
     public var updatedDate: Date?
     
+    /// Coding keys for BSON serialization with obfuscated field names.
     private enum CodingKeys: String, CodingKey, Codable, Sendable {
         case text = "a"
         case metadata = "b"
