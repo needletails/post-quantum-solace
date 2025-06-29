@@ -1,0 +1,64 @@
+{
+    "metadata": {
+        "title": "Post-Quantum Solace SDK",
+        "subtitle": "A secure, post-quantum cryptographic messaging SDK with end-to-end encryption",
+        "version": "1.0.0",
+        "author": "NeedleTails Organization",
+        "abstract": "The Post-Quantum Solace SDK provides a comprehensive solution for secure messaging with both classical (Curve25519) and post-quantum (Kyber1024) cryptography. Built with Swift's modern concurrency features, it offers forward secrecy, device management, and automatic key rotation.",
+        "keywords": [
+            "cryptography",
+            "post-quantum",
+            "messaging",
+            "security",
+            "encryption",
+            "swift",
+            "ios",
+            "macos"
+        ],
+        "platforms": [
+            "iOS 15.0",
+            "macOS 12.0"
+        ],
+        "languages": [
+            "swift"
+        ],
+        "license": "AGPL-3.0",
+        "repository": "https://github.com/needletails/post-quantum-solace"
+    },
+    "topics": {
+        "Getting Started": {
+            "GettingStarted": "Learn how to integrate the Post-Quantum Solace SDK into your application",
+            "Tutorials": "Step-by-step tutorials for common use cases",
+            "Installation": "Installation and setup instructions"
+        },
+        "Core Modules": {
+            "PQSSession": "Main session manager for cryptographic operations",
+            "TaskProcessor": "Asynchronous task processing for cryptographic operations",
+            "SessionCache": "Two-tier caching system with in-memory and persistent storage",
+            "SessionEvents": "Event-driven system for session management",
+            "SessionModels": "Core data models and structures"
+        },
+        "Key Features": {
+            "Post-Quantum Security": "Kyber1024 for long-term security",
+            "Forward Secrecy": "Double Ratchet protocol implementation",
+            "Device Management": "Master/child device support",
+            "Automatic Key Rotation": "Compromise recovery and key freshness",
+            "End-to-End Encryption": "All communications are encrypted",
+            "Thread Safety": "Actor-based concurrency model"
+        },
+        "Architecture": {
+            "PQSSession": "The main session manager that orchestrates all cryptographic operations and manages the session lifecycle",
+            "TaskProcessor": "Handles asynchronous encryption/decryption tasks using dedicated cryptographic executors",
+            "SessionCache": "Provides two-tier caching with in-memory and persistent storage for optimal performance",
+            "SessionEvents": "Event-driven system for handling messages, contacts, and communication updates",
+            "SessionModels": "Core data structures with built-in encryption and secure serialization"
+        }
+    },
+    "references": {
+        "APIReference": "Complete API documentation for the Post-Quantum Solace SDK",
+        "Examples": "Practical examples and code samples",
+        "Troubleshooting": "Common issues and solutions",
+        "SecurityGuide": "Security best practices and guidelines",
+        "PerformanceGuide": "Performance optimization tips and techniques"
+    }
+} 
