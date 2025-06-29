@@ -4,9 +4,57 @@
 //
 //  Created by Cole M on 4/8/25.
 //
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
+//
 import DequeModule
 
 extension Deque {
+    /// Asynchronously finds the index of the first element in the deque that satisfies the given predicate.
+    ///
+    /// This method iterates through the elements of the deque and evaluates the provided asynchronous
+    /// predicate for each element. If the predicate returns `true` for an element, the index of that
+    /// element is returned. If no elements satisfy the predicate, `nil` is returned.
+    ///
+    /// - Parameter predicate: An asynchronous closure that takes an element of the deque and returns
+    ///   a Boolean value indicating whether the element satisfies a certain condition. The closure
+    ///   is marked as `@Sendable`, meaning it can be safely used across concurrency domains.
+    ///
+    /// - Returns: The index of the first element that satisfies the predicate, or `nil` if no such
+    ///   element is found.
+    ///
+    /// - Complexity: O(n), where n is the number of elements in the deque. The function may suspend
+    ///   while waiting for the predicate to complete, so it should be used in an asynchronous context.
+    ///
+    /// - Note: This function is designed to work with deques of any type, as long as the type conforms
+    ///   to the requirements of the predicate closure. The deque maintains its order during iteration,
+    ///   so the first element that satisfies the predicate will be returned regardless of its position
+    ///   in the deque.
+    ///
+    /// ## Example
+    ///
+    /// ```swift
+    /// let numbers = Deque([1, 3, 5, 7, 8, 10])
+    ///
+    /// // Asynchronous predicate function
+    /// func isEven(_ number: Int) async -> Bool {
+    ///     return number % 2 == 0
+    /// }
+    ///
+    /// Task {
+    ///     if let index = await numbers.firstAsyncIndex(where: isEven) {
+    ///         print("The first even number is at index \(index).") // Output: The first even number is at index 4.
+    ///     } else {
+    ///         print("No even number found.")
+    ///     }
+    /// }
+    /// ```
     public func firstAsyncIndex(where predicate: @Sendable (Element) async -> Bool) async -> Int? {
         for (index, element) in self.enumerated() {
             if await predicate(element) {
@@ -16,8 +64,6 @@ extension Deque {
         return nil
     }
 }
-
-
 
 extension Array {
     

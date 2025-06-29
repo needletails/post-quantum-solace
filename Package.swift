@@ -1,4 +1,4 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.1
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -13,18 +13,18 @@ let package = Package(
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
             name: "PostQuantumSolace",
-            targets: ["CryptoSession"]),
+            targets: ["PQSSession"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", .upToNextMajor(from: "3.12.3")),
-        .package(url: "git@github.com:needle-tail/double-ratchet-kit.git", .upToNextMajor(from: "1.0.2")),
-        .package(url: "git@github.com:needle-tail/needletail-crypto.git", .upToNextMajor(from: "1.0.12")),
-        .package(url: "git@github.com:needle-tail/needletail-logger.git", .upToNextMajor(from: "3.0.0")),
-        .package(url: "git@github.com:needletails/needletail-algorithms.git", .upToNextMajor(from: "2.0.0")),
+        .package(url: "https://github.com/needletails/double-ratchet-kit.git", .upToNextMajor(from: "1.0.0")),
+        .package(url: "https://github.com/needletails/needletail-crypto.git", .upToNextMajor(from: "1.0.12")),
+        .package(url: "https://github.com/needletails/needletail-logger.git", .upToNextMajor(from: "3.0.0")),
+        .package(url: "https://github.com/needletails/needletail-algorithms.git", .upToNextMajor(from: "2.0.0")),
     ],
     targets: [
         .target(
-            name: "CryptoSession", dependencies: [
+            name: "PQSSession", dependencies: [
                 "SessionEvents",
                 "SessionModels",
                 .product(name: "Crypto", package: "swift-crypto"),
@@ -43,7 +43,7 @@ let package = Package(
         ]),
         .testTarget(
             name: "PostQuantumSolaceTests",
-            dependencies: ["CryptoSession"]
+            dependencies: ["PQSSession"]
         ),
     ]
 )

@@ -1,8 +1,17 @@
 //
-//  IdentityStore.swift
+//  PQSSessionStore.swift
 //  post-quantum-solace
 //
 //  Created by Cole M on 9/14/24.
+//
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
 //
 import Foundation
 import DoubleRatchetKit
@@ -18,31 +27,31 @@ public enum Ordering: Sendable {
     case ascending, descending
 }
 
-// MARK: - WrappedPrivateMessage Struct
+// MARK: - MessageRecord Struct
 
 /// A struct that wraps a private message along with its associated shared communication ID.
 /// This struct is used to manage encrypted messages in a secure manner.
-public struct _WrappedPrivateMessage: Sendable {
+public struct MessageRecord: Sendable {
     /// The unique identifier for the shared communication associated with the message.
-    public let sharedCommunicationId: String
+    public let sharedCommunicationId: UUID
     
     /// The encrypted message.
     public let message: EncryptedMessage
     
-    /// Initializes a new instance of `_WrappedPrivateMessage`.
+    /// Initializes a new instance of `MessageRecord`.
     /// - Parameters:
     ///   - sharedCommunicationId: The unique identifier for the shared communication.
     ///   - message: The encrypted message to be wrapped.
-    public init(sharedCommunicationId: String, message: EncryptedMessage) {
+    public init(sharedCommunicationId: UUID, message: EncryptedMessage) {
         self.sharedCommunicationId = sharedCommunicationId
         self.message = message
     }
 }
 
-// MARK: - CryptoSessionStore Protocol
+// MARK: - PQSSessionStore Protocol
 
 /// A protocol that defines CRUD (Create, Read, Update, Delete) operations for managing device configurations in a database store.
-public protocol CryptoSessionStore: Sendable {
+public protocol PQSSessionStore: Sendable {
     
     /// Creates a local device configuration with the provided data.
     /// - Parameter data: The configuration data to be stored.
@@ -52,12 +61,12 @@ public protocol CryptoSessionStore: Sendable {
     /// Retrieves the local device configuration.
     /// - Returns: The configuration data stored in the database.
     /// - Throws: An error if the operation fails, such as if the configuration does not exist or if there is a database error.
-    func findLocalSessionContext() async throws -> Data
+    func fetchLocalSessionContext() async throws -> Data
     
     /// Retrieves the local device salt.
     /// - Returns: The salt data associated with the local device.
     /// - Throws: An error if the operation fails, such as if the salt does not exist or if there is a database error.
-    func findLocalDeviceSalt(keyData: Data) async throws -> Data
+    func fetchLocalDeviceSalt(keyData: Data) async throws -> Data
     
     /// Deletes the local device salt from the local database.
     /// - Throws: An error if the operation fails.
@@ -90,7 +99,7 @@ public protocol CryptoSessionStore: Sendable {
     /// Removes a session identity from the database by its identifier.
     /// - Parameter id: The unique identifier of the session identity to be removed.
     /// - Throws: An error if the operation fails.
-    func removeSessionIdentity(_ id: UUID) async throws
+    func deleteSessionIdentity(_ id: UUID) async throws
     
     /// Fetches all contacts from the database.
     /// - Returns: An array of `ContactModel` objects.
@@ -110,7 +119,7 @@ public protocol CryptoSessionStore: Sendable {
     /// Removes a contact from the database by its identifier.
     /// - Parameter id: The unique identifier of the contact to be removed.
     /// - Throws: An error if the operation fails.
-    func removeContact(_ id: UUID) async throws
+    func deleteContact(_ id: UUID) async throws
     
     /// Fetches all communications from the database.
     /// - Returns: An array of `BaseCommunication` objects.
@@ -118,37 +127,37 @@ public protocol CryptoSessionStore: Sendable {
     func fetchCommunications() async throws -> [BaseCommunication]
     
     /// Creates a new communication in the database.
-    /// - Parameter type: The `BaseCommunication` object to be created.
+    /// - Parameter communication: The `BaseCommunication` object to be created.
     /// - Throws: An error if the operation fails.
-    func createCommunication(_ type: BaseCommunication) async throws
+    func createCommunication(_ communication: BaseCommunication) async throws
     
     /// Updates an existing communication in the database.
-    /// - Parameter type: The `BaseCommunication` object to be updated.
+    /// - Parameter communication: The `BaseCommunication` object to be updated.
     /// - Throws: An error if the operation fails.
-    func updateCommunication(_ type: BaseCommunication) async throws
+    func updateCommunication(_ communication: BaseCommunication) async throws
     
     /// Removes a communication from the database.
-    /// - Parameter type: The `BaseCommunication` object to be removed.
+    /// - Parameter communication: The `BaseCommunication` object to be removed.
     /// - Throws: An error if the operation fails.
-    func removeCommunication(_ type: BaseCommunication) async throws
+    func deleteCommunication(_ communication: BaseCommunication) async throws
     
     /// Fetches messages associated with a specific shared communication identifier.
     /// - Parameter sharedCommunicationId: The unique identifier for the shared communication.
-    /// - Returns: An array of `_WrappedPrivateMessage` objects.
+    /// - Returns: An array of `MessageRecord` objects.
     /// - Throws: An error if the operation fails.
-    func fetchMessages(sharedCommunicationId: UUID) async throws -> [_WrappedPrivateMessage]
+    func fetchMessages(sharedCommunicationId: UUID) async throws -> [MessageRecord]
     
     /// Fetches a message by its unique identifier.
     /// - Parameter messageId: The unique identifier of the message to be fetched.
     /// - Returns: The corresponding `EncryptedMessage`.
     /// - Throws: An error if the operation fails.
-    func fetchMessage(byId messageId: UUID) async throws -> EncryptedMessage
+    func fetchMessage(id: UUID) async throws -> EncryptedMessage
     
     /// Fetches a message by its shared message identifier.
     /// - Parameter sharedMessageId: The shared identifier of the message to be fetched.
     /// - Returns: The corresponding `EncryptedMessage`.
     /// - Throws: An error if the operation fails.
-    func fetchMessage(by sharedMessageId: String) async throws -> EncryptedMessage
+    func fetchMessage(sharedId: String) async throws -> EncryptedMessage
     
     /// Creates a new message in the database.
     /// - Parameters:
@@ -167,7 +176,7 @@ public protocol CryptoSessionStore: Sendable {
     /// Removes a message from the database.
     /// - Parameter message: The `EncryptedMessage` to be removed.
     /// - Throws: An error if the operation fails.
-    func removeMessage(_ message: EncryptedMessage) async throws
+    func deleteMessage(_ message: EncryptedMessage) async throws
     
     /// Streams messages associated with a specific shared identifier.
     /// - Parameter sharedIdentifier: The unique identifier for the shared communication.
@@ -179,12 +188,12 @@ public protocol CryptoSessionStore: Sendable {
     /// - Parameter sharedIdentifier: The unique identifier for the shared communication.
     /// - Returns: The count of messages as an `Int`.
     /// - Throws: An error if the operation fails.
-    func messageCount(for sharedIdentifier: UUID) async throws -> Int
+    func messageCount(sharedIdentifier: UUID) async throws -> Int
     
-    /// Reads all jobs asynchronously.
+    /// Fetches all jobs asynchronously.
     /// - Returns: An array of `JobModel` representing the jobs.
     /// - Throws: An error if the operation fails.
-    func readJobs() async throws -> [JobModel]
+    func fetchJobs() async throws -> [JobModel]
     
     /// Creates a new job asynchronously.
     /// - Parameter job: The `JobModel` instance to be created.
@@ -199,7 +208,7 @@ public protocol CryptoSessionStore: Sendable {
     /// Removes a job asynchronously.
     /// - Parameter job: The `JobModel` instance to be removed.
     /// - Throws: An error if the operation fails.
-    func removeJob(_ job: JobModel) async throws
+    func deleteJob(_ job: JobModel) async throws
     
     /// Creates a media job asynchronously.
     /// - Parameter packet: The `DataPacket` instance representing the media job to be created.
@@ -209,7 +218,7 @@ public protocol CryptoSessionStore: Sendable {
     /// Finds all media jobs asynchronously.
     /// - Returns: An array of `DataPacket` representing all media jobs.
     /// - Throws: An error if the operation fails.
-    func findAllMediaJobs() async throws -> [DataPacket]
+    func fetchAllMediaJobs() async throws -> [DataPacket]
     
     /// Finds media jobs for a specific recipient asynchronously.
     /// - Parameters:
@@ -217,7 +226,7 @@ public protocol CryptoSessionStore: Sendable {
     ///   - symmetricKey: The symmetric key used for decryption.
     /// - Returns: An array of `DataPacket` representing the media jobs for the recipient.
     /// - Throws: An error if the operation fails.
-    func findMediaJobs(for recipient: String, symmetricKey: SymmetricKey) async throws -> [DataPacket]
+    func fetchMediaJobs(recipient: String, symmetricKey: SymmetricKey) async throws -> [DataPacket]
     
     /// Finds a media job by its synchronization identifier asynchronously.
     /// - Parameters:
@@ -225,13 +234,13 @@ public protocol CryptoSessionStore: Sendable {
     ///   - symmetricKey: The symmetric key used for decryption.
     /// - Returns: An optional `DataPacket` representing the media job, or `nil` if not found.
     /// - Throws: An error if the operation fails.
-    func findMediaJob(for synchronizationIdentifier: String, symmetricKey: SymmetricKey) async throws -> DataPacket?
+    func fetchMediaJob(synchronizationIdentifier: String, symmetricKey: SymmetricKey) async throws -> DataPacket?
     
     /// Finds a media job by its unique identifier asynchronously.
     /// - Parameter id: The unique identifier of the media job.
     /// - Returns: An optional `DataPacket` representing the media job, or `nil` if not found.
     /// - Throws: An error if the operation fails.
-    func findMediaJob(_ id: UUID) async throws -> DataPacket?
+    func fetchMediaJob(id: UUID) async throws -> DataPacket?
     
     /// Deletes a media job by its unique identifier asynchronously.
     /// - Parameter id: The unique identifier of the media job to be deleted.

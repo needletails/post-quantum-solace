@@ -9,47 +9,147 @@ import Foundation
 /// An enumeration representing various time intervals for destructive messages.
 ///
 /// This enum defines different time intervals that can be used to specify how long a message should remain
-/// before it is considered destructive (i.e., deleted or no longer accessible).
+/// before it is considered destructive (i.e., deleted or no longer accessible). Destructive messages are
+/// automatically removed after the specified time interval has elapsed.
+///
+/// ## Overview
+/// The `DestructiveMessageTimes` enum provides a type-safe way to configure message destruction intervals
+/// in your application. It supports both predefined intervals for common use cases and custom intervals
+/// for specific requirements.
 ///
 /// ## Cases
-/// - `off`: Indicates that the destructive message feature is turned off.
-/// - `custom(TimeInterval)`: A custom time interval specified by the user.
-/// - `thirtyseconds`: A predefined interval of 30 seconds.
-/// - `fiveMinutes`: A predefined interval of 5 minutes.
-/// - `oneHour`: A predefined interval of 1 hour.
-/// - `eightHours`: A predefined interval of 8 hours.
-/// - `oneDay`: A predefined interval of 1 day.
-/// - `oneWeek`: A predefined interval of 1 week.
-/// - `fourWeeks`: A predefined interval of 4 weeks.
+/// - `off`: Disables the destructive message feature entirely
+/// - `custom(TimeInterval)`: Allows specification of a custom time interval in seconds
+/// - `thirtySeconds`: 30-second interval for very temporary messages
+/// - `fiveMinutes`: 5-minute interval for short-term messages
+/// - `oneHour`: 1-hour interval for medium-term messages
+/// - `eightHours`: 8-hour interval for workday messages
+/// - `oneDay`: 24-hour interval for daily messages
+/// - `oneWeek`: 7-day interval for weekly messages
+/// - `fourWeeks`: 28-day interval for monthly messages
 ///
 /// ## Properties
-/// - `id`: A unique identifier for the enum case, generated as a new `UUID`.
-/// - `description`: A string representation of the enum case, providing a human-readable description.
-/// - `timeInterval`: An optional `TimeInterval` representing the duration associated with the enum case.
+/// - `id`: A unique identifier for the enum case (generates new UUID on each access)
+/// - `description`: A human-readable string representation of the enum case
+/// - `timeInterval`: The duration in seconds, or `nil` if destruction is disabled
+///
+/// ## Usage Examples
+///
+/// ### Basic Usage
+/// ```swift
+/// let destructionTime = DestructiveMessageTimes.oneHour
+/// if let interval = destructionTime.timeInterval {
+///     // Schedule message destruction after 1 hour
+///     Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { _ in
+///         // Delete message logic
+///     }
+/// }
+/// ```
+///
+/// ### Custom Interval
+/// ```swift
+/// let customTime = DestructiveMessageTimes.custom(1800) // 30 minutes
+/// print(customTime.description) // "Custom Interval"
+/// print(customTime.timeInterval) // Optional(1800.0)
+/// ```
+///
+/// ### Disabled Destruction
+/// ```swift
+/// let disabled = DestructiveMessageTimes.off
+/// print(disabled.timeInterval) // nil
+/// print(disabled.description) // "Off"
+/// ```
+///
+/// ### User Interface Integration
+/// ```swift
+/// let options: [DestructiveMessageTimes] = [
+///     .off, .thirtySeconds, .fiveMinutes, .oneHour, .oneDay, .oneWeek
+/// ]
+///
+/// // Display in picker or menu
+/// for option in options {
+///     print("\(option.description): \(option.timeInterval?.description ?? "Never")")
+/// }
+/// ```
+///
+/// ## Thread Safety
+/// This enum is marked as `Sendable` and can be safely used across different threads.
+///
+/// ## Conformance
+/// - `Codable`: Can be encoded/decoded for persistence
+/// - `CustomStringConvertible`: Provides human-readable descriptions
+/// - `Identifiable`: Supports SwiftUI list identification
+/// - `Hashable`: Can be used in sets and as dictionary keys
+/// - `Sendable`: Thread-safe for concurrent access
 public enum DestructiveMessageTimes: Codable, CustomStringConvertible, Identifiable, Hashable, Sendable {
     
+    // MARK: - Time Constants
+    
+    /// The number of seconds in one minute
+    private static let secondsInMinute: TimeInterval = 60
+    
+    /// The number of seconds in one hour
+    private static let secondsInHour: TimeInterval = 3600
+    
+    /// The number of seconds in one day (24 hours)
+    private static let secondsInDay: TimeInterval = 86400
+    
+    /// The number of seconds in one week (7 days)
+    private static let secondsInWeek: TimeInterval = 604800
+    
+    // MARK: - Properties
+    
+    /// A unique identifier for the enum case.
+    ///
+    /// This property generates a new UUID each time it's accessed. If you need a stable
+    /// identifier, consider storing the UUID or using a different identification strategy.
     public var id: UUID {
         UUID()
     }
     
+    // MARK: - Enum Cases
+    
+    /// Disables the destructive message feature
     case off
+    
+    /// A custom time interval specified by the user
+    /// - Parameter interval: The duration in seconds before message destruction
     case custom(TimeInterval)
-    case thirtyseconds
+    
+    /// 30-second interval for very temporary messages
+    case thirtySeconds
+    
+    /// 5-minute interval for short-term messages
     case fiveMinutes
+    
+    /// 1-hour interval for medium-term messages
     case oneHour
+    
+    /// 8-hour interval for workday messages
     case eightHours
+    
+    /// 24-hour interval for daily messages
     case oneDay
+    
+    /// 7-day interval for weekly messages
     case oneWeek
+    
+    /// 28-day interval for monthly messages
     case fourWeeks
     
+    // MARK: - CustomStringConvertible
+    
     /// A textual representation of the enum case.
+    ///
+    /// Returns a human-readable string that can be used in user interfaces
+    /// to describe the selected destruction interval.
     public var description: String {
         switch self {
         case .off:
             return "Off"
         case .custom(_):
             return "Custom Interval"
-        case .thirtyseconds:
+        case .thirtySeconds:
             return "30 Seconds"
         case .fiveMinutes:
             return "5 Minutes"
@@ -66,27 +166,34 @@ public enum DestructiveMessageTimes: Codable, CustomStringConvertible, Identifia
         }
     }
     
+    // MARK: - Time Interval Computation
+    
     /// The time interval associated with the enum case, if applicable.
+    ///
+    /// Returns the duration in seconds that the message should remain before being destroyed.
+    /// Returns `nil` for the `.off` case, indicating that message destruction is disabled.
+    ///
+    /// - Returns: The duration in seconds, or `nil` if destruction is disabled
     public var timeInterval: TimeInterval? {
         switch self {
         case .off:
             return nil
         case .custom(let interval):
             return interval
-        case .thirtyseconds:
-            return 30
+        case .thirtySeconds:
+            return Self.secondsInMinute * 0.5
         case .fiveMinutes:
-            return 300
+            return Self.secondsInMinute * 5
         case .oneHour:
-            return 3600
+            return Self.secondsInHour
         case .eightHours:
-            return 3600 * 8
+            return Self.secondsInHour * 8
         case .oneDay:
-            return 86400
+            return Self.secondsInDay
         case .oneWeek:
-            return 86400 * 7
+            return Self.secondsInWeek
         case .fourWeeks:
-            return 604800 * 4
+            return Self.secondsInWeek * 4
         }
     }
 }

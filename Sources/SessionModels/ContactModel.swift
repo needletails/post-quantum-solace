@@ -13,60 +13,69 @@ import DoubleRatchetKit
 import Crypto
 import NIOConcurrencyHelpers
 
-/// A struct representing a contact in the messaging system.
-/// Conforms to `Sendable`, `Codable`, and `Equatable` for thread safety, serialization, and comparison.
-public struct Contact: Sendable, Codable, Equatable {
-    /// The unique identifier for the contact.
-    public let id: UUID
-    
-    /// The secret name associated with the contact, used for identification.
-    public let secretName: String
-    
-    /// The user configuration settings for the contact.
-    public var configuration: UserConfiguration
-    
-    /// Additional metadata associated with the contact.
-    public var metadata: Document
-    
-    /// Initializes a new instance of `Contact`.
-    /// - Parameters:
-    ///   - id: The unique identifier for the contact.
-    ///   - secretName: The secret name associated with the contact.
-    ///   - configuration: The user configuration settings for the contact.
-    ///   - metadata: Additional metadata associated with the contact.
-    public init(id: UUID, secretName: String, configuration: UserConfiguration, metadata: Document) {
-        self.id = id
-        self.secretName = secretName
-        self.configuration = configuration
-        self.metadata = metadata
-    }
-}
-
-
 /// A class representing a secure model for a contact in the messaging system.
-/// Conforms to `SecureModelProtocol`, `Codable`, and `@unchecked Sendable` for serialization and thread safety.
+/// 
+/// This class provides encrypted storage for contact information, ensuring that sensitive contact data
+/// is protected at rest. It implements the `SecureModelProtocol` to provide a consistent interface
+/// for secure data models throughout the system.
+///
+/// ## Security Features
+/// - All contact data is encrypted using symmetric key encryption
+/// - Thread-safe operations with proper locking mechanisms
+/// - Secure serialization and deserialization of contact properties
+///
+/// ## Usage
+/// ```swift
+/// let contactModel = try ContactModel(
+///     id: UUID(),
+///     props: ContactModel.UnwrappedProps(
+///         secretName: "bob_secure",
+///         configuration: UserConfiguration(),
+///         metadata: ["trustLevel": "high"]
+///     ),
+///     symmetricKey: symmetricKey
+/// )
+/// ```
+///
+/// ## Thread Safety
+/// This class uses `@unchecked Sendable` because it manages its own thread safety through
+/// the `NIOLock` mechanism. All operations that modify the encrypted data are properly synchronized.
 public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendable {
     
     /// The unique identifier for the contact model.
+    /// This UUID serves as the primary key for the contact and is used for database operations.
     public let id: UUID
     
     /// The encrypted data associated with the contact model.
+    /// Contains the serialized and encrypted contact properties. This data is opaque and
+    /// requires the correct symmetric key for decryption.
     public var data: Data
     
     /// A lock for synchronizing access to the model's properties.
+    /// Ensures thread-safe operations when reading or writing the encrypted data.
     private let lock = NIOLock()
     
     /// An instance of the cryptographic utility used for encryption and decryption.
+    /// Provides the encryption/decryption capabilities for securing contact data.
     private let crypto = NeedleTailCrypto()
     
+    /// Coding keys for serialization and deserialization.
+    /// Uses abbreviated keys to minimize storage overhead while maintaining readability.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case id = "a"
         case data = "b"
     }
     
     /// Asynchronously retrieves the decrypted properties of the contact model, if available.
-    /// - Parameter symmetricKey: The symmetric key used for decryption.
+    /// 
+    /// This method attempts to decrypt the stored data using the provided symmetric key.
+    /// If decryption fails, it returns `nil` instead of throwing an error, making it safe
+    /// for scenarios where the key might be incorrect or the data corrupted.
+    /// 
+    /// - Parameter symmetricKey: The symmetric key used for decryption. Must be the same key
+    ///   that was used for encryption.
     /// - Returns: The decrypted properties as `UnwrappedProps`, or `nil` if decryption fails.
+    ///   The returned object contains all the contact's properties in a readable format.
     public func props(symmetricKey: SymmetricKey) async -> UnwrappedProps? {
         do {
             return try await decryptProps(symmetricKey: symmetricKey)
@@ -76,7 +85,17 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     /// A struct representing the unwrapped properties of a contact model.
+    /// 
+    /// This struct contains the decrypted and deserialized contact data. It's used internally
+    /// for working with contact properties in a readable format before re-encryption.
+    ///
+    /// ## Properties
+    /// - `secretName`: The contact's secret name for identification
+    /// - `configuration`: The contact's user configuration settings
+    /// - `metadata`: Additional metadata stored as a BSON document
     public struct UnwrappedProps: Codable, Sendable {
+        /// Coding keys for serialization and deserialization.
+        /// Uses abbreviated keys to minimize storage overhead.
         private enum CodingKeys: String, CodingKey, Sendable {
             case secretName = "a"
             case configuration = "b"
@@ -84,15 +103,25 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         }
         
         /// The secret name associated with the contact.
+        /// Used for secure identification in communications and database operations.
         public let secretName: String
         
         /// The user configuration settings for the contact.
+        /// Contains preferences, security settings, and other configuration options.
         public var configuration: UserConfiguration
         
         /// Additional metadata associated with the contact.
+        /// Flexible storage for contact-specific information using BSON document format.
         public var metadata: Document
         
         /// Initializes a new instance of `UnwrappedProps`.
+        /// 
+        /// Creates a new unwrapped properties object with the specified contact information.
+        /// 
+        /// - Parameters:
+        ///   - secretName: The secret name for the contact
+        ///   - configuration: The user configuration settings
+        ///   - metadata: Additional metadata as a BSON document
         public init(
             secretName: String,
             configuration: UserConfiguration,
@@ -105,11 +134,15 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     /// Initializes a new instance of `ContactModel` with encrypted properties.
+    /// 
+    /// Creates a new contact model by encrypting the provided properties using the specified
+    /// symmetric key. The properties are serialized to BSON format before encryption.
+    /// 
     /// - Parameters:
-    ///   - id: The unique identifier for the contact model.
-    ///   - props: The unwrapped properties to be encrypted.
-    ///   - symmetricKey: The symmetric key used for encryption.
-    /// - Throws: An error if encryption fails.
+    ///   - id: The unique identifier for the contact model. Should be a valid UUID.
+    ///   - props: The unwrapped properties to be encrypted. Contains all contact information.
+    ///   - symmetricKey: The symmetric key used for encryption. Must be kept secure.
+    /// - Throws: `CryptoError.encryptionFailed` if the encryption process fails.
     public init(
         id: UUID,
         props: UnwrappedProps,
@@ -124,9 +157,13 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     /// Initializes a new instance of `ContactModel` with existing encrypted data.
+    /// 
+    /// Creates a contact model from pre-existing encrypted data. This is typically used
+    /// when loading contact data from persistent storage.
+    /// 
     /// - Parameters:
-    ///   - id: The unique identifier for the contact model.
-    ///   - data: The encrypted data associated with the contact model.
+    ///   - id: The unique identifier for the contact model. Should match the original contact ID.
+    ///   - data: The encrypted data associated with the contact model. Must be valid encrypted data.
     public init(
         id: UUID,
         data: Data
@@ -136,9 +173,16 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     /// Asynchronously decrypts the properties of the contact model.
-    /// - Parameter symmetricKey: The symmetric key used for decryption.
-    /// - Returns: The decrypted properties as `UnwrappedProps`.
-    /// - Throws: An error if decryption fails.
+    /// 
+    /// Decrypts the stored data using the provided symmetric key and deserializes it into
+    /// an `UnwrappedProps` object. This method is thread-safe and handles the decryption
+    /// process internally.
+    /// 
+    /// - Parameter symmetricKey: The symmetric key used for decryption. Must be the same key
+    ///   that was used for encryption.
+    /// - Returns: The decrypted properties as `UnwrappedProps` containing all contact information.
+    /// - Throws: `CryptoError.decryptionFailed` if decryption fails, or a decoding error if
+    ///   the decrypted data cannot be deserialized.
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         lock.lock()
         defer { lock.unlock() }
@@ -149,11 +193,16 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     /// Asynchronously updates the properties of the contact model.
+    /// 
+    /// Updates the contact's properties by encrypting the new data and replacing the existing
+    /// encrypted data. This operation is atomic and thread-safe.
+    /// 
     /// - Parameters:
-    ///   - symmetricKey: The symmetric key used for encryption.
-    ///   - props: The new unwrapped properties to be set.
-    /// - Returns: The updated decrypted properties as `UnwrappedProps`.
-    /// - Throws: An error if encryption fails.
+    ///   - symmetricKey: The symmetric key used for encryption. Must be kept secure.
+    ///   - props: The new unwrapped properties to be set. Replaces all existing properties.
+    /// - Returns: The updated decrypted properties as `UnwrappedProps` for verification.
+    /// - Throws: `CryptoError.encryptionFailed` if encryption fails, or other errors from
+    ///   the serialization process.
     public func updateProps(symmetricKey: SymmetricKey, props: UnwrappedProps) async throws -> UnwrappedProps? {
         lock.lock()
         let data = try BSONEncoder().encodeData(props)
@@ -171,12 +220,17 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     /// Asynchronously updates the metadata of the contact model using the provided symmetric key.
+    /// 
+    /// Updates a specific metadata key with new data while preserving all other contact properties.
+    /// This method is useful for updating individual pieces of metadata without affecting
+    /// the rest of the contact information.
+    /// 
     /// - Parameters:
-    ///   - symmetricKey: The symmetric key used for encryption.
-    ///   - metadata: The new metadata to be set.
-    ///   - key: The key under which the metadata will be stored.
-    /// - Returns: The updated decrypted properties as `UnwrappedProps`.
-    /// - Throws: An error if the update fails.
+    ///   - symmetricKey: The symmetric key used for encryption and decryption.
+    ///   - metadata: The new metadata to be set. Will replace the existing metadata for the specified key.
+    ///   - key: The key under which the metadata will be stored. Must be a valid string.
+    /// - Returns: The updated decrypted properties as `UnwrappedProps` for verification.
+    /// - Throws: Various errors if decryption, encryption, or serialization fails.
     public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Document, with key: String) async throws -> UnwrappedProps? {
         var props = try await decryptProps(symmetricKey: symmetricKey)
         props.metadata[key] = metadata
@@ -184,11 +238,16 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     /// Asynchronously updates the metadata of the contact model using the provided symmetric key.
+    /// 
+    /// Merges new metadata with existing metadata, updating only the keys that are present
+    /// in the new metadata while preserving all other existing metadata.
+    /// 
     /// - Parameters:
-    ///   - symmetricKey: The symmetric key used for encryption.
-    ///   - metadata: The new metadata to be merged with the existing metadata.
-    /// - Returns: The updated decrypted properties as `UnwrappedProps`.
-    /// - Throws: An error if the update fails.
+    ///   - symmetricKey: The symmetric key used for encryption and decryption.
+    ///   - metadata: The new metadata to be merged with the existing metadata. Only keys present
+    ///     in this metadata will be updated.
+    /// - Returns: The updated decrypted properties as `UnwrappedProps` for verification.
+    /// - Throws: Various errors if decryption, encryption, or serialization fails.
     public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Document) async throws -> UnwrappedProps? {
         var props = try await decryptProps(symmetricKey: symmetricKey)
         
@@ -203,11 +262,17 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     /// Creates a decrypted model of the specified type from the contact properties.
+    /// 
+    /// This method creates a decrypted `Contact` object from the encrypted contact model.
+    /// It's useful for converting the secure model back to a regular contact object for
+    /// use in the application layer.
+    /// 
     /// - Parameters:
     ///   - of: The type of the model to create, which must conform to `Sendable` and `Codable`.
+    ///     Currently supports `Contact` type.
     ///   - symmetricKey: The symmetric key used for decryption.
     /// - Returns: An instance of the specified type populated with the decrypted properties.
-    /// - Throws: An error if decryption fails or if the properties cannot be converted to the specified type.
+    /// - Throws: `Errors.propsError` if decryption fails, or other errors from the conversion process.
     public func makeDecryptedModel<T: Sendable & Codable>(of: T.Type, symmetricKey: SymmetricKey) async throws -> T {
         guard let props = await props(symmetricKey: symmetricKey) else {
             throw Errors.propsError
@@ -220,11 +285,16 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     /// Asynchronously updates the contact's metadata.
+    /// 
+    /// Updates the contact's metadata with new information, merging it with existing metadata
+    /// if present. This method specifically handles `ContactMetadata` objects and provides
+    /// intelligent merging of properties.
+    /// 
     /// - Parameters:
-    ///   - metadata: The new contact metadata to be updated.
-    ///   - symmetricKey: The symmetric key used for decryption.
-    /// - Returns: The updated decrypted properties as `UnwrappedProps`.
-    /// - Throws: An error if the update fails.
+    ///   - metadata: The new contact metadata to be updated. Only non-nil properties will be updated.
+    ///   - symmetricKey: The symmetric key used for encryption and decryption.
+    /// - Returns: The updated decrypted properties as `UnwrappedProps` for verification.
+    /// - Throws: `Errors.propsError` if decryption fails, or other errors from the update process.
     public func updateContact(_ metadata: ContactMetadata, symmetricKey: SymmetricKey) async throws -> UnwrappedProps? {
         guard let props = await props(symmetricKey: symmetricKey) else {
             throw Errors.propsError
@@ -272,366 +342,11 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     }
     
     /// An enumeration representing possible errors that can occur within the `ContactModel`.
+    /// 
+    /// Defines the specific error types that can be thrown by the contact model operations.
     private enum Errors: Error {
-        case propsError  // Indicates an error occurred while retrieving or updating properties.
-    }
-}
-
-
-
-
-
-/// A structure representing metadata for a contact.
-///
-/// This struct conforms to the `Codable` and `Sendable` protocols, allowing it to be easily encoded and decoded
-/// for data transfer and to be safely used across concurrent tasks.
-///
-/// ## Properties
-/// - `status`: An optional string representing the contact's status (e.g., online, offline).
-/// - `nickname`: An optional string representing the contact's nickname.
-/// - `firstName`: An optional string representing the contact's first name.
-/// - `lastName`: An optional string representing the contact's last name.
-/// - `email`: An optional string representing the contact's email address.
-/// - `phone`: An optional string representing the contact's phone number.
-/// - `image`: An optional `Data` object representing the contact's image.
-///
-/// ## Methods
-/// - `init(status:nickname:firstName:lastName:email:phone:image:)`: Initializes a new instance of `ContactMetadata`
-///   with the provided values. All parameters are optional and default to `nil`.
-/// - `updating(status:)`: Returns a new `ContactMetadata` instance with the updated status.
-/// - `updating(nickname:)`: Returns a new `ContactMetadata` instance with the updated nickname.
-/// - `updating(firstName:)`: Returns a new `ContactMetadata` instance with the updated first name.
-/// - `updating(lastName:)`: Returns a new `ContactMetadata` instance with the updated last name.
-/// - `updating(email:)`: Returns a new `ContactMetadata` instance with the updated email address.
-/// - `updating(phone:)`: Returns a new `ContactMetadata` instance with the updated phone number.
-/// - `updating(image:)`: Returns a new `ContactMetadata` instance with the updated image data.
-public struct ContactMetadata: Codable, Sendable {
-    public var status: String?
-    public var nickname: String?
-    public var firstName: String?
-    public var lastName: String?
-    public var email: String?
-    public var phone: String?
-    public var image: Data?
-    
-    public init(status: String? = nil, nickname: String? = nil, firstName: String? = nil, lastName: String? = nil, email: String? = nil, phone: String? = nil, image: Data? = nil) {
-        self.status = status
-        self.nickname = nickname
-        self.firstName = firstName
-        self.lastName = lastName
-        self.email = email
-        self.phone = phone
-        self.image = image
-    }
-    
-    public func updating(status: String) -> ContactMetadata {
-        return ContactMetadata(
-            status: status,
-            nickname: self.nickname,
-            firstName: self.firstName,
-            lastName: self.lastName,
-            email: self.email,
-            phone: self.phone,
-            image: self.image
-        )
-    }
-    
-    public func updating(nickname: String) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
-            nickname: nickname,
-            firstName: self.firstName,
-            lastName: self.lastName,
-            email: self.email,
-            phone: self.phone,
-            image: self.image
-        )
-    }
-    
-    public func updating(firstName: String) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
-            nickname: self.nickname,
-            firstName: firstName,
-            lastName: self.lastName,
-            email: self.email,
-            phone: self.phone,
-            image: self.image
-        )
-    }
-    
-    public func updating(lastName: String) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
-            nickname: self.nickname,
-            firstName: self.firstName,
-            lastName: lastName,
-            email: self.email,
-            phone: self.phone,
-            image: self.image
-        )
-    }
-    
-    public func updating(email: String) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
-            nickname: self.nickname,
-            firstName: self.firstName,
-            lastName: self.lastName,
-            email: email,
-            phone: self.phone,
-            image: self.image
-        )
-    }
-    
-    public func updating(phone: String) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
-            nickname: self.nickname,
-            firstName: self.firstName,
-            lastName: self.lastName,
-            email: self.email,
-            phone: phone,
-            image: self.image
-        )
-    }
-    
-    public func updating(image: Data) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
-            nickname: self.nickname,
-            firstName: self.firstName,
-            lastName: self.lastName,
-            email: self.email,
-            phone: self.phone,
-            image: image
-        )
-    }
-}
-
-
-
-/// A structure representing a data packet.
-///
-/// This struct conforms to the `Codable` and `Sendable` protocols, allowing it to be easily encoded and decoded
-/// for data transfer and to be safely used across concurrent tasks.
-///
-/// ## Properties
-/// - `id`: A unique identifier for the data packet, represented as a `UUID`.
-/// - `data`: The actual data contained in the packet, represented as a `Data` object.
-///
-/// ## Initializer
-/// - `init(id:data:)`: Initializes a new instance of `DataPacket` with the specified unique identifier and data.
-public struct DataPacket: Codable, Sendable {
-    public let id: UUID
-    public var data: Data
-    
-    /// Initializes a new instance of `DataPacket`.
-    ///
-    /// - Parameters:
-    ///   - id: A unique identifier for the data packet.
-    ///   - data: The data to be contained in the packet.
-    public init(id: UUID, data: Data) {
-        self.id = id
-        self.data = data
-    }
-}
-
-/// A structure representing metadata for SDP (Session Description Protocol) negotiation.
-///
-/// This struct contains information about the offer and answer devices involved in the negotiation.
-///
-/// ## Properties
-/// - `offerSecretName`: The secret name associated with the offer.
-/// - `offerDeviceId`: The device ID of the participant making the offer.
-/// - `answerDeviceId`: The device ID of the participant answering the offer.
-///
-/// ## Initializer
-/// - `init(offerSecretName:offerDeviceId:answerDeviceId:)`: Initializes a new instance of `SDPNegotiationMetadata` with the specified values.
-public struct SDPNegotiationMetadata: Codable, Sendable, Equatable {
-    public let offerSecretName: String
-    public let offerDeviceId: String
-    public let answerDeviceId: String
-    
-    public init(
-        offerSecretName: String,
-        offerDeviceId: String,
-        answerDeviceId: String
-    ) {
-        self.offerSecretName = offerSecretName
-        self.offerDeviceId = offerDeviceId
-        self.answerDeviceId = answerDeviceId
-    }
-}
-
-/// A structure representing metadata for starting a call.
-///
-/// This struct contains information about the participants involved in the call and other relevant metadata.
-///
-/// ## Properties
-/// - `offerParticipant`: The participant making the call offer.
-/// - `answerParticipant`: The participant answering the call (optional).
-/// - `sharedMessageId`: An optional identifier for a shared message related to the call.
-/// - `communicationId`: A unique identifier for the communication session.
-/// - `supportsVideo`: A boolean indicating whether video is supported for the call.
-///
-/// ## Initializer
-/// - `init(offerParticipant:answerParticipant:sharedMessageId:communicationId:supportsVideo:)`: Initializes a new instance of `StartCallMetadata` with the specified values.
-public struct StartCallMetadata: Codable, Sendable, Equatable {
-    
-    public let offerParticipant: Call.Participant
-    public let answerParticipant: Call.Participant?
-    public var sharedMessageId: String?
-    public let communicationId: String
-    public let supportsVideo: Bool
-    
-    public init(
-        offerParticipant: Call.Participant,
-        answerParticipant: Call.Participant? = nil,
-        sharedMessageId: String? = nil,
-        communicationId: String,
-        supportsVideo: Bool
-    ) {
-        self.offerParticipant = offerParticipant
-        self.answerParticipant = answerParticipant
-        self.sharedMessageId = sharedMessageId
-        self.communicationId = communicationId
-        self.supportsVideo = supportsVideo
-    }
-}
-
-
-
-/// A structure representing a call object.
-///
-/// A session can have many calls, including current, previous, and on-hold calls. Each call object can be encoded into data
-/// and set on a base communication metadata. A call needs to contain an identifier for the base communication ID.
-///
-/// ## Properties
-/// - `id`: A unique identifier for the call, represented as a `UUID`.
-/// - `sharedMessageIdentifier`: An optional identifier for a shared message related to the call.
-/// - `sharedCommunicationId`: A unique identifier for the shared communication session.
-/// - `sender`: The participant who initiated the call.
-/// - `recipients`: An array of participants who are receiving the call.
-/// - `createdAt`: The date and time when the call was created.
-/// - `updatedAt`: An optional date and time when the call was last updated.
-/// - `endedAt`: An optional date and time when the call ended.
-/// - `supportsVideo`: A boolean indicating whether the call supports video.
-/// - `unanswered`: An optional boolean indicating whether the call was unanswered.
-/// - `rejected`: An optional boolean indicating whether the call was rejected.
-/// - `failed`: An optional boolean indicating whether the call failed.
-/// - `isActive`: A boolean indicating whether the call is currently active.
-/// - `metadata`: Additional metadata associated with the call, represented as a `Document`.
-///
-/// ## Initializer
-/// - `init(id:sharedMessageIdentifier:sharedCommunicationId:sender:recipients:createdAt:updatedAt:endedAt:supportsVideo:unanswered:rejected:failed:isActive:metadata:)`: Initializes a new instance of `Call` with the specified values.
-public struct Call: Sendable, Codable, Equatable {
-    
-    public struct Props: Sendable, Codable {
-        public var id: UUID
-        public var data: Data
-        
-        public init(id: UUID, data: Data) {
-            self.id = id
-            self.data = data
-        }
-    }
-    
-    public struct Participant: Sendable, Codable, Equatable {
-        public let secretName: String
-        public let nickname: String
-        public var deviceId: String
-        
-        /// Initializes a new instance of `Participant`.
-        ///
-        /// - Parameters:
-        ///   - secretName: The secret name of the participant.
-        ///   - nickname: The nickname of the participant.
-        ///   - deviceId: The device ID of the participant.
-        public init(secretName: String, nickname: String, deviceId: String) {
-            self.secretName = secretName
-            self.nickname = nickname
-            self.deviceId = deviceId
-        }
-    }
-    
-    public var id: UUID
-    public var sharedMessageIdentifier: String?
-    public var sharedCommunicationId: String
-    public var sender: Participant
-    public var recipients: [Participant]
-    public var createdAt: Date
-    public var updatedAt: Date?
-    public var endedAt: Date?
-    public var supportsVideo: Bool
-    public var unanswered: Bool?
-    public var rejected: Bool?
-    public var failed: Bool?
-    public var isActive: Bool
-    public var metadata: Document
-    
-    /// Initializes a new instance of `Call`.
-    ///
-    /// - Parameters:
-    ///   - id: A unique identifier for the call (defaults to a new UUID).
-    ///   - sharedMessageIdentifier: An optional identifier for a shared message related to the call.
-    ///   - sharedCommunicationId: A unique identifier for the shared communication session.
-    ///   - sender: The participant who initiated the call.
-    ///   - recipients: An array of participants who are receiving the call.
-    ///   - createdAt: The date and time when the call was created (defaults to the current date).
-    ///   - updatedAt: An optional date and time when the call was last updated.
-    ///   - endedAt: An optional date and time when the call ended.
-    ///   - supportsVideo: A boolean indicating whether the call supports video (defaults to false).
-    ///   - unanswered: An optional boolean indicating whether the call was unanswered.
-    ///   - rejected: An optional boolean indicating whether the call was rejected.
-    ///   - failed: An optional boolean indicating whether the call failed.
-    ///   - isActive: A boolean indicating whether the call is currently active (defaults to false).
-    ///   - metadata: Additional metadata associated with the call (defaults to an empty document).
-    public init(
-        id: UUID = UUID(),
-        sharedMessageIdentifier: String? = nil,
-        sharedCommunicationId: String,
-        sender: Participant,
-        recipients: [Participant],
-        createdAt: Date = Date(),
-        updatedAt: Date? = nil,
-        endedAt: Date? = nil,
-        supportsVideo: Bool = false,
-        unanswered: Bool? = nil,
-        rejected: Bool? = nil,
-        failed: Bool? = nil,
-        isActive: Bool = false,
-        metadata: Document = [:]
-    ) {
-        self.id = id
-        self.sharedMessageIdentifier = sharedMessageIdentifier
-        self.sharedCommunicationId = sharedCommunicationId
-        self.sender = sender
-        self.recipients = recipients
-        self.createdAt = createdAt
-        self.updatedAt = updatedAt
-        self.endedAt = endedAt
-        self.supportsVideo = supportsVideo
-        self.unanswered = unanswered
-        self.rejected = rejected
-        self.failed = failed
-        self.isActive = isActive
-        self.metadata = metadata
-    }
-}
-
-extension Document {
-    /// - Parameter key: document key to find and decode
-    /// - Returns: the Codable object
-    public func decode<T: Codable>(forKey key: String) throws -> T {
-        guard let value = self[key] else {
-            throw DecodingError.dataCorrupted(DecodingError.Context(codingPath: [], debugDescription: "Key \(key) not found in document"))
-        }
-        guard let data = try BSONEncoder().encodePrimitive(value) else { throw Errors.primitiveIsNil }
-        return try BSONDecoder().decode(T.self, fromPrimitive: data)
-    }
-    
-    enum Errors: Error {
-        case primitiveIsNil
+        /// Indicates an error occurred while retrieving or updating properties.
+        /// This typically happens when decryption fails or properties cannot be accessed.
+        case propsError
     }
 }

@@ -4,6 +4,15 @@
 //
 //  Created by Cole M on 4/8/25.
 //
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
+//
 
 import Crypto
 import Foundation
@@ -18,14 +27,14 @@ extension TaskProcessor {
     ///
     /// - Parameters:
     ///   - task: The task to be encrypted and queued.
-    ///   - session: The `CryptoSession` context for processing.
+    ///   - session: The `PQSSession` context for processing.
     /// - Throws: An error if the cache is unavailable or task setup fails.
     public func feedTask(
-        _ task: EncrytableTask,
-        session: CryptoSession
+        _ task: EncryptableTask,
+        session: PQSSession
     ) async throws {
         guard let cache = await session.cache else {
-            throw CryptoSession.SessionErrors.databaseNotInitialized
+            throw PQSSession.SessionErrors.databaseNotInitialized
         }
         
         let sequenceId = await incrementId()
@@ -43,12 +52,12 @@ extension TaskProcessor {
     ///   - job: An optional specific `JobModel` to load; if `nil`, all cached jobs will be loaded.
     ///   - cache: The session's job cache.
     ///   - symmetricKey: The symmetric key for decrypting job properties.
-    ///   - session: The optional `CryptoSession` used to process the jobs after loading.
+    ///   - session: The optional `PQSSession` used to process the jobs after loading.
     func loadTasks(
         _ job: JobModel? = nil,
         cache: SessionCache,
         symmetricKey: SymmetricKey,
-        session: CryptoSession? = nil
+        session: PQSSession? = nil
     ) async throws {
         if let job = job {
             try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
@@ -56,7 +65,7 @@ extension TaskProcessor {
                 try await attemptTaskSequence(session: session)
             }
         } else {
-            for job in try await cache.readJobs() {
+            for job in try await cache.fetchJobs() {
                 try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
                 if let session = session {
                     try await attemptTaskSequence(session: session)
@@ -65,7 +74,7 @@ extension TaskProcessor {
         }
     }
     
-    /// Updates the task processor’s internal running state.
+    /// Updates the task processor's internal running state.
     ///
     /// - Parameter isRunning: A boolean indicating if task processing is active.
     func setIsRunning(_ isRunning: Bool) async {
@@ -85,11 +94,11 @@ extension TaskProcessor {
     /// This function leverages `NeedleTailAsyncSequence` to manage job execution order and cancellation.
     /// It handles error cases such as missing identities and authentication failures, and removes corrupted or outdated jobs.
     ///
-    /// - Parameter session: The `CryptoSession` context for executing jobs.
+    /// - Parameter session: The `PQSSession` context for executing jobs.
     /// - Throws: Any error that occurs during task processing or session access.
-    func attemptTaskSequence(session: CryptoSession) async throws {
+    func attemptTaskSequence(session: PQSSession) async throws {
         guard let cache = await session.cache else {
-            throw CryptoSession.SessionErrors.databaseNotInitialized
+            throw PQSSession.SessionErrors.databaseNotInitialized
         }
         
         guard !isRunning else {
@@ -108,7 +117,7 @@ extension TaskProcessor {
             switch result {
             case .success(let job):
                 guard let props = await job.props(symmetricKey: symmetricKey) else {
-                    throw CryptoSession.SessionErrors.propsError
+                    throw PQSSession.SessionErrors.propsError
                 }
                 
                 logger.log(level: .debug, message: "Running job \(props.sequenceId)")
@@ -136,20 +145,20 @@ extension TaskProcessor {
                 do {
                     logger.log(level: .debug, message: "Executing Job \(props.sequenceId)")
                     try await performRatchet(task: props.task.task, session: session)
-                    try? await cache.removeJob(job)
+                    try? await cache.deleteJob(job)
                     
                 } catch let jobError as JobProcessorErrors where jobError == .missingIdentity {
                     logger.log(level: .error, message: "Removing Job due to: \(jobError)")
-                    try? await cache.removeJob(job)
+                    try? await cache.deleteJob(job)
                     
                 } catch let cryptoError as CryptoKitError where cryptoError == .authenticationFailure {
                     logger.log(level: .error, message: "Removing Job due to: \(cryptoError)")
-                    try? await cache.removeJob(job)
+                    try? await cache.deleteJob(job)
                     
-                } catch let sessionError as CryptoSession.SessionErrors where sessionError == .invalidKeyId || sessionError == .cannotFindOneTimeKey {
+                } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidKeyId || sessionError == .cannotFindOneTimeKey {
                     //TODO: If we are invalid due to a race condition between the server and client we can optionally resend
                     logger.log(level: .error, message: "Removing Job due to: \(sessionError)")
-                    try? await cache.removeJob(job)
+                    try? await cache.deleteJob(job)
                 } catch {
                     logger.log(level: .error, message: "Job error \(error)")
                     
