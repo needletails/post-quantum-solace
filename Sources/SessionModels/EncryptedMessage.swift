@@ -2,7 +2,17 @@
 //  EncryptedMessage.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 4/18/25.
+//  Created by Cole M on 2025-04-18.
+//
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
+//
 //
 import BSON
 import Crypto

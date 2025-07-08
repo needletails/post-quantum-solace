@@ -2,7 +2,7 @@
 //  BaseCommunication.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 4/18/25.
+//  Created by Cole M on 2025-04-18.
 //
 //  Copyright (c) 2025 NeedleTails Organization.
 //
@@ -17,8 +17,6 @@
 import BSON
 import Crypto
 import DoubleRatchetKit
-
-//
 import Foundation
 import NeedleTailCrypto
 

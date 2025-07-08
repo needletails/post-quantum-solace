@@ -2,7 +2,17 @@
 //  SignedRatchetMessage.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 9/15/24.
+//  Created by Cole M on 2024-09-15.
+//
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
+//
 //
 import BSON
 import DoubleRatchetKit

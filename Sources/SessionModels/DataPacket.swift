@@ -2,7 +2,16 @@
 //  DataPacket.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 6/29/25.
+//  Created by Cole M on 2025-06-29.
+//
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
 //
 import Foundation
 

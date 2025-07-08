@@ -2,7 +2,7 @@
 //  EventReceiver.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 9/18/24.
+//  Created by Cole M on 2024-09-18.
 //
 //  Copyright (c) 2025 NeedleTails Organization.
 //

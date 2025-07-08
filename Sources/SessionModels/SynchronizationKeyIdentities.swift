@@ -2,7 +2,7 @@
 //  SynchronizationKeyIdentities.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 7/7/25.
+//  Created by Cole M on 2025-07-07.
 //
 //  Copyright (c) 2025 NeedleTails Organization.
 //
