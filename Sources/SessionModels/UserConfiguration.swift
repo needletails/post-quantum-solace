@@ -4,35 +4,34 @@
 //
 //  Created by Cole M on 9/14/24.
 //
-import Foundation
 import BSON
 import Crypto
 import DoubleRatchetKit
+import Foundation
 
 /// A struct representing the configuration of a user, including the signing identity
 /// and auxiliary devices.
 public struct UserConfiguration: Codable, Sendable, Equatable {
-    
     /// Coding keys for encoding and decoding the struct.
     enum CodingKeys: String, CodingKey, Codable, Sendable {
-        case signingPublicKey = "a"            // Key for the public signing key
-        case signedDevices = "b"                // Key for the signed devices
-        case signedOneTimePublicKeys = "c"      // Key for the signed public one-time keys
-        case signedPQKemOneTimePublicKeys = "d"      // Key for the signed public one-time keys
+        case signingPublicKey = "a" // Key for the public signing key
+        case signedDevices = "b" // Key for the signed devices
+        case signedOneTimePublicKeys = "c" // Key for the signed public one-time keys
+        case signedPQKemOneTimePublicKeys = "d" // Key for the signed public one-time keys
     }
-    
+
     /// The public signing key used for signing device configurations.
     public var signingPublicKey: Data
-    
+
     /// An array of signed device configurations associated with the user.
     public var signedDevices: [SignedDeviceConfiguration]
-    
+
     /// An array of signed Curve25519 one-time public keys associated with the user.
     public var signedOneTimePublicKeys: [SignedOneTimePublicKey]
-    
+
     /// An array of signed post-quantum KEM one-time public keys associated with the user.
     public var signedPQKemOneTimePublicKeys: [SignedPQKemOneTimeKey]
-    
+
     /// Initializes a new instance of `UserConfiguration`.
     ///
     /// - Parameters:
@@ -51,7 +50,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         self.signedOneTimePublicKeys = signedOneTimePublicKeys
         self.signedPQKemOneTimePublicKeys = signedPQKemOneTimePublicKeys
     }
-    
+
     /// Retrieves verified devices from the signed device configurations.
     ///
     /// - Throws: An error if verification fails.
@@ -60,7 +59,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: signingPublicKey)
         return try signedDevices.compactMap { try $0.verified(using: publicKey) }
     }
-    
+
     /// Retrieves verified Curve25519 one-time keys for a specific device.
     ///
     /// - Parameter deviceId: The unique identifier of the device for which to retrieve keys.
@@ -71,7 +70,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         let filteredKeys = signedOneTimePublicKeys.filter { $0.deviceId == deviceId }
         return try filteredKeys.compactMap { try $0.verified(using: publicKey) }
     }
-    
+
     /// Retrieves verified post-quantum KEM one-time keys for a specific device.
     ///
     /// - Parameter deviceId: The unique identifier of the device for which to retrieve keys.
@@ -82,24 +81,24 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         let filteredKeys = signedPQKemOneTimePublicKeys.filter { $0.deviceId == deviceId }
         return try filteredKeys.compactMap { try $0.verified(using: publicKey) }
     }
-    
+
     /// A struct representing a signed device configuration.
     public struct SignedDeviceConfiguration: Codable, Sendable {
         /// The unique identifier for the device.
         public let id: UUID
-        
+
         /// The encoded data for the device configuration.
         public let data: Data
-        
+
         /// The generated signature for the device configuration.
         public let signature: Data
-        
+
         enum CodingKeys: String, CodingKey, Codable, Sendable {
             case id = "a"
             case data = "b"
             case signature = "c"
         }
-        
+
         /// Initializes a new `SignedDeviceConfiguration` instance.
         ///
         /// - Parameters:
@@ -108,11 +107,11 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         /// - Throws: An error if the signing process fails.
         public init(device: UserDeviceConfiguration, signingKey: Curve25519.Signing.PrivateKey) throws {
             let encoded = try BSONEncoder().encodeData(device)
-            self.id = device.deviceId
-            self.data = encoded
-            self.signature = try signingKey.signature(for: encoded)
+            id = device.deviceId
+            data = encoded
+            signature = try signingKey.signature(for: encoded)
         }
-        
+
         /// Verifies the signature of the device configuration data.
         ///
         /// - Parameter publicKey: The public signing key used for verification.
@@ -123,28 +122,28 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             return try BSONDecoder().decodeData(UserDeviceConfiguration.self, from: data)
         }
     }
-    
+
     /// A struct representing a signed Curve25519 one-time public key.
     public struct SignedOneTimePublicKey: Codable, Sendable {
         /// The unique identifier for the one-time key.
         public let id: UUID
-        
+
         /// The unique identifier for the device associated with the key.
         public let deviceId: UUID
-        
+
         /// The encoded data for the public one-time key.
         public let data: Data
-        
+
         /// The generated signature for the public one-time key.
         public let signature: Data
-        
+
         enum CodingKeys: String, CodingKey, Codable, Sendable {
             case id = "a"
             case deviceId = "b"
             case data = "c"
             case signature = "d"
         }
-        
+
         /// Initializes a new `SignedOneTimePublicKey` instance.
         ///
         /// - Parameters:
@@ -158,12 +157,12 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             signingKey: Curve25519.Signing.PrivateKey
         ) throws {
             let encoded = try BSONEncoder().encodeData(key)
-            self.id = key.id
+            id = key.id
             self.deviceId = deviceId
-            self.data = encoded
-            self.signature = try signingKey.signature(for: encoded)
+            data = encoded
+            signature = try signingKey.signature(for: encoded)
         }
-        
+
         /// Verifies the signature of the public one-time key data.
         ///
         /// - Parameter publicKey: The public signing key used for verification.
@@ -174,29 +173,28 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             return try BSONDecoder().decodeData(CurvePublicKey.self, from: data)
         }
     }
-    
-    
+
     /// A struct representing a signed post-quantum KEM one-time public key.
     public struct SignedPQKemOneTimeKey: Codable, Sendable {
         /// The unique identifier for the one-time key.
         public let id: UUID
-        
+
         /// The unique identifier for the device associated with the key.
         public let deviceId: UUID
-        
+
         /// The encoded data for the public one-time key.
         public let data: Data
-        
+
         /// The generated signature for the public one-time key.
         public let signature: Data
-        
+
         enum CodingKeys: String, CodingKey, Codable, Sendable {
             case id = "a"
             case deviceId = "b"
             case data = "c"
             case signature = "d"
         }
-        
+
         /// Initializes a new `SignedPQKemOneTimeKey` instance.
         ///
         /// - Parameters:
@@ -210,12 +208,12 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             signingKey: Curve25519.Signing.PrivateKey
         ) throws {
             let encoded = try BSONEncoder().encodeData(key)
-            self.id = key.id
+            id = key.id
             self.deviceId = deviceId
-            self.data = encoded
-            self.signature = try signingKey.signature(for: encoded)
+            data = encoded
+            signature = try signingKey.signature(for: encoded)
         }
-        
+
         /// Verifies the signature of the public one-time key data.
         ///
         /// - Parameter publicKey: The public signing key used for verification.
@@ -226,15 +224,15 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             return try BSONDecoder().decodeData(PQKemPublicKey.self, from: data)
         }
     }
-    
+
     /// Compares two `UserConfiguration` instances for equality.
     ///
     /// - Parameters:
     ///   - lhs: The left-hand side `UserConfiguration` instance.
     ///   - rhs: The right-hand side `UserConfiguration` instance.
     /// - Returns: A boolean indicating whether the two instances are equal.
-    public static func ==(lhs: UserConfiguration, rhs: UserConfiguration) -> Bool {
-        return lhs.signingPublicKey == rhs.signingPublicKey
+    public static func == (lhs: UserConfiguration, rhs: UserConfiguration) -> Bool {
+        lhs.signingPublicKey == rhs.signingPublicKey
     }
 }
 

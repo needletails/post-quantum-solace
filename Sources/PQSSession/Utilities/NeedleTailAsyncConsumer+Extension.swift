@@ -18,8 +18,8 @@
 //  It provides functionality for loading, organizing, and inserting tasks with
 //  proper sequence ordering based on cryptographic properties.
 //
-import NeedleTailAsyncSequence
 import Crypto
+import NeedleTailAsyncSequence
 import SessionModels
 
 /// Extension to NeedleTailAsyncConsumer providing task management capabilities
@@ -30,7 +30,6 @@ import SessionModels
 /// - Inserting tasks into the consumer's deque based on sequence IDs
 /// - Maintaining cryptographic integrity during task processing
 extension NeedleTailAsyncConsumer {
-    
     /// Loads and organizes a job into the consumer's task queue with proper sequence ordering.
     ///
     /// This method determines whether to feed the job directly to the consumer or insert it
@@ -59,22 +58,23 @@ extension NeedleTailAsyncConsumer {
     ///   try await consumer.loadAndOrganizeTasks(job, symmetricKey: key)
     ///   ```
     func loadAndOrganizeTasks(_ job: JobModel, symmetricKey: SymmetricKey) async throws {
-        guard let props = await job.props(symmetricKey: symmetricKey) else { 
-            throw PQSSession.SessionErrors.propsError 
+        guard let props = await job.props(symmetricKey: symmetricKey) else {
+            throw PQSSession.SessionErrors.propsError
         }
-        
+
         // We are an empty deque and are not a background or delayed task
-        if self.deque.isEmpty {
+        if deque.isEmpty {
             await feedConsumer(job as! T, priority: .standard)
         } else {
             let taskJob = TaskJob(item: job as! T, priority: .standard)
             await insertSequence(
                 taskJob,
                 sequenceId: props.sequenceId,
-                symmetricKey: symmetricKey)
+                symmetricKey: symmetricKey
+            )
         }
     }
-    
+
     /// Inserts a task job into the deque at the appropriate position based on sequence ordering.
     ///
     /// This private method maintains the integrity of the task sequence by inserting new jobs
@@ -107,5 +107,4 @@ extension NeedleTailAsyncConsumer {
         // Insert the new job at the found index
         deque.insert(taskJob, at: index)
     }
-    
 }

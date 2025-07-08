@@ -13,53 +13,52 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import Foundation
 import DoubleRatchetKit
+import Foundation
 
 /// Errors that can occur during signing operations.
 enum SigningErrors: Error {
-    case invalidSignature          // Indicates that the signature is invalid.
-    case missingSignedObject       // Indicates that a signed object is missing.
+    case invalidSignature // Indicates that the signature is invalid.
+    case missingSignedObject // Indicates that a signed object is missing.
     case signingFailedOnVerification // Indicates that signing failed during verification.
 }
 
 /// A struct representing the configuration of a user device, including its identity,
 /// signing information, and whether it is a master device.
 public struct UserDeviceConfiguration: Codable, Sendable {
-    
     /// Unique identifier for the device.
     public let deviceId: UUID
-    
+
     /// The Curve25519 public key used for digital signatures and authentication in the PQXDH protocol.
     public var signingPublicKey: Data
-    
+
     /// The Curve25519 public key used for long-term identity in the PQXDH protocol.
     public var longTermPublicKey: Data
-    
+
     /// The final PQKEM public key used for post-quantum key exchange in the PQXDH protocol.
     public var finalPQKemPublicKey: PQKemPublicKey
-    
+
     /// An optional device name to identify what device this actually is.
     public let deviceName: String?
-    
+
     /// HMAC data for JWT authentication.
     public let hmacData: Data
-    
+
     /// A flag indicating if this device is the master device.
     public let isMasterDevice: Bool
-    
+
     /// Coding keys for encoding and decoding the struct.
     /// Single-letter keys are used for obfuscation and reduced payload size.
     enum CodingKeys: String, CodingKey, Codable, Sendable {
-        case deviceId = "a"               // Key for the device identifier
-        case signingPublicKey = "b"       // Key for the public signing key
-        case longTermPublicKey = "c"      // Key for the public long-term key
-        case finalPQKemPublicKey = "d"     // Key for the Kyber 1024 public key
-        case deviceName = "e"              // Key for the device name
-        case hmacData = "f"                // Key for the HMAC data
-        case isMasterDevice = "g"          // Key for the master device flag
+        case deviceId = "a" // Key for the device identifier
+        case signingPublicKey = "b" // Key for the public signing key
+        case longTermPublicKey = "c" // Key for the public long-term key
+        case finalPQKemPublicKey = "d" // Key for the Kyber 1024 public key
+        case deviceName = "e" // Key for the device name
+        case hmacData = "f" // Key for the HMAC data
+        case isMasterDevice = "g" // Key for the master device flag
     }
-    
+
     /// Initializes a new `UserDeviceConfiguration` instance.
     ///
     /// - Parameters:
@@ -87,44 +86,43 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         self.hmacData = hmacData
         self.isMasterDevice = isMasterDevice
     }
-    
+
     /// Updates the signing public key with new data.
     ///
     /// - Parameter data: The new Curve25519 public key data for digital signatures.
     public mutating func updateSigningPublicKey(_ data: Data) async {
-        self.signingPublicKey = data
+        signingPublicKey = data
     }
-    
+
     /// Updates the long-term public key with new data.
     ///
     /// - Parameter data: The new Curve25519 public key data for long-term identity.
     public mutating func updateLongTermPublicKey(_ data: Data) async {
-        self.longTermPublicKey = data
+        longTermPublicKey = data
     }
-    
+
     /// Updates the final PQKEM public key with a new key.
     ///
     /// - Parameter key: The new PQKEM public key for post-quantum key exchange.
     public mutating func updateFinalPQKemPublicKey(_ key: PQKemPublicKey) async {
-        self.finalPQKemPublicKey = key
+        finalPQKemPublicKey = key
     }
 }
 
 /// A struct representing a user session, including its identity, secret name, and device configuration.
 public struct UserSession: Identifiable, Codable, Sendable, Hashable {
-    
     /// The unique identifier for the user session.
     public let id: UUID
-    
+
     /// The secret name associated with the user session.
     public let secretName: String
-    
+
     /// The unique identifier for the device associated with the session.
     public let deviceId: UUID
-    
+
     /// The configuration of the user device associated with the session.
     public let configuration: UserDeviceConfiguration
-    
+
     /// Initializes a new `UserSession` instance.
     ///
     /// - Parameters:
@@ -138,10 +136,10 @@ public struct UserSession: Identifiable, Codable, Sendable, Hashable {
     ) {
         self.id = id
         self.secretName = secretName
-        self.deviceId = configuration.deviceId
+        deviceId = configuration.deviceId
         self.configuration = configuration
     }
-    
+
     /// Compares two `UserSession` instances for equality.
     ///
     /// - Parameters:
@@ -149,9 +147,9 @@ public struct UserSession: Identifiable, Codable, Sendable, Hashable {
     ///   - rhs: The right-hand side `UserSession` instance.
     /// - Returns: A boolean indicating whether the two instances are equal.
     public static func == (lhs: UserSession, rhs: UserSession) -> Bool {
-        return lhs.id == rhs.id
+        lhs.id == rhs.id
     }
-    
+
     /// Computes a hash value for the `UserSession`.
     ///
     /// - Parameter hasher: The hasher to use for hashing the `UserSession`.
@@ -165,10 +163,10 @@ public struct UserSession: Identifiable, Codable, Sendable, Hashable {
 public struct OneTimeKeys: Codable, Sendable {
     /// The Curve25519 public key for classical cryptography operations.
     public let curve: DoubleRatchetKit.CurvePublicKey?
-    
+
     /// The Kyber public key for post-quantum cryptography operations.
     public let kyber: DoubleRatchetKit.PQKemPublicKey?
-    
+
     /// Initializes a new `OneTimeKeys` instance.
     ///
     /// - Parameters:
@@ -188,13 +186,13 @@ public struct OneTimeKeys: Codable, Sendable {
 public struct LongTermKeys: Codable, Sendable {
     /// The Curve25519 public key for classical cryptography operations.
     public let curve: DoubleRatchetKit.CurvePublicKey?
-    
+
     /// The Curve25519 public key used for digital signatures and authentication.
-    public let signing:  DoubleRatchetKit.CurvePublicKey?
-    
+    public let signing: DoubleRatchetKit.CurvePublicKey?
+
     /// The Kyber public key for post-quantum cryptography operations.
     public let kyber: DoubleRatchetKit.PQKemPublicKey?
-    
+
     /// Initializes a new `LongTermKeys` instance.
     ///
     /// - Parameters:
@@ -217,10 +215,10 @@ public struct LongTermKeys: Codable, Sendable {
 public struct RotatedPublicKeys: Codable, Sendable {
     /// The pre-shared key data used for the key rotation.
     public let pskData: Data
-    
+
     /// The signed device configuration after the key rotation has been completed.
     public let signedDevice: UserConfiguration.SignedDeviceConfiguration
-    
+
     /// Initializes a new `RotatedPublicKeys` instance.
     ///
     /// - Parameters:

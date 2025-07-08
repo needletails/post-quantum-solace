@@ -4,10 +4,10 @@
 //
 //  Created by Cole M on 9/15/24.
 //
-import Foundation
 import BSON
-import NeedleTailCrypto
 import DoubleRatchetKit
+import Foundation
+import NeedleTailCrypto
 
 /// A struct representing a signed ratchet message that provides cryptographic authenticity
 /// and integrity verification for ratchet messages in the post-quantum Solace protocol.
@@ -19,13 +19,13 @@ import DoubleRatchetKit
 /// ```swift
 /// let ratchetMessage = RatchetMessage(...)
 /// let privateKeyData = Data(...) // Your Curve25519 private key raw representation
-/// 
+///
 /// do {
 ///     let signedMessage = try SignedRatchetMessage(
 ///         message: ratchetMessage,
 ///         signingPrivateKey: privateKeyData
 ///     )
-///     
+///
 ///     // Verify the signature
 ///     if let signed = signedMessage.signed {
 ///         let isValid = try signed.verifySignature(using: publicKey)
@@ -36,21 +36,20 @@ import DoubleRatchetKit
 /// }
 /// ```
 public struct SignedRatchetMessage: Codable & Sendable {
-    
     /// The signed representation of the ratchet message, containing the encoded data
     /// and cryptographic signature for verification.
     ///
     /// This property is optional because signing might fail during initialization,
     /// in which case this will be `nil`.
     public var signed: Signed?
-    
+
     /// Coding keys for encoding and decoding the struct.
     ///
     /// Uses single-letter keys for serialization efficiency in network transmission.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
-        case signed = "a"  // Single letter for serialization efficiency
+        case signed = "a" // Single letter for serialization efficiency
     }
-    
+
     /// Initializes a new `SignedRatchetMessage` instance by signing the provided ratchet message.
     ///
     /// This initializer creates a digital signature of the ratchet message using the provided
@@ -62,7 +61,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
     ///     message payload that needs cryptographic protection.
     ///   - signingPrivateKey: The raw representation of the Curve25519 private signing key
     ///     used to create the digital signature. This key should correspond to the sender's identity.
-    /// - Throws: 
+    /// - Throws:
     ///   - `BSONEncoderError` if the message cannot be encoded to BSON format
     ///   - `CryptoError` if the signing operation fails due to invalid key or cryptographic issues
     ///   - `Curve25519Error` if the private key is invalid or corrupted
@@ -70,39 +69,38 @@ public struct SignedRatchetMessage: Codable & Sendable {
         message: RatchetMessage,
         signingPrivateKey data: Data
     ) throws {
-        self.signed = try Signed(
+        signed = try Signed(
             message: message,
-            signingPrivateKey: try Curve25519SigningPrivateKey(rawRepresentation: data)
+            signingPrivateKey: Curve25519SigningPrivateKey(rawRepresentation: data)
         )
     }
-    
+
     /// A struct representing the signed version of the ratchet message with cryptographic
     /// verification capabilities.
     ///
     /// This nested struct contains the encoded message data and its corresponding digital
     /// signature, providing methods to verify the authenticity and integrity of the message.
     public struct Signed: Codable & Sendable {
-        
         /// The BSON-encoded data of the original ratchet message.
         ///
         /// This data represents the serialized form of the `RatchetMessage` that was signed.
         /// The signature was created over this exact data to ensure integrity.
         public let data: Data
-        
+
         /// The cryptographic signature generated from the message data.
         ///
         /// This signature is created using the sender's private key and can be verified
         /// using the corresponding public key to ensure message authenticity.
         private let signature: Data
-        
+
         /// Coding keys for encoding and decoding the signed struct.
         ///
         /// Uses single-letter keys for serialization efficiency in network transmission.
         enum CodingKeys: String, CodingKey, Codable & Sendable {
-            case data = "a"      // Single letter for serialization efficiency
+            case data = "a" // Single letter for serialization efficiency
             case signature = "c" // Single letter for serialization efficiency
         }
-        
+
         /// Initializes a new `Signed` instance by encoding and signing the provided message.
         ///
         /// This initializer performs two operations:
@@ -112,14 +110,14 @@ public struct SignedRatchetMessage: Codable & Sendable {
         /// - Parameters:
         ///   - message: The `RatchetMessage` to be encoded and signed.
         ///   - signingPrivateKey: The Curve25519 private key used to create the signature.
-        /// - Throws: 
+        /// - Throws:
         ///   - `BSONEncoderError` if the message cannot be encoded to BSON format
         ///   - `CryptoError` if the signing operation fails
         init(
             message: RatchetMessage,
             signingPrivateKey: Curve25519SigningPrivateKey
         ) throws {
-            self.data = try BSONEncoder().encodeData(message)
+            data = try BSONEncoder().encodeData(message)
             signature = try signingPrivateKey.signature(for: data)
         }
 
@@ -135,7 +133,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
         ///   tampered with, `false` otherwise.
         /// - Throws: `CryptoError` if the verification process fails due to cryptographic issues
         public func verifySignature(using publicKey: Curve25519SigningPublicKey) throws -> Bool {
-            return publicKey.isValidSignature(signature, for: data)
+            publicKey.isValidSignature(signature, for: data)
         }
     }
 }

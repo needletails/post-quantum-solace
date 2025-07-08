@@ -13,11 +13,11 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import Foundation
-import DoubleRatchetKit
 import BSON
-import SessionModels
 import Crypto
+import DoubleRatchetKit
+import Foundation
+import SessionModels
 
 /// Metadata structure for signed ratchet messages that contains sensitive information
 /// used to prepare messages for network transmission.
@@ -42,31 +42,33 @@ public struct SignedRatchetMessageMetadata: Sendable {
     /// This identifier is used to route messages without exposing real user identities.
     /// It should be treated as sensitive information and not logged or exposed.
     public let secretName: String
-    
+
     /// The unique identifier for the recipient's device.
     ///
     /// This UUID identifies the specific device that should receive the message.
     /// Multiple devices can be associated with the same user.
     public let deviceId: UUID
-    
+
     /// The type of recipient for the message.
     ///
     /// Determines how the message should be processed and routed (e.g., individual user,
     /// group conversation, broadcast, etc.).
     public let recipient: MessageRecipient
-    
+
     /// Optional metadata for transport layer processing.
     ///
     /// Contains additional information that may be needed by the transport layer
     /// for message delivery, but should not be included in the message payload.
     public let transportMetadata: Data?
-    
+
     /// A shared identifier for message correlation and tracking.
     ///
     /// Used to group related messages and track message delivery across
     /// different devices and sessions.
     public let sharedMessageId: String
-    
+
+    public var synchronizationKeyIds: SynchronizationKeyIdentities?
+
     /// Initializes a new instance of `SignedRatchetMessageMetadata`.
     ///
     /// - Parameters:
@@ -80,13 +82,15 @@ public struct SignedRatchetMessageMetadata: Sendable {
         deviceId: UUID,
         recipient: MessageRecipient,
         transportMetadata: Data?,
-        sharedMessageId: String
+        sharedMessageId: String,
+        synchronizationKeyIds: SynchronizationKeyIdentities?
     ) {
         self.secretName = secretName
         self.deviceId = deviceId
         self.recipient = recipient
         self.transportMetadata = transportMetadata
         self.sharedMessageId = sharedMessageId
+        self.synchronizationKeyIds = synchronizationKeyIds
     }
 }
 
@@ -106,7 +110,7 @@ public struct SignedRatchetMessageMetadata: Sendable {
 ///     func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
 ///         // Implement message sending logic
 ///     }
-///     
+///
 ///     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
 ///         // Implement configuration retrieval logic
 ///     }
@@ -119,7 +123,6 @@ public struct SignedRatchetMessageMetadata: Sendable {
 /// with thread safety in mind. The protocol conforms to `Sendable` to support
 /// concurrent execution contexts.
 public protocol SessionTransport: Sendable {
-
     /// Sends a signed ratchet message to the network with associated metadata.
     ///
     /// This method is responsible for transmitting encrypted messages to the specified
@@ -130,10 +133,10 @@ public protocol SessionTransport: Sendable {
     ///   - message: The signed ratchet message containing the encrypted payload
     ///   - metadata: Metadata containing recipient information and routing details
     /// - Throws: An error if the message could not be sent (e.g., network failure, invalid recipient)
-    func sendMessage(_
-                     message: SignedRatchetMessage,
+    func sendMessage(_ message: SignedRatchetMessage,
+
                      metadata: SignedRatchetMessageMetadata) async throws
-    
+
     /// Retrieves the user configuration for a given secret name from the network.
     ///
     /// This method fetches the complete user configuration including device information,
@@ -144,7 +147,7 @@ public protocol SessionTransport: Sendable {
     /// - Returns: The complete user configuration containing device and key information
     /// - Throws: An error if the configuration could not be found or retrieved
     func findConfiguration(for secretName: String) async throws -> UserConfiguration
-    
+
     /// Publishes a user configuration to the network for device synchronization.
     ///
     /// This method is called for master devices and when updating device bundles with
@@ -156,7 +159,7 @@ public protocol SessionTransport: Sendable {
     ///   - identity: The UUID of the recipient identity for the configuration
     /// - Throws: An error if the configuration could not be published
     func publishUserConfiguration(_ configuration: UserConfiguration, recipient identity: UUID) async throws
-    
+
     /// Fetches one-time keys for a specific user and device.
     ///
     /// Retrieves the available one-time keys that can be used for establishing
@@ -169,7 +172,7 @@ public protocol SessionTransport: Sendable {
     /// - Returns: A collection of one-time keys available for the specified device
     /// - Throws: An error if the keys could not be retrieved
     func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys
-    
+
     /// Fetches the identities of one-time keys for a specific user and device.
     ///
     /// Retrieves the UUIDs of available one-time keys without the actual key data.
@@ -182,7 +185,7 @@ public protocol SessionTransport: Sendable {
     /// - Returns: An array of UUIDs representing the available one-time key identities
     /// - Throws: An error if the key identities could not be retrieved
     func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID]
-    
+
     /// Updates the one-time keys for a specific user and device.
     ///
     /// Adds new Curve25519 one-time keys to the user's key bundle. These keys
@@ -195,7 +198,7 @@ public protocol SessionTransport: Sendable {
     ///   - keys: An array of signed one-time public keys to add
     /// - Throws: An error if the keys could not be updated
     func updateOneTimeKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedOneTimePublicKey]) async throws
-    
+
     /// Updates the post-quantum KEM one-time keys for a specific user and device.
     ///
     /// Adds new post-quantum KEM one-time keys to the user's key bundle. These keys
@@ -207,7 +210,7 @@ public protocol SessionTransport: Sendable {
     ///   - keys: An array of signed post-quantum KEM one-time keys to add
     /// - Throws: An error if the keys could not be updated
     func updateOneTimePQKemKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedPQKemOneTimeKey]) async throws
-    
+
     /// Deletes multiple one-time keys in a batch operation.
     ///
     /// Removes multiple one-time keys of the specified type for a user. This is
@@ -219,7 +222,7 @@ public protocol SessionTransport: Sendable {
     ///   - type: The type of keys to delete (e.g., Curve25519, PQKEM)
     /// - Throws: An error if the keys could not be deleted
     func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
-    
+
     /// Deletes a specific one-time key.
     ///
     /// Removes a single one-time key of the specified type for a user. This is
@@ -231,7 +234,7 @@ public protocol SessionTransport: Sendable {
     ///   - type: The type of key to delete (e.g., Curve25519, PQKEM)
     /// - Throws: An error if the key could not be deleted
     func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
-    
+
     /// Publishes rotated cryptographic keys to the network.
     ///
     /// Announces new rotated keys to other users in the system. Key rotation
@@ -247,7 +250,7 @@ public protocol SessionTransport: Sendable {
         deviceId: String,
         rotated keys: RotatedPublicKeys
     ) async throws
-    
+
     /// Creates an upload packet for secure data transmission.
     ///
     /// Prepares a data packet for secure upload to the network. This method
@@ -265,16 +268,4 @@ public protocol SessionTransport: Sendable {
         recipient: MessageRecipient,
         metadata: Document
     ) async throws
-    
-    /// Notifies the network of identity creation with associated keys.
-    ///
-    /// Announces the creation of a new user identity along with their initial
-    /// cryptographic keys. This allows other users to discover and establish
-    /// communication with the new identity.
-    ///
-    /// - Parameters:
-    ///   - secretName: The secret name of the newly created identity
-    ///   - keys: The initial one-time keys associated with the new identity
-    /// - Throws: An error if the identity creation could not be notified
-    func notifyIdentityCreation(for secretName: String, keys: OneTimeKeys) async throws
 }

@@ -15,7 +15,7 @@
 //
 import DequeModule
 
-extension Deque {
+public extension Deque {
     /// Asynchronously finds the index of the first element in the deque that satisfies the given predicate.
     ///
     /// This method iterates through the elements of the deque and evaluates the provided asynchronous
@@ -55,8 +55,8 @@ extension Deque {
     ///     }
     /// }
     /// ```
-    public func firstAsyncIndex(where predicate: @Sendable (Element) async -> Bool) async -> Int? {
-        for (index, element) in self.enumerated() {
+    func firstAsyncIndex(where predicate: @Sendable (Element) async -> Bool) async -> Int? {
+        for (index, element) in enumerated() {
             if await predicate(element) {
                 return index
             }
@@ -65,8 +65,7 @@ extension Deque {
     }
 }
 
-extension Array {
-    
+public extension Array {
     /// Asynchronously finds the first element in the array that satisfies the given predicate.
     ///
     /// This method iterates through the elements of the array and evaluates the provided asynchronous
@@ -103,7 +102,7 @@ extension Array {
     ///     }
     /// }
     /// ```
-    public func asyncFirst(where predicate: @Sendable (Element) async -> Bool) async -> Element? {
+    func asyncFirst(where predicate: @Sendable (Element) async -> Bool) async -> Element? {
         for element in self {
             if await predicate(element) {
                 return element
@@ -111,8 +110,8 @@ extension Array {
         }
         return nil
     }
-    
-    public func asyncMap<T>(transform: @Sendable (Element) async -> T) async -> [T] {
+
+    func asyncMap<T>(transform: @Sendable (Element) async -> T) async -> [T] {
         var results = [T]()
         for element in self {
             let result = await transform(element)
@@ -120,8 +119,8 @@ extension Array {
         }
         return results
     }
-    
-    public func asyncCompactMap<T>(transform: @Sendable (Element) async -> T?) async -> [T] {
+
+    func asyncCompactMap<T>(transform: @Sendable (Element) async -> T?) async -> [T] {
         var results = [T]()
         for element in self {
             if let result = await transform(element) {
@@ -130,7 +129,7 @@ extension Array {
         }
         return results
     }
-    
+
     // Asynchronously finds the index of the first element in the array that satisfies the given predicate.
     ///
     /// This method iterates through the elements of the array and evaluates the provided asynchronous
@@ -168,15 +167,15 @@ extension Array {
     ///     }
     /// }
     /// ```
-    public func firstAsyncIndex(where predicate: @Sendable (Element) async -> Bool) async -> Int? {
-        for (index, element) in self.enumerated() {
+    func firstAsyncIndex(where predicate: @Sendable (Element) async -> Bool) async -> Int? {
+        for (index, element) in enumerated() {
             if await predicate(element) {
                 return index
             }
         }
         return nil
     }
-    
+
     /// Asynchronously filters the array based on the given predicate.
     ///
     /// This method iterates through the elements of the array and evaluates the provided asynchronous
@@ -211,7 +210,7 @@ extension Array {
     ///     print("Even numbers: \(evenNumbers)") // Output: Even numbers: [2, 4]
     /// }
     /// ```
-    public func asyncFilter(_ predicate: @Sendable (Element) async -> Bool) async -> [Element] {
+    func asyncFilter(_ predicate: @Sendable (Element) async -> Bool) async -> [Element] {
         var result: [Element] = []
         for element in self {
             if await predicate(element) {
@@ -220,8 +219,7 @@ extension Array {
         }
         return result
     }
-    
-    
+
     /// Asynchronously removes all elements that satisfy the given predicate from the current array.
     ///
     /// This method evaluates the provided asynchronous predicate for each element in the array. If the
@@ -256,7 +254,7 @@ extension Array {
     ///     print("Remaining numbers: \(numbers)") // Output: Remaining numbers: [1, 3, 5]
     /// }
     /// ```
-    public mutating func asyncRemoveAll(where predicate: @Sendable (Element) async -> Bool) async {
+    mutating func asyncRemoveAll(where predicate: @Sendable (Element) async -> Bool) async {
         // Create a new array with elements that should remain
         let filteredArray = await asyncFilter { element in
             await !predicate(element)
@@ -264,7 +262,7 @@ extension Array {
         // Update the current array
         self = filteredArray
     }
-    
+
     /// Asynchronously checks if the array contains an element that satisfies the given predicate.
     ///
     /// This method iterates through the elements of the array and evaluates the provided asynchronous
@@ -299,7 +297,7 @@ extension Array {
     ///     print("Contains even number: \(containsEven)") // Output: Contains even number: true
     /// }
     /// ```
-    public func asyncContains(where predicate: @Sendable (Element) async -> Bool) async -> Bool {
+    func asyncContains(where predicate: @Sendable (Element) async -> Bool) async -> Bool {
         for element in self {
             if await predicate(element) {
                 return true
@@ -307,5 +305,4 @@ extension Array {
         }
         return false
     }
-    
 }

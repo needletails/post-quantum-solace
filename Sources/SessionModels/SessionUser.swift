@@ -38,31 +38,30 @@ import Foundation
 /// - `Codable`: Allows the struct to be encoded and decoded for persistence and transmission.
 /// - `Sendable`: Ensures thread safety when used across concurrent tasks.
 public struct SessionUser: Codable & Sendable {
-    
     /// Coding keys for encoding and decoding the struct.
     ///
     /// Single-letter keys are used for obfuscation and to reduce payload size during
     /// network transmission. This pattern is consistent across the codebase for
     /// security-sensitive data structures.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
-        case secretName = "a"      // Key for the secret name
-        case deviceId = "b"        // Key for the device identifier
-        case deviceKeys = "c"      // Key for the device keys
-        case metadata = "d"        // Key for the user-specific metadata
+        case secretName = "a" // Key for the secret name
+        case deviceId = "b" // Key for the device identifier
+        case deviceKeys = "c" // Key for the device keys
+        case metadata = "d" // Key for the user-specific metadata
     }
-    
+
     /// The secret name associated with the session user.
     ///
     /// This is a privacy-preserving identifier used for secure communication without
     /// exposing real user identities. It should be treated as sensitive information.
     public let secretName: String
-    
+
     /// Unique identifier for the device associated with the session user.
     ///
     /// This UUID uniquely identifies the specific device that the user is using
     /// for the session. Multiple devices can be associated with the same user.
     public let deviceId: UUID
-    
+
     /// The device keys associated with the session user.
     ///
     /// Contains all cryptographic keys needed for secure communication, including:
@@ -71,13 +70,13 @@ public struct SessionUser: Codable & Sendable {
     /// - One-time keys for ephemeral key exchange
     /// - Post-quantum keys for future-proof security
     public var deviceKeys: DeviceKeys
-    
+
     /// The contact metadata associated with the session user.
     ///
     /// Contains user profile information such as nickname, status, contact details,
     /// and other metadata that can be shared with other users in the system.
     public var metadata: ContactMetadata
-    
+
     /// Initializes a new instance of `SessionUser`.
     ///
     /// Creates a session user with the specified secret name, device identifier,

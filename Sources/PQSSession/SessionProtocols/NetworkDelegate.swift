@@ -25,14 +25,14 @@ import Foundation
  * for establishing and maintaining secure post-quantum cryptographic sessions.
  *
  * ## Usage
- * 
+ *
  * Conform to this protocol in your network monitoring classes to provide
  * real-time network status updates to the session management system:
  *
  * ```swift
  * class MyNetworkMonitor: NetworkDelegate {
  *     var isViable: Bool = false
- *     
+ *
  *     func startMonitoring() {
  *         // Monitor network connectivity
  *         // Update isViable property based on connection status
@@ -41,12 +41,11 @@ import Foundation
  * ```
  *
  * ## Thread Safety
- * 
+ *
  * This protocol conforms to `Sendable`, ensuring thread-safe access
  * to network status information across concurrent operations.
  */
 public protocol NetworkDelegate: Sendable {
-    
     /**
      * Indicates whether the current network connection is viable for
      * establishing and maintaining secure sessions.
@@ -57,7 +56,7 @@ public protocol NetworkDelegate: Sendable {
      * while `false` indicates network unavailability or instability.
      *
      * ## Implementation Notes
-     * 
+     *
      * - Set to `true` when network connectivity is established and stable
      * - Set to `false` when network is unavailable, unstable, or disconnected
      * - Should be updated immediately when network status changes

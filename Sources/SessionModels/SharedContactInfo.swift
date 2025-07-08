@@ -4,8 +4,8 @@
 //
 //  Created by Cole M on 4/19/25.
 //
-import Foundation
 import struct BSON.Document
+import Foundation
 
 /// A structure representing shared contact information for secure communication.
 ///
@@ -34,14 +34,13 @@ import struct BSON.Document
 /// for storing additional contact-related information without requiring struct
 /// modifications.
 public struct SharedContactInfo: Codable, Sendable {
-    
     /// The secret name associated with the shared contact.
     ///
     /// This identifier is used for privacy-preserving contact identification
     /// in the secure messaging system. It should be treated as sensitive
     /// information and not exposed in logs or error messages.
     public let secretName: String
-    
+
     /// The metadata associated with the shared contact, represented as a BSON `Document`.
     ///
     /// This field provides flexible storage for additional contact-related information
@@ -49,14 +48,14 @@ public struct SharedContactInfo: Codable, Sendable {
     /// with the contact. The BSON format allows for efficient serialization and
     /// flexible schema evolution.
     public let metadata: Document
-    
+
     /// An optional unique identifier for shared communication related to the contact.
     ///
     /// When present, this identifier can be used to establish or reference
     /// shared communication channels between users. This is particularly useful
     /// for group conversations or persistent communication sessions.
     public let sharedCommunicationId: UUID?
-    
+
     /// Initializes a new instance of `SharedContactInfo`.
     ///
     /// - Parameters:

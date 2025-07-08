@@ -82,23 +82,22 @@ import Foundation
 /// - `Hashable`: Can be used in sets and as dictionary keys
 /// - `Sendable`: Thread-safe for concurrent access
 public enum DestructiveMessageTimes: Codable, CustomStringConvertible, Identifiable, Hashable, Sendable {
-    
     // MARK: - Time Constants
-    
+
     /// The number of seconds in one minute
     private static let secondsInMinute: TimeInterval = 60
-    
+
     /// The number of seconds in one hour
     private static let secondsInHour: TimeInterval = 3600
-    
+
     /// The number of seconds in one day (24 hours)
     private static let secondsInDay: TimeInterval = 86400
-    
+
     /// The number of seconds in one week (7 days)
-    private static let secondsInWeek: TimeInterval = 604800
-    
+    private static let secondsInWeek: TimeInterval = 604_800
+
     // MARK: - Properties
-    
+
     /// A unique identifier for the enum case.
     ///
     /// This property generates a new UUID each time it's accessed. If you need a stable
@@ -106,39 +105,39 @@ public enum DestructiveMessageTimes: Codable, CustomStringConvertible, Identifia
     public var id: UUID {
         UUID()
     }
-    
+
     // MARK: - Enum Cases
-    
+
     /// Disables the destructive message feature
     case off
-    
+
     /// A custom time interval specified by the user
     /// - Parameter interval: The duration in seconds before message destruction
     case custom(TimeInterval)
-    
+
     /// 30-second interval for very temporary messages
     case thirtySeconds
-    
+
     /// 5-minute interval for short-term messages
     case fiveMinutes
-    
+
     /// 1-hour interval for medium-term messages
     case oneHour
-    
+
     /// 8-hour interval for workday messages
     case eightHours
-    
+
     /// 24-hour interval for daily messages
     case oneDay
-    
+
     /// 7-day interval for weekly messages
     case oneWeek
-    
+
     /// 28-day interval for monthly messages
     case fourWeeks
-    
+
     // MARK: - CustomStringConvertible
-    
+
     /// A textual representation of the enum case.
     ///
     /// Returns a human-readable string that can be used in user interfaces
@@ -146,28 +145,28 @@ public enum DestructiveMessageTimes: Codable, CustomStringConvertible, Identifia
     public var description: String {
         switch self {
         case .off:
-            return "Off"
-        case .custom(_):
-            return "Custom Interval"
+            "Off"
+        case .custom:
+            "Custom Interval"
         case .thirtySeconds:
-            return "30 Seconds"
+            "30 Seconds"
         case .fiveMinutes:
-            return "5 Minutes"
+            "5 Minutes"
         case .oneHour:
-            return "1 Hour"
+            "1 Hour"
         case .eightHours:
-            return "8 Hours"
+            "8 Hours"
         case .oneDay:
-            return "1 Day"
+            "1 Day"
         case .oneWeek:
-            return "1 Week"
+            "1 Week"
         case .fourWeeks:
-            return "4 Weeks"
+            "4 Weeks"
         }
     }
-    
+
     // MARK: - Time Interval Computation
-    
+
     /// The time interval associated with the enum case, if applicable.
     ///
     /// Returns the duration in seconds that the message should remain before being destroyed.
@@ -177,23 +176,23 @@ public enum DestructiveMessageTimes: Codable, CustomStringConvertible, Identifia
     public var timeInterval: TimeInterval? {
         switch self {
         case .off:
-            return nil
-        case .custom(let interval):
-            return interval
+            nil
+        case let .custom(interval):
+            interval
         case .thirtySeconds:
-            return Self.secondsInMinute * 0.5
+            Self.secondsInMinute * 0.5
         case .fiveMinutes:
-            return Self.secondsInMinute * 5
+            Self.secondsInMinute * 5
         case .oneHour:
-            return Self.secondsInHour
+            Self.secondsInHour
         case .eightHours:
-            return Self.secondsInHour * 8
+            Self.secondsInHour * 8
         case .oneDay:
-            return Self.secondsInDay
+            Self.secondsInDay
         case .oneWeek:
-            return Self.secondsInWeek
+            Self.secondsInWeek
         case .fourWeeks:
-            return Self.secondsInWeek * 4
+            Self.secondsInWeek * 4
         }
     }
 }

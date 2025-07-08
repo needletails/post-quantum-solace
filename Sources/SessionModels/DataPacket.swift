@@ -32,11 +32,11 @@ public struct DataPacket: Codable, Sendable {
     /// A unique identifier for the data packet.
     /// Used for tracking, deduplication, and correlation of related packets.
     public let id: UUID
-    
+
     /// The actual data contained in the packet.
     /// This typically contains encrypted message content or other secure data.
     public var data: Data
-    
+
     /// Initializes a new instance of `DataPacket`.
     ///
     /// Creates a data packet with the specified identifier and data payload.

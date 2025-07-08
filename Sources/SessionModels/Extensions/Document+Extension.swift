@@ -15,7 +15,6 @@
 //
 import BSON
 
-
 /// Extension to `Document` providing convenient decoding capabilities.
 ///
 /// This extension adds a generic decoding method to BSON documents, making it easier
@@ -37,7 +36,7 @@ extension Document {
         guard let data = try BSONEncoder().encodePrimitive(value) else { throw Errors.primitiveIsNil }
         return try BSONDecoder().decode(T.self, fromPrimitive: data)
     }
-    
+
     /// An enumeration representing possible errors that can occur during document decoding.
     ///
     /// Defines the specific error types that can be thrown by the document decoding operations.

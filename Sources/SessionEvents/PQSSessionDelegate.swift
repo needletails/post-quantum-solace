@@ -14,11 +14,11 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
+import struct BSON.BSONDecoder
+import struct BSON.Document
+import class DoubleRatchetKit.SessionIdentity
 import Foundation
 import SessionModels
-import struct BSON.Document
-import struct BSON.BSONDecoder
-import class DoubleRatchetKit.SessionIdentity
 
 /// A delegate protocol that provides hooks for integrating application-specific
 /// logic with the lifecycle of a cryptographic messaging session.
@@ -36,7 +36,7 @@ import class DoubleRatchetKit.SessionIdentity
 ///     func synchronizeCommunication(recipient: MessageRecipient, sharedIdentifier: String) async throws {
 ///         // Handle communication synchronization
 ///     }
-///     
+///
 ///     func handleBlockUnblock(recipient: MessageRecipient, blockData: Data?, metadata: Document, currentState: FriendshipMetadata.State) async throws {
 ///         // Handle contact blocking/unblocking
 ///     }
@@ -50,7 +50,6 @@ import class DoubleRatchetKit.SessionIdentity
 /// with thread safety in mind. The protocol is marked as `Sendable` to support
 /// concurrent execution contexts.
 public protocol PQSSessionDelegate: Sendable {
-    
     /// Called to synchronize communication state between two users.
     ///
     /// This method is invoked when the session needs to establish or refresh
@@ -72,7 +71,7 @@ public protocol PQSSessionDelegate: Sendable {
         sharedIdentifier: String
     ) async throws
 
-    /// Called when a contact is blocked or unblocked.
+    /// Called when friendshipstate changes. May block or unblock a contact
     ///
     /// This method is invoked whenever the blocking state of a contact changes.
     /// Use this to update your application's contact management system and
@@ -88,7 +87,7 @@ public protocol PQSSessionDelegate: Sendable {
     ///     after the block/unblock action has been applied.
     ///
     /// - Throws: Any error that occurs while processing the block/unblock event.
-    func handleBlockUnblock(
+    func requestFriendshipStateChange(
         recipient: MessageRecipient,
         blockData: Data?,
         metadata: Document,
@@ -187,7 +186,7 @@ public protocol PQSSessionDelegate: Sendable {
     /// - Throws: Any error that occurs while extracting user information.
     func retrieveUserInfo(
         _ transportInfo: Data?
-    ) async throws -> (secretName: String, deviceId: String)?
+    ) async -> (secretName: String, deviceId: String)?
 
     /// Updates the metadata of a `CryptoMessage` after the Double Ratchet sender initialization,
     /// but before encryption is performed via `ratchetEncrypt()`.
@@ -210,7 +209,7 @@ public protocol PQSSessionDelegate: Sendable {
     func updateCryptoMessageMetadata(
         _ message: CryptoMessage,
         sharedMessageId: String
-    ) throws -> CryptoMessage
+    ) -> CryptoMessage
 
     /// Allows customization of an encrypted message's metadata before it is processed
     /// by the Double Ratchet encryption pipeline (PQXDH).
@@ -239,7 +238,7 @@ public protocol PQSSessionDelegate: Sendable {
         transportInfo: Data?,
         identity: SessionIdentity,
         recipient: MessageRecipient
-    ) async throws -> SessionModels.EncryptedMessage
+    ) async -> SessionModels.EncryptedMessage
 
     /// Determines whether communication synchronization should be finalized.
     ///
@@ -279,5 +278,5 @@ public protocol PQSSessionDelegate: Sendable {
         _ message: CryptoMessage,
         senderSecretName: String,
         senderDeviceId: UUID
-    ) async throws -> Bool
+    ) async -> Bool
 }

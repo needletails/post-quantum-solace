@@ -75,14 +75,14 @@ public struct DeliveryStateMetadata: Codable, Sendable {
     /// from initial sending through final confirmation. The state can be updated
     /// as the message progresses through the delivery pipeline.
     public let state: DeliveryState
-    
+
     /// A unique identifier shared across the communication context.
     ///
     /// This identifier is used to correlate the metadata with the actual message
     /// across different parts of the system. It should remain constant throughout
     /// the message's lifecycle and is typically derived from the message's unique ID.
     public let sharedId: String
-    
+
     /// Initializes a new instance of `DeliveryStateMetadata`.
     ///
     /// - Parameters:
@@ -171,20 +171,20 @@ public struct EditMessageMetadata<T: Codable & Sendable>: Codable, Sendable {
     /// message content. The type is generic, allowing for flexible content types
     /// while maintaining type safety and serialization capabilities.
     public let value: T
-    
+
     /// A unique identifier shared across the communication context.
     ///
     /// This identifier is used to correlate the edit operation with the original
     /// message. It should match the `sharedId` of the message being edited.
     public let sharedId: String
-    
+
     /// The identifier of the sender who is editing the message.
     ///
     /// This property tracks who initiated the edit operation, providing an audit
     /// trail for message modifications. It's typically the user ID or device ID
     /// of the person making the edit.
     public let sender: String
-    
+
     /// Initializes a new instance of `EditMessageMetadata`.
     ///
     /// - Parameters:
@@ -256,7 +256,7 @@ public struct RevokeMessageMetadata: Codable, Sendable {
     /// This identifier is used to identify the specific message that should be
     /// revoked. It should match the `sharedId` of the original message.
     public let sharedId: String
-    
+
     /// Initializes a new instance of `RevokeMessageMetadata`.
     ///
     /// - Parameter sharedId: A unique identifier shared across the communication context
