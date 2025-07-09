@@ -1,8 +1,8 @@
 //
-//  TaskProcessor+Helpers.swift
+//  TaskProcessor+Cache.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 4/8/25.
+//  Created by Cole M on 2025-04-08.
 //
 //  Copyright (c) 2025 NeedleTails Organization.
 //
@@ -14,17 +14,16 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
-import Foundation
-import Crypto
 import BSON
+import Crypto
 import DoubleRatchetKit
+import Foundation
 import SessionModels
 
 /// Extension providing cache management and model creation capabilities for the TaskProcessor.
 /// This extension handles the creation and management of communication models, message models,
 /// and job models used throughout the cryptographic session lifecycle.
 extension TaskProcessor {
-    
     /// Creates a new communication model for a given recipient group and type.
     ///
     /// This method initializes a new `BaseCommunication` object with encrypted properties
@@ -63,7 +62,7 @@ extension TaskProcessor {
         metadata: Document,
         symmetricKey: SymmetricKey
     ) async throws -> BaseCommunication {
-        return try BaseCommunication(
+        try BaseCommunication(
             id: UUID(),
             props: .init(
                 messageCount: 0,
@@ -75,7 +74,7 @@ extension TaskProcessor {
             symmetricKey: symmetricKey
         )
     }
-    
+
     /// Creates a message model from a received and decrypted message.
     ///
     /// This function updates the message count for the communication and creates a persistable
@@ -118,15 +117,15 @@ extension TaskProcessor {
         sessionIdentity: SessionIdentity
     ) async throws -> EncryptedMessage {
         let symmetricKey = try await session.getDatabaseSymmetricKey()
-        
+
         guard let props = await sessionIdentity.props(symmetricKey: symmetricKey) else {
             throw JobProcessorErrors.missingIdentity
         }
-        
+
         guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else {
             throw PQSSession.SessionErrors.propsError
         }
-        
+
         let newMessageCount = communicationProps.messageCount + 1
         let messageId = UUID()
         let messageModel = try EncryptedMessage(
@@ -146,15 +145,15 @@ extension TaskProcessor {
             ),
             symmetricKey: symmetricKey
         )
-        
+
         var newProps = communicationProps
         newProps.messageCount = newMessageCount
         _ = try await communication.updateProps(symmetricKey: symmetricKey, props: newProps)
         try await session.cache?.updateCommunication(communication)
-        
+
         return messageModel
     }
-    
+
     /// Creates a new outbound message model ready for encryption and persistence.
     ///
     /// This method prepares an outbound message for transmission by creating an encrypted
@@ -214,9 +213,9 @@ extension TaskProcessor {
         guard let sessionContext = await session.sessionContext else {
             throw PQSSession.SessionErrors.sessionNotInitialized
         }
-        
+
         let sessionUser = sessionContext.sessionUser
-        
+
         guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else {
             throw PQSSession.SessionErrors.propsError
         }
@@ -238,20 +237,20 @@ extension TaskProcessor {
             ),
             symmetricKey: symmetricKey
         )
-        
+
         guard let cache = await session.cache else {
             throw PQSSession.SessionErrors.databaseNotInitialized
         }
-        
+
         if shouldUpdateCommunication {
             try await cache.updateCommunication(communication)
             await session.receiverDelegate?.updatedCommunication(communication, members: members)
         }
-        
+
         try await cache.createMessage(messageModel, symmetricKey: symmetricKey)
         return messageModel
     }
-    
+
     /// Creates a job model to be scheduled for processing by the task consumer.
     ///
     /// This method prepares a job for execution by creating an encrypted job model with
@@ -302,7 +301,7 @@ extension TaskProcessor {
             symmetricKey: symmetricKey
         )
     }
-    
+
     /// Retrieves a communication model from cache based on the message recipient type.
     ///
     /// This method searches through cached communications to find a matching conversation
@@ -349,7 +348,7 @@ extension TaskProcessor {
     ) async throws -> BaseCommunication {
         let communications = try await cache.fetchCommunications()
         let symmetricKey = try await session.getDatabaseSymmetricKey()
-        
+
         guard let foundCommunication = await communications.asyncFirst(where: { model in
             do {
                 let decrypted = try await model.makeDecryptedModel(of: Communication.self, symmetricKey: symmetricKey)
@@ -360,7 +359,7 @@ extension TaskProcessor {
         }) else {
             throw PQSSession.SessionErrors.cannotFindCommunication
         }
-        
+
         return foundCommunication
     }
 }

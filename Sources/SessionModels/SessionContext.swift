@@ -2,7 +2,17 @@
 //  SessionContext.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 9/14/24.
+//  Created by Cole M on 2024-09-14.
+//
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
+//
 //
 import Foundation
 
@@ -17,36 +27,35 @@ import Foundation
 /// - Note: The coding keys use single-letter identifiers for security through obscurity,
 ///         making it harder for attackers to understand the serialized data structure.
 public struct SessionContext: Codable & Sendable {
-    
     /// Coding keys for encoding and decoding the struct.
     ///
     /// Uses single-letter keys to obfuscate the data structure and reduce payload size
     /// while maintaining security through obscurity principles.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
-        case sessionUser = "a"                // Key for the session user
-        case databaseEncryptionKey = "b"      // Key for the database encryption key
-        case sessionContextId = "c"           // Key for the session context identity
-        case activeUserConfiguration = "d"       // Key for the last user configuration
-        case registrationState = "e"           // Key for the registration state
+        case sessionUser = "a" // Key for the session user
+        case databaseEncryptionKey = "b" // Key for the database encryption key
+        case sessionContextId = "c" // Key for the session context identity
+        case activeUserConfiguration = "d" // Key for the last user configuration
+        case registrationState = "e" // Key for the registration state
     }
-    
+
     /// The session user associated with this context.
     ///
     /// Contains user-specific information and credentials for the current session.
     public var sessionUser: SessionUser
-    
+
     /// Data representing the encryption key used for securing the database.
     ///
     /// This key is used to encrypt and decrypt sensitive data stored in the local database.
     /// The key should be securely generated and stored.
     public let databaseEncryptionKey: Data
-    
+
     /// Unique identifier for the device associated with the session.
     ///
     /// This identifier distinguishes between different devices that may be associated
     /// with the same user account.
     public let sessionContextId: Int
-    
+
     /// The current active user configuration associated with the session.
     ///
     /// Contains the user's current cryptographic identity, including signed device configurations,
@@ -54,13 +63,13 @@ public struct SessionContext: Codable & Sendable {
     /// cryptographic operations and is updated throughout the session lifecycle as keys are
     /// rotated, devices are added, or one-time keys are refreshed.
     public var activeUserConfiguration: UserConfiguration
-    
+
     /// The current registration state of the user.
     ///
     /// Indicates whether the user has completed the registration process or is still
     /// in an unregistered state.
     public var registrationState: RegistrationState
-    
+
     /// Initializes a new instance of `SessionContext`.
     ///
     /// - Parameters:
@@ -80,12 +89,12 @@ public struct SessionContext: Codable & Sendable {
         registrationState: RegistrationState
     ) {
         self.sessionUser = sessionUser
-        self.databaseEncryptionKey = data
+        databaseEncryptionKey = data
         self.sessionContextId = sessionContextId
         self.activeUserConfiguration = activeUserConfiguration
         self.registrationState = registrationState
     }
-    
+
     /// Updates the session user with a new value.
     ///
     /// This method allows for updating the session user information, which may be
@@ -97,7 +106,7 @@ public struct SessionContext: Codable & Sendable {
     /// - Note: This method is marked as `mutating` since it modifies the struct's
     ///          `sessionUser` property.
     public mutating func updateSessionUser(_ newSessionUser: SessionUser) {
-        self.sessionUser = newSessionUser
+        sessionUser = newSessionUser
     }
 }
 
@@ -108,7 +117,7 @@ public struct SessionContext: Codable & Sendable {
 public enum RegistrationState: Codable, Sendable {
     /// The user has completed the registration process and has full access.
     case registered
-    
+
     /// The user has not completed the registration process and has limited access.
     case unregistered
 }
@@ -121,25 +130,24 @@ public enum RegistrationState: Codable, Sendable {
 /// It implements `Sendable` to ensure thread safety when passed between
 /// concurrent contexts.
 public struct LinkDeviceInfo: Sendable {
-    
     /// The name of the secret associated with the device link.
     ///
     /// This identifier is used to uniquely identify the device linking session
     /// and should be kept secure.
     public let secretName: String
-    
+
     /// An array of device configurations associated with the user.
     ///
     /// Contains configuration information for all devices that are or will be
     /// linked to this user account.
     public let devices: [UserDeviceConfiguration]
-    
+
     /// The password used for securing the device link.
     ///
     /// This password is used to authenticate and secure the device linking process.
     /// It should be strong and kept confidential.
     public let password: String
-    
+
     /// Initializes a new instance of `LinkDeviceInfo`.
     ///
     /// - Parameters:
@@ -166,7 +174,6 @@ public struct LinkDeviceInfo: Sendable {
 /// allowing for secure cryptographic operations during the device linking process.
 /// It implements `Sendable` to ensure thread safety in concurrent environments.
 public protocol DeviceLinkingDelegate: AnyObject, Sendable {
-    
     /// Asynchronously generates cryptographic data for a device.
     ///
     /// This method is responsible for creating the necessary cryptographic information

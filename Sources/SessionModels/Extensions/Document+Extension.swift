@@ -2,7 +2,7 @@
 //  Document+Extension.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 6/29/25.
+//  Created by Cole M on 2025-06-29.
 //
 //  Copyright (c) 2025 NeedleTails Organization.
 //
@@ -14,7 +14,6 @@
 //  post-quantum cryptographic session management capabilities.
 //
 import BSON
-
 
 /// Extension to `Document` providing convenient decoding capabilities.
 ///
@@ -37,7 +36,7 @@ extension Document {
         guard let data = try BSONEncoder().encodePrimitive(value) else { throw Errors.primitiveIsNil }
         return try BSONDecoder().decode(T.self, fromPrimitive: data)
     }
-    
+
     /// An enumeration representing possible errors that can occur during document decoding.
     ///
     /// Defines the specific error types that can be thrown by the document decoding operations.

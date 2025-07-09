@@ -2,19 +2,27 @@
 //  ContactModel.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 9/18/24.
+//  Created by Cole M on 2024-09-18.
+//
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
 //
 
-
-import Foundation
 import BSON
-import NeedleTailCrypto
-import DoubleRatchetKit
 import Crypto
+import DoubleRatchetKit
+import Foundation
+import NeedleTailCrypto
 import NIOConcurrencyHelpers
 
 /// A class representing a secure model for a contact in the messaging system.
-/// 
+///
 /// This class provides encrypted storage for contact information, ensuring that sensitive contact data
 /// is protected at rest. It implements the `SecureModelProtocol` to provide a consistent interface
 /// for secure data models throughout the system.
@@ -41,37 +49,36 @@ import NIOConcurrencyHelpers
 /// This class uses `@unchecked Sendable` because it manages its own thread safety through
 /// the `NIOLock` mechanism. All operations that modify the encrypted data are properly synchronized.
 public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendable {
-    
     /// The unique identifier for the contact model.
     /// This UUID serves as the primary key for the contact and is used for database operations.
     public let id: UUID
-    
+
     /// The encrypted data associated with the contact model.
     /// Contains the serialized and encrypted contact properties. This data is opaque and
     /// requires the correct symmetric key for decryption.
     public var data: Data
-    
+
     /// A lock for synchronizing access to the model's properties.
     /// Ensures thread-safe operations when reading or writing the encrypted data.
     private let lock = NIOLock()
-    
+
     /// An instance of the cryptographic utility used for encryption and decryption.
     /// Provides the encryption/decryption capabilities for securing contact data.
     private let crypto = NeedleTailCrypto()
-    
+
     /// Coding keys for serialization and deserialization.
     /// Uses abbreviated keys to minimize storage overhead while maintaining readability.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case id = "a"
         case data = "b"
     }
-    
+
     /// Asynchronously retrieves the decrypted properties of the contact model, if available.
-    /// 
+    ///
     /// This method attempts to decrypt the stored data using the provided symmetric key.
     /// If decryption fails, it returns `nil` instead of throwing an error, making it safe
     /// for scenarios where the key might be incorrect or the data corrupted.
-    /// 
+    ///
     /// - Parameter symmetricKey: The symmetric key used for decryption. Must be the same key
     ///   that was used for encryption.
     /// - Returns: The decrypted properties as `UnwrappedProps`, or `nil` if decryption fails.
@@ -83,9 +90,9 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
             return nil
         }
     }
-    
+
     /// A struct representing the unwrapped properties of a contact model.
-    /// 
+    ///
     /// This struct contains the decrypted and deserialized contact data. It's used internally
     /// for working with contact properties in a readable format before re-encryption.
     ///
@@ -101,23 +108,23 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
             case configuration = "b"
             case metadata = "c"
         }
-        
+
         /// The secret name associated with the contact.
         /// Used for secure identification in communications and database operations.
         public let secretName: String
-        
+
         /// The user configuration settings for the contact.
         /// Contains preferences, security settings, and other configuration options.
         public var configuration: UserConfiguration
-        
+
         /// Additional metadata associated with the contact.
         /// Flexible storage for contact-specific information using BSON document format.
         public var metadata: Document
-        
+
         /// Initializes a new instance of `UnwrappedProps`.
-        /// 
+        ///
         /// Creates a new unwrapped properties object with the specified contact information.
-        /// 
+        ///
         /// - Parameters:
         ///   - secretName: The secret name for the contact
         ///   - configuration: The user configuration settings
@@ -132,12 +139,12 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
             self.metadata = metadata
         }
     }
-    
+
     /// Initializes a new instance of `ContactModel` with encrypted properties.
-    /// 
+    ///
     /// Creates a new contact model by encrypting the provided properties using the specified
     /// symmetric key. The properties are serialized to BSON format before encryption.
-    /// 
+    ///
     /// - Parameters:
     ///   - id: The unique identifier for the contact model. Should be a valid UUID.
     ///   - props: The unwrapped properties to be encrypted. Contains all contact information.
@@ -155,12 +162,12 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         }
         self.data = encryptedData
     }
-    
+
     /// Initializes a new instance of `ContactModel` with existing encrypted data.
-    /// 
+    ///
     /// Creates a contact model from pre-existing encrypted data. This is typically used
     /// when loading contact data from persistent storage.
-    /// 
+    ///
     /// - Parameters:
     ///   - id: The unique identifier for the contact model. Should match the original contact ID.
     ///   - data: The encrypted data associated with the contact model. Must be valid encrypted data.
@@ -171,13 +178,13 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         self.id = id
         self.data = data
     }
-    
+
     /// Asynchronously decrypts the properties of the contact model.
-    /// 
+    ///
     /// Decrypts the stored data using the provided symmetric key and deserializes it into
     /// an `UnwrappedProps` object. This method is thread-safe and handles the decryption
     /// process internally.
-    /// 
+    ///
     /// - Parameter symmetricKey: The symmetric key used for decryption. Must be the same key
     ///   that was used for encryption.
     /// - Returns: The decrypted properties as `UnwrappedProps` containing all contact information.
@@ -186,17 +193,17 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         lock.lock()
         defer { lock.unlock() }
-        guard let decrypted = try crypto.decrypt(data: self.data, symmetricKey: symmetricKey) else {
+        guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.decryptionFailed
         }
         return try BSONDecoder().decodeData(UnwrappedProps.self, from: decrypted)
     }
-    
+
     /// Asynchronously updates the properties of the contact model.
-    /// 
+    ///
     /// Updates the contact's properties by encrypting the new data and replacing the existing
     /// encrypted data. This operation is atomic and thread-safe.
-    /// 
+    ///
     /// - Parameters:
     ///   - symmetricKey: The symmetric key used for encryption. Must be kept secure.
     ///   - props: The new unwrapped properties to be set. Replaces all existing properties.
@@ -212,19 +219,19 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
             }
             self.data = encryptedData
             lock.unlock()
-            return try await self.decryptProps(symmetricKey: symmetricKey)
+            return try await decryptProps(symmetricKey: symmetricKey)
         } catch {
             lock.unlock()
             throw error
         }
     }
-    
+
     /// Asynchronously updates the metadata of the contact model using the provided symmetric key.
-    /// 
+    ///
     /// Updates a specific metadata key with new data while preserving all other contact properties.
     /// This method is useful for updating individual pieces of metadata without affecting
     /// the rest of the contact information.
-    /// 
+    ///
     /// - Parameters:
     ///   - symmetricKey: The symmetric key used for encryption and decryption.
     ///   - metadata: The new metadata to be set. Will replace the existing metadata for the specified key.
@@ -236,12 +243,12 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         props.metadata[key] = metadata
         return try await updateProps(symmetricKey: symmetricKey, props: props)
     }
-    
+
     /// Asynchronously updates the metadata of the contact model using the provided symmetric key.
-    /// 
+    ///
     /// Merges new metadata with existing metadata, updating only the keys that are present
     /// in the new metadata while preserving all other existing metadata.
-    /// 
+    ///
     /// - Parameters:
     ///   - symmetricKey: The symmetric key used for encryption and decryption.
     ///   - metadata: The new metadata to be merged with the existing metadata. Only keys present
@@ -250,7 +257,7 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     /// - Throws: Various errors if decryption, encryption, or serialization fails.
     public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Document) async throws -> UnwrappedProps? {
         var props = try await decryptProps(symmetricKey: symmetricKey)
-        
+
         var newMetadata = props.metadata
         for key in metadata.keys {
             if let value = metadata[key] {
@@ -260,20 +267,20 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         props.metadata = newMetadata
         return try await updateProps(symmetricKey: symmetricKey, props: props)
     }
-    
+
     /// Creates a decrypted model of the specified type from the contact properties.
-    /// 
+    ///
     /// This method creates a decrypted `Contact` object from the encrypted contact model.
     /// It's useful for converting the secure model back to a regular contact object for
     /// use in the application layer.
-    /// 
+    ///
     /// - Parameters:
     ///   - of: The type of the model to create, which must conform to `Sendable` and `Codable`.
     ///     Currently supports `Contact` type.
     ///   - symmetricKey: The symmetric key used for decryption.
     /// - Returns: An instance of the specified type populated with the decrypted properties.
     /// - Throws: `Errors.propsError` if decryption fails, or other errors from the conversion process.
-    public func makeDecryptedModel<T: Sendable & Codable>(of: T.Type, symmetricKey: SymmetricKey) async throws -> T {
+    public func makeDecryptedModel<T: Sendable & Codable>(of _: T.Type, symmetricKey: SymmetricKey) async throws -> T {
         guard let props = await props(symmetricKey: symmetricKey) else {
             throw Errors.propsError
         }
@@ -281,15 +288,16 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
             id: id,
             secretName: props.secretName,
             configuration: props.configuration,
-            metadata: props.metadata) as! T
+            metadata: props.metadata
+        ) as! T
     }
-    
+
     /// Asynchronously updates the contact's metadata.
-    /// 
+    ///
     /// Updates the contact's metadata with new information, merging it with existing metadata
     /// if present. This method specifically handles `ContactMetadata` objects and provides
     /// intelligent merging of properties.
-    /// 
+    ///
     /// - Parameters:
     ///   - metadata: The new contact metadata to be updated. Only non-nil properties will be updated.
     ///   - symmetricKey: The symmetric key used for encryption and decryption.
@@ -299,7 +307,7 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         guard let props = await props(symmetricKey: symmetricKey) else {
             throw Errors.propsError
         }
-        
+
         var contactMetadata: ContactMetadata
         if let metaDoc = props.metadata["contactMetadata"] as? Document, !metaDoc.isEmpty {
             // Decode the existing metadata
@@ -330,19 +338,21 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
                 firstName: metadata.firstName,
                 lastName: metadata.lastName,
                 email: metadata.email,
-                image: metadata.image)
+                image: metadata.image
+            )
         }
-        
+
         let metadata = try BSONEncoder().encode(contactMetadata)
         // Encode the updated metadata
         return try await updatePropsMetadata(
             symmetricKey: symmetricKey,
             metadata: metadata,
-            with: "contactMetadata")
+            with: "contactMetadata"
+        )
     }
-    
+
     /// An enumeration representing possible errors that can occur within the `ContactModel`.
-    /// 
+    ///
     /// Defines the specific error types that can be thrown by the contact model operations.
     private enum Errors: Error {
         /// Indicates an error occurred while retrieving or updating properties.

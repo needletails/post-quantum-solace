@@ -2,7 +2,7 @@
 //  EventReceiver.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 9/18/24.
+//  Created by Cole M on 2024-09-18.
 //
 //  Copyright (c) 2025 NeedleTails Organization.
 //
@@ -37,7 +37,6 @@ import SessionModels
 /// concurrent access safely. The `Sendable` conformance ensures that implementations can be
 /// safely used across different execution contexts.
 public protocol EventReceiver: Sendable {
-    
     /// Called when a new message is created in the system.
     ///
     /// This method is invoked when a new encrypted message has been successfully created
@@ -48,7 +47,7 @@ public protocol EventReceiver: Sendable {
     ///   the encrypted message data and associated metadata.
     /// - Returns: An asynchronous operation that completes when the event has been processed.
     func createdMessage(_ message: EncryptedMessage) async
-    
+
     /// Called when an existing message is updated in the system.
     ///
     /// This method is invoked when an existing encrypted message has been modified,
@@ -59,7 +58,7 @@ public protocol EventReceiver: Sendable {
     ///   the updated message data and metadata.
     /// - Returns: An asynchronous operation that completes when the event has been processed.
     func updatedMessage(_ message: EncryptedMessage) async
-    
+
     /// Called when a message is deleted from the system.
     ///
     /// This method is invoked when an encrypted message has been permanently removed
@@ -70,7 +69,7 @@ public protocol EventReceiver: Sendable {
     ///   the message data that was removed (may be useful for cleanup operations).
     /// - Returns: An asynchronous operation that completes when the event has been processed.
     func deletedMessage(_ message: EncryptedMessage) async
-    
+
     /// Called when a new contact is created in the system.
     ///
     /// This method is invoked when a new contact has been successfully added to the
@@ -82,7 +81,7 @@ public protocol EventReceiver: Sendable {
     /// - Throws: An error if the operation fails, such as database errors or
     ///   validation failures.
     func createdContact(_ contact: Contact) async throws
-    
+
     /// Called when a contact is removed from the system.
     ///
     /// This method is invoked when a contact has been permanently removed from the
@@ -94,7 +93,7 @@ public protocol EventReceiver: Sendable {
     /// - Throws: An error if the operation fails, such as database errors or
     ///   cleanup failures.
     func removedContact(_ secretName: String) async throws
-    
+
     /// Synchronizes a contact with the remote system, optionally requesting friendship.
     ///
     /// This method is invoked to synchronize contact information with other devices
@@ -110,7 +109,7 @@ public protocol EventReceiver: Sendable {
     /// - Throws: An error if the operation fails, such as network errors,
     ///   authentication failures, or synchronization conflicts.
     func synchronize(contact: Contact, requestFriendship: Bool) async throws
-    
+
     /// Transports contact metadata to other devices or users in the network.
     ///
     /// This method is invoked to share the current user's contact metadata with
@@ -120,7 +119,7 @@ public protocol EventReceiver: Sendable {
     /// - Throws: An error if the operation fails, such as network errors,
     ///   authentication failures, or transport layer issues.
     func transportContactMetadata() async throws
-    
+
     /// Updates an existing contact in the system.
     ///
     /// This method is invoked when an existing contact's information has been
@@ -132,7 +131,7 @@ public protocol EventReceiver: Sendable {
     /// - Throws: An error if the operation fails, such as database errors,
     ///   validation failures, or update conflicts.
     func updateContact(_ contact: Contact) async throws
-    
+
     /// Called when the metadata for a contact has changed.
     ///
     /// This method is invoked when a contact's metadata has been updated, such as
@@ -144,7 +143,7 @@ public protocol EventReceiver: Sendable {
     ///   the updated contact information including the modified metadata.
     /// - Returns: An asynchronous operation that completes when the event has been processed.
     func contactMetadata(changed for: Contact) async
-    
+
     /// Called when communication is updated in the system.
     ///
     /// This method is invoked when a communication channel or group has been

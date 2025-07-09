@@ -2,7 +2,7 @@
 //  PQSSession+KeyRotation.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 6/20/25.
+//  Created by Cole M on 2025-06-20.
 //
 //  Copyright (c) 2025 NeedleTails Organization.
 //
@@ -13,11 +13,11 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import Foundation
-import SessionModels
 import BSON
-import NeedleTailCrypto
 import DoubleRatchetKit
+import Foundation
+import NeedleTailCrypto
+import SessionModels
 
 /// Extension to `PQSSession` providing comprehensive key rotation and compromise recovery capabilities.
 ///
@@ -56,7 +56,6 @@ import DoubleRatchetKit
 /// - All rotation operations are atomic and either complete fully or fail completely
 
 extension PQSSession {
-    
     /// Rotates all cryptographic keys when a potential compromise is suspected.
     ///
     /// This method performs a complete key rotation, replacing all cryptographic keys including
@@ -102,52 +101,55 @@ extension PQSSession {
     /// - Warning: This operation may take several seconds to complete due to cryptographic operations.
     public func rotateKeysOnPotentialCompromise() async throws {
         await setRotatingKeys(true)
-        
+
         let longTerm = try createLongTermKeys()
         let kyberId = UUID()
         let kyberPrivateKey = try PQKemPrivateKey(id: kyberId, longTerm.kyber.encode())
         let kyberPublicKey = try PQKemPublicKey(id: kyberId, longTerm.kyber.publicKey.rawRepresentation)
-        
+
         var sessionContext = try await getSessionContext()
-        
+
         let oldSigningKeyData = sessionContext.activeUserConfiguration.signingPublicKey
         let oldSigningKey = try Curve25519SigningPublicKey(rawRepresentation: oldSigningKeyData)
-        
+
         guard let index = sessionContext
             .activeUserConfiguration
             .signedDevices
             .firstIndex(where: { signed in
                 guard let verified = try? signed.verified(using: oldSigningKey) else { return false }
                 return verified.deviceId == sessionContext.sessionUser.deviceId
-            }) else {
+            })
+        else {
             throw PQSSession.SessionErrors.invalidDeviceIdentity
         }
         guard var device = try sessionContext.activeUserConfiguration.signedDevices[index]
-            .verified(using: oldSigningKey) else {
+            .verified(using: oldSigningKey)
+        else {
             throw SessionErrors.invalidSignature
         }
-        
+
         await device.updateSigningPublicKey(longTerm.signing.publicKey.rawRepresentation)
         await device.updateLongTermPublicKey(longTerm.curve.publicKey.rawRepresentation)
         await device.updateFinalPQKemPublicKey(kyberPublicKey)
-        
+
         let reSigned = try UserConfiguration.SignedDeviceConfiguration(device: device, signingKey: longTerm.signing)
-        
+
         sessionContext.sessionUser.deviceKeys.signingPrivateKey = longTerm.signing.rawRepresentation
         sessionContext.activeUserConfiguration.signingPublicKey = longTerm.signing.publicKey.rawRepresentation
         sessionContext.sessionUser.deviceKeys.longTermPrivateKey = longTerm.curve.rawRepresentation
         sessionContext.sessionUser.deviceKeys.finalPQKemPrivateKey = kyberPrivateKey
         sessionContext.activeUserConfiguration.signedDevices[index] = reSigned
-        
+
         try await updateRotatedKeySessionContext(sessionContext: sessionContext)
-        
-        //Send Public Keys to server
+
+        // Send Public Keys to server
         try await transportDelegate?.publishRotatedKeys(
             for: sessionContext.sessionUser.secretName,
             deviceId: sessionContext.sessionUser.deviceId.uuidString,
-            rotated: .init(pskData: device.signingPublicKey, signedDevice: reSigned))
+            rotated: .init(pskData: device.signingPublicKey, signedDevice: reSigned)
+        )
     }
-    
+
     func setRotatingKeys(_ rotating: Bool) async {
         rotatingKeys = rotating
     }
@@ -193,26 +195,25 @@ extension PQSSession {
         if let rotateKeyDate = await sessionContext?.sessionUser.deviceKeys.rotateKeysDate {
             // Get the current date
             let currentDate = Date()
-            
+
             // Create a Calendar instance
             let calendar = Calendar.current
-            
+
             // Calculate the date one week ago from the current date
             if let oneWeekAgo = calendar.date(byAdding: .weekOfYear, value: -1, to: currentDate) {
                 // Check if rotateKeyDate is older than or equal to one week ago
                 if rotateKeyDate <= oneWeekAgo {
-                    
                     try await rotatePQKemFinalKey()
-                    
+
                     guard let cache else {
                         throw SessionErrors.databaseNotInitialized
                     }
                     let data = try await cache.fetchLocalSessionContext()
-                    
+
                     guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
                         throw SessionErrors.sessionDecryptionError
                     }
-                    
+
                     // Decode the session context from the decrypted data
                     var sessionContext = try BSONDecoder().decodeData(SessionContext.self, from: configurationData)
                     await sessionContext.sessionUser.deviceKeys.updateRotateKeysDate(Date())
@@ -228,84 +229,86 @@ extension PQSSession {
     }
 }
 
-extension PQSSession {
-    
-    fileprivate func getSessionContext() async throws -> SessionContext {
+private extension PQSSession {
+    func getSessionContext() async throws -> SessionContext {
         guard let cache else {
             throw SessionErrors.databaseNotInitialized
         }
-        
+
         let config = try await cache.fetchLocalSessionContext()
-        
+
         // Decrypt the session context data using the app's symmetric key
         guard let configurationData = try await crypto.decrypt(data: config, symmetricKey: getAppSymmetricKey()) else {
             throw SessionErrors.sessionDecryptionError
         }
-        
+
         // Decode the session context from the decrypted data
         return try BSONDecoder().decodeData(SessionContext.self, from: configurationData)
     }
-    
-    fileprivate func updateRotatedKeySessionContext(sessionContext: SessionContext) async throws {
+
+    func updateRotatedKeySessionContext(sessionContext: SessionContext) async throws {
         var sessionContext = sessionContext
-        
+
         guard let cache else {
             throw SessionErrors.databaseNotInitialized
         }
-        
+
         sessionContext.updateSessionUser(sessionContext.sessionUser)
         await setSessionContext(sessionContext)
-        
+
         // Encrypt and persist
         let encodedData = try BSONEncoder().encode(sessionContext)
-        guard let encryptedConfig = try await self.crypto.encrypt(data: encodedData.makeData(), symmetricKey: getAppSymmetricKey()) else {
+        guard let encryptedConfig = try await crypto.encrypt(data: encodedData.makeData(), symmetricKey: getAppSymmetricKey()) else {
             throw PQSSession.SessionErrors.sessionEncryptionError
         }
-        
+
         try await cache.updateLocalSessionContext(encryptedConfig)
     }
 
-    fileprivate func rotatePQKemFinalKey() async throws {
+    func rotatePQKemFinalKey() async throws {
         let kyber = try crypto.generateKyber1024PrivateSigningKey()
-        
+
         var sessionContext = try await getSessionContext()
-        
+
         let kyberId = UUID()
         let kyberPrivateKey = try PQKemPrivateKey(id: kyberId, kyber.encode())
         let kyberPublicKey = try PQKemPublicKey(id: kyberId, kyber.publicKey.rawRepresentation)
-        
+
         sessionContext.sessionUser.deviceKeys.finalPQKemPrivateKey = kyberPrivateKey
-        
+
         let signingKeyData = sessionContext.activeUserConfiguration.signingPublicKey
         let signingKey = try Curve25519SigningPublicKey(rawRepresentation: signingKeyData)
         let signingPrivateKeyData = sessionContext.sessionUser.deviceKeys.signingPrivateKey
         let signingPrivateKey = try Curve25519SigningPrivateKey(rawRepresentation: signingPrivateKeyData)
-        
+
         guard let index = sessionContext
             .activeUserConfiguration
             .signedDevices
             .firstIndex(where: { signed in
                 guard let verified = try? signed.verified(using: signingKey) else { return false }
                 return verified.deviceId == sessionContext.sessionUser.deviceId
-            }) else {
+            })
+        else {
             throw PQSSession.SessionErrors.invalidDeviceIdentity
         }
-        
+
         guard var device = try sessionContext.activeUserConfiguration.signedDevices[index]
-            .verified(using: signingKey) else {
+            .verified(using: signingKey)
+        else {
             throw SessionErrors.invalidSignature
         }
-        
+
         await device.updateFinalPQKemPublicKey(kyberPublicKey)
         let reSigned = try UserConfiguration.SignedDeviceConfiguration(device: device, signingKey: signingPrivateKey)
         sessionContext.activeUserConfiguration.signedDevices[index] = reSigned
-        
+
         try await updateRotatedKeySessionContext(sessionContext: sessionContext)
-        
-        //Send Public Keys to server
+
+        // Send Public Keys to server
         try await transportDelegate?.publishRotatedKeys(
             for: sessionContext.sessionUser.secretName,
             deviceId: sessionContext.sessionUser.deviceId.uuidString,
-            rotated: .init(pskData: device.signingPublicKey, signedDevice: reSigned))
+            rotated: .init(pskData: device.signingPublicKey, signedDevice: reSigned)
+        )
     }
 }

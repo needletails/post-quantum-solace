@@ -2,7 +2,17 @@
 //  FriendshipMetadata.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 9/19/24.
+//  Created by Cole M on 2024-09-19.
+//
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
+//
 //
 
 import Foundation
@@ -16,7 +26,7 @@ import Foundation
 ///
 /// ## State Management
 /// - `myState`: Represents the current user's perspective of the friendship
-/// - `theirState`: Represents the other user's perspective of the friendship  
+/// - `theirState`: Represents the other user's perspective of the friendship
 /// - `ourState`: A computed state that reflects the combined relationship status
 ///
 /// ## Usage Example
@@ -27,7 +37,6 @@ import Foundation
 /// friendship.setBlockState(isBlocking: true) // Block the other user
 /// ```
 public struct FriendshipMetadata: Sendable, Codable {
-    
     /// An enumeration representing the various states of a friendship.
     ///
     /// Each state represents a specific point in the friendship lifecycle, from initial
@@ -35,48 +44,48 @@ public struct FriendshipMetadata: Sendable, Codable {
     public enum State: String, Sendable, Codable {
         /// The friendship request is pending - no action has been taken yet.
         case pending = "a"
-        
+
         /// A friendship request has been sent by the current user.
         case requested = "b"
-        
+
         /// The friendship has been accepted by both parties and is active.
         case accepted = "c"
-        
+
         /// The current user has rejected a friendship request from the other party.
         case rejected = "d"
-        
+
         /// The other party has rejected a friendship request from the current user.
         case rejectedByOther = "e"
-        
+
         /// Both parties have rejected each other's friendship requests.
         case mutuallyRejected = "f"
-        
+
         /// The current user has blocked the other party.
         case blocked = "g"
-        
+
         /// The other party has blocked the current user.
         case blockedByOther = "h"
-        
+
         /// The current user has unblocked the other party (resets to pending state).
         case unblocked = "i"
     }
-    
+
     /// The state of the friendship from the current user's perspective.
     ///
     /// This represents how the current user views the friendship relationship.
     public var myState: State
-    
+
     /// The state of the friendship from the other user's perspective.
     ///
     /// This represents how the other user views the friendship relationship.
     public var theirState: State
-    
+
     /// The combined state that reflects the overall friendship status.
     ///
     /// This computed state is derived from both `myState` and `theirState` and represents
     /// the effective status of the friendship relationship.
     public var ourState: State
-    
+
     /// Initializes a new instance of `FriendshipMetadata`.
     ///
     /// Creates a new friendship metadata instance with the specified states. All states
@@ -95,7 +104,7 @@ public struct FriendshipMetadata: Sendable, Codable {
         self.theirState = theirState
         self.ourState = ourState
     }
-    
+
     /// Sets the state to indicate that a friend request has been sent.
     ///
     /// This method updates the current user's state to `.requested` and recalculates
@@ -112,7 +121,7 @@ public struct FriendshipMetadata: Sendable, Codable {
         myState = .requested
         updateOurState()
     }
-    
+
     /// Sets the state to indicate that a friend request has been accepted.
     ///
     /// This method updates both users' states to `.accepted` and sets the combined
@@ -131,7 +140,7 @@ public struct FriendshipMetadata: Sendable, Codable {
         theirState = .accepted
         updateOurState()
     }
-    
+
     /// Resets the friendship states to the original pending state.
     ///
     /// This method clears all friendship states and returns them to the initial
@@ -150,7 +159,7 @@ public struct FriendshipMetadata: Sendable, Codable {
         theirState = .pending
         updateOurState()
     }
-    
+
     /// Sets the state to indicate that a friend request has been rejected.
     ///
     /// This method updates the states to reflect that the current user has rejected
@@ -169,7 +178,7 @@ public struct FriendshipMetadata: Sendable, Codable {
         theirState = .rejected
         updateOurState()
     }
-    
+
     /// Sets the block state for the friendship.
     ///
     /// This method updates the states to reflect blocking behavior. When `isBlocking` is `true`,
@@ -194,7 +203,7 @@ public struct FriendshipMetadata: Sendable, Codable {
         theirState = isBlocking ? .blockedByOther : .blocked
         updateOurState()
     }
-    
+
     /// Sets the state to indicate that the user has unblocked the other party.
     ///
     /// This method resets both users' states to `.pending`, effectively removing the block
@@ -216,7 +225,7 @@ public struct FriendshipMetadata: Sendable, Codable {
         theirState = .pending
         updateOurState()
     }
-    
+
     /// Updates the combined state based on the individual states of both users.
     ///
     /// This method analyzes both `myState` and `theirState` to determine the appropriate
@@ -239,19 +248,19 @@ public struct FriendshipMetadata: Sendable, Codable {
             ourState = .pending
         } else if (myState == .rejected && theirState == .rejectedByOther) || (myState == .rejectedByOther && theirState == .rejected) {
             ourState = .mutuallyRejected
-        } else if myState == .pending && theirState == .pending {
+        } else if myState == .pending, theirState == .pending {
             ourState = .pending // Both parties are pending.
         } else if theirState == .blockedByOther {
             ourState = .blocked
-        } else if myState == .mutuallyRejected && theirState == .pending {
+        } else if myState == .mutuallyRejected, theirState == .pending {
             ourState = .mutuallyRejected
-        } else if myState == .requested && theirState == .requested {
+        } else if myState == .requested, theirState == .requested {
             ourState = .requested
         } else {
             ourState = .pending // Default state if no other conditions are met.
         }
     }
-    
+
     /// Switches the states between the requester and the receiver for clarity in the inbound request process.
     ///
     /// This method swaps `myState` and `theirState` to provide a different perspective
@@ -279,4 +288,3 @@ public struct FriendshipMetadata: Sendable, Codable {
         (myState, theirState) = (theirState, myState)
     }
 }
-

@@ -2,7 +2,7 @@
 //  TaskProcessor.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 4/8/25.
+//  Created by Cole M on 2025-04-08.
 //
 //  Copyright (c) 2025 NeedleTails Organization.
 //
@@ -13,15 +13,17 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 
-import Foundation
+import struct BSON.BSONDecoder
+import struct BSON.Document
 import Crypto
-import NeedleTailLogger
+import DequeModule
+import DoubleRatchetKit
+import Foundation
 import NeedleTailAsyncSequence
 import NeedleTailCrypto
-import DoubleRatchetKit
+import NeedleTailLogger
 import SessionEvents
 import SessionModels
-import DequeModule
 
 /// `TaskProcessor` manages the asynchronous execution of encryption and decryption tasks
 /// using Double Ratchet and other cryptographic mechanisms. It handles inbound and outbound
@@ -57,7 +59,6 @@ import DequeModule
 /// - Message ordering is preserved to maintain cryptographic properties
 /// - Actor isolation prevents concurrent access to mutable state
 public actor TaskProcessor {
-
     // MARK: - Properties
 
     /// Executor for running cryptographic tasks on a serial queue.
@@ -67,7 +68,7 @@ public actor TaskProcessor {
         queue: DispatchQueue(label: "com.needletails.crypto-executor-queue"),
         shouldExecuteAsTask: false
     )
-    
+
     /// Executor for key transport operations on a separate serial queue.
     /// Used for key exchange, rotation, and deletion operations.
     /// Separated from message processing to prevent blocking.
@@ -75,11 +76,11 @@ public actor TaskProcessor {
         queue: DispatchQueue(label: "com.needletails.key-transport-executor-queue"),
         shouldExecuteAsTask: false
     )
-    
+
     /// Queue of tasks for updating cryptographic keys.
     /// These tasks run on the key transport executor to avoid blocking message processing.
     var updateKeyTasks: Deque<Task<Void, Never>> = []
-    
+
     /// Queue of tasks for deleting cryptographic keys.
     /// These tasks run on the key transport executor for proper cleanup.
     var deleteKeyTasks: Deque<Task<Void, Never>> = []
@@ -88,7 +89,7 @@ public actor TaskProcessor {
     /// External code can use this to schedule work on the cryptographic executor
     /// while maintaining actor isolation for the processor's state.
     public nonisolated var unownedExecutor: UnownedSerialExecutor {
-        self.cryptoExecutor.asUnownedSerialExecutor()
+        cryptoExecutor.asUnownedSerialExecutor()
     }
 
     /// The currently active session.
@@ -122,7 +123,7 @@ public actor TaskProcessor {
     /// Delegate responsible for transport-level session communication.
     /// Handles the actual sending and receiving of encrypted messages over the network.
     var delegate: (any SessionTransport)?
-    
+
     /// Represents a stashed inbound task for later processing.
     ///
     /// This struct is used to temporarily store inbound messages that cannot be processed
@@ -135,11 +136,11 @@ public actor TaskProcessor {
         /// Unique identifier for the stashed task.
         /// Used for deduplication and task tracking.
         let id = UUID()
-        
+
         /// The inbound task message to be processed.
         /// Contains the encrypted message and metadata needed for decryption.
         let task: InboundTaskMessage
-        
+
         /// Equality comparison based on task ID.
         /// - Parameters:
         ///   - lhs: Left-hand side of the comparison
@@ -148,7 +149,7 @@ public actor TaskProcessor {
         public static func == (lhs: TaskProcessor.StashedTask, rhs: TaskProcessor.StashedTask) -> Bool {
             lhs.id == rhs.id
         }
-        
+
         /// Generates a hash value for the task.
         /// - Parameter hasher: The hasher to use for generating the hash value
         public func hash(into hasher: inout Hasher) {
@@ -169,8 +170,8 @@ public actor TaskProcessor {
     /// - Note: The processor is not ready for use until a session is set and the delegate is configured.
     public init(logger: NeedleTailLogger = NeedleTailLogger()) {
         self.logger = logger
-        self.ratchetManager = RatchetStateManager<SHA256>(executor: self.cryptoExecutor)
-        self.jobConsumer = NeedleTailAsyncConsumer<JobModel>(logger: logger, executor: self.cryptoExecutor)
+        ratchetManager = RatchetStateManager<SHA256>(executor: cryptoExecutor)
+        jobConsumer = NeedleTailAsyncConsumer<JobModel>(logger: logger, executor: cryptoExecutor)
     }
 
     /// Sets the session transport delegate.
@@ -243,10 +244,24 @@ public actor TaskProcessor {
         case .personalMessage:
             identities = try await gatherPersonalIdentities(session: session, sender: sender, logger: logger)
             recipients.insert(sender)
-        case .nickname(let nickname):
-            identities = try await gatherPrivateMessageIdentities(session: session, target: nickname, logger: logger)
+        case let .nickname(nickname):
+            var sendOneTimeIdentities = false
+
+            if let document = message.metadata["friendshipMetadata"] as? Document {
+                let state = try BSONDecoder().decode(FriendshipMetadata.self, from: document)
+                if state.myState == .requested {
+                    sendOneTimeIdentities = true
+                }
+            }
+
+            identities = try await gatherPrivateMessageIdentities(
+                session: session,
+                target: nickname,
+                logger: logger,
+                sendOneTimeIdentities: sendOneTimeIdentities
+            )
             recipients.formUnion([sender, nickname])
-        case .channel(_):
+        case .channel:
             let (channelIdentities, members) = try await gatherChannelIdentities(
                 cache: cache,
                 session: session,
@@ -270,7 +285,7 @@ public actor TaskProcessor {
         /// - Returns: The matching `SessionIdentity` if found, else `nil`.
         ///   Returns `nil` if no identity matches or if the device ID is invalid.
         func getIdentity(secretName: String, deviceId: String) async -> SessionIdentity? {
-            return await identities.asyncFirst { identity in
+            await identities.asyncFirst { identity in
                 guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
                 return props.secretName == secretName && props.deviceId == UUID(uuidString: deviceId)
             }
@@ -278,7 +293,7 @@ public actor TaskProcessor {
 
         // Filter identities based on delegate-supplied info
         if let sessionDelegate = await session.sessionDelegate {
-            if let (secretName, deviceId) = try await sessionDelegate.retrieveUserInfo(message.transportInfo) {
+            if let (secretName, deviceId) = await sessionDelegate.retrieveUserInfo(message.transportInfo) {
                 if !deviceId.isEmpty {
                     let resolvedIdentity = await getIdentity(secretName: secretName.isEmpty ? type.nicknameDescription : secretName, deviceId: deviceId)
                     if let offerIdentity = resolvedIdentity {
@@ -290,7 +305,7 @@ public actor TaskProcessor {
                 }
             } else {
                 await identities.asyncRemoveAll {
-                    (await $0.props(symmetricKey: symmetricKey)?.isMasterDevice == false)
+                    await ($0.props(symmetricKey: symmetricKey)?.isMasterDevice == false)
                 }
             }
         }
@@ -340,8 +355,13 @@ public actor TaskProcessor {
     ///   - logger: Logger for debug output and identity resolution tracking.
     /// - Returns: An array of `SessionIdentity` objects for the target's devices.
     /// - Throws: Errors from identity refresh, typically network or cryptographic errors.
-    private func gatherPrivateMessageIdentities(session: PQSSession, target: String, logger: NeedleTailLogger) async throws -> [SessionIdentity] {
-        let identities = try await session.refreshIdentities(secretName: target)
+    private func gatherPrivateMessageIdentities(
+        session: PQSSession,
+        target: String,
+        logger: NeedleTailLogger,
+        sendOneTimeIdentities: Bool
+    ) async throws -> [SessionIdentity] {
+        let identities = try await session.refreshIdentities(secretName: target, sendOneTimeIdentities: sendOneTimeIdentities)
         logger.log(level: .info, message: "Gathered \(identities.count) Private Message Session Identities")
         return identities
     }
@@ -383,7 +403,7 @@ public actor TaskProcessor {
         let members = props.members
         var identities = [SessionIdentity]()
         for member in members {
-            identities.append(contentsOf: try await session.refreshIdentities(secretName: member))
+            try await identities.append(contentsOf: session.refreshIdentities(secretName: member))
         }
 
         logger.log(level: .info, message: "Gathered \(identities.count) Channel Session Identities")
@@ -430,7 +450,7 @@ public actor TaskProcessor {
         cache: SessionCache,
         session: PQSSession,
         symmetricKey: SymmetricKey,
-        sender: String,
+        sender _: String,
         recipients: Set<String>,
         shouldPersist: Bool,
         logger: NeedleTailLogger
@@ -476,11 +496,12 @@ public actor TaskProcessor {
 
         for identity in sessionIdentities {
             if let unwrappedEncryptableMessage = encryptableMessage {
-                encryptableMessage = try await session.sessionDelegate?.updateEncryptableMessageMetadata(
+                encryptableMessage = await session.sessionDelegate?.updateEncryptableMessageMetadata(
                     unwrappedEncryptableMessage,
                     transportInfo: message.transportInfo,
                     identity: identity,
-                    recipient: message.recipient)
+                    recipient: message.recipient
+                )
             }
 
             if shouldPersist {
@@ -495,8 +516,7 @@ public actor TaskProcessor {
                         recipientIdentity: identity,
                         localId: encryptableMessage.id,
                         sharedId: encryptableMessage.sharedId
-                    ))
-                )
+                    )))
             } else {
                 if await session.sessionDelegate?.shouldFinishCommunicationSynchronization(message.transportInfo) == true {
                     guard !message.text.isEmpty else { return }
@@ -525,7 +545,6 @@ public actor TaskProcessor {
                     ))
                 )
             }
-
             try await feedTask(task, session: session)
         }
     }

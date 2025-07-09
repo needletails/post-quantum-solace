@@ -2,19 +2,29 @@
 //  JobModel.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 9/15/24.
+//  Created by Cole M on 2024-09-15.
+//
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
+//
 //
 //  This file contains models for job management in the post-quantum solace system.
 //  It provides structures for representing outbound and inbound task messages,
 //  encryptable tasks with priority and scheduling, and secure job models with
 //  encryption/decryption capabilities.
 //
-import Foundation
 import BSON
-import NeedleTailCrypto
-import DoubleRatchetKit
-import NeedleTailAsyncSequence
 import Crypto
+import DoubleRatchetKit
+import Foundation
+import NeedleTailAsyncSequence
+import NeedleTailCrypto
 
 /// A struct representing an outbound task message to be sent to a recipient.
 ///
@@ -24,16 +34,16 @@ import Crypto
 public struct OutboundTaskMessage: Codable & Sendable {
     /// The encrypted message content to be sent.
     public var message: CryptoMessage
-    
+
     /// The identity of the recipient session for routing and authentication.
     public let recipientIdentity: SessionIdentity
-    
+
     /// A unique identifier for the local message used for tracking and deduplication.
     public let localId: UUID
-    
+
     /// A shared identifier for the message that can be used across devices.
     public let sharedId: String
-    
+
     /// Initializes a new instance of `OutboundTaskMessage`.
     /// - Parameters:
     ///   - message: The encrypted message content to be sent.
@@ -60,16 +70,16 @@ public struct OutboundTaskMessage: Codable & Sendable {
 public struct InboundTaskMessage: Codable & Sendable {
     /// The signed ratchet message containing the encrypted payload and authentication.
     public let message: SignedRatchetMessage
-    
+
     /// The secret name of the sender for privacy and identification.
     public let senderSecretName: String
-    
+
     /// The unique identifier for the sender's device for routing and verification.
     public let senderDeviceId: UUID
-    
+
     /// A shared identifier for the message that can be used across devices.
     public let sharedMessageId: String
-    
+
     /// Initializes a new instance of `InboundTaskMessage`.
     /// - Parameters:
     ///   - message: The signed ratchet message received.
@@ -107,13 +117,13 @@ public enum TaskType: Codable & Sendable {
 public struct EncryptableTask: Codable & Sendable {
     /// The task type, which can be an inbound or outbound message.
     public let task: TaskType
-    
+
     /// The priority of the task for queue ordering and resource allocation.
     public let priority: Priority
-    
+
     /// The date and time when the task is scheduled for execution.
     public let scheduledAt: Date
-    
+
     /// Initializes a new instance of `EncryptableTask`.
     /// - Parameters:
     ///   - task: The task type (inbound or outbound message).
@@ -137,32 +147,32 @@ public struct EncryptableTask: Codable & Sendable {
 public struct Job: Sendable, Codable, Equatable {
     /// A unique identifier for the job.
     public let id: UUID
-    
+
     /// The sequence identifier for the job used for ordering and tracking.
     public let sequenceId: Int
-    
+
     /// A Boolean indicating whether the job is a background task.
     public let isBackgroundTask: Bool
-    
+
     /// The task associated with the job containing the actual work to be performed.
     var task: EncryptableTask
-    
+
     /// The date until which the job is delayed, if applicable.
     public var delayedUntil: Date?
-    
+
     /// The date and time when the job is scheduled for execution.
     public var scheduledAt: Date
-    
+
     /// The number of attempts made to execute the job.
     public var attempts: Int
-    
+
     /// Compares two `Job` instances for equality based on their unique identifiers.
     /// - Parameters:
     ///   - lhs: The first `Job` instance.
     ///   - rhs: The second `Job` instance.
     /// - Returns: A Boolean value indicating whether the two instances are equal.
     public static func == (lhs: Job, rhs: Job) -> Bool {
-        return lhs.id == rhs.id
+        lhs.id == rhs.id
     }
 }
 
@@ -174,16 +184,16 @@ public struct Job: Sendable, Codable, Equatable {
 public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
     /// A unique identifier for the job model.
     public let id: UUID
-    
+
     /// The encrypted data associated with the job model.
     public var data: Data
-    
+
     /// Coding keys with obfuscated names for enhanced security.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case id = "a"
         case data = "b"
     }
-    
+
     /// Asynchronously retrieves the decrypted properties of the job model, if available.
     /// - Parameter symmetricKey: The symmetric key used for decryption.
     /// - Returns: An optional `UnwrappedProps` containing the decrypted properties.
@@ -210,25 +220,25 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             case scheduledAt = "e"
             case attempts = "f"
         }
-        
+
         /// The sequence identifier for the job used for ordering and tracking.
         public let sequenceId: Int
-        
+
         /// The task associated with the job containing the actual work to be performed.
         public var task: EncryptableTask
-        
+
         /// A Boolean indicating whether the job is a background task.
         public let isBackgroundTask: Bool
-        
+
         /// The date until which the job is delayed, if applicable.
         public var delayedUntil: Date?
-        
+
         /// The date and time when the job is scheduled for execution.
         public var scheduledAt: Date
-        
+
         /// The number of attempts made to execute the job.
         public var attempts: Int
-        
+
         /// Initializes a new instance of `UnwrappedProps`.
         /// - Parameters:
         ///   - sequenceId: The sequence identifier for the job.
@@ -253,7 +263,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             self.attempts = attempts
         }
     }
-    
+
     /// Initializes a new `JobModel` instance with encrypted properties.
     /// - Parameters:
     ///   - id: A unique identifier for the job model.
@@ -273,7 +283,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         }
         self.data = encryptedData
     }
-    
+
     /// Initializes a new `JobModel` instance with existing encrypted data.
     /// - Parameters:
     ///   - id: A unique identifier for the job model.
@@ -282,19 +292,19 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         self.id = id
         self.data = data
     }
-    
+
     /// Asynchronously decrypts the properties of the job model using the provided symmetric key.
     /// - Parameter symmetricKey: The symmetric key used for decryption.
     /// - Returns: The decrypted properties of the job model.
     /// - Throws: An error if decryption fails.
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         let crypto = NeedleTailCrypto()
-        guard let decrypted = try crypto.decrypt(data: self.data, symmetricKey: symmetricKey) else {
+        guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.decryptionFailed
         }
         return try BSONDecoder().decodeData(UnwrappedProps.self, from: decrypted)
     }
-    
+
     /// Asynchronously updates the properties of the model with new encrypted data.
     /// - Parameters:
     ///   - symmetricKey: The symmetric key used for encryption.
@@ -308,16 +318,16 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             throw CryptoError.encryptionFailed
         }
         self.data = encryptedData
-        return try await self.decryptProps(symmetricKey: symmetricKey)
+        return try await decryptProps(symmetricKey: symmetricKey)
     }
-    
+
     /// Creates a decrypted model of the specified type from the encrypted job data.
     /// - Parameters:
     ///   - of: The type of the model to create, which must conform to `Sendable` and `Codable`.
     ///   - symmetricKey: The symmetric key used for decryption.
     /// - Returns: An instance of the specified type containing the decrypted job properties.
     /// - Throws: An error if decryption fails or if the properties cannot be cast to the specified type.
-    public func makeDecryptedModel<T: Sendable & Codable>(of: T.Type, symmetricKey: SymmetricKey) async throws -> T {
+    public func makeDecryptedModel<T: Sendable & Codable>(of _: T.Type, symmetricKey: SymmetricKey) async throws -> T {
         guard let props = await props(symmetricKey: symmetricKey) else {
             throw Errors.propsError
         }
@@ -327,9 +337,10 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             isBackgroundTask: props.isBackgroundTask,
             task: props.task,
             scheduledAt: props.scheduledAt,
-            attempts: props.attempts) as! T
+            attempts: props.attempts
+        ) as! T
     }
-    
+
     /// Private error types for internal use within the JobModel.
     private enum Errors: Error {
         case propsError

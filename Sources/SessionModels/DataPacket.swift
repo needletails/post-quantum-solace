@@ -2,7 +2,16 @@
 //  DataPacket.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 6/29/25.
+//  Created by Cole M on 2025-06-29.
+//
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
 //
 import Foundation
 
@@ -32,11 +41,11 @@ public struct DataPacket: Codable, Sendable {
     /// A unique identifier for the data packet.
     /// Used for tracking, deduplication, and correlation of related packets.
     public let id: UUID
-    
+
     /// The actual data contained in the packet.
     /// This typically contains encrypted message content or other secure data.
     public var data: Data
-    
+
     /// Initializes a new instance of `DataPacket`.
     ///
     /// Creates a data packet with the specified identifier and data payload.

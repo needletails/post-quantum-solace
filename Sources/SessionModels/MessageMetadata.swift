@@ -2,7 +2,17 @@
 //  MessageMetadata.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 9/29/24.
+//  Created by Cole M on 2024-09-29.
+//
+//  Copyright (c) 2025 NeedleTails Organization.
+//
+//  This project is licensed under the AGPL-3.0 License.
+//
+//  See the LICENSE file for more information.
+//
+//  This file is part of the Post-Quantum Solace SDK, which provides
+//  post-quantum cryptographic session management capabilities.
+//
 //
 import Foundation
 
@@ -48,21 +58,20 @@ import Foundation
 /// - JSON/BSON encoding
 /// - Message synchronization between devices
 public struct MessageMetadata: Sendable, Codable {
-    
     /// A Boolean value indicating whether the user has marked the message as pinned.
     ///
     /// When `true`, this indicates that the user has explicitly pinned the message for easy access.
     /// Pinned messages are typically displayed prominently in the user interface and may be
     /// organized separately from regular messages.
     public var userMarkedPinned: Bool
-    
+
     /// A Boolean value indicating whether the user has marked the message as read.
     ///
     /// When `true`, this indicates that the user has viewed or acknowledged the message content.
     /// This state is typically used to determine unread message counts and visual indicators
     /// in the user interface.
     public var userMarkedRead: Bool
-    
+
     /// Initializes a new instance of `MessageMetadata`.
     ///
     /// - Parameters:
@@ -77,25 +86,25 @@ public struct MessageMetadata: Sendable, Codable {
         self.userMarkedPinned = userMarkedPinned
         self.userMarkedRead = userMarkedRead
     }
-    
+
     /// Creates a copy of the current metadata with updated pinned state.
     ///
     /// - Parameter isPinned: The new pinned state for the message.
     /// - Returns: A new `MessageMetadata` instance with the updated pinned state.
     public func updatingPinnedState(_ isPinned: Bool) -> MessageMetadata {
-        return MessageMetadata(
+        MessageMetadata(
             userMarkedPinned: isPinned,
-            userMarkedRead: self.userMarkedRead
+            userMarkedRead: userMarkedRead
         )
     }
-    
+
     /// Creates a copy of the current metadata with updated read state.
     ///
     /// - Parameter isRead: The new read state for the message.
     /// - Returns: A new `MessageMetadata` instance with the updated read state.
     public func updatingReadState(_ isRead: Bool) -> MessageMetadata {
-        return MessageMetadata(
-            userMarkedPinned: self.userMarkedPinned,
+        MessageMetadata(
+            userMarkedPinned: userMarkedPinned,
             userMarkedRead: isRead
         )
     }

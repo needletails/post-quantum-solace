@@ -2,7 +2,7 @@
 //  ContactMetadata.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 6/29/25.
+//  Created by Cole M on 2025-06-29.
 //
 //  Copyright (c) 2025 NeedleTails Organization.
 //
@@ -51,27 +51,27 @@ public struct ContactMetadata: Codable, Sendable {
     /// The contact's current status or availability.
     /// Examples: "Online", "Away", "Busy", "Do Not Disturb"
     public var status: String?
-    
+
     /// The contact's preferred display name or nickname.
     /// This is typically used in the UI instead of the full name.
     public var nickname: String?
-    
+
     /// The contact's first name.
     public var firstName: String?
-    
+
     /// The contact's last name.
     public var lastName: String?
-    
+
     /// The contact's email address.
     public var email: String?
-    
+
     /// The contact's phone number.
     public var phone: String?
-    
+
     /// The contact's profile image data.
     /// Should contain image data in a common format (JPEG, PNG, etc.)
     public var image: Data?
-    
+
     /// Initializes a new instance of `ContactMetadata`.
     ///
     /// Creates a contact metadata object with the specified values. All parameters are optional
@@ -94,7 +94,7 @@ public struct ContactMetadata: Codable, Sendable {
         self.phone = phone
         self.image = image
     }
-    
+
     /// Returns a new `ContactMetadata` instance with the updated status.
     ///
     /// Creates a copy of the current metadata with the specified status while preserving
@@ -103,17 +103,17 @@ public struct ContactMetadata: Codable, Sendable {
     /// - Parameter status: The new status to set
     /// - Returns: A new `ContactMetadata` instance with the updated status
     public func updating(status: String) -> ContactMetadata {
-        return ContactMetadata(
+        ContactMetadata(
             status: status,
-            nickname: self.nickname,
-            firstName: self.firstName,
-            lastName: self.lastName,
-            email: self.email,
-            phone: self.phone,
-            image: self.image
+            nickname: nickname,
+            firstName: firstName,
+            lastName: lastName,
+            email: email,
+            phone: phone,
+            image: image
         )
     }
-    
+
     /// Returns a new `ContactMetadata` instance with the updated nickname.
     ///
     /// Creates a copy of the current metadata with the specified nickname while preserving
@@ -122,17 +122,17 @@ public struct ContactMetadata: Codable, Sendable {
     /// - Parameter nickname: The new nickname to set
     /// - Returns: A new `ContactMetadata` instance with the updated nickname
     public func updating(nickname: String) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
+        ContactMetadata(
+            status: status,
             nickname: nickname,
-            firstName: self.firstName,
-            lastName: self.lastName,
-            email: self.email,
-            phone: self.phone,
-            image: self.image
+            firstName: firstName,
+            lastName: lastName,
+            email: email,
+            phone: phone,
+            image: image
         )
     }
-    
+
     /// Returns a new `ContactMetadata` instance with the updated first name.
     ///
     /// Creates a copy of the current metadata with the specified first name while preserving
@@ -141,17 +141,17 @@ public struct ContactMetadata: Codable, Sendable {
     /// - Parameter firstName: The new first name to set
     /// - Returns: A new `ContactMetadata` instance with the updated first name
     public func updating(firstName: String) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
-            nickname: self.nickname,
+        ContactMetadata(
+            status: status,
+            nickname: nickname,
             firstName: firstName,
-            lastName: self.lastName,
-            email: self.email,
-            phone: self.phone,
-            image: self.image
+            lastName: lastName,
+            email: email,
+            phone: phone,
+            image: image
         )
     }
-    
+
     /// Returns a new `ContactMetadata` instance with the updated last name.
     ///
     /// Creates a copy of the current metadata with the specified last name while preserving
@@ -160,17 +160,17 @@ public struct ContactMetadata: Codable, Sendable {
     /// - Parameter lastName: The new last name to set
     /// - Returns: A new `ContactMetadata` instance with the updated last name
     public func updating(lastName: String) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
-            nickname: self.nickname,
-            firstName: self.firstName,
+        ContactMetadata(
+            status: status,
+            nickname: nickname,
+            firstName: firstName,
             lastName: lastName,
-            email: self.email,
-            phone: self.phone,
-            image: self.image
+            email: email,
+            phone: phone,
+            image: image
         )
     }
-    
+
     /// Returns a new `ContactMetadata` instance with the updated email address.
     ///
     /// Creates a copy of the current metadata with the specified email address while preserving
@@ -179,17 +179,17 @@ public struct ContactMetadata: Codable, Sendable {
     /// - Parameter email: The new email address to set
     /// - Returns: A new `ContactMetadata` instance with the updated email address
     public func updating(email: String) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
-            nickname: self.nickname,
-            firstName: self.firstName,
-            lastName: self.lastName,
+        ContactMetadata(
+            status: status,
+            nickname: nickname,
+            firstName: firstName,
+            lastName: lastName,
             email: email,
-            phone: self.phone,
-            image: self.image
+            phone: phone,
+            image: image
         )
     }
-    
+
     /// Returns a new `ContactMetadata` instance with the updated phone number.
     ///
     /// Creates a copy of the current metadata with the specified phone number while preserving
@@ -198,17 +198,17 @@ public struct ContactMetadata: Codable, Sendable {
     /// - Parameter phone: The new phone number to set
     /// - Returns: A new `ContactMetadata` instance with the updated phone number
     public func updating(phone: String) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
-            nickname: self.nickname,
-            firstName: self.firstName,
-            lastName: self.lastName,
-            email: self.email,
+        ContactMetadata(
+            status: status,
+            nickname: nickname,
+            firstName: firstName,
+            lastName: lastName,
+            email: email,
             phone: phone,
-            image: self.image
+            image: image
         )
     }
-    
+
     /// Returns a new `ContactMetadata` instance with the updated image data.
     ///
     /// Creates a copy of the current metadata with the specified image data while preserving
@@ -217,13 +217,13 @@ public struct ContactMetadata: Codable, Sendable {
     /// - Parameter image: The new image data to set
     /// - Returns: A new `ContactMetadata` instance with the updated image data
     public func updating(image: Data) -> ContactMetadata {
-        return ContactMetadata(
-            status: self.status,
-            nickname: self.nickname,
-            firstName: self.firstName,
-            lastName: self.lastName,
-            email: self.email,
-            phone: self.phone,
+        ContactMetadata(
+            status: status,
+            nickname: nickname,
+            firstName: firstName,
+            lastName: lastName,
+            email: email,
+            phone: phone,
             image: image
         )
     }

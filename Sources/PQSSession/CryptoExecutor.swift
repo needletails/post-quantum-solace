@@ -2,7 +2,7 @@
 //  CryptoExecutor.swift
 //  post-quantum-solace
 //
-//  Created by Cole M on 4/19/25.
+//  Created by Cole M on 2025-04-19.
 //
 //  Copyright (c) 2025 NeedleTail Organization. All rights reserved.
 //
@@ -60,7 +60,6 @@ import NeedleTailAsyncSequence
  * - Consider using different executors for different types of cryptographic operations
  */
 final class CryptoExecutor: AnyExecutor {
-    
     /**
      * The dispatch queue on which all cryptographic operations are executed.
      *
@@ -69,7 +68,7 @@ final class CryptoExecutor: AnyExecutor {
      * security isolation.
      */
     let queue: DispatchQueue
-    
+
     /**
      * Determines whether jobs should be executed as tasks or serial operations.
      *
@@ -80,7 +79,7 @@ final class CryptoExecutor: AnyExecutor {
      * Default value is `true` for better performance and integration.
      */
     let shouldExecuteAsTask: Bool
-    
+
     /**
      * Initializes a new crypto executor with the specified queue and execution mode.
      *
@@ -97,7 +96,7 @@ final class CryptoExecutor: AnyExecutor {
         self.queue = queue
         self.shouldExecuteAsTask = shouldExecuteAsTask
     }
-    
+
     /**
      * Creates an unowned task executor for use with Swift concurrency.
      *
@@ -110,7 +109,7 @@ final class CryptoExecutor: AnyExecutor {
     func asUnownedTaskExecutor() -> UnownedTaskExecutor {
         UnownedTaskExecutor(ordinary: self)
     }
-    
+
     /**
      * Verifies that the current execution context is on the correct dispatch queue.
      *
@@ -134,7 +133,7 @@ final class CryptoExecutor: AnyExecutor {
     func checkIsolated() {
         dispatchPrecondition(condition: .onQueue(queue))
     }
-    
+
     /**
      * Enqueues a cryptographic job for execution on the dedicated queue.
      *
@@ -161,16 +160,16 @@ final class CryptoExecutor: AnyExecutor {
      */
     func enqueue(_ job: consuming ExecutorJob) {
         let job = UnownedJob(job)
-        self.queue.async { [weak self] in
+        queue.async { [weak self] in
             guard let self else { return }
-            if self.shouldExecuteAsTask {
-                job.runSynchronously(on: self.asUnownedTaskExecutor())
+            if shouldExecuteAsTask {
+                job.runSynchronously(on: asUnownedTaskExecutor())
             } else {
-                job.runSynchronously(on: self.asUnownedSerialExecutor())
+                job.runSynchronously(on: asUnownedSerialExecutor())
             }
         }
     }
-    
+
     /**
      * Creates an unowned serial executor for serial job execution.
      *
