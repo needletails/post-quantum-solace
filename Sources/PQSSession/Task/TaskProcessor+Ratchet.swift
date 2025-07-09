@@ -221,13 +221,11 @@ extension TaskProcessor: SessionIdentityDelegate {
         case let .writeMessage(outboundTask):
             try await handleWriteMessage(
                 outboundTask: outboundTask,
-                session: session
-            )
+                session: session)
         case let .streamMessage(inboundTask):
             try await handleStreamMessage(
                 inboundTask: inboundTask,
-                session: session
-            )
+                session: session)
         }
     }
 
@@ -354,37 +352,30 @@ extension TaskProcessor: SessionIdentityDelegate {
             } catch {}
         }
 
-        let publicKey = try Curve25519PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.longTermPrivateKey).publicKey.rawRepresentation
-
         try await ratchetManager.senderInitialization(
             sessionIdentity: sessionIdentity,
             sessionSymmetricKey: databaseSymmetricKey,
             remoteKeys: RemoteKeys(
                 longTerm: .init(props.state?.remoteLongTermPublicKey ?? props.longTermPublicKey),
                 oneTime: remoteOneTimePublicKey,
-                pqKem: props.pqKemPublicKey
-            ),
+                pqKem: props.pqKemPublicKey),
             localKeys: LocalKeys(
                 longTerm: .init(sessionContext.sessionUser.deviceKeys.longTermPrivateKey),
                 oneTime: localOneTimePrivateKey,
-                pqKem: localPQKemPrivateKey
-            )
-        )
+                pqKem: localPQKemPrivateKey))
 
-        if props.state == nil || needsRemoteDeletion {
-//            try await removeUsedKeys(
-//                session: session,
-//                sessionContext: sessionContext,
-//                localOneTimePrivateKey: localOneTimePrivateKey,
-//                localPQKemPrivateKey: localPQKemPrivateKey)
+        if needsRemoteDeletion {
+            try await removeKeys(
+                session: session,
+                curveId: localOneTimePrivateKey?.id.uuidString,
+                kyberId: localPQKemPrivateKey.id.uuidString)
             needsRemoteDeletion = false
         }
 
         if let sessionDelegate = await session.sessionDelegate {
             outboundTask.message = sessionDelegate.updateCryptoMessageMetadata(
                 outboundTask.message,
-                sharedMessageId: outboundTask.sharedId
-            )
+                sharedMessageId: outboundTask.sharedId)
         }
 
         let encodedData = try BSONEncoder().encodeData(outboundTask.message)
@@ -397,8 +388,7 @@ extension TaskProcessor: SessionIdentityDelegate {
             recipient: outboundTask.message.recipient,
             transportMetadata: outboundTask.message.transportInfo,
             sharedMessageId: outboundTask.sharedId,
-            synchronizationKeyIds: identities
-        ))
+            synchronizationKeyIds: identities))
     }
 
     // MARK: - Inbound Message Handling
@@ -445,8 +435,7 @@ extension TaskProcessor: SessionIdentityDelegate {
         try await initializeRecipient(
             sessionIdentity: sessionIdentity,
             session: session,
-            ratchetMessage: ratchetMessage
-        )
+            ratchetMessage: ratchetMessage)
 
         let decryptedData = try await ratchetManager.ratchetDecrypt(ratchetMessage)
         let decodedMessage = try BSONDecoder().decode(CryptoMessage.self, from: Document(data: decryptedData))
@@ -457,12 +446,17 @@ extension TaskProcessor: SessionIdentityDelegate {
             canSaveMessage = await sessionDelegate.processUnpersistedMessage(
                 decodedMessage,
                 senderSecretName: inboundTask.senderSecretName,
-                senderDeviceId: inboundTask.senderDeviceId
-            )
+                senderDeviceId: inboundTask.senderDeviceId)
         }
 
         if let transportInfo = decodedMessage.transportInfo {
-            try await removeKeys(session: session, transportInfo: transportInfo)
+            guard let keys = try? BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: transportInfo) else {
+                return
+            }
+            try await removeKeys(
+                session: session,
+                curveId: keys.recipientCurveId,
+                kyberId: keys.recipientKyberId)
         }
 
         if canSaveMessage {
@@ -471,16 +465,11 @@ extension TaskProcessor: SessionIdentityDelegate {
                 decodedMessage,
                 inboundTask: inboundTask,
                 session: session,
-                sessionIdentity: sessionIdentity
-            )
+                sessionIdentity: sessionIdentity)
         }
     }
 
-    private func removeKeys(session: PQSSession, transportInfo: Data) async throws {
-        // If we can’t decode SynchronizationKeyIdentities, just ignore & return
-        guard let keys = try? BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: transportInfo) else {
-            return
-        }
+    private func removeKeys(session: PQSSession, curveId: String?, kyberId: String) async throws {
 
         guard let cache = await session.cache else { return }
         let data = try await cache.fetchLocalSessionContext()
@@ -493,14 +482,16 @@ extension TaskProcessor: SessionIdentityDelegate {
         // Decode the session context from the decrypted data
         var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
 
-        try await delegate?.deleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: keys.recipientCurveId, type: .curve)
-        try await delegate?.deleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: keys.recipientKyberId, type: .kyber)
+        if let curveId {
+            try await delegate?.deleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: curveId, type: .curve)
+        }
+        try await delegate?.deleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: kyberId, type: .kyber)
         logger.log(level: .info, message: "Requested to Remove Remote Public Curve and Kyber One Time Keys")
 
-        sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll(where: { $0.id.uuidString == keys.recipientCurveId })
-        sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.removeAll(where: { $0.id.uuidString == keys.recipientKyberId })
-        sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll(where: { $0.id.uuidString == keys.recipientCurveId })
-        sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.removeAll(where: { $0.id.uuidString == keys.recipientKyberId })
+        sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll(where: { $0.id.uuidString == curveId })
+        sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.removeAll(where: { $0.id.uuidString == kyberId })
+        sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll(where: { $0.id.uuidString == curveId })
+        sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.removeAll(where: { $0.id.uuidString == kyberId })
 
         await session.setSessionContext(sessionContext)
 
@@ -580,30 +571,18 @@ extension TaskProcessor: SessionIdentityDelegate {
             localOneTimePrivateKey = state.localOneTimePrivateKey
             localPQKemPrivateKey = state.localPQKemPrivateKey
         }
-        let publicKey = try Curve25519PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.longTermPrivateKey).publicKey.rawRepresentation
-
+        
         try await ratchetManager.recipientInitialization(
             sessionIdentity: sessionIdentity,
             sessionSymmetricKey: databaseSymmetricKey,
             remoteKeys: RemoteKeys(
                 longTerm: .init(ratchetMessage.header.remoteLongTermPublicKey),
                 oneTime: ratchetMessage.header.remoteOneTimePublicKey,
-                pqKem: ratchetMessage.header.remotePQKemPublicKey
-            ),
+                pqKem: ratchetMessage.header.remotePQKemPublicKey),
             localKeys: LocalKeys(
                 longTerm: .init(sessionContext.sessionUser.deviceKeys.longTermPrivateKey),
                 oneTime: localOneTimePrivateKey,
-                pqKem: localPQKemPrivateKey
-            )
-        )
-
-//        if props.state == nil {
-//            try await removeUsedKeys(
-//                session: session,
-//                sessionContext: sessionContext,
-//                localOneTimePrivateKey: localOneTimePrivateKey,
-//                localPQKemPrivateKey: localPQKemPrivateKey)
-//        }
+                pqKem: localPQKemPrivateKey))
     }
 
     /// Handles the processing of a decoded message, specifically for private messages,
@@ -891,7 +870,7 @@ extension TaskProcessor: SessionIdentityDelegate {
             guard try signedMessage.verifySignature(using: rotatedKey) else {
                 throw PQSSession.SessionErrors.invalidSignature
             }
-
+          
             return try decode(signedMessage)
         }
         func decode(_ signedMessage: SignedRatchetMessage.Signed) throws -> (RatchetMessage, SessionIdentity) {

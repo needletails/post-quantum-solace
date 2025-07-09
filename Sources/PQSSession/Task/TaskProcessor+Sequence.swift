@@ -159,6 +159,7 @@ extension TaskProcessor {
                     logger.log(level: .error, message: "Removing Job due to: \(sessionError)")
                     try? await cache.deleteJob(job)
                 } catch {
+                    
                     logger.log(level: .error, message: "Job error \(error)")
 
                     if await jobConsumer.deque.isEmpty || Task.isCancelled {

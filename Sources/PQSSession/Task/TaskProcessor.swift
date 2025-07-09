@@ -496,7 +496,7 @@ public actor TaskProcessor {
 
         for identity in sessionIdentities {
             if let unwrappedEncryptableMessage = encryptableMessage {
-                encryptableMessage = try await session.sessionDelegate?.updateEncryptableMessageMetadata(
+                encryptableMessage = await session.sessionDelegate?.updateEncryptableMessageMetadata(
                     unwrappedEncryptableMessage,
                     transportInfo: message.transportInfo,
                     identity: identity,

@@ -25,86 +25,95 @@ import NeedleTailCrypto
 import Testing
 
 @Suite(.serialized)
-class EndToEndTests: @unchecked Sendable {
+actor EndToEndTests {
     let crypto = NeedleTailCrypto()
-    let _senderSession = PQSSession()
-    let _recipientSession = PQSSession()
+    var _senderSession = PQSSession()
+    var _recipientSession = PQSSession()
     let sMockUserData: MockUserData
     let rMockUserData: MockUserData
     let transport = _MockTransportDelegate()
-
+    var senderReceiver = ReceiverDelegate()
+    var recipientReceiver = ReceiverDelegate()
+    let bobProcessedRotated = ContinuationSignal()
+    let aliceProcessedRotated = ContinuationSignal()
+    let aliceProcessedBobRotation = ContinuationSignal() // NEW SIGNAL
+    
     var aliceStreamContinuation: AsyncStream<ReceivedMessage>.Continuation? {
         didSet { transport.aliceStreamContinuation = aliceStreamContinuation }
     }
-
+    
     var bobStreamContinuation: AsyncStream<ReceivedMessage>.Continuation? {
         didSet { transport.bobStreamContinuation = bobStreamContinuation }
     }
-
+    private let bobProcessedThree = ContinuationSignal()
+    private let aliceProcessedSix = ContinuationSignal()
+    
     init() {
         sMockUserData = MockUserData(session: _senderSession)
         rMockUserData = MockUserData(session: _recipientSession)
     }
-
+    
     // MARK: - Helper Methods
-
+    
     func createSenderStore() -> MockIdentityStore {
         sMockUserData.identityStore(isSender: true)
     }
-
+    
     func createRecipientStore() -> MockIdentityStore {
         rMockUserData.identityStore(isSender: false)
     }
-
+    
     func createSenderSession(store: MockIdentityStore) async throws {
         store.localDeviceSalt = "testSalt1"
         await _senderSession.setLogLevel(.trace)
         await _senderSession.setDatabaseDelegate(conformer: store)
         await _senderSession.setTransportDelegate(conformer: transport)
         await _senderSession.setPQSSessionDelegate(conformer: SessionDelegate())
-
+        
         _senderSession.isViable = true
-        await _senderSession.setReceiverDelegate(conformer: ReceiverDelegate())
+        await _senderSession.setReceiverDelegate(conformer: senderReceiver)
         transport.publishableName = sMockUserData.ssn
-        _ = try await _senderSession.createSession(secretName: sMockUserData.ssn, appPassword: sMockUserData.sap) {}
+        _senderSession = try await _senderSession.createSession(secretName: sMockUserData.ssn, appPassword: sMockUserData.sap) {}
         await _senderSession.setAppPassword(sMockUserData.sap)
-        _ = try await _senderSession.startSession(appPassword: sMockUserData.sap)
+        _senderSession = try await _senderSession.startSession(appPassword: sMockUserData.sap)
+        try await senderReceiver.setKey(_senderSession.getDatabaseSymmetricKey())
     }
-
+    
     func createRecipientSession(store: MockIdentityStore) async throws {
         store.localDeviceSalt = "testSalt2"
         await _recipientSession.setLogLevel(.trace)
         await _recipientSession.setDatabaseDelegate(conformer: store)
         await _recipientSession.setTransportDelegate(conformer: transport)
         await _recipientSession.setPQSSessionDelegate(conformer: SessionDelegate())
-
+        
         _recipientSession.isViable = true
-        await _recipientSession.setReceiverDelegate(conformer: ReceiverDelegate())
+        await _recipientSession.setReceiverDelegate(conformer: recipientReceiver)
         transport.publishableName = rMockUserData.rsn
-        _ = try await _recipientSession.createSession(secretName: rMockUserData.rsn, appPassword: rMockUserData.sap) {}
+        _recipientSession = try await _recipientSession.createSession(secretName: rMockUserData.rsn, appPassword: rMockUserData.sap) {}
         await _recipientSession.setAppPassword(rMockUserData.sap)
-        _ = try await _recipientSession.startSession(appPassword: rMockUserData.sap)
+        _recipientSession = try await _recipientSession.startSession(appPassword: rMockUserData.sap)
+        try await recipientReceiver.setKey(_recipientSession.getDatabaseSymmetricKey())
     }
-
+    
     // MARK: - Test Methods
-
+    
     @Test
     func ratchetManagerReCreation() async throws {
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
             self.aliceStreamContinuation = continuation
         }
-
+        
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             self.bobStreamContinuation = continuation
         }
-
+        
         await #expect(throws: Never.self, "Session initialization and first message should complete without errors") {
             let senderStore = self.createSenderStore()
             let recipientStore = self.createRecipientStore()
-
+            
             try await self.createSenderSession(store: senderStore)
             try await self.createRecipientSession(store: recipientStore)
-
+            
             try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Message One", metadata: [:])
         }
         Task {
@@ -118,7 +127,7 @@ class EndToEndTests: @unchecked Sendable {
                         deviceId: received.deviceId,
                         messageId: received.messageId
                     )
-
+                    
                     if aliceIterations == 2 {
                         try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Message Four", metadata: [:])
                         try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Message Five", metadata: [:])
@@ -126,7 +135,7 @@ class EndToEndTests: @unchecked Sendable {
                 }
             }
         }
-
+        
         await #expect(throws: Never.self, "Bob's message processing loop should handle received messages and send replies without errors") {
             var bobIterations = 0
             for await received in bobStream {
@@ -137,12 +146,12 @@ class EndToEndTests: @unchecked Sendable {
                     deviceId: received.deviceId,
                     messageId: received.messageId
                 )
-
+                
                 if bobIterations == 1 {
                     try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Message Two", metadata: [:])
                     try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Message Three", metadata: [:])
                 }
-
+                
                 if bobIterations == 3 {
                     self.aliceStreamContinuation?.finish()
                     self.bobStreamContinuation?.finish()
@@ -152,15 +161,15 @@ class EndToEndTests: @unchecked Sendable {
             await self._recipientSession.shutdown()
         }
     }
-
+    
     @Test
     func thousandMessageExchange() async throws {
         let totalMessages = 1000
-
+        
         // 1) Create stores & streams
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
-
+        
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
             self.aliceStreamContinuation = continuation
         }
@@ -171,7 +180,7 @@ class EndToEndTests: @unchecked Sendable {
             // 2) Initialize sessions (PQXDH handshake)
             try await self.createSenderSession(store: senderStore)
             try await self.createRecipientSession(store: recipientStore)
-
+            
             // 3) Kick off the very first message from Alice → Bob
             try await self._senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
@@ -185,7 +194,7 @@ class EndToEndTests: @unchecked Sendable {
                 var bobReceivedCount = 0
                 for await received in bobStream {
                     bobReceivedCount += 1
-
+                    
                     // Process incoming
                     try await self._recipientSession.receiveMessage(
                         message: received.message,
@@ -193,7 +202,7 @@ class EndToEndTests: @unchecked Sendable {
                         deviceId: received.deviceId,
                         messageId: received.messageId
                     )
-
+                    
                     // If Bob still needs to send more, reply with next number
                     if bobReceivedCount < totalMessages {
                         let next = bobReceivedCount * 2 // Bob sends even‑numbered msgs
@@ -210,7 +219,7 @@ class EndToEndTests: @unchecked Sendable {
                 }
             }
         }
-
+        
         // 5) Alice's receive‑and‑reply loop
         var aliceReceivedCount = 0
         for await received in aliceStream {
@@ -223,7 +232,7 @@ class EndToEndTests: @unchecked Sendable {
                     deviceId: received.deviceId,
                     messageId: received.messageId
                 )
-
+                
                 // If Alice still needs to send more, reply with next odd number
                 if aliceReceivedCount < totalMessages {
                     let next = aliceReceivedCount * 2 + 1 // Alice sends odd‑numbered msgs
@@ -235,30 +244,30 @@ class EndToEndTests: @unchecked Sendable {
                 }
             }
         }
-
+        
         // 6) Cleanly shut down both sessions
         await _senderSession.shutdown()
         await _recipientSession.shutdown()
     }
-
+    
     @Test
     func outOfOrderMessagesHandledCorrectly() async throws {
         await #expect(throws: Never.self, "Out-of-order test: session setup, message send, and out-of-order receive should not throw") {
             let senderStore = self.createSenderStore()
             let recipientStore = self.createRecipientStore()
-
+            
             // 1) Set up a single AsyncStream on the recipient side
             let stream = AsyncStream<ReceivedMessage> { continuation in
                 self.bobStreamContinuation = continuation
             }
-
+            
             // 2) Do the PQXDH handshake before sending any data
             try await self.createSenderSession(store: senderStore)
             try await self.createRecipientSession(store: recipientStore)
-
+            
             // 3) Prepare 79 distinct messages
             let messages = (0 ..< 79).map { "Out‑of‑order Message \($0)" }
-
+            
             // 4) Send them all (in-order) from Alice → Bob
             for text in messages {
                 try await self._senderSession.writeTextMessage(
@@ -267,7 +276,7 @@ class EndToEndTests: @unchecked Sendable {
                     metadata: [:]
                 )
             }
-
+            
             // 5) Collect exactly 79 ReceivedMessage frames from the stream …
             var collected: [ReceivedMessage] = []
             for await received in stream {
@@ -278,7 +287,7 @@ class EndToEndTests: @unchecked Sendable {
                     break
                 }
             }
-
+            
             // 6) Now actually feed them into Bob's ratchet out‑of‑order:
             //    first the very first message he should ever see…
             let first = collected.removeFirst()
@@ -288,7 +297,7 @@ class EndToEndTests: @unchecked Sendable {
                 deviceId: first.deviceId,
                 messageId: first.messageId
             )
-
+            
             //    …then the rest in a random order:
             for msg in collected.shuffled() {
                 try await self._recipientSession.receiveMessage(
@@ -300,25 +309,25 @@ class EndToEndTests: @unchecked Sendable {
             }
         }
     }
-
+    
     @Test
-    func ratchetManagerReCreationReKey() async throws {
+    func testRatchetManagerReCreationReKey() async throws {
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
-
+        
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
             self.aliceStreamContinuation = continuation
         }
-
+        
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             self.bobStreamContinuation = continuation
         }
         await #expect(throws: Never.self, "Session initialization and first message should complete without errors (rekey test)") {
             try await self.createSenderSession(store: senderStore)
             try await self.createRecipientSession(store: recipientStore)
-
             try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Message One", metadata: [:])
         }
+        // Alice's receive loop
         Task {
             await #expect(throws: Never.self, "Alice's message processing loop should handle received messages and key rotation without errors") {
                 var aliceIterations = 0
@@ -328,26 +337,24 @@ class EndToEndTests: @unchecked Sendable {
                         message: received.message,
                         sender: received.sender,
                         deviceId: received.deviceId,
-                        messageId: received.messageId
-                    )
-
-                    if aliceIterations == 1 {
-                        try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Message Five", metadata: [:])
-                    }
-
+                        messageId: received.messageId)
+                    // First user message (after protocol message)
                     if aliceIterations == 2 {
                         try await self._senderSession.rotateKeysOnPotentialCompromise()
-                        try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Message Five", metadata: [:])
+                        try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Message Three", metadata: [:])
+                        await self.bobProcessedRotated.wait()
                     }
-
-                    if aliceIterations == 8 {
-                        try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Message Five", metadata: [:])
-                        try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Message Five", metadata: [:])
+                    // After Bob's post-rotation message
+                    if aliceIterations == 3 {
+                        await self.aliceProcessedBobRotation.signal()
+                        self.aliceStreamContinuation?.finish()
+                        self.bobStreamContinuation?.finish()
                     }
                 }
+                await self._senderSession.shutdown()
             }
         }
-
+        // Bob's receive loop
         var bobIterations = 0
         for await received in bobStream {
             bobIterations += 1
@@ -356,56 +363,77 @@ class EndToEndTests: @unchecked Sendable {
                     message: received.message,
                     sender: received.sender,
                     deviceId: received.deviceId,
-                    messageId: received.messageId
-                )
-
-                if bobIterations == 1 {
-                    try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Message Two", metadata: [:])
-                }
-
+                    messageId: received.messageId)
+                // First user message (after protocol message)
                 if bobIterations == 2 {
+                    await self.bobProcessedRotated.signal()
                     try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Message Two", metadata: [:])
                 }
-
+                // After Alice's post-rotation message
                 if bobIterations == 3 {
                     try await self._recipientSession.rotateKeysOnPotentialCompromise()
-                    try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Message Two", metadata: [:])
-                    try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Message Two", metadata: [:])
-                    try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Message Two", metadata: [:])
-                    try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Message Two", metadata: [:])
-                    try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Message Two", metadata: [:])
-                    try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Message Two", metadata: [:])
+                    try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Message Four", metadata: [:])
+                    await self.aliceProcessedBobRotation.wait()
+                    self.bobStreamContinuation?.finish()
+                    self.aliceStreamContinuation?.finish()
                 }
             }
-            if bobIterations == 4 {
-                aliceStreamContinuation?.finish()
-                bobStreamContinuation?.finish()
-            }
         }
-        await _senderSession.shutdown()
-        await _recipientSession.shutdown()
+        await self._recipientSession.shutdown()
+    }
+}
+
+actor ContinuationSignal {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var pendingSignals = 0
+    
+    func wait() async {
+        if pendingSignals > 0 {
+            pendingSignals -= 1
+            return
+        }
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            continuation = c
+        }
+    }
+    
+    func signal() {
+        if let c = continuation {
+            continuation = nil
+            c.resume()
+        } else {
+            pendingSignals += 1
+        }
     }
 }
 
 // MARK: - Supporting Types
 
 struct SessionDelegate: PQSSessionDelegate {
+    
     func synchronizeCommunication(recipient _: SessionModels.MessageRecipient, sharedIdentifier _: String) async throws {}
-    func handleBlockUnblock(recipient _: SessionModels.MessageRecipient, blockData _: Data?, metadata _: BSON.Document, currentState _: SessionModels.FriendshipMetadata.State) async throws {}
+    func requestFriendshipStateChange(recipient: SessionModels.MessageRecipient, blockData: Data?, metadata: BSON.Document, currentState: SessionModels.FriendshipMetadata.State) async throws {}
     func deliveryStateChanged(recipient _: SessionModels.MessageRecipient, metadata _: BSON.Document) async throws {}
     func contactCreated(recipient _: SessionModels.MessageRecipient) async throws {}
     func requestMetadata(recipient _: SessionModels.MessageRecipient) async throws {}
     func editMessage(recipient _: SessionModels.MessageRecipient, metadata _: BSON.Document) async throws {}
     func shouldPersist(transportInfo _: Data?) -> Bool { true }
-    func retrieveUserInfo(_: Data?) async throws -> (secretName: String, deviceId: String)? { nil }
-    func updateCryptoMessageMetadata(_ message: SessionModels.CryptoMessage, sharedMessageId _: String) throws -> SessionModels.CryptoMessage { message }
-    func updateEncryptableMessageMetadata(_ message: SessionModels.EncryptedMessage, transportInfo _: Data?, identity _: DoubleRatchetKit.SessionIdentity, recipient _: SessionModels.MessageRecipient) async throws -> SessionModels.EncryptedMessage { message }
+    func retrieveUserInfo(_: Data?) async -> (secretName: String, deviceId: String)? { nil }
+    func updateCryptoMessageMetadata(_ message: SessionModels.CryptoMessage, sharedMessageId _: String) -> SessionModels.CryptoMessage { message }
+    func updateEncryptableMessageMetadata(_ message: SessionModels.EncryptedMessage, transportInfo _: Data?, identity _: DoubleRatchetKit.SessionIdentity, recipient _: SessionModels.MessageRecipient) async -> SessionModels.EncryptedMessage { message }
     func shouldFinishCommunicationSynchronization(_: Data?) -> Bool { false }
-    func processUnpersistedMessage(_: SessionModels.CryptoMessage, senderSecretName _: String, senderDeviceId _: UUID) async throws -> Bool { true }
+    func processUnpersistedMessage(_: SessionModels.CryptoMessage, senderSecretName _: String, senderDeviceId _: UUID) async -> Bool { true }
 }
 
-struct ReceiverDelegate: EventReceiver {
-    func createdMessage(_: SessionModels.EncryptedMessage) async {}
+actor ReceiverDelegate: EventReceiver {
+    
+    var key: SymmetricKey?
+    
+    func setKey(_ key: SymmetricKey) async {
+        self.key = key
+    }
+    
+    func createdMessage(_ message: SessionModels.EncryptedMessage) async {}
     func updatedMessage(_: SessionModels.EncryptedMessage) async {}
     func updateContact(_: SessionModels.Contact) async throws {}
     func contactMetadata(changed _: SessionModels.Contact) async {}
@@ -429,41 +457,41 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
         let id: String
         var keys: [UserConfiguration.SignedOneTimePublicKey]
     }
-
+    
     struct IdentifiableSignedKyberOneTimeKey {
         let id: String
         var keys: [UserConfiguration.SignedPQKemOneTimeKey]
     }
-
+    
     // MARK: - Properties
-
+    
     var oneTimePublicKeyPairs = [IdentifiableSignedoneTimePublicKey]()
     var kyberOneTimeKeyPairs = [IdentifiableSignedKyberOneTimeKey]()
     var publishableName: String!
     var userConfigurations = [User]()
     var aliceStreamContinuation: AsyncStream<ReceivedMessage>.Continuation?
     var bobStreamContinuation: AsyncStream<ReceivedMessage>.Continuation?
-
+    
     // MARK: - Used Methods
-
+    
     func fetchOneTimeKeys(for secretName: String, deviceId _: String) async throws -> SessionModels.OneTimeKeys {
         let config = userConfigurations.first(where: { $0.secretName == secretName })
         guard let signingKeyData = config?.config.signingPublicKey else { fatalError() }
         let signingKey = try Curve25519SigningPublicKey(rawRepresentation: signingKeyData)
-
+        
         guard let oneTimeKeyPairIndex = oneTimePublicKeyPairs.firstIndex(where: { $0.id == secretName }) else { fatalError() }
         let oneTimeKeyPair = oneTimePublicKeyPairs[oneTimeKeyPairIndex]
         guard let publicKey = try oneTimeKeyPair.keys.last?.verified(using: signingKey) else { fatalError() }
         oneTimePublicKeyPairs.remove(at: oneTimeKeyPairIndex)
-
+        
         guard let kyberKeyPairIndex = kyberOneTimeKeyPairs.firstIndex(where: { $0.id == secretName }) else { fatalError() }
         let kyberKeyPair = kyberOneTimeKeyPairs[kyberKeyPairIndex]
         guard let kyberKey = try kyberKeyPair.keys.last?.verified(using: signingKey) else { fatalError() }
         kyberOneTimeKeyPairs.remove(at: kyberKeyPairIndex)
-
+        
         return SessionModels.OneTimeKeys(curve: publicKey, kyber: kyberKey)
     }
-
+    
     func fetchOneTimeKeyIdentities(for secretName: String, deviceId _: String, type _: KeysType) async throws -> [UUID] {
         let config = userConfigurations.first(where: { $0.secretName == secretName })
         guard let signingKeyData = config?.config.signingPublicKey else { fatalError() }
@@ -479,37 +507,43 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
         }
         return verifiedIDs
     }
-
+    
     func publishUserConfiguration(_ configuration: SessionModels.UserConfiguration, recipient identity: UUID) async throws {
         userConfigurations.append(.init(secretName: publishableName, deviceId: identity, config: configuration))
         oneTimePublicKeyPairs.append(IdentifiableSignedoneTimePublicKey(id: publishableName, keys: configuration.signedOneTimePublicKeys))
         kyberOneTimeKeyPairs.append(IdentifiableSignedKyberOneTimeKey(id: publishableName, keys: configuration.signedPQKemOneTimePublicKeys))
     }
-
+    
     func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
         guard let sender = userConfigurations.first(where: { $0.secretName != metadata.secretName }) else { return }
-        let received = ReceivedMessage(message: message, sender: sender.secretName, deviceId: sender.deviceId, messageId: metadata.sharedMessageId)
-        if sender.secretName == "alice" {
-            bobStreamContinuation?.yield(received)
-        } else {
+        guard let recipient = userConfigurations.first(where: { $0.secretName == metadata.secretName }) else { return }
+        let received = ReceivedMessage(
+            message: message,
+            sender: sender.secretName,
+            deviceId: sender.deviceId,
+            messageId: metadata.sharedMessageId
+        )
+        if recipient.secretName == "alice" {
             aliceStreamContinuation?.yield(received)
+        } else if recipient.secretName == "bob" {
+            bobStreamContinuation?.yield(received)
         }
     }
-
+    
     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
         guard let userConfiguration = userConfigurations.first(where: { $0.secretName == secretName })?.config else {
             throw PQSSession.SessionErrors.userNotFound
         }
         return userConfiguration
     }
-
+    
     func findUserConfiguration(secretName: String) async throws -> UserConfiguration {
         guard let userConfiguration = userConfigurations.first(where: { $0.secretName == secretName })?.config else {
             throw PQSSession.SessionErrors.configurationError
         }
         return userConfiguration
     }
-
+    
     func publishRotatedKeys(for secretName: String, deviceId: String, rotated keys: SessionModels.RotatedPublicKeys) async throws {
         guard let index = userConfigurations.firstIndex(where: { $0.secretName == secretName }) else { fatalError() }
         var userConfig = userConfigurations[index]
@@ -522,9 +556,9 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
         userConfig.config.signingPublicKey = keys.pskData
         userConfigurations[index] = userConfig
     }
-
+    
     // MARK: - Unused Methods (Stubs)
-
+    
     func receiveMessage() async throws -> String { "" }
     func updateOneTimeKeys(for _: String, deviceId _: String, keys _: [SessionModels.UserConfiguration.SignedOneTimePublicKey]) async throws {}
     func updateOneTimePQKemKeys(for _: String, deviceId _: String, keys _: [SessionModels.UserConfiguration.SignedPQKemOneTimeKey]) async throws {}
@@ -536,7 +570,7 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
 
 final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
     // MARK: - Properties
-
+    
     var sessionContext: Data?
     var identities = [SessionIdentity]()
     let crypto = NeedleTailCrypto()
@@ -545,15 +579,16 @@ final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
     let isSender: Bool
     var localDeviceSalt: String?
     var encyrptedConfigurationForTesting = Data()
-
+    var createdMessages = [EncryptedMessage]()
+    
     init(mockUserData: MockUserData, session: PQSSession, isSender: Bool) {
         self.mockUserData = mockUserData
         self.session = session
         self.isSender = isSender
     }
-
+    
     // MARK: - Used Methods
-
+    
     func createLocalSessionContext(_ data: Data) async throws { sessionContext = data }
     func fetchLocalSessionContext() async throws -> Data { sessionContext! }
     func updateLocalSessionContext(_ data: Data) async throws { sessionContext = data }
@@ -565,18 +600,18 @@ final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
         identities.removeAll(where: { $0.id == session.id })
         identities.append(session)
     }
-
+    
     func createSessionIdentity(_ session: SessionIdentity) async throws { identities.append(session) }
     func fetchLocalDeviceSalt() async throws -> String {
         guard let salt = localDeviceSalt else { throw PQSSession.SessionErrors.saltError }
         return salt
     }
-
+    
     func findLocalDeviceConfiguration() async throws -> Data { encyrptedConfigurationForTesting }
     func createLocalDeviceConfiguration(_ configuration: Data) async throws { encyrptedConfigurationForTesting = configuration }
-
+    
     // MARK: - Unused Methods (Stubs)
-
+    
     func removeContact(_: UUID) async throws {}
     func deleteContact(_: UUID) async throws {}
     func deleteSessionIdentity(_: UUID) async throws {}
@@ -596,12 +631,14 @@ final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
     func fetchMessage(id _: UUID) async throws -> SessionModels.EncryptedMessage {
         try .init(id: UUID(), communicationId: UUID(), sessionContextId: 1, sharedId: "123", sequenceNumber: 1, data: Data())
     }
-
+    
     func fetchMessage(sharedId _: String) async throws -> SessionModels.EncryptedMessage {
         try .init(id: UUID(), communicationId: UUID(), sessionContextId: 1, sharedId: "123", sequenceNumber: 1, data: Data())
     }
-
-    func createMessage(_: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws {}
+    
+    func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {
+        createdMessages.append(message)
+    }
     func updateMessage(_: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws {}
     func removeMessage(_: SessionModels.EncryptedMessage) async throws {}
     func deleteMessage(_: SessionModels.EncryptedMessage) async throws {}
@@ -616,7 +653,7 @@ final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
         }
         return (stream, nil)
     }
-
+    
     func messageCount(sharedIdentifier _: UUID) async throws -> Int { 1 }
     func readJobs() async throws -> [SessionModels.JobModel] { [] }
     func fetchJobs() async throws -> [SessionModels.JobModel] { [] }
@@ -648,11 +685,11 @@ struct MockUserData {
     )
     let smi = "123456789"
     let session: PQSSession
-
+    
     init(session: PQSSession) {
         self.session = session
     }
-
+    
     func identityStore(isSender: Bool) -> MockIdentityStore {
         MockIdentityStore(mockUserData: self, session: session, isSender: isSender)
     }
@@ -669,3 +706,4 @@ extension Data {
         map { String(format: "%02hhx", $0) }.joined()
     }
 }
+

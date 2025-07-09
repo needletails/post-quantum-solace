@@ -461,7 +461,6 @@ public extension PQSSession {
             recipient: .nickname(secretName),
             text: "",
             transportInfo: metadata.makeData(),
-            metadata: metadata
-        )
+            metadata: metadata)
     }
 }

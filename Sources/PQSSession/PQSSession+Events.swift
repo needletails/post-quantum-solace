@@ -169,8 +169,7 @@ public extension PQSSession {
 
         try await taskProcessor.inboundTask(
             message,
-            session: self
-        )
+            session: self)
     }
 
     // MARK: Outbound
