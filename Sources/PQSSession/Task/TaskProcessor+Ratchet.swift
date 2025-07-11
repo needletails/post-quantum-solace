@@ -449,15 +449,12 @@ extension TaskProcessor: SessionIdentityDelegate {
                 senderDeviceId: inboundTask.senderDeviceId)
         }
 
-        if let transportInfo = decodedMessage.transportInfo {
-            guard let keys = try? BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: transportInfo) else {
-                return
+        if let transportInfo = decodedMessage.transportInfo, let keys = try? BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: transportInfo) {
+                try await removeKeys(
+                    session: session,
+                    curveId: keys.recipientCurveId,
+                    kyberId: keys.recipientKyberId)
             }
-            try await removeKeys(
-                session: session,
-                curveId: keys.recipientCurveId,
-                kyberId: keys.recipientKyberId)
-        }
 
         if canSaveMessage {
             /// Now we can handle the message
