@@ -139,11 +139,13 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     ///
     /// This initializer is provided to support the singleton pattern.
     /// In practice, you should always use `PQSSession.shared` instead.
-    public init() {}
+    public init() {
+        taskProcessor = TaskProcessor(logger: logger)
+    }
 
     private(set) var _sessionContext: SessionContext?
     private var _appPassword = ""
-    private(set) var taskProcessor = TaskProcessor()
+    private(set) var taskProcessor: TaskProcessor
     private(set) var transportDelegate: (any SessionTransport)?
     private(set) var receiverDelegate: (any EventReceiver)?
     private(set) var sessionDelegate: (any PQSSessionDelegate)?
@@ -185,10 +187,15 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     // Sets the logger log level
     public func setLogLevel(_ level: Logging.Logger.Level) async {
         logger.setLogLevel(level)
+        await taskProcessor.setLogLevel(level)
     }
 
     public func setAddingContact(_ data: Data?) async {
         addingContactData = data
+    }
+    
+    public func removeIdentity(with secretName: String) {
+        sessionIdentities.remove(secretName)
     }
 
     // Synchronizes the local configuration with the provided data
@@ -585,7 +592,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             deviceId: bundle.deviceConfiguration.deviceId,
             signingPublicKey: Data(),
             longTermPublicKey: Data(),
-            finalPQKemPublicKey: .init(Data()),
+            finalPQKemPublicKey: .init(Data(count: 1568)),
             deviceName: bundle.deviceConfiguration.deviceName,
             hmacData: bundle.deviceConfiguration.hmacData,
             isMasterDevice: bundle.deviceConfiguration.isMasterDevice
@@ -620,8 +627,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 signingPrivateKeyData: bundle.deviceKeys.signingPrivateKey,
                 devices: credentials.devices,
                 keys: bundle.userConfiguration.getVerifiedCurveKeys(deviceId: bundle.deviceKeys.deviceId),
-                pqKemKeys: bundle.userConfiguration.getVerifiedPQKemKeys(deviceId: bundle.deviceKeys.deviceId)
-            )
+                pqKemKeys: bundle.userConfiguration.getVerifiedPQKemKeys(deviceId: bundle.deviceKeys.deviceId))
 
             // Create a new session context with the session user and user configuration
             var sessionContext = SessionContext(
@@ -629,8 +635,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 databaseEncryptionKey: databaseEncryptionKey,
                 sessionContextId: .random(in: 1 ..< .max),
                 activeUserConfiguration: userConfiguration,
-                registrationState: .unregistered
-            )
+                registrationState: .unregistered)
 
             // Set the session context
             await setSessionContext(sessionContext)
@@ -644,8 +649,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             let saltData = try await cache.fetchLocalDeviceSalt(keyData: passwordData)
             let symmetricKey = await crypto.deriveStrictSymmetricKey(
                 data: passwordData,
-                salt: saltData
-            )
+                salt: saltData)
 
             // Update the registration state to registered
             sessionContext.registrationState = .registered
@@ -669,8 +673,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 recipients: [credentials.secretName],
                 communicationType: .personalMessage,
                 metadata: [:],
-                symmetricKey: databaseSymmetricKey
-            )
+                symmetricKey: databaseSymmetricKey)
 
             // Update properties of the communication model
             guard var props = await communicationModel.props(symmetricKey: databaseSymmetricKey) else {
@@ -690,7 +693,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             logger.log(level: .debug, message: "Created Communication Model")
 
             // Start the session and return the PQSSession
-            return try await startSession(appPassword: credentials.password)
+            return try! await startSession(appPassword: credentials.password)
         } else {
             throw SessionErrors.registrationError
         }

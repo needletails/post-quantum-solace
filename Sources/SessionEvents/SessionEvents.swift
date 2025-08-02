@@ -843,8 +843,8 @@ public extension SessionEvents {
             recipient: .nickname(contact.secretName),
             blockData: blockUnblockData,
             metadata: ["friendshipMetadata": metadata],
-            currentState: currentMetadata.myState
-        )
+            currentState: currentMetadata.myState)
+        
         logger.log(level: .info, message: "Sent Friendship State Change Request")
     }
 

@@ -30,7 +30,7 @@ import Testing
 actor SessionTests {
     // MARK: - Properties
 
-    let session = PQSSession.shared
+    let session = PQSSession()
     let crypto = NeedleTailCrypto()
 
     // MARK: - Helper Types
@@ -174,6 +174,9 @@ actor SessionTests {
             let decodedFinal = try BSONDecoder().decode(SessionContext.self, from: Document(data: decryptedFinal!))
             #expect(decodedFinal.sessionUser.deviceKeys.oneTimePrivateKeys.count == 0, "All private keys should be removed.")
             #expect(decodedFinal.activeUserConfiguration.signedOneTimePublicKeys.count == 0, "All public keys should be removed.")
+            
+            // Ensure proper cleanup
+            await session.shutdown()
         }
     }
 
@@ -191,7 +194,7 @@ actor SessionTests {
                 return databaseSymmetricKey.withUnsafeBytes { Data($0) }
             }
 
-            let bundle = try await PQSSession.shared.createDeviceCryptographicBundle(isMaster: true)
+            let bundle = try await session.createDeviceCryptographicBundle(isMaster: true)
             let sessionUser = SessionUser(
                 secretName: "u1",
                 deviceId: bundle.deviceKeys.deviceId,
@@ -214,10 +217,10 @@ actor SessionTests {
             let data = try! BSONEncoder().encodeData(sessionContext)
             let encrypted = try self.crypto.encrypt(data: data, symmetricKey: appSymmetricKey)!
             try await mockCache.createLocalSessionContext(encrypted)
-            await PQSSession.shared.setSessionContext(sessionContext)
-            await PQSSession.shared.setTransportDelegate(conformer: mockTransport)
-            await PQSSession.shared.setDatabaseDelegate(conformer: mockCache)
-            await PQSSession.shared.setAppPassword("secret")
+            await session.setSessionContext(sessionContext)
+            await session.setTransportDelegate(conformer: mockTransport)
+            await session.setDatabaseDelegate(conformer: mockCache)
+            await session.setAppPassword("secret")
 
             let config = try await mockCache.fetchLocalSessionContext()
             let configurationData = try self.crypto.decrypt(data: config, symmetricKey: appSymmetricKey)!
@@ -226,7 +229,7 @@ actor SessionTests {
             let foundContext = try BSONDecoder().decodeData(SessionContext.self, from: configurationData)
 
             // Run
-            try await PQSSession.shared.refreshOneTimeKeys(refreshType: .curve)
+            try await session.refreshOneTimeKeys(refreshType: .curve)
 
             #expect(foundContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == 100)
             #expect(foundContext.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
@@ -253,7 +256,7 @@ actor SessionTests {
             #expect(foundContext.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
             await #expect(mockTransport.publicKeys.count == 105)
 
-            try await PQSSession.shared.refreshOneTimeKeys(refreshType: .curve)
+            try await session.refreshOneTimeKeys(refreshType: .curve)
             #expect(foundContext.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
 
             let config2 = try await mockCache.fetchLocalSessionContext()
@@ -264,6 +267,9 @@ actor SessionTests {
 
             await #expect(mockTransport.publicKeys.count == 205)
             #expect(foundContext3.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
+            
+            // Ensure proper cleanup
+            await session.shutdown()
         }
     }
 }

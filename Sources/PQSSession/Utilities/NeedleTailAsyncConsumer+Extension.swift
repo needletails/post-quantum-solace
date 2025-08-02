@@ -64,9 +64,15 @@ extension NeedleTailAsyncConsumer {
 
         // We are an empty deque and are not a background or delayed task
         if deque.isEmpty {
-            await feedConsumer(job as! T, priority: .standard)
+            guard let typedJob = job as? T else {
+                throw PQSSession.SessionErrors.propsError
+            }
+            await feedConsumer(typedJob, priority: .standard)
         } else {
-            let taskJob = TaskJob(item: job as! T, priority: .standard)
+            guard let typedJob = job as? T else {
+                throw PQSSession.SessionErrors.propsError
+            }
+            let taskJob = TaskJob(item: typedJob, priority: .standard)
             await insertSequence(
                 taskJob,
                 sequenceId: props.sequenceId,
@@ -100,7 +106,11 @@ extension NeedleTailAsyncConsumer {
     private func insertSequence(_ taskJob: TaskJob<T>, sequenceId: Int, symmetricKey: SymmetricKey) async {
         // Find the index where the new job should be inserted
         let index = await deque.firstAsyncIndex(where: {
-            let currentJobSequenceId = await ($0.item as! JobModel).props(symmetricKey: symmetricKey)!.sequenceId
+            guard let jobModel = $0.item as? JobModel,
+                  let props = await jobModel.props(symmetricKey: symmetricKey) else {
+                return false
+            }
+            let currentJobSequenceId = props.sequenceId
             return currentJobSequenceId >= sequenceId // Find the first job with a sequence ID greater than or equal to the new job
         }) ?? deque.count // If no such index is found, use the end of the deque
 

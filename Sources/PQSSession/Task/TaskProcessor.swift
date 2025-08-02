@@ -24,6 +24,7 @@ import NeedleTailCrypto
 import NeedleTailLogger
 import SessionEvents
 import SessionModels
+import Logging
 
 /// `TaskProcessor` manages the asynchronous execution of encryption and decryption tasks
 /// using Double Ratchet and other cryptographic mechanisms. It handles inbound and outbound
@@ -102,7 +103,7 @@ public actor TaskProcessor {
 
     /// Logger for debugging, telemetry, and audit trails.
     /// All sensitive data is filtered before logging to prevent information leakage.
-    let logger: NeedleTailLogger
+    var logger: NeedleTailLogger
 
     /// Consumer that asynchronously receives and handles jobs for processing.
     /// Manages the job queue with proper sequencing and error handling.
@@ -170,7 +171,7 @@ public actor TaskProcessor {
     /// - Note: The processor is not ready for use until a session is set and the delegate is configured.
     public init(logger: NeedleTailLogger = NeedleTailLogger()) {
         self.logger = logger
-        ratchetManager = RatchetStateManager<SHA256>(executor: cryptoExecutor)
+        ratchetManager = RatchetStateManager<SHA256>(executor: cryptoExecutor, logger: logger)
         jobConsumer = NeedleTailAsyncConsumer<JobModel>(logger: logger, executor: cryptoExecutor)
     }
 
@@ -184,6 +185,12 @@ public actor TaskProcessor {
     public func setDelegate(_ delegate: (any SessionTransport)?) {
         self.delegate = delegate
     }
+    
+    public func setLogLevel(_ level: Logging.Logger.Level) async {
+        logger.setLogLevel(level)
+        await ratchetManager.setLogLevel(level)
+    }
+
 
     // MARK: - Outbound Messaging
 
@@ -244,13 +251,16 @@ public actor TaskProcessor {
         case .personalMessage:
             identities = try await gatherPersonalIdentities(session: session, sender: sender, logger: logger)
             recipients.insert(sender)
-        case let .nickname(nickname):
+        case .nickname(let nickname):
             var sendOneTimeIdentities = false
-
+            var createIdentity = true
             if let document = message.metadata["friendshipMetadata"] as? Document {
                 let state = try BSONDecoder().decode(FriendshipMetadata.self, from: document)
                 if state.myState == .requested {
                     sendOneTimeIdentities = true
+                }
+                if state.myState == .pending && state.theirState == .pending {
+                    createIdentity = false
                 }
             }
 
@@ -258,6 +268,7 @@ public actor TaskProcessor {
                 session: session,
                 target: nickname,
                 logger: logger,
+                createIdentity: createIdentity,
                 sendOneTimeIdentities: sendOneTimeIdentities
             )
             recipients.formUnion([sender, nickname])
@@ -359,9 +370,13 @@ public actor TaskProcessor {
         session: PQSSession,
         target: String,
         logger: NeedleTailLogger,
+        createIdentity: Bool = true,
         sendOneTimeIdentities: Bool
     ) async throws -> [SessionIdentity] {
-        let identities = try await session.refreshIdentities(secretName: target, sendOneTimeIdentities: sendOneTimeIdentities)
+        let identities = try await session.refreshIdentities(
+            secretName: target,
+            createIdentity: createIdentity,
+            sendOneTimeIdentities: sendOneTimeIdentities)
         logger.log(level: .info, message: "Gathered \(identities.count) Private Message Session Identities")
         return identities
     }

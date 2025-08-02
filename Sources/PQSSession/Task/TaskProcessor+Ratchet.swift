@@ -166,7 +166,7 @@ extension TaskProcessor: SessionIdentityDelegate {
                 await cancelAndRemoveUpdateKeyTasks()
             } catch {
                 await cancelAndRemoveUpdateKeyTasks()
-                logger.log(level: .error, message: "Failed to update one time key: \(error)")
+                await logger.log(level: .error, message: "Failed to update one time key: \(error)")
             }
         })
     }
@@ -288,24 +288,35 @@ extension TaskProcessor: SessionIdentityDelegate {
         }
 
         var localOneTimePrivateKey: CurvePrivateKey?
-        var remoteOneTimePublicKey: CurvePublicKey?
         var localPQKemPrivateKey: PQKemPrivateKey
+        var remoteLongTermPublicKey: Data
+        var remoteOneTimePublicKey: CurvePublicKey?
+        var remotePQKemPublicKey: PQKemPublicKey
         var needsRemoteDeletion = false
         var identities: SynchronizationKeyIdentities?
 
         if props.state == nil {
             if let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last {
                 localOneTimePrivateKey = privateOneTimeKey
+                logger.log(level: .debug, message: "Found my localOneTimePrivateKey")
             }
+            
+            remoteLongTermPublicKey = props.longTermPublicKey
+            remotePQKemPublicKey = props.pqKemPublicKey
 
             if let remoteOneTimePublicKeyData = props.oneTimePublicKey {
                 remoteOneTimePublicKey = remoteOneTimePublicKeyData
+                logger.log(level: .debug, message: "Found remoteOneTimePublicKey on props")
+            } else {
+                logger.log(level: .debug, message: "Did not find remoteOneTimePublicKey on props, will perform ratchet without one-time key")
             }
 
             if let pqKemOneTimePrivateKey = sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.last {
                 localPQKemPrivateKey = pqKemOneTimePrivateKey
+                logger.log(level: .debug, message: "Found my localPQKemPrivateKey")
             } else {
                 localPQKemPrivateKey = sessionContext.sessionUser.deviceKeys.finalPQKemPrivateKey
+                logger.log(level: .debug, message: "Did not find my localPQKemPrivateKey, will use final PQKem key")
             }
 
         } else {
@@ -337,7 +348,9 @@ extension TaskProcessor: SessionIdentityDelegate {
                 localPQKemPrivateKey = state.localPQKemPrivateKey
             }
             localOneTimePrivateKey = state.localOneTimePrivateKey
+            remoteLongTermPublicKey = state.remoteLongTermPublicKey
             remoteOneTimePublicKey = state.remoteOneTimePublicKey
+            remotePQKemPublicKey = state.remotePQKemPublicKey
         }
 
         // If we are intially attempting communication with a contact, we need to first send a session identity created message for the contact to delete their one time keys from being used again, the recipient can know what keys via key identities that are sent. This call also needs to send the sender's one time key identities so that the recipient also knows what one times to create their session with. We get the sender's next.
@@ -352,13 +365,27 @@ extension TaskProcessor: SessionIdentityDelegate {
             } catch {}
         }
 
+        logger.log(level: .debug, message:
+            """
+            [DEBUG - Sender Init] About to call senderInitialization with:
+            SessionIdentity ID: \(sessionIdentity.id)
+            Props state: \(String(describing: props.state))
+            Remote LONG TERM Private Key: \(props.state?.remoteLongTermPublicKey.base64EncodedString())
+            Remote One-Time Private Key ID: \(remoteOneTimePublicKey?.id.uuidString ?? "nil")
+            Remote PQ-KEM Private Key ID: \(props.state?.remotePQKemPublicKey.id.uuidString)
+            Local One-Time Private Key ID: \(localOneTimePrivateKey?.id.uuidString ?? "nil")
+            Local PQ-KEM Private Key ID: \(localPQKemPrivateKey.id.uuidString)
+            Local Long-Term Public Key (base64): \(try Curve25519PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.longTermPrivateKey).publicKey.rawRepresentation.base64EncodedString())
+            """
+        )
+
         try await ratchetManager.senderInitialization(
             sessionIdentity: sessionIdentity,
             sessionSymmetricKey: databaseSymmetricKey,
             remoteKeys: RemoteKeys(
-                longTerm: .init(props.state?.remoteLongTermPublicKey ?? props.longTermPublicKey),
+                longTerm: .init(remoteLongTermPublicKey),
                 oneTime: remoteOneTimePublicKey,
-                pqKem: props.pqKemPublicKey),
+                pqKem: remotePQKemPublicKey),
             localKeys: LocalKeys(
                 longTerm: .init(sessionContext.sessionUser.deviceKeys.longTermPrivateKey),
                 oneTime: localOneTimePrivateKey,
@@ -377,7 +404,7 @@ extension TaskProcessor: SessionIdentityDelegate {
                 outboundTask.message,
                 sharedMessageId: outboundTask.sharedId)
         }
-
+        
         let encodedData = try BSONEncoder().encodeData(outboundTask.message)
         let ratchetedMessage = try await ratchetManager.ratchetEncrypt(plainText: encodedData)
         let signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
@@ -389,6 +416,23 @@ extension TaskProcessor: SessionIdentityDelegate {
             transportMetadata: outboundTask.message.transportInfo,
             sharedMessageId: outboundTask.sharedId,
             synchronizationKeyIds: identities))
+                
+//#if DEBUG
+//            logger.log(level: .debug, message:
+//                """
+//                Ratchet Encrypt
+//                Sender Device ID: \(await session.sessionContext?.sessionUser.deviceId.uuidString ?? "nil")
+//                Sender Long-Term Public Key (base64): \(try Curve25519PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.longTermPrivateKey).publicKey.rawRepresentation.base64EncodedString())
+//                Sender One-Time Public Key ID: \(localOneTimePrivateKey?.id.uuidString ?? "nil")
+//                Sender PQ-KEM Public Key ID: \(localPQKemPrivateKey.id.uuidString)
+//                Recipient Device ID: \(outboundTask.recipientIdentity.id)
+//                Recipient Long-Term Public Key (base64): \(props.state?.remoteLongTermPublicKey.base64EncodedString() ?? props.longTermPublicKey.base64EncodedString())
+//                Recipient One-Time Private Key ID: \(remoteOneTimePublicKey?.id.uuidString ?? "nil")
+//                Recipient PQ-KEM One-Time Private Key ID: \(props.pqKemPublicKey.id)
+//                """
+//            )
+//#endif
+        
     }
 
     // MARK: - Inbound Message Handling
@@ -430,39 +474,76 @@ extension TaskProcessor: SessionIdentityDelegate {
         inboundTask: InboundTaskMessage,
         session: PQSSession
     ) async throws {
+        
         let (ratchetMessage, sessionIdentity) = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
 
         try await initializeRecipient(
             sessionIdentity: sessionIdentity,
             session: session,
             ratchetMessage: ratchetMessage)
-
-        let decryptedData = try await ratchetManager.ratchetDecrypt(ratchetMessage)
-        let decodedMessage = try BSONDecoder().decode(CryptoMessage.self, from: Document(data: decryptedData))
-
-        var canSaveMessage = true
-
-        if let sessionDelegate = await session.sessionDelegate {
-            canSaveMessage = await sessionDelegate.processUnpersistedMessage(
-                decodedMessage,
-                senderSecretName: inboundTask.senderSecretName,
-                senderDeviceId: inboundTask.senderDeviceId)
-        }
-
-        if let transportInfo = decodedMessage.transportInfo, let keys = try? BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: transportInfo) {
+        do {
+            let decryptedData = try await ratchetManager.ratchetDecrypt(ratchetMessage)
+            let decodedMessage = try BSONDecoder().decode(CryptoMessage.self, from: Document(data: decryptedData))
+            
+            var canSaveMessage = true
+            
+            if let sessionDelegate = await session.sessionDelegate {
+                canSaveMessage = await sessionDelegate.processUnpersistedMessage(
+                    decodedMessage,
+                    senderSecretName: inboundTask.senderSecretName,
+                    senderDeviceId: inboundTask.senderDeviceId)
+            }
+            
+            if let transportInfo = decodedMessage.transportInfo, let keys = try? BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: transportInfo) {
                 try await removeKeys(
                     session: session,
                     curveId: keys.recipientCurveId,
                     kyberId: keys.recipientKyberId)
             }
-
-        if canSaveMessage {
-            /// Now we can handle the message
-            try await handleDecodedMessage(
-                decodedMessage,
-                inboundTask: inboundTask,
-                session: session,
-                sessionIdentity: sessionIdentity)
+            
+            if canSaveMessage {
+                /// Now we can handle the message
+                try await handleDecodedMessage(
+                    decodedMessage,
+                    inboundTask: inboundTask,
+                    session: session,
+                    sessionIdentity: sessionIdentity)
+            }
+        } catch {
+#if DEBUG
+                // Expanded debug logging with detailed info
+                let senderDeviceId = inboundTask.senderDeviceId.uuidString
+                let senderLongTermKeyHex = ratchetMessage.header.remoteLongTermPublicKey.base64EncodedString()
+                let senderOneTimePublicKeyId = ratchetMessage.header.remoteOneTimePublicKey?.id.uuidString ?? "nil"
+                let senderPQKemPublicKeyId = ratchetMessage.header.remotePQKemPublicKey.id.uuidString
+                
+                guard let props = try await sessionIdentity.props(symmetricKey: session.getDatabaseSymmetricKey()) else {
+                    throw CryptoError.propsError
+                }
+                guard let state = props.state else {
+                    throw CryptoError.propsError
+                }
+                
+                let recipientDeviceId = await session.sessionContext?.sessionUser.deviceId.uuidString ?? "nil"
+                let recipientLongTermPublicKeyHex = try Curve25519PrivateKey(rawRepresentation: state.localLongTermPrivateKey).publicKey.rawRepresentation.base64EncodedString()
+                let recipientOneTimeKeyId = state.localOneTimePrivateKey?.id.uuidString ?? "nil"
+                let recipientPQKemOneTimeKeyId = state.localPQKemPrivateKey.id.uuidString
+                
+                logger.log(level: .debug, message:
+                    """
+                    RatchetError during ratchet decryption: \(error)
+                    Sender Device ID: \(senderDeviceId)
+                    Sender Long-Term Public Key (base64): \(senderLongTermKeyHex)
+                    Sender One-Time Public Key ID: \(senderOneTimePublicKeyId)
+                    Sender PQ-KEM Public Key ID: \(senderPQKemPublicKeyId)
+                    Recipient Device ID: \(recipientDeviceId)
+                    Recipient Long-Term Public Key (base64): \(recipientLongTermPublicKeyHex)
+                    Recipient One-Time Private Key ID: \(recipientOneTimeKeyId)
+                    Recipient PQ-KEM One-Time Private Key ID: \(recipientPQKemOneTimeKeyId)
+                    """
+                )
+#endif
+            throw error
         }
     }
 
@@ -554,12 +635,17 @@ extension TaskProcessor: SessionIdentityDelegate {
         if props.state == nil {
             if let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.first(where: { $0.id == ratchetMessage.header.oneTimeKeyId }) {
                 localOneTimePrivateKey = privateOneTimeKey
+                logger.log(level: .debug, message: "Found localOneTimePrivateKey from received id")
+            } else {
+                logger.log(level: .debug, message: "Did not find localOneTimePrivateKey from received id, will perform ratchet without one-time key")
             }
 
             if let privateKyberOneTimeKey = sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.first(where: { $0.id == ratchetMessage.header.pqKemOneTimeKeyId }) {
                 localPQKemPrivateKey = privateKyberOneTimeKey
+                logger.log(level: .debug, message: "Found localPQKemPrivateKey from received id")
             } else {
                 localPQKemPrivateKey = sessionContext.sessionUser.deviceKeys.finalPQKemPrivateKey
+                logger.log(level: .debug, message: "Did not find localPQKemPrivateKey from received id, using final key")
             }
         } else {
             guard let state = props.state else {
@@ -568,6 +654,19 @@ extension TaskProcessor: SessionIdentityDelegate {
             localOneTimePrivateKey = state.localOneTimePrivateKey
             localPQKemPrivateKey = state.localPQKemPrivateKey
         }
+//        
+//        logger.log(level: .debug, message:
+//            """
+//            [DEBUG - Recipient Init] About to call recipientInitialization with:
+//            SessionIdentity ID: \(sessionIdentity.id)
+//            Remote LONG TERM Private Key: \(ratchetMessage.header.remoteLongTermPublicKey.base64EncodedString())
+//            Remote One-Time Private Key ID: \(ratchetMessage.header.remoteOneTimePublicKey?.id.uuidString ?? "nil")
+//            Remote PQ-KEM Private Key ID: \(ratchetMessage.header.remotePQKemPublicKey.id.uuidString)
+//            Local LONG TERM Private Key: \(try Curve25519PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.longTermPrivateKey).publicKey.rawRepresentation.base64EncodedString())
+//            Local One-Time Private Key ID: \(localOneTimePrivateKey?.id.uuidString ?? "nil")
+//            Local PQ-KEM Private Key ID: \(localPQKemPrivateKey.id.uuidString)
+//            """
+//        )
         
         try await ratchetManager.recipientInitialization(
             sessionIdentity: sessionIdentity,
@@ -833,17 +932,26 @@ extension TaskProcessor: SessionIdentityDelegate {
         session: PQSSession,
         inboundTask: InboundTaskMessage
     ) async throws -> (RatchetMessage, SessionIdentity) {
-        let identities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName)
+        var identities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName)
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
 
-        guard let sessionIdentity = await identities.asyncFirst(where: { identity in
+        var sessionIdentity = await identities.asyncFirst(where: { identity in
             guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else { return false }
             return props.deviceId == inboundTask.senderDeviceId
-        }) else {
-            // If we did not have an identity we need to create it
+        })
+        
+        if sessionIdentity == nil {
+            identities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
+            sessionIdentity = await identities.asyncFirst(where: { identity in
+                guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else { return false }
+                return props.deviceId == inboundTask.senderDeviceId
+            })
+        }
+        
+        guard let sessionIdentity else {
             throw JobProcessorErrors.missingIdentity
         }
-
+        
         // Unwrap properties and retrieve the public signing key
         guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else {
             throw JobProcessorErrors.missingIdentity
@@ -917,3 +1025,4 @@ extension TaskProcessor: SessionIdentityDelegate {
         )
     }
 }
+

@@ -83,12 +83,6 @@ public extension PQSSession {
         destructionTime: TimeInterval? = nil
     ) async throws {
         do {
-            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= 10 {
-                async let _ = await refreshOneTimeKeysTask()
-            }
-            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.count <= 10 {
-                async let _ = await refreshOneTimeKeysTask()
-            }
             let message = CryptoMessage(
                 text: text,
                 metadata: metadata,

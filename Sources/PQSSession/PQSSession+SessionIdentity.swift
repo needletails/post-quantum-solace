@@ -222,34 +222,67 @@ public extension PQSSession {
     ///   work when necessary based on the `forceRefresh` parameter and current state.
     func refreshIdentities(
         secretName: String,
+        createIdentity: Bool = true,
         forceRefresh: Bool = false,
         sendOneTimeIdentities: Bool = false
     ) async throws -> [SessionIdentity] {
-        let filtered = try await getSessionIdentities(with: secretName)
-        // Always make sure the identities are up to date
-        do {
-            var curveId: String?
-            var kyberId: String?
-            if let addingContactData {
-                let keys = try BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: addingContactData)
-                curveId = keys.senderCurveId
-                kyberId = keys.senderKyberId
-                await setAddingContact(nil)
+        let existingIdentities = try await getSessionIdentities(with: secretName)
+        
+        // Check if we have valid identities for this specific recipient
+        let hasValidIdentities = await hasValidIdentitiesForRecipient(existingIdentities, secretName: secretName)
+        
+        // Extract synchronization keys if available
+        let syncKeys = try await extractSynchronizationKeys()
+        
+        // Determine if refresh is needed
+        let needsRefresh = forceRefresh || !hasValidIdentities
+        
+        if needsRefresh {
+            do {
+                return try await refreshSessionIdentities(
+                    for: secretName,
+                    from: existingIdentities,
+                    createIdentity: createIdentity,
+                    forceRefresh: forceRefresh,
+                    sendOneTimeIdentities: sendOneTimeIdentities,
+                    oneTime: syncKeys?.curveId,
+                    oneTime: syncKeys?.kyberId
+                )
+            } catch {
+                logger.log(level: .error, message: "Error in refreshIdentities for \(secretName): \(error)")
+                return existingIdentities
             }
-
-            return try await refreshSessionIdentities(
-                for: secretName,
-                from: filtered,
-                forceRefresh: forceRefresh,
-                sendOneTimeIdentities: sendOneTimeIdentities,
-                oneTime: curveId,
-                oneTime: kyberId
-            )
-        } catch {
-            return filtered
+        } else {
+            return existingIdentities
         }
     }
 
+    /// Checks if there are valid identities for a specific recipient
+    /// - Parameters:
+    ///   - identities: Array of existing identities to check
+    ///   - secretName: The secret name to validate against
+    /// - Returns: True if valid identities exist for the recipient
+    private func hasValidIdentitiesForRecipient(_ identities: [SessionIdentity], secretName: String) async -> Bool {
+        for identity in identities {
+            if let props = try? await identity.props(symmetricKey: getDatabaseSymmetricKey()),
+               props.secretName == secretName {
+                return true
+            }
+        }
+        return false
+    }
+    
+    /// Extracts synchronization keys from adding contact data if available
+    /// - Returns: Optional tuple containing curve and kyber key IDs
+    private func extractSynchronizationKeys() async throws -> (curveId: String?, kyberId: String?)? {
+        guard let addingContactData else { return nil }
+        
+        let keys = try BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: addingContactData)
+        await setAddingContact(nil)
+        
+        return (curveId: keys.senderCurveId, kyberId: keys.senderKyberId)
+    }
+    
     /// Retrieves session identities associated with a specified recipient name.
     /// This method filters out identities that do not match the recipient name or are the current user's identities.
     /// - Parameter recipientName: The name of the recipient for which to retrieve identities.
@@ -278,11 +311,7 @@ public extension PQSSession {
         }
     }
 
-    private func refreshIdentities(secretName: String, forceRefresh: Bool) async -> Bool {
-        forceRefresh
-            || sessionIdentities.isEmpty
-            || !sessionIdentities.contains(secretName)
-    }
+
 
     /// Refreshes the session identities for a specified recipient name based on the provided filtered identities.
     /// This method verifies the devices and removes any stale identities that are no longer valid.
@@ -293,13 +322,22 @@ public extension PQSSession {
     /// - Throws: An error if the refresh operation fails.
     internal func refreshSessionIdentities(
         for secretName: String,
-        from filtered: [SessionIdentity],
+        from existingIdentities: [SessionIdentity],
+        createIdentity: Bool = true,
         forceRefresh: Bool,
-        sendOneTimeIdentities _: Bool = false,
+        sendOneTimeIdentities: Bool = false,
         oneTime curveId: String?,
         oneTime kyberId: String?
     ) async throws -> [SessionIdentity] {
-        var filtered = filtered
+        
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= 10 {
+            async let _ = await refreshOneTimeKeysTask()
+        }
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.count <= 10 {
+            async let _ = await refreshOneTimeKeysTask()
+        }
+        
+        var identities = existingIdentities
         guard let transportDelegate else {
             throw PQSSession.SessionErrors.transportNotInitialized
         }
@@ -307,19 +345,19 @@ public extension PQSSession {
         guard let sessionUser = await sessionContext?.sessionUser else {
             throw PQSSession.SessionErrors.sessionNotInitialized
         }
-
-        if await refreshIdentities(secretName: secretName, forceRefresh: forceRefresh) {
+        
+        if createIdentity, forceRefresh || sessionIdentities.isEmpty || !sessionIdentities.contains(secretName) {
             // Get the user configuration for the recipient
             let configuration = try await transportDelegate.findConfiguration(for: secretName)
             var verifiedDevices = try configuration.getVerifiedDevices()
             var collected = [UserDeviceConfiguration]()
-            // Create a set of existing device IDs from the filtered identities for quick lookup
-            let existingDeviceIds = await Set(filtered.asyncCompactMap {
+            // Create a set of existing device IDs from the existing identities for quick lookup
+            let existingDeviceIds = await Set(identities.asyncCompactMap {
                 try? await $0.props(symmetricKey: getDatabaseSymmetricKey())?.deviceId
             })
 
             for device in verifiedDevices {
-                // Only collect devices that are not already in the filtered identities
+                // Only collect devices that are not already in the existing identities
                 if !existingDeviceIds.contains(device.deviceId), device.deviceId != sessionUser.deviceId {
                     collected.append(device)
                 }
@@ -337,7 +375,7 @@ public extension PQSSession {
             var generatedSessionContextIds = Set<Int>()
 
             for device in collected {
-                // Check if the device ID is already in the filtered identities
+                // Check if the device ID is already in the existing identities
                 if !existingDeviceIds.contains(device.deviceId), device.deviceId != sessionUser.deviceId {
                     var sessionContextId: Int
                     repeat {
@@ -348,14 +386,13 @@ public extension PQSSession {
 
                     var curveId = curveId
                     var kyberId = kyberId
-
                     // On Contact Creation this will be nil for the requester. The recipient will contained the passed identities, thus containing values.
-                    if curveId == nil || kyberId == nil {
+                    if sendOneTimeIdentities {
                         let keys = try await transportDelegate.fetchOneTimeKeys(for: secretName, deviceId: device.deviceId.uuidString)
                         curveId = keys.curve?.id.uuidString
                         kyberId = keys.kyber?.id.uuidString
                     }
-
+                    
                     let signedOneTimePublicKey = try configuration.signedOneTimePublicKeys.first(where: { $0.id.uuidString == curveId })?.verified(using: signingPublicKey)
 
                     var pqKemPublicKey: PQKemPublicKey
@@ -380,14 +417,13 @@ public extension PQSSession {
                         new: sessionContextId
                     )
                     logger.log(level: .info, message: "Created Session Identity: \(identity)")
-                    filtered.append(identity)
+                    identities.append(identity)
 
                     if let curveId, let kyberId {
                         try await notifyIdentityCreation(
                             for: secretName,
                             curveId: curveId,
-                            kyberId: kyberId
-                        )
+                            kyberId: kyberId)
                     }
                 }
             }
@@ -409,7 +445,7 @@ public extension PQSSession {
                 if !isVerified {
                     logger.log(level: .info, message: "Will remove stale session identity for recipient: \(secretName)")
                     // If our current list in the DB contains a session identity that is not in the master list, we need to remove it.
-                    if let identityToRemove = await filtered.asyncFirst(where: { element in
+                    if let identityToRemove = await identities.asyncFirst(where: { element in
                         // Try to get the properties for each element.
                         guard let props = try? await element.props(symmetricKey: getDatabaseSymmetricKey()) else {
                             return false
@@ -417,22 +453,25 @@ public extension PQSSession {
                         // Compare the deviceIds; make sure deviceId is available in this scope.
                         return props.deviceId == deviceId
                     }) {
-                        try await cache?.deleteSessionIdentity(identityToRemove.id)
-                        logger.log(level: .info, message: "Did remove stale session identity for recipient: \(secretName)")
+                        do {
+                            try await cache?.deleteSessionIdentity(identityToRemove.id)
+                            logger.log(level: .info, message: "Did remove stale session identity for recipient: \(secretName)")
 
-                        // Remove the identity from the filtered array.
-                        if let index = filtered.firstIndex(where: { identity in
-                            identity.id == identityToRemove.id
-                        }) {
-                            filtered.remove(at: index)
+                            // Remove the identity from the identities array.
+                            if let index = identities.firstIndex(where: { identity in
+                                identity.id == identityToRemove.id
+                            }) {
+                                identities.remove(at: index)
+                            }
+                        } catch {
+                            logger.log(level: .warning, message: "Failed to delete stale session identity for recipient \(secretName): \(error)")
                         }
                     }
                 }
             }
             sessionIdentities.insert(secretName)
         }
-
-        return filtered
+        return identities
     }
 
     /// Notifies the network of identity creation with associated keys.

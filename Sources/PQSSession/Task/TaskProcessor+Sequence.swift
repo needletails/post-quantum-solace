@@ -144,20 +144,36 @@ extension TaskProcessor {
                 do {
                     logger.log(level: .debug, message: "Executing Job \(props.sequenceId)")
                     try await performRatchet(task: props.task.task, session: session)
-                    try? await cache.deleteJob(job)
+                    do {
+                        try await cache.deleteJob(job)
+                    } catch {
+                        logger.log(level: .warning, message: "Failed to delete job after successful execution: \(error)")
+                    }
 
                 } catch let jobError as JobProcessorErrors where jobError == .missingIdentity {
                     logger.log(level: .error, message: "Removing Job due to: \(jobError)")
-                    try? await cache.deleteJob(job)
+                    do {
+                        try await cache.deleteJob(job)
+                    } catch {
+                        logger.log(level: .warning, message: "Failed to delete job after missing identity error: \(error)")
+                    }
 
                 } catch let cryptoError as CryptoKitError where cryptoError == .authenticationFailure {
                     logger.log(level: .error, message: "Removing Job due to: \(cryptoError)")
-                    try? await cache.deleteJob(job)
+                    do {
+                        try await cache.deleteJob(job)
+                    } catch {
+                        logger.log(level: .warning, message: "Failed to delete job after authentication failure: \(error)")
+                    }
 
                 } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidKeyId || sessionError == .cannotFindOneTimeKey {
                     // Note: If we are invalid due to a race condition between the server and client we can optionally resend
                     logger.log(level: .error, message: "Removing Job due to: \(sessionError)")
-                    try? await cache.deleteJob(job)
+                    do {
+                        try await cache.deleteJob(job)
+                    } catch {
+                        logger.log(level: .warning, message: "Failed to delete job after session error: \(error)")
+                    }
                 } catch {
                     
                     logger.log(level: .error, message: "Job error \(error)")

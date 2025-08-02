@@ -1,3 +1,5 @@
+<img src="post_quantum_solace.svg" alt="Post Quantum Solace" width="200" />
+
 # Post-Quantum Solace
 
 [![Swift](https://img.shields.io/badge/Swift-6.1+-orange.svg)](https://swift.org)
