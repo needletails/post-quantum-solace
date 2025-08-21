@@ -274,7 +274,7 @@ public protocol PQSSessionDelegate: Sendable {
     ///   or that processing failed.
     ///
     /// - Throws: Any error that occurs while processing the unpersisted message.
-    func processUnpersistedMessage(
+    func processMessage(
         _ message: CryptoMessage,
         senderSecretName: String,
         senderDeviceId: UUID

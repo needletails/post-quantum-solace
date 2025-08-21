@@ -15,11 +15,15 @@
 //
 //
 import BSON
-import Crypto
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
 import NIOConcurrencyHelpers
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 /// A model representing an encrypted message stored locally on a device.
 ///

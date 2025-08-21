@@ -15,9 +15,13 @@
 //
 //
 import BSON
-import Crypto
 import DoubleRatchetKit
 import Foundation
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 /// A struct representing the configuration of a user, including the signing identity
 /// and auxiliary devices.

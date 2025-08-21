@@ -15,11 +15,15 @@
 //
 
 import BSON
-import Crypto
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
 import NIOConcurrencyHelpers
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 /// A class representing a secure model for a contact in the messaging system.
 ///

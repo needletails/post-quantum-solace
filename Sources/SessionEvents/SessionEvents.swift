@@ -14,10 +14,15 @@
 //  post-quantum cryptographic session management capabilities.
 //
 import BSON
-import Crypto
 import Foundation
 import NeedleTailLogger
 import SessionModels
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
+
 
 /// An enumeration representing various errors that can occur in session events.
 enum EventErrors: Error {

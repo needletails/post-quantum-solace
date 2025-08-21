@@ -15,10 +15,14 @@
 //
 
 import BSON
-import Crypto
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 /// A protocol that defines the requirements for communication models in the messaging system.
 ///
@@ -101,7 +105,7 @@ public struct Communication: Sendable & Codable {
 ///
 /// - Note: This class is marked as `@unchecked Sendable` because the underlying cryptographic
 ///   operations are thread-safe, but the class itself doesn't automatically guarantee thread safety.
-public final class BaseCommunication: Codable, @unchecked Sendable {
+public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     /// The unique identifier for this communication.
     public let id: UUID
 
@@ -359,6 +363,10 @@ public final class BaseCommunication: Codable, @unchecked Sendable {
             metadata: props.metadata,
             communicationType: props.communicationType
         ) as! T
+    }
+    
+    public static func == (lhs: BaseCommunication, rhs: BaseCommunication) -> Bool {
+        lhs.id == rhs.id
     }
 }
 

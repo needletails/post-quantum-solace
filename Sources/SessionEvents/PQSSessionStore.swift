@@ -13,10 +13,15 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import Crypto
+
 import DoubleRatchetKit
 import Foundation
 import SessionModels
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 // MARK: - Ordering Enum
 

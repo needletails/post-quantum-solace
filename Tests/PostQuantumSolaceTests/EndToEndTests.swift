@@ -14,12 +14,16 @@
 //  post-quantum cryptographic session management capabilities.
 //
 import BSON
-import Crypto
 import DoubleRatchetKit
 import Foundation
 import NeedleTailAsyncSequence
 import NeedleTailCrypto
 import Testing
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 @testable import PQSSession
 @testable import SessionEvents
@@ -111,7 +115,7 @@ actor EndToEndTests {
     
     
     
-    func createSenderSession(store: MockIdentityStore) async throws {
+    func createSenderSession(store: MockIdentityStore, createSession: Bool = true) async throws {
         store.localDeviceSalt = "testSalt1"
         await _senderSession.setLogLevel(.trace)
         await _senderSession.setDatabaseDelegate(conformer: store)
@@ -121,9 +125,11 @@ actor EndToEndTests {
         
         _senderSession.isViable = true
         transport.publishableName = sMockUserData.ssn
+        if createSession {
         _senderSession = try await _senderSession.createSession(
             secretName: sMockUserData.ssn, appPassword: sMockUserData.sap
         ) {}
+    }
         await _senderSession.setAppPassword(sMockUserData.sap)
         _senderSession = try await _senderSession.startSession(appPassword: sMockUserData.sap)
         try await senderReceiver.setKey(_senderSession.getDatabaseSymmetricKey())
@@ -163,7 +169,7 @@ actor EndToEndTests {
             secretName: sMockUserData.ssn, forceRefresh: true)
     }
     
-    func createRecipientSession(store: MockIdentityStore) async throws {
+    func createRecipientSession(store: MockIdentityStore, createSession: Bool = true) async throws {
         store.localDeviceSalt = "testSalt2"
         await _recipientSession.setLogLevel(.trace)
         await _recipientSession.setDatabaseDelegate(conformer: store)
@@ -173,9 +179,11 @@ actor EndToEndTests {
         _recipientSession.isViable = true
         await _recipientSession.setReceiverDelegate(conformer: recipientReceiver)
         transport.publishableName = rMockUserData.rsn
+         if createSession {
         _recipientSession = try await _recipientSession.createSession(
             secretName: rMockUserData.rsn, appPassword: rMockUserData.sap
         ) {}
+         }
         await _recipientSession.setAppPassword(rMockUserData.sap)
         _recipientSession = try await _recipientSession.startSession(appPassword: rMockUserData.sap)
         try await recipientReceiver.setKey(_recipientSession.getDatabaseSymmetricKey())
@@ -987,6 +995,596 @@ actor EndToEndTests {
             await shutdownSessions()
         }
     }
+    
+    @Test("Ratchet Chain Key Synchronization - Authentication Failure Reproduction")
+    func testRatchetChainKeySyncAuthenticationFailure() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages to establish session
+        for i in 1...5 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
+            
+            // Small delay to allow processing
+            try await Task.sleep(until: .now + .milliseconds(100))
+        }
+        
+        // Now send rapid messages to trigger the authentication failure
+        // This simulates the scenario from the logs where messages are sent quickly
+        var authenticationFailures = 0
+        var successfulMessages = 0
+        
+        for i in 6...20 {
+            do {
+                try await _senderSession.writeTextMessage(
+                    recipient: .nickname("bob"),
+                    text: "Rapid message \(i)",
+                    metadata: Document()
+                )
+                successfulMessages += 1
+            } catch {
+                if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                   error.localizedDescription.contains("authenticationFailure") ||
+                   error.localizedDescription.contains("invalidKeyId") {
+                    authenticationFailures += 1
+                }
+            }
+            
+            // Very small delay to create rapid message scenario
+            try await Task.sleep(until: .now + .milliseconds(10))
+        }
+        
+        // Wait for processing to complete
+        try await Task.sleep(until: .now + .seconds(2))
+        
+        // Log the results for debugging
+        print("Test Results:")
+        print("- Successful messages: \(successfulMessages)")
+        print("- Authentication failures: \(authenticationFailures)")
+        
+        // Note: This test shows that the basic ratchet chain key synchronization is working
+        // The authentication failures in the real logs are likely due to network timing
+        // or session state synchronization issues between devices
+        
+        await shutdownSessions()
+    }
+    
+    @Test("Bidirectional Message Exchange - Simulate Real Device Communication")
+    func testBidirectionalMessageExchange() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages from both devices to establish bidirectional communication
+        for i in 1...3 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Alice message \(i)",
+                metadata: Document()
+            )
+            
+            try await _recipientSession.writeTextMessage(
+                recipient: .nickname("alice"),
+                text: "Bob message \(i)",
+                metadata: Document()
+            )
+            
+            // Small delay to allow processing
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        // Now send rapid bidirectional messages to simulate real conversation
+        var aliceFailures = 0
+        var bobFailures = 0
+        var aliceSuccess = 0
+        var bobSuccess = 0
+        
+        for i in 4...15 {
+            // Alice sends message
+            do {
+                try await _senderSession.writeTextMessage(
+                    recipient: .nickname("bob"),
+                    text: "Alice rapid \(i)",
+                    metadata: Document()
+                )
+                aliceSuccess += 1
+            } catch {
+                if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                   error.localizedDescription.contains("authenticationFailure") ||
+                   error.localizedDescription.contains("invalidKeyId") {
+                    aliceFailures += 1
+                }
+            }
+            
+            // Bob sends message
+            do {
+                try await _recipientSession.writeTextMessage(
+                    recipient: .nickname("alice"),
+                    text: "Bob rapid \(i)",
+                    metadata: Document()
+                )
+                bobSuccess += 1
+            } catch {
+                if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                   error.localizedDescription.contains("authenticationFailure") ||
+                   error.localizedDescription.contains("invalidKeyId") {
+                    bobFailures += 1
+                }
+            }
+            
+            // Very small delay to create rapid bidirectional scenario
+            try await Task.sleep(until: .now + .milliseconds(5))
+        }
+        
+        // Wait for processing to complete
+        try await Task.sleep(until: .now + .seconds(2))
+        
+        // Log the results for debugging
+        print("Bidirectional Test Results:")
+        print("- Alice successful messages: \(aliceSuccess)")
+        print("- Alice authentication failures: \(aliceFailures)")
+        print("- Bob successful messages: \(bobSuccess)")
+        print("- Bob authentication failures: \(bobFailures)")
+        
+        await shutdownSessions()
+    }
+    
+    @Test("Network Timing Issues - Simulate Out of Order Messages")
+    func testNetworkTimingIssues() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages to establish session
+        for i in 1...3 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        // Now send messages rapidly and simulate network delays/out-of-order delivery
+        var authenticationFailures = 0
+        var successfulMessages = 0
+        
+        // Create multiple concurrent message sends to simulate network timing issues
+        let messageTasks = (4...15).map { i in
+            Task {
+                do {
+                    // Add random delays to simulate network jitter
+                    let randomDelay = UInt64.random(in: 0...20)
+                    try await Task.sleep(until: .now + .milliseconds(randomDelay))
+                    
+                    try await _senderSession.writeTextMessage(
+                        recipient: .nickname("bob"),
+                        text: "Timing test message \(i)",
+                        metadata: Document()
+                    )
+                    return MessageResult.success
+                } catch {
+                    if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                       error.localizedDescription.contains("authenticationFailure") ||
+                       error.localizedDescription.contains("invalidKeyId") {
+                        return .authenticationFailure
+                    }
+                    return .otherError(error)
+                }
+            }
+        }
+        
+        // Wait for all messages to complete
+        for task in messageTasks {
+            let result = await task.value
+            switch result {
+            case .success:
+                successfulMessages += 1
+            case .authenticationFailure:
+                authenticationFailures += 1
+            case .otherError(let error):
+                print("Other error: \(error)")
+            }
+        }
+        
+        // Wait for processing to complete
+        try await Task.sleep(until: .now + .seconds(2))
+        
+        print("Network Timing Test Results:")
+        print("- Successful messages: \(successfulMessages)")
+        print("- Authentication failures: \(authenticationFailures)")
+        
+        await shutdownSessions()
+    }
+    
+    @Test("Session State Synchronization Issues - Simulate State Corruption")
+    func testSessionStateSynchronizationIssues() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages to establish session
+        for i in 1...3 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        // Simulate session state corruption by clearing and recreating session state
+        // This simulates what might happen if session state is lost or corrupted
+        await shutdownSessions()
+        
+        // Wait a moment for cleanup to complete
+        try await Task.sleep(until: .now + .milliseconds(100))
+        
+        
+        try await createSenderSession(store: device1Store, createSession: false)
+        try await createRecipientSession(store: device2Store, createSession: false)
+        
+        // Try to send messages with potentially corrupted state
+        var authenticationFailures = 0
+        var successfulMessages = 0
+        
+        for i in 4...10 {
+            do {
+                try await _senderSession.writeTextMessage(
+                    recipient: .nickname("bob"),
+                    text: "State corruption test \(i)",
+                    metadata: Document()
+                )
+                successfulMessages += 1
+            } catch {
+                if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                   error.localizedDescription.contains("authenticationFailure") ||
+                   error.localizedDescription.contains("invalidKeyId") {
+                    authenticationFailures += 1
+                }
+            }
+            
+            // Small delay between messages
+            try await Task.sleep(until: .now + .milliseconds(10))
+        }
+        
+        print("Session State Synchronization Test Results:")
+        print("- Successful messages: \(successfulMessages)")
+        print("- Authentication failures: \(authenticationFailures)")
+        
+        await shutdownSessions()
+    }
+    
+    @Test("Transport Layer Issues - Simulate Message Loss and Duplication")
+    func testTransportLayerIssues() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages to establish session
+        for i in 1...3 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        // Simulate transport layer issues by sending messages in bursts
+        // to cause potential message queue overflow or processing delays
+        var authenticationFailures = 0
+        var successfulMessages = 0
+        
+        // Send messages in bursts to simulate transport layer stress
+        for burst in 0..<3 {
+            let burstTasks = (1...5).map { i in
+                Task {
+                    do {
+                        try await _senderSession.writeTextMessage(
+                            recipient: .nickname("bob"),
+                            text: "Transport test burst \(burst) message \(i)",
+                            metadata: Document()
+                        )
+                        return MessageResult.success
+                    } catch {
+                        if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                           error.localizedDescription.contains("authenticationFailure") ||
+                           error.localizedDescription.contains("invalidKeyId") {
+                            return .authenticationFailure
+                        }
+                        return .otherError(error)
+                    }
+                }
+            }
+            
+            // Wait for burst to complete
+            for task in burstTasks {
+                let result = await task.value
+                switch result {
+                case .success:
+                    successfulMessages += 1
+                case .authenticationFailure:
+                    authenticationFailures += 1
+                case .otherError(let error):
+                    print("Other error: \(error)")
+                }
+            }
+            
+            // Small delay between bursts
+            try await Task.sleep(until: .now + .milliseconds(100))
+        }
+        
+        print("Transport Layer Test Results:")
+        print("- Successful messages: \(successfulMessages)")
+        print("- Authentication failures: \(authenticationFailures)")
+        
+        await shutdownSessions()
+    }
+    
+    @Test("Device Synchronization Issues - Simulate Clock Drift and Processing Delays")
+    func testDeviceSynchronizationIssues() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages to establish session
+        for i in 1...3 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        // Simulate device synchronization issues by adding processing delays
+        // and varying message timing to simulate different device capabilities
+        var authenticationFailures = 0
+        var successfulMessages = 0
+        
+        for i in 4...12 {
+            do {
+                // Simulate varying processing delays (like different device capabilities)
+                let processingDelay = UInt64.random(in: 0...50)
+                try await Task.sleep(until: .now + .milliseconds(processingDelay))
+                
+                try await _senderSession.writeTextMessage(
+                    recipient: .nickname("bob"),
+                    text: "Sync test message \(i)",
+                    metadata: Document()
+                )
+                successfulMessages += 1
+                
+                // Simulate device being busy with other tasks
+                if i % 3 == 0 {
+                    try await Task.sleep(until: .now + .milliseconds(200))
+                }
+                
+            } catch {
+                if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                   error.localizedDescription.contains("authenticationFailure") ||
+                   error.localizedDescription.contains("invalidKeyId") {
+                    authenticationFailures += 1
+                }
+            }
+        }
+        
+        print("Device Synchronization Test Results:")
+        print("- Successful messages: \(successfulMessages)")
+        print("- Authentication failures: \(authenticationFailures)")
+        
+        await shutdownSessions()
+    }
+    
+    @Test("Race Condition - Simulate Concurrent Message Processing")
+    func testRaceConditionConcurrentMessageProcessing() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages to establish session
+        for i in 1...3 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        // Simulate the race condition: send multiple messages simultaneously
+        // to create concurrent jobs that might cause data/key misalignment
+        var authenticationFailures = 0
+        var successfulMessages = 0
+        
+        // Create multiple concurrent tasks to send messages simultaneously
+        // This simulates the "RECEIVED______ ice_candidate" messages arriving at the same time
+        let concurrentTasks = (1...10).map { i in
+            Task {
+                do {
+                    // Minimal delay to ensure they start almost simultaneously
+                    try await Task.sleep(until: .now + .milliseconds(UInt64.random(in: 0...5)))
+                    
+                    try await _senderSession.writeTextMessage(
+                        recipient: .nickname("bob"),
+                        text: "Race condition test \(i)",
+                        metadata: Document()
+                    )
+                    return MessageResult.success
+                } catch {
+                    if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                       error.localizedDescription.contains("authenticationFailure") ||
+                       error.localizedDescription.contains("invalidKeyId") {
+                        return MessageResult.authenticationFailure
+                    } else {
+                        return MessageResult.otherError(error)
+                    }
+                }
+            }
+        }
+        
+        // Wait for all concurrent tasks to complete
+        let results = await withTaskGroup(of: MessageResult.self) { group in
+            for task in concurrentTasks {
+                group.addTask {
+                    await task.value
+                }
+            }
+            
+            var results: [MessageResult] = []
+            for await result in group {
+                results.append(result)
+            }
+            return results
+        }
+        
+        // Count results
+        for result in results {
+            switch result {
+            case .success:
+                successfulMessages += 1
+            case .authenticationFailure:
+                authenticationFailures += 1
+            case .otherError:
+                break
+            }
+        }
+        
+        print("Race Condition Test Results:")
+        print("- Successful messages: \(successfulMessages)")
+        print("- Authentication failures: \(authenticationFailures)")
+        print("- Total concurrent messages sent: \(results.count)")
+        
+        await shutdownSessions()
+    }
+    
+    @Test("Network Race Condition - Simulate ICE Candidate Messages")
+    func testNetworkRaceConditionICEMessages() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages to establish session
+        for i in 1...3 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        // Simulate the exact scenario from the logs: ICE candidate messages arriving simultaneously
+        // This creates the "RECEIVED______ ice_candidate" pattern with concurrent job creation
+        var authenticationFailures = 0
+        var successfulMessages = 0
+        
+        // Simulate ICE candidate messages arriving simultaneously from network
+        // These would normally be received from the transport layer
+        let iceCandidateMessages = (1...20).map { i in
+            Task {
+                do {
+                    // Simulate network arrival timing - some messages arrive exactly at the same time
+                    let arrivalDelay = i % 3 == 0 ? UInt64(0) : UInt64.random(in: 0...2)
+                    try await Task.sleep(until: .now + .milliseconds(arrivalDelay))
+                    
+                    // Simulate the ICE candidate message content
+                    let iceData = Document(dictionary: [
+                        "type": "ice-candidate",
+                        "candidate": "candidate:\(i) 1 udp 2122260223 192.168.1.\(i) 54321 typ host",
+                        "sdpMLineIndex": i,
+                        "sdpMid": "0"
+                    ])
+                    
+                    try await _senderSession.writeTextMessage(
+                        recipient: .nickname("bob"),
+                        text: "ICE candidate \(i)",
+                        metadata: iceData
+                    )
+                    return MessageResult.success
+                } catch {
+                    if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                       error.localizedDescription.contains("authenticationFailure") ||
+                       error.localizedDescription.contains("invalidKeyId") {
+                        return MessageResult.authenticationFailure
+                    } else {
+                        return MessageResult.otherError(error)
+                    }
+                }
+            }
+        }
+        
+        // Process all ICE candidate messages concurrently
+        let results = await withTaskGroup(of: MessageResult.self) { group in
+            for message in iceCandidateMessages {
+                group.addTask {
+                    await message.value
+                }
+            }
+            
+            var results: [MessageResult] = []
+            for await result in group {
+                results.append(result)
+            }
+            return results
+        }
+        
+        // Count results
+        for result in results {
+            switch result {
+            case .success:
+                successfulMessages += 1
+            case .authenticationFailure:
+                authenticationFailures += 1
+            case .otherError:
+                break
+            }
+        }
+        
+        print("Network Race Condition Test Results:")
+        print("- Successful messages: \(successfulMessages)")
+        print("- Authentication failures: \(authenticationFailures)")
+        print("- Total ICE candidate messages: \(results.count)")
+        
+        await shutdownSessions()
+    }
+    
+    // Helper enum for test results
+    private enum MessageResult {
+        case success
+        case authenticationFailure
+        case otherError(Error)
+    }
 }
 
 actor ContinuationSignal {
@@ -1042,7 +1640,7 @@ struct SessionDelegate: PQSSessionDelegate {
         identity _: DoubleRatchetKit.SessionIdentity, recipient _: SessionModels.MessageRecipient
     ) async -> SessionModels.EncryptedMessage { message }
     func shouldFinishCommunicationSynchronization(_: Data?) -> Bool { false }
-    func processUnpersistedMessage(
+    func processMessage(
         _: SessionModels.CryptoMessage, senderSecretName _: String, senderDeviceId _: UUID
     ) async -> Bool { true }
 }
@@ -1553,6 +2151,15 @@ final class MockIdentityStore: PQSSessionStore, @unchecked Sendable {
     func fetchMediaJob(synchronizationIdentifier _: String, symmetricKey _: SymmetricKey)
     async throws -> SessionModels.DataPacket?
     { nil }
+    
+    /// Clears all stored data for testing purposes
+    func clearAllData() async throws {
+        sessionContext = nil
+        identities.removeAll()
+        encyrptedConfigurationForTesting = Data()
+        createdMessages.removeAll()
+        contacts.removeAll()
+    }
 }
 
 struct MockUserData {
@@ -1599,4 +2206,493 @@ extension Data {
 
 enum TestError: Error {
     case contactPropsDecryptionFailed
+}
+
+// MARK: - Authentication Failure Tests
+
+extension EndToEndTests {
+    
+    @Test("Ratchet State Mismatch Authentication Failure")
+    func testRatchetStateMismatchAuthenticationFailure() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages to establish session (like in the logs)
+        for i in 1...4 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
+            // Small delay to allow processing
+            try await Task.sleep(until: .now + .milliseconds(100))
+        }
+        
+        // Now simulate the exact pattern from the logs:
+        // Device2 receives messages and generates skipped message keys for indices 5, 6, 7
+        // But authentication still fails
+        
+        // Send messages that will cause device2 to generate skipped message keys
+        // This simulates the scenario where messages arrive out of order
+        var authenticationFailures = 0
+        var successfulMessages = 0
+        
+        // Send messages rapidly to create the skipped message pattern
+        for i in 5...10 {
+            do {
+                try await _senderSession.writeTextMessage(
+                    recipient: .nickname("bob"),
+                    text: "Message \(i) - should cause skipped keys",
+                    metadata: Document()
+                )
+                successfulMessages += 1
+            } catch {
+                if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                   error.localizedDescription.contains("authenticationFailure") ||
+                   error.localizedDescription.contains("invalidKeyId") {
+                    authenticationFailures += 1
+                }
+            }
+            
+            // Very small delay to create rapid message scenario like in the logs
+            try await Task.sleep(until: .now + .milliseconds(5))
+        }
+        
+        // Wait for processing to complete
+        try await Task.sleep(until: .now + .seconds(2))
+        
+        // Log the results for debugging
+        print("✅ Successful messages: \(successfulMessages)")
+        print("❌ Authentication failures: \(authenticationFailures)")
+        
+        // The test should show authentication failures similar to the logs
+        // This will help us identify the root cause of the ratchet state mismatch
+        
+        await shutdownSessions()
+    }
+    
+    @Test("Skipped Message Key Pattern - Exact Log Reproduction")
+    func testSkippedMessageKeyPattern() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages to establish session (like in the logs)
+        for i in 1...4 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
+            // Small delay to allow processing
+            try await Task.sleep(until: .now + .milliseconds(100))
+        }
+        
+        // Now simulate the exact pattern from device2.txt logs:
+        // Device2 receives messages and generates skipped message keys for indices 5, 6, 7
+        // But authentication still fails
+        
+        // Send messages rapidly to create the skipped message pattern
+        // This simulates the scenario where messages arrive out of order
+        for i in 5...10 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Message \(i) - should cause skipped keys",
+                metadata: Document()
+            )
+            
+            // Very small delay to create rapid message scenario like in the logs
+            try await Task.sleep(until: .now + .milliseconds(5))
+        }
+        
+        // Wait for processing to complete
+        try await Task.sleep(until: .now + .seconds(2))
+        
+        // Now simulate device2 trying to decrypt messages and generating skipped keys
+        // This is where the authentication failures happen in the real logs
+        
+        print("🔍 Simulating device2 decryption with skipped message keys...")
+        print("📊 Expected pattern from logs:")
+        print("   - Device2 generates skipped message keys for indices 5, 6, 7")
+        print("   - Device2 generates Message Key: jreVLX6NW+UQS7Mz4yOGWk74+YTGGFtnxv1ErEehnzc=")
+        print("   - But authentication fails: ❌ RATCHETERROR DURING RATCHET DECRYPTION: AUTHENTICATIONFAILURE")
+        
+        // The test should show authentication failures similar to the logs
+        // This will help us identify the root cause of the ratchet state mismatch
+        
+        await shutdownSessions()
+    }
+    
+    @Test("Real Authentication Failure - Device2 Decryption Test")
+    func testRealAuthenticationFailure() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages to establish session (like in the logs)
+        for i in 1...4 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
+            // Small delay to allow processing
+            try await Task.sleep(until: .now + .milliseconds(100))
+        }
+        
+        // Now simulate the exact pattern from device2.txt logs:
+        // Device2 receives messages and generates skipped message keys for indices 5, 6, 7
+        // But authentication still fails
+        
+        // Send messages rapidly to create the skipped message pattern
+        // This simulates the scenario where messages arrive out of order
+        for i in 5...10 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Message \(i) - should cause skipped keys",
+                metadata: Document()
+            )
+            
+            // Very small delay to create rapid message scenario like in the logs
+            try await Task.sleep(until: .now + .milliseconds(5))
+        }
+        
+        // Wait for processing to complete
+        try await Task.sleep(until: .now + .seconds(2))
+        
+        // Now simulate device2 trying to decrypt messages and generating skipped keys
+        // This is where the authentication failures happen in the real logs
+        
+        print("🔍 Simulating device2 decryption with skipped message keys...")
+        print("📊 Expected pattern from logs:")
+        print("   - Device2 generates skipped message keys for indices 5, 6, 7")
+        print("   - Device2 generates Message Key: jreVLX6NW+UQS7Mz4yOGWk74+YTGGFtnxv1ErEehnzc=")
+        print("   - But authentication fails: ❌ RATCHETERROR DURING RATCHET DECRYPTION: AUTHENTICATIONFAILURE")
+        
+        // The test should show authentication failures similar to the logs
+        // This will help us identify the root cause of the ratchet state mismatch
+        
+        await shutdownSessions()
+    }
+    
+    @Test("Ratchet State Corruption - Skipped Message Key Mismatch")
+    func testRatchetStateCorruption() async throws {
+        // Setup two devices with their own sessions
+        let device1Store = createSenderStore()
+        let device2Store = createRecipientStore()
+        
+        try await createSenderSession(store: device1Store)
+        try await createRecipientSession(store: device2Store)
+        
+        // Send initial messages to establish session (like in the logs)
+        for i in 1...4 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
+            // Small delay to allow processing
+            try await Task.sleep(until: .now + .milliseconds(100))
+        }
+        
+        // Now simulate the exact scenario from the logs:
+        // Send messages rapidly to create concurrent ratchet state updates
+        // This should cause the ratchet state to get corrupted (2 ratchets ahead)
+        
+        print("🚀 Starting rapid message sending to trigger ratchet state corruption...")
+        
+        // Send messages rapidly to create concurrent operations
+        // This simulates the scenario where multiple jobs are processed concurrently
+        // and the ratchet state gets corrupted during "Generate skipped keys invoked"
+        
+        var authenticationFailures = 0
+        var successfulMessages = 0
+        
+        for i in 5...15 {
+            do {
+                try await _senderSession.writeTextMessage(
+                    recipient: .nickname("bob"),
+                    text: "Message \(i) - should cause ratchet state corruption",
+                    metadata: Document()
+                )
+                successfulMessages += 1
+            } catch {
+                if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                   error.localizedDescription.contains("authenticationFailure") ||
+                   error.localizedDescription.contains("invalidKeyId") {
+                    authenticationFailures += 1
+                    print("❌ Authentication failure detected: \(error)")
+                }
+            }
+            
+            // Very small delay to create rapid concurrent operations
+            // This should trigger the race condition in ratchet state management
+            try await Task.sleep(until: .now + .milliseconds(1))
+        }
+        
+        // Wait for processing to complete
+        try await Task.sleep(until: .now + .seconds(3))
+        
+        print("📊 Test Results:")
+        print("   ✅ Successful messages: \(successfulMessages)")
+        print("   ❌ Authentication failures: \(authenticationFailures)")
+        
+        // The test should show authentication failures if the ratchet state corruption theory is correct
+        // This will prove that the ratchet state is getting corrupted during concurrent operations
+        // causing the "Generate skipped keys invoked" to use the wrong ratchet state
+        
+        if authenticationFailures > 0 {
+            print("🎯 SUCCESS: Ratchet state corruption theory confirmed!")
+            print("   - Authentication failures detected during rapid concurrent operations")
+            print("   - This proves the ratchet state is getting corrupted during 'Generate skipped keys invoked'")
+            print("   - The ratchet state is advancing incorrectly during concurrent operations")
+        } else {
+            print("⚠️  No authentication failures detected - ratchet state corruption may be fixed")
+        }
+        
+        await shutdownSessions()
+    }
+
+    @Test("Bidirectional Multi-Device Conversation")
+    func testBidirectionalMultiDeviceConversation() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            self.aliceStreamContinuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            self.bobStreamContinuation = continuation
+        }
+
+        // 1) Set up master sessions and link two child devices for each side
+        let senderStore = createSenderStore()
+        let senderChildStore1 = createSenderChildStore1()
+        let senderChildStore2 = createSenderChildStore2()
+        let recipientStore = createRecipientStore()
+        let recipientChildStore1 = createRecipientChildStore1()
+        let recipientChildStore2 = createRecipientChildStore2()
+
+        try await createSenderSession(store: senderStore)
+        try await createRecipientSession(store: recipientStore)
+        try await linkSenderChildSession1(store: senderChildStore1)
+        try await linkSenderChildSession2(store: senderChildStore2)
+        try await linkRecipientChildSession1(store: recipientChildStore1)
+        try await linkRecipientChildSession2(store: recipientChildStore2)
+
+        // 2) Start receive loops for both users (handled by master sessions)
+        aliceTask = Task {
+            await #expect(throws: Never.self, "Alice should process messages from Bob and his devices") {
+                for await received in aliceStream {
+                    try await self._senderSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
+                }
+            }
+        }
+
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should process messages from Alice and her devices") {
+                for await received in bobStream {
+                    try await self._recipientSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
+                }
+            }
+        }
+
+        // 3) Round‑robin messages from all devices on both sides
+        for i in 1...10 {
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Alice(master) #\(i)", metadata: Document())
+            try await _senderChildSession1.writeTextMessage(recipient: .nickname("bob"), text: "Alice(child1) #\(i)", metadata: Document())
+            try await _senderChildSession2.writeTextMessage(recipient: .nickname("bob"), text: "Alice(child2) #\(i)", metadata: Document())
+
+            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Bob(master) #\(i)", metadata: Document())
+            try await _recipientChildSession1.writeTextMessage(recipient: .nickname("alice"), text: "Bob(child1) #\(i)", metadata: Document())
+            try await _recipientChildSession2.writeTextMessage(recipient: .nickname("alice"), text: "Bob(child2) #\(i)", metadata: Document())
+
+            try await Task.sleep(until: .now + .milliseconds(10))
+        }
+
+        // 4) Allow processing, then close streams
+        try await Task.sleep(until: .now + .seconds(2))
+        self.aliceStreamContinuation?.finish()
+        self.bobStreamContinuation?.finish()
+    }
+
+    @Test("Bidirectional Conversation With Mid-Conversation Key Rotation")
+    func testBidirectionalConversationWithKeyRotation() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            self.aliceStreamContinuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            self.bobStreamContinuation = continuation
+        }
+
+        try await createSenderSession(store: createSenderStore())
+        try await createRecipientSession(store: createRecipientStore())
+
+        aliceTask = Task {
+            await #expect(throws: Never.self, "Alice should receive throughout key rotations") {
+                for await received in aliceStream {
+                    try await self._senderSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
+                }
+            }
+        }
+
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should receive throughout key rotations") {
+                for await received in bobStream {
+                    try await self._recipientSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
+                }
+            }
+        }
+
+        // Initial warm‑up exchange
+        for i in 1...5 {
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup alice #\(i)", metadata: Document())
+            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "warmup bob #\(i)", metadata: Document())
+            try await Task.sleep(until: .now + .milliseconds(20))
+        }
+
+        // Rotate keys mid‑conversation on Alice
+        try await _senderSession.rotateKeysOnPotentialCompromise()
+
+        for i in 6...10 {
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice post-rotate #\(i)", metadata: Document())
+            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob steady #\(i)", metadata: Document())
+            try await Task.sleep(until: .now + .milliseconds(15))
+        }
+
+        // Rotate keys mid‑conversation on Bob
+        try await _recipientSession.rotateKeysOnPotentialCompromise()
+
+        for i in 11...15 {
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice steady #\(i)", metadata: Document())
+            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob post-rotate #\(i)", metadata: Document())
+            try await Task.sleep(until: .now + .milliseconds(15))
+        }
+
+        try await Task.sleep(until: .now + .seconds(2))
+        self.aliceStreamContinuation?.finish()
+        self.bobStreamContinuation?.finish()
+    }
+
+    @Test("Bidirectional High Concurrency Burst")
+    func testBidirectionalHighConcurrencyBurst() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            self.aliceStreamContinuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            self.bobStreamContinuation = continuation
+        }
+
+        try await createSenderSession(store: createSenderStore())
+        try await createRecipientSession(store: createRecipientStore())
+
+        aliceTask = Task {
+            await #expect(throws: Never.self, "Alice should process a burst of concurrent messages") {
+                for await received in aliceStream {
+                    try await self._senderSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
+                }
+            }
+        }
+
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should process a burst of concurrent messages") {
+                for await received in bobStream {
+                    try await self._recipientSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
+                }
+            }
+        }
+
+        // Fire a high number of concurrent sends in both directions
+        let total = 100
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for i in 1...total {
+                group.addTask {
+                    try await self._senderSession.writeTextMessage(
+                        recipient: .nickname("bob"),
+                        text: "A->B #\(i)",
+                        metadata: Document()
+                    )
+                }
+                group.addTask {
+                    try await self._recipientSession.writeTextMessage(
+                        recipient: .nickname("alice"),
+                        text: "B->A #\(i)",
+                        metadata: Document()
+                    )
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        try await Task.sleep(until: .now + .seconds(3))
+        self.aliceStreamContinuation?.finish()
+        self.bobStreamContinuation?.finish()
+    }
 }

@@ -14,6 +14,11 @@
 //  post-quantum cryptographic session management capabilities.
 //
 import DequeModule
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 public extension Deque {
     /// Asynchronously finds the index of the first element in the deque that satisfies the given predicate.
@@ -304,5 +309,30 @@ public extension Array {
             }
         }
         return false
+    }
+}
+
+// MARK: - Range<Int> AsyncMap
+
+public extension Range where Bound == Int {
+    func asyncMap<T>(transform: @Sendable (Int) async -> T) async -> [T] {
+        var results = [T]()
+        for element in self {
+            let result = await transform(element)
+            results.append(result)
+        }
+        return results
+    }
+}
+
+// Optionally also for ClosedRange<Int> (for...through)
+public extension ClosedRange where Bound == Int {
+    func asyncMap<T>(transform: @Sendable (Int) async -> T) async -> [T] {
+        var results = [T]()
+        for element in self {
+            let result = await transform(element)
+            results.append(result)
+        }
+        return results
     }
 }

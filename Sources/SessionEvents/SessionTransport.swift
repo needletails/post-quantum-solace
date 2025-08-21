@@ -14,10 +14,14 @@
 //  post-quantum cryptographic session management capabilities.
 //
 import BSON
-import Crypto
 import DoubleRatchetKit
 import Foundation
 import SessionModels
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 /// Metadata structure for signed ratchet messages that contains sensitive information
 /// used to prepare messages for network transmission.

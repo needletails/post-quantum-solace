@@ -14,11 +14,15 @@
 //  post-quantum cryptographic session management capabilities.
 //
 import BSON
-import Crypto
 import Foundation
 import NeedleTailAsyncSequence
 import SessionEvents
 import SessionModels
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 /// Extension to `PQSSession` providing all event-driven messaging, contact management, and protocol conformance for session events.
 ///
