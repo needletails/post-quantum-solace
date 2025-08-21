@@ -26,7 +26,7 @@ import Foundation
 ///
 /// - Note: The coding keys use single-letter identifiers for security through obscurity,
 ///         making it harder for attackers to understand the serialized data structure.
-public struct SessionContext: Codable & Sendable {
+public struct SessionContext: Codable & Sendable, Equatable {
     /// Coding keys for encoding and decoding the struct.
     ///
     /// Uses single-letter keys to obfuscate the data structure and reduce payload size
@@ -107,6 +107,10 @@ public struct SessionContext: Codable & Sendable {
     ///          `sessionUser` property.
     public mutating func updateSessionUser(_ newSessionUser: SessionUser) {
         sessionUser = newSessionUser
+    }
+    
+    public static func == (lhs: SessionContext, rhs: SessionContext) -> Bool {
+        lhs.sessionUser.deviceId == rhs.sessionUser.deviceId
     }
 }
 

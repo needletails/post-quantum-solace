@@ -20,11 +20,15 @@
 //  encryption/decryption capabilities.
 //
 import BSON
-import Crypto
 import DoubleRatchetKit
 import Foundation
 import NeedleTailAsyncSequence
 import NeedleTailCrypto
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 /// A struct representing an outbound task message to be sent to a recipient.
 ///

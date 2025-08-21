@@ -14,15 +14,29 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
-import Crypto
 import Foundation
 import NeedleTailAsyncSequence
 import SessionModels
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 extension TaskProcessor {
+    /// Increments and returns the internal sequence identifier atomically.
+    /// Since TaskProcessor is an actor, this is already thread-safe.
+    ///
+    /// - Returns: The next sequence ID as an `Int`.
+    func incrementId() async -> Int {
+        sequenceId += 1
+        return sequenceId
+    }
+    
     /// Feeds an encryptable task into the session's job queue for processing.
     ///
     /// This method prepares a job by encrypting and caching it, then attempts to execute the sequence of tasks.
+    /// Since TaskProcessor is an actor, all operations are automatically serialized.
     ///
     /// - Parameters:
     ///   - task: The task to be encrypted and queued.
@@ -42,7 +56,11 @@ extension TaskProcessor {
 
         try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
         try await cache.createJob(job)
-        try await attemptTaskSequence(session: session)
+        print("CREATED JOB: \(sequenceId)")
+        
+        if !isRunning {
+            try await attemptTaskSequence(session: session)
+        }
     }
 
     /// Loads and optionally processes a job or all cached jobs using the provided session and symmetric key.
@@ -79,15 +97,18 @@ extension TaskProcessor {
     func setIsRunning(_ isRunning: Bool) async {
         self.isRunning = isRunning
     }
-
-    /// Increments and returns the internal sequence identifier.
-    ///
-    /// - Returns: The next sequence ID as an `Int`.
-    func incrementId() async -> Int {
-        sequenceId += 1
-        return sequenceId
+    
+    /// Atomically checks if not running and sets running to true.
+    /// Returns true if the operation was successful (was not running and now is running).
+    /// Returns false if already running.
+    func trySetRunning() async -> Bool {
+        if !isRunning {
+            isRunning = true
+            return true
+        }
+        return false
     }
-
+    
     /// Processes tasks from the job queue using a serial, cancellation-aware execution model.
     ///
     /// This function leverages `NeedleTailAsyncSequence` to manage job execution order and cancellation.
@@ -100,7 +121,8 @@ extension TaskProcessor {
             throw PQSSession.SessionErrors.databaseNotInitialized
         }
 
-        guard !isRunning else {
+        // Fix race condition: Use atomic check-and-set to prevent multiple concurrent job processors
+        guard await trySetRunning() else {
             if await jobConsumer.deque.isEmpty {
                 await jobConsumer.gracefulShutdown()
                 await setIsRunning(false)
@@ -109,7 +131,6 @@ extension TaskProcessor {
         }
 
         logger.log(level: .debug, message: "Starting job queue")
-        await setIsRunning(true)
         let symmetricKey = try await session.getDatabaseSymmetricKey()
 
         for try await result in NeedleTailAsyncSequence(consumer: jobConsumer) {
@@ -121,17 +142,18 @@ extension TaskProcessor {
 
                 logger.log(level: .debug, message: "Running job \(props.sequenceId)")
 
+                // Check session viability before processing
                 guard session.isViable else {
                     logger.log(level: .debug, message: "Skipping job \(props.sequenceId) as we are offline")
+                    // Job remains in cache for later processing when session becomes viable
                     await jobConsumer.gracefulShutdown()
                     await setIsRunning(false)
-                    try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
                     return
                 }
 
                 if let delayedUntil = props.delayedUntil, delayedUntil >= Date() {
                     logger.log(level: .debug, message: "Task was delayed into the future")
-                    try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
+                    // Job remains in cache for later processing when delay expires
 
                     if await jobConsumer.deque.isEmpty {
                         await jobConsumer.gracefulShutdown()
@@ -143,7 +165,12 @@ extension TaskProcessor {
 
                 do {
                     logger.log(level: .debug, message: "Executing Job \(props.sequenceId)")
-                    try await performRatchet(task: props.task.task, session: session)
+                    // Custom task delegate may be used, but usually only for testing
+                    if let taskDelegate {
+                        try await taskDelegate.performRatchet(task: props.task.task, session: session)
+                    } else {
+                        try await performRatchet(task: props.task.task, session: session)
+                    }
                     do {
                         try await cache.deleteJob(job)
                     } catch {
@@ -201,6 +228,8 @@ extension TaskProcessor {
             await setIsRunning(false)
         }
     }
+    
+
 
     /// Errors specific to job processing operations.
     enum JobProcessorErrors: Error {
@@ -208,3 +237,94 @@ extension TaskProcessor {
         case missingIdentity
     }
 }
+
+
+/// A protocol that defines the interface for custom task execution delegates.
+///
+/// This protocol allows for custom implementation of task processing logic,
+/// primarily used for testing purposes but can also be used for specialized
+/// task handling in production environments.
+///
+/// - Note: This protocol is `Sendable` to ensure thread safety when used
+///   across concurrent contexts. Implementations must be thread-safe.
+///
+/// - Important: The default implementation in `TaskProcessor` handles most
+///   production use cases. Custom delegates are typically only needed for:
+///   - Unit testing and mocking
+///   - Specialized task processing requirements
+///   - Debugging and instrumentation
+///
+/// - Example Usage:
+///   ```swift
+///   class CustomTaskDelegate: TaskSequenceDelegate {
+///       func performRatchet(task: TaskType, session: PQSSession) async throws {
+///           // Custom task processing logic
+///           switch task {
+///           case .writeMessage(let writeTask):
+///               // Handle write message task
+///               try await session.writeMessage(writeTask)
+///           case .streamMessage(let streamTask):
+///               // Handle stream message task
+///               try await session.streamMessage(streamTask)
+///           }
+///       }
+///   }
+///   ```
+///
+/// - Thread Safety: Implementations must be thread-safe as this protocol
+///   may be called from concurrent contexts within the `TaskProcessor`.
+protocol TaskSequenceDelegate: Sendable {
+    
+    /// Performs the ratchet operation for a given task within the session context.
+    ///
+    /// This method is responsible for executing the actual cryptographic ratchet
+    /// operation associated with the task. The implementation should handle all
+    /// necessary cryptographic operations, error handling, and session state
+    /// management for the specific task type.
+    ///
+    /// - Parameters:
+    ///   - task: The `TaskType` to be processed. This can be a write message task,
+    ///     stream message task, or other task types defined in the system.
+    ///   - session: The `PQSSession` context providing access to cryptographic
+    ///     operations, identity management, and session state.
+    ///
+    /// - Throws: Any error that occurs during task execution, including but not
+    ///   limited to:
+    ///   - Cryptographic errors (encryption/decryption failures)
+    ///   - Network errors (connection issues, timeouts)
+    ///   - Session errors (invalid session state, missing identities)
+    ///   - Task-specific errors (invalid message format, recipient not found)
+    ///
+    /// - Note: This method is called asynchronously and should not block the
+    ///   calling thread. Long-running operations should be properly awaited.
+    ///
+    /// - Important: Implementations should ensure proper error propagation
+    ///   to allow the `TaskProcessor` to handle failures appropriately.
+    ///   Errors thrown from this method will be caught and handled by the
+    ///   task processing loop.
+    ///
+    /// - Example Implementation:
+    ///   ```swift
+    ///   func performRatchet(task: TaskType, session: PQSSession) async throws {
+    ///       switch task {
+    ///       case .writeMessage(let writeTask):
+    ///           // Validate the task
+    ///           guard let recipient = writeTask.recipientIdentity else {
+    ///               throw TaskProcessor.JobProcessorErrors.missingIdentity
+    ///           }
+    ///           
+    ///           // Perform the ratchet operation
+    ///           try await session.writeMessage(writeTask)
+    ///           
+    ///       case .streamMessage(let streamTask):
+    ///           // Handle stream message processing
+    ///           try await session.streamMessage(streamTask)
+    ///       }
+    ///   }
+    ///   ```
+    func performRatchet(
+        task: TaskType,
+        session: PQSSession
+    ) async throws
+}
+

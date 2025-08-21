@@ -15,7 +15,6 @@
 
 import struct BSON.BSONDecoder
 import struct BSON.Document
-import Crypto
 import DequeModule
 import DoubleRatchetKit
 import Foundation
@@ -25,6 +24,11 @@ import NeedleTailLogger
 import SessionEvents
 import SessionModels
 import Logging
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 /// `TaskProcessor` manages the asynchronous execution of encryption and decryption tasks
 /// using Double Ratchet and other cryptographic mechanisms. It handles inbound and outbound
@@ -124,6 +128,8 @@ public actor TaskProcessor {
     /// Delegate responsible for transport-level session communication.
     /// Handles the actual sending and receiving of encrypted messages over the network.
     var delegate: (any SessionTransport)?
+    
+    var taskDelegate: TaskSequenceDelegate?
 
     /// Represents a stashed inbound task for later processing.
     ///
@@ -184,6 +190,10 @@ public actor TaskProcessor {
     ///   Pass `nil` to remove the current delegate.
     public func setDelegate(_ delegate: (any SessionTransport)?) {
         self.delegate = delegate
+    }
+    
+    func setTaskDelegate(_ delegate: TaskSequenceDelegate) {
+        self.taskDelegate = delegate
     }
     
     public func setLogLevel(_ level: Logging.Logger.Level) async {
@@ -470,6 +480,7 @@ public actor TaskProcessor {
         shouldPersist: Bool,
         logger: NeedleTailLogger
     ) async throws {
+
         var task: EncryptableTask
         var encryptableMessage: EncryptedMessage?
 
@@ -490,8 +501,7 @@ public actor TaskProcessor {
                     recipients: recipients,
                     communicationType: message.recipient,
                     metadata: message.metadata,
-                    symmetricKey: symmetricKey
-                )
+                    symmetricKey: symmetricKey)
                 await session.receiverDelegate?.updatedCommunication(communicationModel, members: recipients)
             }
 
@@ -502,65 +512,68 @@ public actor TaskProcessor {
                 symmetricKey: symmetricKey,
                 members: recipients,
                 sharedId: UUID().uuidString,
-                shouldUpdateCommunication: shouldUpdateCommunication
-            )
-
+                shouldUpdateCommunication: shouldUpdateCommunication)
             await session.receiverDelegate?.createdMessage(savedMessage)
             encryptableMessage = savedMessage
         }
-
+        
         for identity in sessionIdentities {
-            if let unwrappedEncryptableMessage = encryptableMessage {
-                encryptableMessage = await session.sessionDelegate?.updateEncryptableMessageMetadata(
-                    unwrappedEncryptableMessage,
-                    transportInfo: message.transportInfo,
-                    identity: identity,
-                    recipient: message.recipient
-                )
-            }
-
-            if shouldPersist {
-                guard let encryptableMessage else { return }
-                guard let messageProps = await encryptableMessage.props(symmetricKey: symmetricKey) else {
-                    throw PQSSession.SessionErrors.propsError
-                }
-
-                task = EncryptableTask(
-                    task: .writeMessage(OutboundTaskMessage(
-                        message: messageProps.message,
-                        recipientIdentity: identity,
-                        localId: encryptableMessage.id,
-                        sharedId: encryptableMessage.sharedId
-                    )))
-            } else {
-                if await session.sessionDelegate?.shouldFinishCommunicationSynchronization(message.transportInfo) == true {
-                    guard !message.text.isEmpty else { return }
-
-                    logger.log(level: .debug, message: "Requester Synchronizing Communication Message")
-                    let communicationModel = try await findCommunicationType(
-                        cache: cache,
-                        communicationType: message.recipient,
-                        session: session
+            do {
+                if let unwrappedEncryptableMessage = encryptableMessage {
+                    encryptableMessage = await session.sessionDelegate?.updateEncryptableMessageMetadata(
+                        unwrappedEncryptableMessage,
+                        transportInfo: message.transportInfo,
+                        identity: identity,
+                        recipient: message.recipient
                     )
-
-                    var props = await communicationModel.props(symmetricKey: symmetricKey)
-                    props?.sharedId = UUID(uuidString: message.text)
-                    _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
-                    try await cache.updateCommunication(communicationModel)
-
-                    logger.log(level: .debug, message: "Updated Communication Model with Shared ID: \(String(describing: props?.sharedId))")
                 }
 
-                task = EncryptableTask(
-                    task: .writeMessage(OutboundTaskMessage(
-                        message: message,
-                        recipientIdentity: identity,
-                        localId: UUID(),
-                        sharedId: UUID().uuidString
-                    ))
-                )
+                if shouldPersist {
+                    guard let encryptableMessage else { return }
+                    guard let messageProps = await encryptableMessage.props(symmetricKey: symmetricKey) else {
+                        throw PQSSession.SessionErrors.propsError
+                    }
+                    logger.log(level: .debug, message: "Obtained encryptable message props for recipient \(identity)")
+
+                    task = EncryptableTask(
+                        task: .writeMessage(OutboundTaskMessage(
+                            message: messageProps.message,
+                            recipientIdentity: identity,
+                            localId: encryptableMessage.id,
+                            sharedId: encryptableMessage.sharedId
+                        )))
+                } else {
+                    if await session.sessionDelegate?.shouldFinishCommunicationSynchronization(message.transportInfo) == true {
+                        guard !message.text.isEmpty else { return }
+
+                        logger.log(level: .debug, message: "Requester Synchronizing Communication Message")
+                        let communicationModel = try await findCommunicationType(
+                            cache: cache,
+                            communicationType: message.recipient,
+                            session: session
+                        )
+
+                        var props = await communicationModel.props(symmetricKey: symmetricKey)
+                        props?.sharedId = UUID(uuidString: message.text)
+                        _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
+                        try await cache.updateCommunication(communicationModel)
+
+                        logger.log(level: .debug, message: "Updated Communication Model with Shared ID: \(String(describing: props?.sharedId))")
+                    }
+
+                    task = EncryptableTask(
+                        task: .writeMessage(OutboundTaskMessage(
+                            message: message,
+                            recipientIdentity: identity,
+                            localId: UUID(),
+                            sharedId: UUID().uuidString
+                        ))
+                    )
+                }
+                try await feedTask(task, session: session)
+            } catch {
+                logger.log(level: .error, message: "Error handling recipient identity \(identity): \(error)")
             }
-            try await feedTask(task, session: session)
         }
     }
 
@@ -599,3 +612,4 @@ public actor TaskProcessor {
         )
     }
 }
+

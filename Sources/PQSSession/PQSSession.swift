@@ -15,7 +15,6 @@
 //
 
 import BSON
-import Crypto
 import DoubleRatchetKit
 import Foundation
 import Logging
@@ -24,6 +23,11 @@ import NeedleTailLogger
 import SessionEvents
 import SessionModels
 import SwiftKyber
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 /// A secure, post-quantum cryptographic session manager for end-to-end encrypted messaging.
 ///
@@ -1310,6 +1314,9 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         await setPQSSessionDelegate(conformer: nil)
         await setSessionEventDelegate(conformer: nil)
         sessionIdentities.removeAll()
+        
+        // Reset task processor state to ensure clean restart
+        await taskProcessor.setIsRunning(false)
     }
 
     #if os(iOS)
@@ -1463,3 +1470,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         #endif
     }
 }
+
+#if os(Android)
+extension SymmetricKey: @unchecked Sendable {}
+extension SHA256: @unchecked Sendable {}
+#endif

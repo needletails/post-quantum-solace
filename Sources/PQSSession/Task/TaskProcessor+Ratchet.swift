@@ -37,7 +37,7 @@ import SessionModels
 /// - Keys are rotated automatically to prevent forward secrecy attacks
 /// - Message integrity is ensured through digital signatures
 /// - Session state is encrypted and persisted securely
-extension TaskProcessor: SessionIdentityDelegate {
+extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     /// Updates the session identity with the provided identity.
     ///
     /// This method persists an updated session identity to the cache, typically after
@@ -451,7 +451,7 @@ extension TaskProcessor: SessionIdentityDelegate {
             var canSaveMessage = true
             
             if let sessionDelegate = await session.sessionDelegate {
-                canSaveMessage = await sessionDelegate.processUnpersistedMessage(
+                canSaveMessage = await sessionDelegate.processMessage(
                     decodedMessage,
                     senderSecretName: inboundTask.senderSecretName,
                     senderDeviceId: inboundTask.senderDeviceId)
@@ -474,22 +474,7 @@ extension TaskProcessor: SessionIdentityDelegate {
             }
         } catch {
 #if DEBUG
-                // Expanded debug logging with detailed info
-                let senderDeviceId = inboundTask.senderDeviceId.uuidString
-                let senderLongTermKeyHex = ratchetMessage.header.remoteLongTermPublicKey.base64EncodedString()
-                let senderOneTimePublicKeyId = ratchetMessage.header.remoteOneTimePublicKey?.id.uuidString ?? "nil"
-                let senderPQKemPublicKeyId = ratchetMessage.header.remotePQKemPublicKey.id.uuidString
-                
-                guard let props = try await sessionIdentity.props(symmetricKey: session.getDatabaseSymmetricKey()) else {
-                    throw CryptoError.propsError
-                }
-                guard let state = props.state else {
-                    throw CryptoError.propsError
-                }
-                
-
-                
-                logger.log(level: .error, message: "RatchetError during ratchet decryption: \(error)")
+            logger.log(level: .error, message: "RatchetError during ratchet decryption: \(error)")
 #endif
             throw error
         }

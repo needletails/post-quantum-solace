@@ -15,10 +15,14 @@
 //
 
 import BSON
-import Crypto
 import DoubleRatchetKit
 import Foundation
 import SessionModels
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 /// Extension providing cache management and model creation capabilities for the TaskProcessor.
 /// This extension handles the creation and management of communication models, message models,
@@ -233,20 +237,19 @@ extension TaskProcessor {
                 deliveryState: .sending,
                 message: message,
                 senderSecretName: sessionUser.secretName,
-                senderDeviceId: sessionUser.deviceId
-            ),
-            symmetricKey: symmetricKey
-        )
-
+                senderDeviceId: sessionUser.deviceId),
+            symmetricKey: symmetricKey)
+        
         guard let cache = await session.cache else {
             throw PQSSession.SessionErrors.databaseNotInitialized
         }
 
         if shouldUpdateCommunication {
             try await cache.updateCommunication(communication)
-            await session.receiverDelegate?.updatedCommunication(communication, members: members)
+            Task {
+                await session.receiverDelegate?.updatedCommunication(communication, members: members)
+            }
         }
-
         try await cache.createMessage(messageModel, symmetricKey: symmetricKey)
         return messageModel
     }

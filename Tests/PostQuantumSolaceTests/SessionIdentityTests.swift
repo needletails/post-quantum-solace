@@ -15,7 +15,6 @@
 //
 
 import BSON
-import Crypto
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
@@ -23,6 +22,11 @@ import NeedleTailCrypto
 import SessionEvents
 import SessionModels
 import Testing
+#if os(Android)
+@preconcurrency import Crypto
+#else
+import Crypto
+#endif
 
 // MARK: - Test Suite
 
