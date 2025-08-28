@@ -159,7 +159,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     public nonisolated(unsafe) weak var linkDelegate: DeviceLinkingDelegate?
     public var cache: SessionCache?
     let crypto = NeedleTailCrypto()
-    var logger = NeedleTailLogger(.init(label: "[PQSSession]"))
+    var logger = NeedleTailLogger("[PQSSession]")
     var sessionIdentities = Set<String>()
     var rotatingKeys = false
     var addingContactData: Data?

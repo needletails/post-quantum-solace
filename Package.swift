@@ -19,7 +19,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-crypto.git", from: "3.12.3"),
         .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "1.0.2"),
-        .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.0.0")
+        .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.0")
     ],
     targets: [
         .target(
