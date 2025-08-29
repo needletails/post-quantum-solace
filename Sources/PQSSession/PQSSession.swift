@@ -17,7 +17,6 @@
 import BSON
 import DoubleRatchetKit
 import Foundation
-import Logging
 import NeedleTailCrypto
 import NeedleTailLogger
 import SessionEvents
@@ -189,7 +188,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     // Sets the logger log level
-    public func setLogLevel(_ level: Logging.Logger.Level) async {
+    public func setLogLevel(_ level: Level) async {
         logger.setLogLevel(level)
         await taskProcessor.setLogLevel(level)
     }

@@ -56,7 +56,7 @@ extension TaskProcessor {
 
         try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
         try await cache.createJob(job)
-        print("CREATED JOB: \(sequenceId)")
+//        print("CREATED JOB: \(sequenceId)")
         
         if !isRunning {
             try await attemptTaskSequence(session: session)
