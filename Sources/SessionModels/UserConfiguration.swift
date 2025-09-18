@@ -17,7 +17,7 @@
 import BSON
 import DoubleRatchetKit
 import Foundation
-#if os(Android)
+#if os(Android) || os(Linux)
 @preconcurrency import Crypto
 #else
 import Crypto

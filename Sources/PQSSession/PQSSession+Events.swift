@@ -18,7 +18,7 @@ import Foundation
 import NeedleTailAsyncSequence
 import SessionEvents
 import SessionModels
-#if os(Android)
+#if os(Android) || os(Linux)
 @preconcurrency import Crypto
 #else
 import Crypto

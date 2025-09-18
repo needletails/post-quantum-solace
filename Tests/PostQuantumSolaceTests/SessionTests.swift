@@ -22,7 +22,7 @@ import NeedleTailCrypto
 import SessionEvents
 import SessionModels
 import Testing
-#if os(Android)
+#if os(Android) || os(Linux)
 @preconcurrency import Crypto
 #else
 import Crypto
