@@ -1469,8 +1469,3 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         #endif
     }
 }
-
-#if !canImport(CryptoKit)
-extension SymmetricKey: @retroactive @unchecked Sendable {}
-extension SHA256: @retroactive @unchecked Sendable {}
-#endif
