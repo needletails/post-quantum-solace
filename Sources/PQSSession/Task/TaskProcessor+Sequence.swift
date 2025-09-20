@@ -17,7 +17,7 @@
 import Foundation
 import NeedleTailAsyncSequence
 import SessionModels
-#if os(Android)
+#if os(Android) || os(Linux)
 @preconcurrency import Crypto
 #else
 import Crypto
@@ -56,7 +56,6 @@ extension TaskProcessor {
 
         try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
         try await cache.createJob(job)
-        print("CREATED JOB: \(sequenceId)")
         
         if !isRunning {
             try await attemptTaskSequence(session: session)

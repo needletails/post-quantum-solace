@@ -23,8 +23,7 @@ import NeedleTailCrypto
 import NeedleTailLogger
 import SessionEvents
 import SessionModels
-import Logging
-#if os(Android)
+#if os(Android) || os(Linux)
 @preconcurrency import Crypto
 #else
 import Crypto
@@ -196,7 +195,7 @@ public actor TaskProcessor {
         self.taskDelegate = delegate
     }
     
-    public func setLogLevel(_ level: Logging.Logger.Level) async {
+    public func setLogLevel(_ level: Level) async {
         logger.setLogLevel(level)
         await ratchetManager.setLogLevel(level)
     }

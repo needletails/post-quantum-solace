@@ -17,13 +17,12 @@
 import BSON
 import DoubleRatchetKit
 import Foundation
-import Logging
 import NeedleTailCrypto
 import NeedleTailLogger
 import SessionEvents
 import SessionModels
 import SwiftKyber
-#if os(Android)
+#if os(Android) || os(Linux)
 @preconcurrency import Crypto
 #else
 import Crypto
@@ -159,7 +158,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     public nonisolated(unsafe) weak var linkDelegate: DeviceLinkingDelegate?
     public var cache: SessionCache?
     let crypto = NeedleTailCrypto()
-    var logger = NeedleTailLogger(.init(label: "[PQSSession]"))
+    var logger = NeedleTailLogger("[PQSSession]")
     var sessionIdentities = Set<String>()
     var rotatingKeys = false
     var addingContactData: Data?
@@ -189,7 +188,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     // Sets the logger log level
-    public func setLogLevel(_ level: Logging.Logger.Level) async {
+    public func setLogLevel(_ level: Level) async {
         logger.setLogLevel(level)
         await taskProcessor.setLogLevel(level)
     }
@@ -1470,8 +1469,3 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         #endif
     }
 }
-
-#if os(Android)
-extension SymmetricKey: @unchecked Sendable {}
-extension SHA256: @unchecked Sendable {}
-#endif
