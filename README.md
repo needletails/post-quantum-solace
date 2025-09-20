@@ -3,7 +3,7 @@
 # Post-Quantum Solace
 
 [![Swift](https://img.shields.io/badge/Swift-6.1+-orange.svg)](https://swift.org)
-[![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20macOS%2015%2B-blue.svg)](https://developer.apple.com)
+[![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20macOS%2015%2B%20%7C%20Linux%20%7C%20Android-blue.svg)](https://developer.apple.com)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-green.svg)](LICENSE)
 
 A secure, post-quantum cryptographic messaging SDK with end-to-end encryption, built for the quantum-resistant future.
@@ -23,8 +23,10 @@ A secure, post-quantum cryptographic messaging SDK with end-to-end encryption, b
 
 - **iOS**: 18.0+
 - **macOS**: 15.0+
+- **Linux**: Ubuntu 24.04+ or equivalent
+- **Android**: API Level 24+ (Android 7.0+)
 - **Swift**: 6.1+
-- **Xcode**: 15.0+
+- **Xcode**: 15.0+ (for iOS/macOS development)
 
 ## 🚀 Installation
 
@@ -43,6 +45,40 @@ dependencies: [
 ```swift
 import PostQuantumSolace
 ```
+
+## 🌐 Cross-Platform Support
+
+Post-Quantum Solace is designed to work seamlessly across multiple platforms:
+
+### iOS & macOS
+- Native Swift implementation with full Apple ecosystem integration
+- Optimized for iOS 18+ and macOS 15+
+- Supports all Apple Silicon and Intel architectures
+
+### Linux
+- Full Swift support on Ubuntu 24.04+ and equivalent distributions
+- Compatible with Swift Package Manager on Linux
+- Tested on Ubuntu 24.04
+
+### Android
+- Swift for Android support via Swift Package Manager
+- Compatible with Android API Level 24+ (Android 7.0+)
+- Supports both ARM64 and x86_64 architectures
+- Integration with Android NDK and Gradle build system
+- Requires [Swift Android SDK 6.1+](https://github.com/finagolfin/swift-android-sdk/releases)
+
+### Platform-Specific Considerations
+
+**Android Development:**
+- Install [Swift Android SDK 6.1+](https://github.com/finagolfin/swift-android-sdk/releases)
+- Use Swift Package Manager with Android NDK integration
+- Ensure proper JNI bindings for Android-specific functionality
+- Consider memory management for mobile environments
+
+**Linux Development:**
+- Install Swift toolchain for your Linux distribution
+- Ensure proper cryptographic library dependencies
+- Test on target Linux distributions
 
 ## 🏗️ Architecture
 
@@ -237,12 +273,20 @@ Run the test suite to verify functionality:
 swift test
 ```
 
+### Cross-Platform Testing
+
 The package includes comprehensive tests covering:
 - Session management
 - Key synchronization
 - Message encryption/decryption
 - Device linking
 - End-to-end scenarios
+- Cross-platform compatibility
+
+**Platform-Specific Testing:**
+- **iOS/macOS**: Run tests in Xcode or via `swift test`
+- **Linux**: Use Swift Package Manager on your target Linux distribution
+- **Android**: Test via Android NDK integration and emulator/device testing
 
 ## 📚 Documentation
 
@@ -269,7 +313,9 @@ This project is licensed under the AGPL-3.0 License - see the [LICENSE](LICENSE)
 
 ## 🏢 About
 
-Post-Quantum Solace is developed by the [NeedleTails Organization](https://github.com/needletails) as part of our commitment to secure, quantum-resistant communication.
+Post-Quantum Solace is developed by the [NeedleTails Organization](https://github.com/needletails) as part of our commitment to secure, quantum-resistant communication across all major platforms.
+
+Built with cross-platform compatibility in mind, Post-Quantum Solace ensures your applications can maintain the highest security standards whether deployed on iOS, macOS, Linux, or Android.
 
 ---
 
