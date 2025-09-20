@@ -1470,7 +1470,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 }
 
-#if os(Android)
-extension SymmetricKey: @unchecked Sendable {}
-extension SHA256: @unchecked Sendable {}
+#if !canImport(CryptoKit)
+extension SymmetricKey: @retroactive @unchecked Sendable {}
+extension SHA256: @retroactive @unchecked Sendable {}
 #endif
