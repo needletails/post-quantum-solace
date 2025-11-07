@@ -4,7 +4,7 @@ A secure, post-quantum cryptographic messaging SDK with end-to-end encryption.
 
 ## Overview
 
-The Post-Quantum Solace SDK provides a comprehensive solution for secure messaging with both classical (Curve25519) and post-quantum (Kyber1024) cryptography. Built with Swift's modern concurrency features, it offers forward secrecy, device management, and automatic key rotation.
+The Post-Quantum Solace SDK provides a comprehensive solution for secure messaging with both classical (Curve25519) and post-quantum (MLKEM1024) cryptography. Built with Swift's modern concurrency features, it offers forward secrecy, device management, and automatic key rotation.
 
 ## Topics
 
@@ -24,7 +24,7 @@ The Post-Quantum Solace SDK provides a comprehensive solution for secure messagi
 
 ### Key Features
 
-- **Post-Quantum Security**: Kyber1024 for long-term security
+- **Post-Quantum Security**: MLKEM1024 for long-term security
 - **Forward Secrecy**: Double Ratchet protocol implementation
 - **Device Management**: Master/child device support
 - **Automatic Key Rotation**: Compromise recovery and key freshness
@@ -86,7 +86,7 @@ try await session.writeTextMessage(
 
 ### Cryptographic Protocols
 - **Double Ratchet**: For forward secrecy and message ordering
-- **Kyber1024**: Post-quantum key exchange
+- **MLKEM1024**: Post-quantum key exchange
 - **Curve25519**: Classical cryptography for immediate security
 - **AES-GCM**: Symmetric encryption for message content
 

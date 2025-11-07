@@ -10,7 +10,7 @@ A secure, post-quantum cryptographic messaging SDK with end-to-end encryption, b
 
 ## 🌟 Features
 
-- **🔐 Post-Quantum Security**: Kyber1024 for long-term security against quantum attacks
+- **🔐 Post-Quantum Security**: MLKEM1024 for long-term security against quantum attacks
 - **🔄 Forward Secrecy**: Double Ratchet protocol implementation for perfect forward secrecy
 - **📱 Device Management**: Master/child device support with secure linking
 - **🔄 Automatic Key Rotation**: Compromise recovery and key freshness
@@ -220,7 +220,7 @@ class AppEventReceiver: EventReceiver {
 
 ### Cryptographic Protocols
 - **Double Ratchet**: For forward secrecy and message ordering
-- **Kyber1024**: Post-quantum key exchange
+- **MLKEM1024**: Post-quantum key exchange
 - **Curve25519**: Classical cryptography for immediate security
 - **AES-GCM**: Symmetric encryption for message content
 

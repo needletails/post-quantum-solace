@@ -106,14 +106,14 @@ actor SessionTests {
                 )
             }
 
-            let kyberOneTimeKeyPairs: [PQSSession.KeyPair] = try (0 ..< 100).map { _ in
+            let mlKEMOneTimeKeyPairs: [PQSSession.KeyPair] = try (0 ..< 100).map { _ in
                 let id = UUID()
-                let privateKey = try self.crypto.generateKyber1024PrivateSigningKey()
-                let privateKeyRep = try PQKemPrivateKey(id: id, privateKey.encode())
-                let publicKey = try PQKemPublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                let privateKey = try self.crypto.generateMLKem1024PrivateKey()
+                let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
+                let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
                 return PQSSession.KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
             }
-            let finalKyber1024Key = try self.crypto.generateKyber1024PrivateSigningKey()
+            let finalMLKEM1024Key = try self.crypto.generateMLKem1024PrivateKey()
 
             let sessionUser = try SessionUser(
                 secretName: "user1",
@@ -123,14 +123,14 @@ actor SessionTests {
                     signingPrivateKey: senderspk.rawRepresentation,
                     longTermPrivateKey: senderltpk.rawRepresentation,
                     oneTimePrivateKeys: validKeys.map(\.privateKey),
-                    pqKemOneTimePrivateKeys: kyberOneTimeKeyPairs.map(\.privateKey),
-                    finalPQKemPrivateKey: .init(finalKyber1024Key.encode())
+                    mlKEMOneTimePrivateKeys: mlKEMOneTimeKeyPairs.map(\.privateKey),
+                    finalMLKEMPrivateKey: .init(finalMLKEM1024Key.encode())
                 ),
                 metadata: .init()
             )
 
-            let signedPublicKyberOneTimeKeys: [UserConfiguration.SignedPQKemOneTimeKey] = try kyberOneTimeKeyPairs.map { keyPair in
-                try UserConfiguration.SignedPQKemOneTimeKey(
+            let signedPublicMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
+                try UserConfiguration.SignedMLKEMOneTimeKey(
                     key: keyPair.publicKey,
                     deviceId: did,
                     signingKey: senderspk
@@ -145,7 +145,7 @@ actor SessionTests {
                     signingPublicKey: senderspk.publicKey.rawRepresentation,
                     signedDevices: [],
                     signedOneTimePublicKeys: signedOneTimePublicKeys,
-                    signedPQKemOneTimePublicKeys: signedPublicKyberOneTimeKeys
+                    signedMLKEMOneTimePublicKeys: signedPublicMLKEMOneTimeKeys
                 ),
                 registrationState: .registered
             )
@@ -378,7 +378,7 @@ actor MockTransport: SessionTransport {
 
     // Generate 100 private one-time key pairs
     let privateOneTimeKeyPairs: [PQSSession.KeyPair<CurvePublicKey, CurvePrivateKey>]
-    let kyberOneTimeKeyPairs: [PQSSession.KeyPair<PQKemPublicKey, PQKemPrivateKey>]
+    let mlKEMOneTimeKeyPairs: [PQSSession.KeyPair<MLKEMPublicKey, MLKEMPrivateKey>]
 
     init(cache: MockCache, appKey: SymmetricKey, publicKeys: [UserConfiguration.SignedOneTimePublicKey]) {
         self.cache = cache
@@ -394,12 +394,12 @@ actor MockTransport: SessionTransport {
             return PQSSession.KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
         }
 
-        kyberOneTimeKeyPairs = try! (0 ..< 100).map { _ in
+        mlKEMOneTimeKeyPairs = try! (0 ..< 100).map { _ in
             let crypto = NeedleTailCrypto()
             let id = UUID()
-            let privateKey = try crypto.generateKyber1024PrivateSigningKey()
-            let privateKeyRep = try PQKemPrivateKey(id: id, privateKey.encode())
-            let publicKey = try PQKemPublicKey(id: id, privateKey.publicKey.rawRepresentation)
+            let privateKey = try crypto.generateMLKem1024PrivateKey()
+            let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
+            let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
             return PQSSession.KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
         }
     }
@@ -442,14 +442,14 @@ actor MockTransport: SessionTransport {
 
     func fetchOneTimeKeys(for _: String, deviceId _: String) async throws -> SessionModels.OneTimeKeys {
         guard let privateKey = privateOneTimeKeyPairs.last else { fatalError() }
-        guard let privateKyberKey = kyberOneTimeKeyPairs.last else { fatalError() }
-        return SessionModels.OneTimeKeys(curve: privateKey.publicKey, kyber: privateKyberKey.publicKey)
+        guard let privateMLKEMKey = mlKEMOneTimeKeyPairs.last else { fatalError() }
+        return SessionModels.OneTimeKeys(curve: privateKey.publicKey, mlKEM: privateMLKEMKey.publicKey)
     }
 
     func fetchOneTimeKeyIdentities(for _: String, deviceId _: String, type _: KeysType) async throws -> [UUID] {
         privateOneTimeKeyPairs.map(\.publicKey.id)
     }
 
-    func updateOneTimePQKemKeys(for _: String, deviceId _: String, keys _: [SessionModels.UserConfiguration.SignedPQKemOneTimeKey]) async throws {}
+    func updateOneTimeMLKEMKeys(for _: String, deviceId _: String, keys _: [SessionModels.UserConfiguration.SignedMLKEMOneTimeKey]) async throws {}
     func deleteOneTimeKeys(for _: String, with _: String, type _: KeysType) async throws {}
 }

@@ -127,7 +127,7 @@ actor SessionIdentityTests {
         
         func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys {
             if shouldThrowError { throw PQSSession.SessionErrors.userNotFound }
-            return oneTimeKeys[secretName] ?? OneTimeKeys(curve: nil, kyber: nil)
+            return oneTimeKeys[secretName] ?? OneTimeKeys(curve: nil, mlKEM: nil)
         }
         
         func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] { [] }
@@ -152,7 +152,7 @@ actor SessionIdentityTests {
         
         // Required SessionTransport methods
         func updateOneTimeKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedOneTimePublicKey]) async throws {}
-        func updateOneTimePQKemKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedPQKemOneTimeKey]) async throws {}
+        func updateOneTimeMLKEMKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedMLKEMOneTimeKey]) async throws {}
         func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
         func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
         func publishRotatedKeys(for secretName: String, deviceId: String, rotated keys: RotatedPublicKeys) async throws {}
@@ -220,20 +220,20 @@ actor SessionIdentityTests {
         
         // Get one-time keys if available
         let oneTimeKey = bundle.userConfiguration.signedOneTimePublicKeys.first
-        let pqKemKey = bundle.userConfiguration.signedPQKemOneTimePublicKeys.first
+        let mlKEMKey = bundle.userConfiguration.signedMLKEMOneTimePublicKeys.first
         
         // Verify and extract the actual keys
         let verifiedOneTimeKey = oneTimeKey != nil ? try oneTimeKey!.verified(using: signingPublicKey) : nil
-        let verifiedPQKemKey = pqKemKey != nil ? try pqKemKey!.verified(using: signingPublicKey) : nil
+        let verifiedMLKEMKey = mlKEMKey != nil ? try mlKEMKey!.verified(using: signingPublicKey) : nil
         
-        guard let verifiedPQKemKey = verifiedPQKemKey else {
+        guard let verifiedMLKEMKey = verifiedMLKEMKey else {
             throw PQSSession.SessionErrors.configurationError
         }
         
         return try await session.createEncryptableSessionIdentityModel(
             with: deviceConfig,
             oneTimePublicKey: verifiedOneTimeKey,
-            pqKemPublicKey: verifiedPQKemKey,
+            mlKEMPublicKey: verifiedMLKEMKey,
             for: secretName,
             associatedWith: bundle.deviceKeys.deviceId,
             new: 123
@@ -253,13 +253,13 @@ actor SessionIdentityTests {
         
         // Get one-time keys if available
         let oneTimeKey = bundle.userConfiguration.signedOneTimePublicKeys.first
-        let pqKemKey = bundle.userConfiguration.signedPQKemOneTimePublicKeys.first
+        let mlKEMKey = bundle.userConfiguration.signedMLKEMOneTimePublicKeys.first
         
         // Verify and extract the actual keys
         let verifiedOneTimeKey = oneTimeKey != nil ? try oneTimeKey!.verified(using: signingPublicKey) : nil
-        let verifiedPQKemKey = pqKemKey != nil ? try pqKemKey!.verified(using: signingPublicKey) : nil
+        let verifiedMLKEMKey = mlKEMKey != nil ? try mlKEMKey!.verified(using: signingPublicKey) : nil
         
-        guard let verifiedPQKemKey = verifiedPQKemKey else {
+        guard let verifiedMLKEMKey = verifiedMLKEMKey else {
             throw PQSSession.SessionErrors.configurationError
         }
         
@@ -275,7 +275,7 @@ actor SessionIdentityTests {
                 sessionContextId: 123,
                 longTermPublicKey: deviceConfig.longTermPublicKey,
                 signingPublicKey: deviceConfig.signingPublicKey,
-                pqKemPublicKey: verifiedPQKemKey,
+                mlKEMPublicKey: verifiedMLKEMKey,
                 oneTimePublicKey: verifiedOneTimeKey,
                 state: nil,
                 deviceName: deviceName,

@@ -81,7 +81,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
     ) throws {
         signed = try Signed(
             message: message,
-            signingPrivateKey: Curve25519SigningPrivateKey(rawRepresentation: data)
+            signingPrivateKey: Curve25519.Signing.PrivateKey(rawRepresentation: data)
         )
     }
 
@@ -125,7 +125,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
         ///   - `CryptoError` if the signing operation fails
         init(
             message: RatchetMessage,
-            signingPrivateKey: Curve25519SigningPrivateKey
+            signingPrivateKey: Curve25519.Signing.PrivateKey
         ) throws {
             data = try BSONEncoder().encodeData(message)
             signature = try signingPrivateKey.signature(for: data)
@@ -142,7 +142,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
         /// - Returns: `true` if the signature is valid and the message data hasn't been
         ///   tampered with, `false` otherwise.
         /// - Throws: `CryptoError` if the verification process fails due to cryptographic issues
-        public func verifySignature(using publicKey: Curve25519SigningPublicKey) throws -> Bool {
+        public func verifySignature(using publicKey: Curve25519.Signing.PublicKey) throws -> Bool {
             publicKey.isValidSignature(signature, for: data)
         }
     }

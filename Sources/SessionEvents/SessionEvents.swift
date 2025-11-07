@@ -544,7 +544,7 @@ public extension SessionEvents {
         } else {
             var userConfiguration = try await transport.findConfiguration(for: newContactSecretName)
             // Not needed on the contact level
-            userConfiguration.signedPQKemOneTimePublicKeys.removeAll()
+            userConfiguration.signedMLKEMOneTimePublicKeys.removeAll()
             userConfiguration.signedOneTimePublicKeys.removeAll()
 
             let contact = Contact(

@@ -204,7 +204,7 @@ The SDK automatically manages key rotation:
 try await session.rotateKeysOnPotentialCompromise()
 
 // Check if PQ-KEM keys need rotation
-if try await session.rotatePQKemKeysIfNeeded() {
+if try await session.rotateMLKEMKeysIfNeeded() {
     print("PQ-KEM keys were rotated")
 }
 ```
@@ -214,7 +214,7 @@ if try await session.rotatePQKemKeysIfNeeded() {
 ```swift
 // Refresh one-time keys when needed
 await session.refreshOneTimeKeysTask()
-await session.refreshKyberOneTimeKeysTask()
+await session.refreshMLKEMOneTimeKeysTask()
 ```
 
 ## Device Management

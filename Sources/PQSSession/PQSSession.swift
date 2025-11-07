@@ -21,23 +21,17 @@ import NeedleTailCrypto
 import NeedleTailLogger
 import SessionEvents
 import SessionModels
-import SwiftKyber
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
-import Crypto
-#endif
 
 /// A secure, post-quantum cryptographic session manager for end-to-end encrypted messaging.
 ///
 /// `PQSSession` is the central actor responsible for managing cryptographic sessions, key management,
 /// and secure communication channels. It implements both classical (Curve25519) and post-quantum
-/// (Kyber1024) cryptography to ensure long-term security against quantum attacks.
+/// (MLKEM1024) cryptography to ensure long-term security against quantum attacks.
 ///
 /// ## Overview
 ///
 /// The session manager provides:
-/// - **Post-quantum secure key exchange** using Kyber1024
+/// - **Post-quantum secure key exchange** using MLKEM1024
 /// - **Forward secrecy** through Double Ratchet protocol
 /// - **Device management** with master/child device support
 /// - **Automatic key rotation** and compromise recovery
@@ -85,7 +79,7 @@ import Crypto
 ///
 /// ## Security Features
 ///
-/// - **Post-quantum cryptography**: Kyber1024 for key exchange
+/// - **Post-quantum cryptography**: MLKEM1024 for key exchange
 /// - **Forward secrecy**: Double Ratchet protocol with automatic key rotation
 /// - **Compromise recovery**: Key rotation on potential compromise
 /// - **Device verification**: Signed device configurations
@@ -142,8 +136,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     ///
     /// This initializer is provided to support the singleton pattern.
     /// In practice, you should always use `PQSSession.shared` instead.
-    public init() {
-        taskProcessor = TaskProcessor(logger: logger)
+    public init(_ ratchetConfiguration: RatchetConfiguration? = nil) {
+        taskProcessor = TaskProcessor(logger: logger, ratchetConfiguration: ratchetConfiguration)
     }
 
     private(set) var _sessionContext: SessionContext?
@@ -154,7 +148,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     private(set) var sessionDelegate: (any PQSSessionDelegate)?
     private(set) var eventDelegate: (any SessionEvents)?
     private var refreshOTKeysTask: Task<Void, Never>?
-    private var refreshKyberOTKeysTask: Task<Void, Never>?
+    private var refreshMLKEMOTKeysTask: Task<Void, Never>?
     public nonisolated(unsafe) weak var linkDelegate: DeviceLinkingDelegate?
     public var cache: SessionCache?
     let crypto = NeedleTailCrypto()
@@ -305,19 +299,19 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     struct PrivateKeys: Sendable {
-        let curve: Curve25519PrivateKey
-        let signing: Curve25519SigningPrivateKey
-        let kyber: Kyber1024.KeyAgreement.PrivateKey
+        let curve: Curve25519.KeyAgreement.PrivateKey
+        let signing: Curve25519.Signing.PrivateKey
+        let mlKem: MLKEM1024.PrivateKey
     }
 
     func createLongTermKeys() throws -> PrivateKeys {
         let curve = crypto.generateCurve25519PrivateKey()
         let signing = crypto.generateCurve25519SigningPrivateKey()
-        let kyber = try crypto.generateKyber1024PrivateSigningKey()
+        let mlKem = try crypto.generateMLKem1024PrivateKey()
         return PrivateKeys(
             curve: curve,
             signing: signing,
-            kyber: kyber
+            mlKem: mlKem
         )
     }
 
@@ -349,17 +343,17 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
         }
 
-        let kyberOneTimeKeyPairs: [KeyPair] = try (0 ..< 100).map { _ in
+        let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< 100).map { _ in
             let id = UUID()
-            let privateKey = try crypto.generateKyber1024PrivateSigningKey()
-            let privateKeyRep = try PQKemPrivateKey(id: id, privateKey.encode())
-            let publicKey = try PQKemPublicKey(id: id, privateKey.publicKey.rawRepresentation)
+            let privateKey = try crypto.generateMLKem1024PrivateKey()
+            let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
+            let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
             return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
         }
 
-        let kyberId = UUID()
-        let kyberPrivateKey = try PQKemPrivateKey(id: kyberId, longTerm.kyber.encode())
-        let kyberPublicKey = try PQKemPublicKey(id: kyberId, longTerm.kyber.publicKey.rawRepresentation)
+        let mlKEMId = UUID()
+        let mlKEMPrivateKey = try MLKEMPrivateKey(id: mlKEMId, longTerm.mlKem.encode())
+        let mlKEMPublicKey = try MLKEMPublicKey(id: mlKEMId, longTerm.mlKem.publicKey.rawRepresentation)
 
         // Create a unique device ID
         let deviceId = UUID()
@@ -373,8 +367,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             signingPrivateKey: longTerm.signing.rawRepresentation,
             longTermPrivateKey: longTerm.curve.rawRepresentation,
             oneTimePrivateKeys: curveOneTimeKeyPairs.map(\.privateKey),
-            pqKemOneTimePrivateKeys: kyberOneTimeKeyPairs.map(\.privateKey),
-            finalPQKemPrivateKey: kyberPrivateKey,
+            mlKEMOneTimePrivateKeys: mlKEMOneTimeKeyPairs.map(\.privateKey),
+            finalMLKEMPrivateKey: mlKEMPrivateKey,
             rotateKeysDate: Calendar.current.date(byAdding: .weekOfYear, value: 1, to: Date())
         )
 
@@ -383,7 +377,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             deviceId: deviceKeys.deviceId,
             signingPublicKey: longTerm.signing.publicKey.rawRepresentation,
             longTermPublicKey: longTerm.curve.publicKey.rawRepresentation,
-            finalPQKemPublicKey: kyberPublicKey,
+            finalMLKEMPublicKey: mlKEMPublicKey,
             deviceName: getDeviceName(),
             hmacData: hmacData,
             isMasterDevice: isMaster
@@ -404,8 +398,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             )
         }
 
-        let signedPublicKyberOneTimeKeys: [UserConfiguration.SignedPQKemOneTimeKey] = try kyberOneTimeKeyPairs.map { keyPair in
-            try UserConfiguration.SignedPQKemOneTimeKey(
+        let signedPublicMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
+            try UserConfiguration.SignedMLKEMOneTimeKey(
                 key: keyPair.publicKey,
                 deviceId: deviceId,
                 signingKey: longTerm.signing
@@ -417,7 +411,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             signingPublicKey: longTerm.signing.publicKey.rawRepresentation,
             signedDevices: [signedDeviceConfiguration],
             signedOneTimePublicKeys: signedOneTimePublicKeys,
-            signedPQKemOneTimePublicKeys: signedPublicKyberOneTimeKeys
+            signedMLKEMOneTimePublicKeys: signedPublicMLKEMOneTimeKeys
         )
 
         // Return the complete cryptographic bundle
@@ -595,7 +589,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             deviceId: bundle.deviceConfiguration.deviceId,
             signingPublicKey: Data(),
             longTermPublicKey: Data(),
-            finalPQKemPublicKey: .init(Data(count: 1568)),
+            finalMLKEMPublicKey: .init(Data(count: 1568)),
             deviceName: bundle.deviceConfiguration.deviceName,
             hmacData: bundle.deviceConfiguration.hmacData,
             isMasterDevice: bundle.deviceConfiguration.isMasterDevice
@@ -630,7 +624,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 signingPrivateKeyData: bundle.deviceKeys.signingPrivateKey,
                 devices: credentials.devices,
                 keys: bundle.userConfiguration.getVerifiedCurveKeys(deviceId: bundle.deviceKeys.deviceId),
-                pqKemKeys: bundle.userConfiguration.getVerifiedPQKemKeys(deviceId: bundle.deviceKeys.deviceId))
+                mlKEMKeys: bundle.userConfiguration.getVerifiedMLKEMKeys(deviceId: bundle.deviceKeys.deviceId))
 
             // Create a new session context with the session user and user configuration
             var sessionContext = SessionContext(
@@ -735,7 +729,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             signingPrivateKeyData: sessionContext.sessionUser.deviceKeys.signingPrivateKey,
             devices: devices,
             keys: sessionContext.activeUserConfiguration.getVerifiedCurveKeys(deviceId: sessionContext.sessionUser.deviceId),
-            pqKemKeys: sessionContext.activeUserConfiguration.getVerifiedPQKemKeys(deviceId: sessionContext.sessionUser.deviceId)
+            mlKEMKeys: sessionContext.activeUserConfiguration.getVerifiedMLKEMKeys(deviceId: sessionContext.sessionUser.deviceId)
         )
 
         // Update the last user configuration in the session context
@@ -789,7 +783,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             signingPublicKey: sessionContext.activeUserConfiguration.signingPublicKey,
             signedDevices: sessionContext.activeUserConfiguration.signedDevices,
             signedOneTimePublicKeys: keys,
-            signedPQKemOneTimePublicKeys: sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys
+            signedMLKEMOneTimePublicKeys: sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
         )
 
         // Update the last user configuration in the session context
@@ -840,13 +834,13 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         signingPrivateKeyData: Data,
         devices: [UserDeviceConfiguration],
         keys: [CurvePublicKey],
-        pqKemKeys: [PQKemPublicKey]
+        mlKEMKeys: [MLKEMPublicKey]
     ) async throws -> UserConfiguration {
         // 1) Reconstruct your Curve25519 signing key
-        let signingPrivateKey = try Curve25519SigningPrivateKey(
+        let signingPrivateKey = try Curve25519.Signing.PrivateKey(
             rawRepresentation: signingPrivateKeyData
         )
-        let signingPublicKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.signingPublicKey)
+        let signingPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: configuration.signingPublicKey)
 
         // Verify that the public signing key matches the reconstructed private signing key
         guard signingPublicKey.rawRepresentation == signingPrivateKey.publicKey.rawRepresentation else {
@@ -880,9 +874,9 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
 
         // Create signed public one-time keys for each device
-        let signedKyberKeys: [UserConfiguration.SignedPQKemOneTimeKey] = try devices.flatMap { device in
-            try pqKemKeys.map { key in
-                try UserConfiguration.SignedPQKemOneTimeKey(
+        let signedMLKEMKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try devices.flatMap { device in
+            try mlKEMKeys.map { key in
+                try UserConfiguration.SignedMLKEMOneTimeKey(
                     key: key,
                     deviceId: device.deviceId,
                     signingKey: signingPrivateKey
@@ -895,7 +889,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             signingPublicKey: signingPublicKey.rawRepresentation,
             signedDevices: signedDevices,
             signedOneTimePublicKeys: signedKeys,
-            signedPQKemOneTimePublicKeys: signedKyberKeys
+            signedMLKEMOneTimePublicKeys: signedMLKEMKeys
         )
     }
 
@@ -952,8 +946,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         refreshOTKeysTask = nil
     }
 
-    private func removeExpiredKyberOTKeys() {
-        refreshKyberOTKeysTask = nil
+    private func removeExpiredMLKEMOTKeys() {
+        refreshMLKEMOTKeysTask = nil
     }
 
     public func refreshOneTimeKeysTask() async {
@@ -975,22 +969,22 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
 
-    public func refreshKyberOneTimeKeysTask() async {
+    public func refreshMLKEMOneTimeKeysTask() async {
         // Cancel any existing task before creating a new one
-        refreshKyberOTKeysTask?.cancel()
+        refreshMLKEMOTKeysTask?.cancel()
 
-        refreshKyberOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
+        refreshMLKEMOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
             guard let self else { return }
 
             do {
-                try await refreshOneTimeKeys(refreshType: .kyber)
+                try await refreshOneTimeKeys(refreshType: .mlKEM)
             } catch {
                 // Handle any errors that may occur during the refresh
                 await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
             }
 
             // Clean up the task reference after completion
-            await removeExpiredKyberOTKeys()
+            await removeExpiredMLKEMOTKeys()
         }
     }
 
@@ -1046,31 +1040,31 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                         keys: signedOneTimePublicKeys
                     )
 
-                case .kyber:
+                case .mlKEM:
                     // Create needed key pairs
-                    let kyberOneTimeKeyPairs: [KeyPair] = try (0 ..< 100).map { _ in
+                    let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< 100).map { _ in
                         let id = UUID()
-                        let privateKey = try crypto.generateKyber1024PrivateSigningKey()
-                        let privateKeyRep = try PQKemPrivateKey(id: id, privateKey.encode())
-                        let publicKey = try PQKemPublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                        let privateKey = try crypto.generateMLKem1024PrivateKey()
+                        let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
+                        let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
                         return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
                     }
 
-                    sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.append(contentsOf: kyberOneTimeKeyPairs.map(\.privateKey))
-                    let signedKyberOneTimeKeys: [UserConfiguration.SignedPQKemOneTimeKey] = try kyberOneTimeKeyPairs.map { keyPair in
-                        try UserConfiguration.SignedPQKemOneTimeKey(
+                    sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
+                    let signedMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
+                        try UserConfiguration.SignedMLKEMOneTimeKey(
                             key: keyPair.publicKey,
                             deviceId: sessionContext.sessionUser.deviceId,
                             signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
                         )
                     }
 
-                    sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.append(contentsOf: signedKyberOneTimeKeys)
+                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
 
-                    try await transportDelegate?.updateOneTimePQKemKeys(
+                    try await transportDelegate?.updateOneTimeMLKEMKeys(
                         for: sessionContext.sessionUser.secretName,
                         deviceId: sessionContext.sessionUser.deviceId.uuidString,
-                        keys: signedKyberOneTimeKeys
+                        keys: signedMLKEMOneTimeKeys
                     )
                 }
 
@@ -1145,9 +1139,9 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 }
             }
             return sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count
-        case .kyber:
-            let privateKeys = sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys
-            let publicKeys = sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys
+        case .mlKEM:
+            let privateKeys = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys
+            let publicKeys = sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
             let privateKeyIDs = Set(privateKeys.map(\.id))
             let publicKeyIDs = Set(publicKeys.map(\.id))
             let remoteKeySet = Set(keys)
@@ -1157,20 +1151,20 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
             if privateIntersection.isEmpty, publicIntersection.isEmpty {
                 // No shared keys — remove all
-                sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.removeAll()
-                sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.removeAll()
+                sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
+                sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll()
                 didUpdate = true
             } else {
                 // Remove only keys not in remote list
                 let filteredPrivate = privateKeys.filter { remoteKeySet.contains($0.id) }
                 if filteredPrivate.count != privateKeys.count {
-                    sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys = filteredPrivate
+                    sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys = filteredPrivate
                     didUpdate = true
                 }
 
                 let filteredPublic = publicKeys.filter { remoteKeySet.contains($0.id) }
                 if filteredPublic.count != publicKeys.count {
-                    sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys = filteredPublic
+                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys = filteredPublic
                     didUpdate = true
                 }
             }
@@ -1187,11 +1181,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 try await cache.updateLocalSessionContext(encryptedConfig)
 
                 // if we have no keys delete all public keys on the server so we can regenerated a fresh batch
-                if sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.isEmpty || sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.isEmpty {
+                if sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.isEmpty || sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.isEmpty {
                     try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
                 }
             }
-            return sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.count
+            return sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count
         }
     }
 

@@ -19,11 +19,7 @@ import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
 import NIOConcurrencyHelpers
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 /// A class representing a secure model for a contact in the messaging system.
 ///

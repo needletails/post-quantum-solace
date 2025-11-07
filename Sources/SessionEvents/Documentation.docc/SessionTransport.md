@@ -22,7 +22,7 @@ A protocol that defines the interface for network communication and key distribu
 - ``SessionTransport/fetchOneTimeKeys(for:deviceId:)``
 - ``SessionTransport/fetchOneTimeKeyIdentities(for:deviceId:type:)``
 - ``SessionTransport/updateOneTimeKeys(for:deviceId:keys:)``
-- ``SessionTransport/updateOneTimePQKemKeys(for:deviceId:keys:)``
+- ``SessionTransport/updateOneTimeMLKEMKeys(for:deviceId:keys:)``
 - ``SessionTransport/deleteOneTimeKeys(for:with:type:)``
 - ``SessionTransport/batchDeleteOneTimeKeys(for:with:type:)``
 

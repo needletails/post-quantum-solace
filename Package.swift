@@ -17,8 +17,8 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.12.3"),
-        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "1.0.5"),
+        .package(path: "/Users/cartisim/Developer/NeedleTailsOrganization/SDKs/NeedleTailSDKProject/double-ratchet-kit"),
+//        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "1.0.5"),
         .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.1")
     ],
     targets: [
@@ -26,7 +26,6 @@ let package = Package(
             name: "PQSSession", dependencies: [
                 "SessionEvents",
                 "SessionModels",
-                .product(name: "Crypto", package: "swift-crypto"),
                 .product(name: "DoubleRatchetKit", package: "double-ratchet-kit"),
                 .product(name: "NeedleTailLogger", package: "needletail-logger")
             ]

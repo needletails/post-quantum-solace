@@ -27,20 +27,26 @@ import Testing
 actor TaskProcessorSequenceTests {
     
     var session = PQSSession()
-    let transport = _MockTransportDelegate()
-    var senderReceiver = ReceiverDelegate()
+    let transport: _MockTransportDelegate
+    var senderReceiver: ReceiverDelegate
     let localId = UUID()
+    let store = TransportStore()
+    
+    init() {
+        senderReceiver = ReceiverDelegate(session: session)
+        self.transport =  _MockTransportDelegate(session: session, store: store)
+    }
     
     func createSenderSession(store: MockIdentityStore, shouldCreate: Bool = true) async throws {
-        store.localDeviceSalt = "testSalt1"
+        await store.setLocalSalt("testSalt1")
         await session.setLogLevel(.trace)
         await session.setDatabaseDelegate(conformer: store)
         await session.setTransportDelegate(conformer: transport)
-        await session.setPQSSessionDelegate(conformer: SessionDelegate())
+        await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: senderReceiver)
         
         session.isViable = true
-        transport.publishableName = "alice"
+        await self.store.setPublishableName("alice")
         if shouldCreate {
             session = try await session.createSession(
                 secretName: "alice", appPassword: "123"
@@ -669,7 +675,7 @@ actor TaskProcessorSequenceTests {
                 sessionContextId: 0,
                 longTermPublicKey: .init(),
                 signingPublicKey: .init(),
-                pqKemPublicKey: .init(.init(count: 1568)),
+                mlKEMPublicKey: .init(.init(count: 1568)),
                 oneTimePublicKey: nil,
                 deviceName: "alice-device",
                 isMasterDevice: true),

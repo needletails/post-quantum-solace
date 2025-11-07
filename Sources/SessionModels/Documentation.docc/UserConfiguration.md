@@ -10,22 +10,22 @@ A model representing a user's cryptographic configuration and device information
 
 ### Essentials
 
-- ``UserConfiguration/init(signingPublicKey:signedDevices:signedOneTimePublicKeys:signedPQKemOneTimePublicKeys:)``
+- ``UserConfiguration/init(signingPublicKey:signedDevices:signedOneTimePublicKeys:signedMLKEMOneTimePublicKeys:)``
 - ``UserConfiguration/signingPublicKey``
 - ``UserConfiguration/signedDevices``
 - ``UserConfiguration/signedOneTimePublicKeys``
-- ``UserConfiguration/signedPQKemOneTimePublicKeys``
+- ``UserConfiguration/signedMLKEMOneTimePublicKeys``
 
 ### Device Management
 
 - ``UserConfiguration/SignedDeviceConfiguration``
 - ``UserConfiguration/SignedOneTimePublicKey``
-- ``UserConfiguration/SignedPQKemOneTimeKey``
+- ``UserConfiguration/SignedMLKEMOneTimeKey``
 
 ### Key Verification
 
 - ``UserConfiguration/getVerifiedCurveKeys(deviceId:)``
-- ``UserConfiguration/getVerifiedPQKemKeys(deviceId:)``
+- ``UserConfiguration/getVerifiedMLKEMKeys(deviceId:)``
 
 ## Key Features
 
@@ -65,8 +65,8 @@ let signedOneTimeKeys = try oneTimeKeys.map { key in
 }
 
 // Create signed PQ-KEM one-time keys
-let signedPQKemKeys = try pqKemKeys.map { key in
-    try UserConfiguration.SignedPQKemOneTimeKey(
+let signedMLKEMKeys = try mlKEMKeys.map { key in
+    try UserConfiguration.SignedMLKEMOneTimeKey(
         key: key,
         deviceId: deviceId,
         signingKey: signingPrivateKey
@@ -78,7 +78,7 @@ let userConfig = UserConfiguration(
     signingPublicKey: signingPublicKey.rawRepresentation,
     signedDevices: signedDevices,
     signedOneTimePublicKeys: signedOneTimeKeys,
-    signedPQKemOneTimePublicKeys: signedPQKemKeys
+    signedMLKEMOneTimePublicKeys: signedMLKEMKeys
 )
 ```
 
@@ -89,7 +89,7 @@ let userConfig = UserConfiguration(
 let curveKeys = userConfig.getVerifiedCurveKeys(deviceId: deviceId)
 
 // Get verified PQ-KEM keys for a specific device
-let pqKemKeys = userConfig.getVerifiedPQKemKeys(deviceId: deviceId)
+let mlKEMKeys = userConfig.getVerifiedMLKEMKeys(deviceId: deviceId)
 
 // Use the keys for cryptographic operations
 for key in curveKeys {
@@ -131,7 +131,7 @@ for signedDevice in userConfig.signedDevices {
 ```swift
 // Access one-time keys
 let oneTimeKeys = userConfig.signedOneTimePublicKeys
-let pqKemKeys = userConfig.signedPQKemOneTimePublicKeys
+let mlKEMKeys = userConfig.signedMLKEMOneTimePublicKeys
 
 // Filter keys by device
 let deviceKeys = oneTimeKeys.filter { key in
@@ -176,16 +176,16 @@ public struct SignedOneTimePublicKey: Codable & Sendable {
 }
 ```
 
-### SignedPQKemOneTimeKey
+### SignedMLKEMOneTimeKey
 
 ```swift
-public struct SignedPQKemOneTimeKey: Codable & Sendable {
-    public let key: PQKemPublicKey
+public struct SignedMLKEMOneTimeKey: Codable & Sendable {
+    public let key: MLKEMPublicKey
     public let deviceId: UUID
     public let signature: Data
     
-    public init(key: PQKemPublicKey, deviceId: UUID, signingKey: Curve25519SigningPrivateKey) throws
-    public func verified(using publicKey: Curve25519SigningPublicKey) throws -> PQKemPublicKey?
+    public init(key: MLKEMPublicKey, deviceId: UUID, signingKey: Curve25519SigningPrivateKey) throws
+    public func verified(using publicKey: Curve25519SigningPublicKey) throws -> MLKEMPublicKey?
 }
 ```
 

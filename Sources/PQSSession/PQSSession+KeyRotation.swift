@@ -23,17 +23,17 @@ import SessionModels
 ///
 /// This extension implements both manual and automatic key rotation mechanisms to ensure long-term
 /// security and provide recovery from potential key compromises. It handles both classical (Curve25519)
-/// and post-quantum (Kyber1024) key rotation with proper cryptographic verification and signing.
+/// and post-quantum (MLKEM1024) key rotation with proper cryptographic verification and signing.
 ///
 /// ## Key Rotation Types
 ///
 /// - **Compromise Recovery**: Manual rotation of all keys when compromise is suspected
-/// - **Automatic Rotation**: Scheduled rotation of PQKem keys based on time intervals
+/// - **Automatic Rotation**: Scheduled rotation of MLKEM keys based on time intervals
 /// - **Partial Rotation**: Rotation of specific key types while maintaining others
 ///
 /// ## Security Features
 ///
-/// - **Complete Key Replacement**: Rotates all cryptographic keys (Curve25519, Kyber1024, signing)
+/// - **Complete Key Replacement**: Rotates all cryptographic keys (Curve25519, MLKEM1024, signing)
 /// - **Signed Device Configurations**: All rotated keys are properly signed and verified
 /// - **Transport Integration**: Automatically publishes rotated keys to the transport layer
 /// - **Session Context Updates**: Maintains consistency across all session data
@@ -45,25 +45,25 @@ import SessionModels
 /// try await session.rotateKeysOnPotentialCompromise()
 ///
 /// // Automatic rotation check (called periodically)
-/// let wasRotated = try await session.rotatePQKemKeysIfNeeded()
+/// let wasRotated = try await session.rotateMLKEMKeysIfNeeded()
 /// ```
 ///
 /// ## Important Notes
 ///
 /// - Key rotation invalidates all existing sessions and requires re-establishment
 /// - Recipients must manually verify new key fingerprints after rotation
-/// - Automatic rotation only affects PQKem keys, not signing or Curve25519 keys
+/// - Automatic rotation only affects MLKEM keys, not signing or Curve25519 keys
 /// - All rotation operations are atomic and either complete fully or fail completely
 
 extension PQSSession {
     /// Rotates all cryptographic keys when a potential compromise is suspected.
     ///
     /// This method performs a complete key rotation, replacing all cryptographic keys including
-    /// Curve25519 long-term keys, Kyber1024 PQKem keys, and signing keys. It's designed for
+    /// Curve25519 long-term keys, MLKEM1024 MLKEM keys, and signing keys. It's designed for
     /// emergency situations where key compromise is suspected or confirmed.
     ///
     /// ## Rotation Process
-    /// 1. **Key Generation**: Creates new Curve25519, Kyber1024, and signing key pairs
+    /// 1. **Key Generation**: Creates new Curve25519, MLKEM1024, and signing key pairs
     /// 2. **Device Configuration Update**: Updates the device configuration with new public keys
     /// 3. **Session Context Update**: Updates all session data with new private keys
     /// 4. **Transport Publication**: Publishes new keys to the transport layer for distribution
@@ -100,54 +100,60 @@ extension PQSSession {
     ///   using the `fingerprint(from:_)` method before communication can resume.
     /// - Warning: This operation may take several seconds to complete due to cryptographic operations.
     public func rotateKeysOnPotentialCompromise() async throws {
+        logger.log(level: .debug, message: "Rotating keys")
         await setRotatingKeys(true)
+        do {
+            let longTerm = try createLongTermKeys()
+            let mlKEMId = UUID()
+            let mlKEMPrivateKey = try MLKEMPrivateKey(id: mlKEMId, longTerm.mlKem.encode())
+            let mlKEMPublicKey = try MLKEMPublicKey(id: mlKEMId, longTerm.mlKem.publicKey.rawRepresentation)
 
-        let longTerm = try createLongTermKeys()
-        let kyberId = UUID()
-        let kyberPrivateKey = try PQKemPrivateKey(id: kyberId, longTerm.kyber.encode())
-        let kyberPublicKey = try PQKemPublicKey(id: kyberId, longTerm.kyber.publicKey.rawRepresentation)
+            var sessionContext = try await getSessionContext()
 
-        var sessionContext = try await getSessionContext()
+            let oldSigningKeyData = sessionContext.activeUserConfiguration.signingPublicKey
+            let oldSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: oldSigningKeyData)
 
-        let oldSigningKeyData = sessionContext.activeUserConfiguration.signingPublicKey
-        let oldSigningKey = try Curve25519SigningPublicKey(rawRepresentation: oldSigningKeyData)
+            guard let index = sessionContext
+                .activeUserConfiguration
+                .signedDevices
+                .firstIndex(where: { signed in
+                    guard let verified = try? signed.verified(using: oldSigningKey) else { return false }
+                    return verified.deviceId == sessionContext.sessionUser.deviceId
+                })
+            else {
+                throw PQSSession.SessionErrors.invalidDeviceIdentity
+            }
+            guard var device = try sessionContext.activeUserConfiguration.signedDevices[index]
+                .verified(using: oldSigningKey)
+            else {
+                throw SessionErrors.invalidSignature
+            }
 
-        guard let index = sessionContext
-            .activeUserConfiguration
-            .signedDevices
-            .firstIndex(where: { signed in
-                guard let verified = try? signed.verified(using: oldSigningKey) else { return false }
-                return verified.deviceId == sessionContext.sessionUser.deviceId
-            })
-        else {
-            throw PQSSession.SessionErrors.invalidDeviceIdentity
+            await device.updateSigningPublicKey(longTerm.signing.publicKey.rawRepresentation)
+            await device.updateLongTermPublicKey(longTerm.curve.publicKey.rawRepresentation)
+            await device.updateFinalMLKEMPublicKey(mlKEMPublicKey)
+
+            let reSigned = try UserConfiguration.SignedDeviceConfiguration(device: device, signingKey: longTerm.signing)
+
+            sessionContext.sessionUser.deviceKeys.signingPrivateKey = longTerm.signing.rawRepresentation
+            sessionContext.activeUserConfiguration.signingPublicKey = longTerm.signing.publicKey.rawRepresentation
+            sessionContext.sessionUser.deviceKeys.longTermPrivateKey = longTerm.curve.rawRepresentation
+            sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey = mlKEMPrivateKey
+            sessionContext.activeUserConfiguration.signedDevices[index] = reSigned
+
+            try await updateRotatedKeySessionContext(sessionContext: sessionContext)
+
+            logger.log(level: .debug, message: "Will publish rotated keys")
+            // Send Public Keys to server
+            try await transportDelegate?.publishRotatedKeys(
+                for: sessionContext.sessionUser.secretName,
+                deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                rotated: .init(pskData: device.signingPublicKey, signedDevice: reSigned))
+            logger.log(level: .debug, message: "Completed rotating keys")
+        } catch {
+            await setRotatingKeys(false)
+            throw error
         }
-        guard var device = try sessionContext.activeUserConfiguration.signedDevices[index]
-            .verified(using: oldSigningKey)
-        else {
-            throw SessionErrors.invalidSignature
-        }
-
-        await device.updateSigningPublicKey(longTerm.signing.publicKey.rawRepresentation)
-        await device.updateLongTermPublicKey(longTerm.curve.publicKey.rawRepresentation)
-        await device.updateFinalPQKemPublicKey(kyberPublicKey)
-
-        let reSigned = try UserConfiguration.SignedDeviceConfiguration(device: device, signingKey: longTerm.signing)
-
-        sessionContext.sessionUser.deviceKeys.signingPrivateKey = longTerm.signing.rawRepresentation
-        sessionContext.activeUserConfiguration.signingPublicKey = longTerm.signing.publicKey.rawRepresentation
-        sessionContext.sessionUser.deviceKeys.longTermPrivateKey = longTerm.curve.rawRepresentation
-        sessionContext.sessionUser.deviceKeys.finalPQKemPrivateKey = kyberPrivateKey
-        sessionContext.activeUserConfiguration.signedDevices[index] = reSigned
-
-        try await updateRotatedKeySessionContext(sessionContext: sessionContext)
-
-        // Send Public Keys to server
-        try await transportDelegate?.publishRotatedKeys(
-            for: sessionContext.sessionUser.secretName,
-            deviceId: sessionContext.sessionUser.deviceId.uuidString,
-            rotated: .init(pskData: device.signingPublicKey, signedDevice: reSigned)
-        )
     }
 
     func setRotatingKeys(_ rotating: Bool) async {
@@ -156,25 +162,25 @@ extension PQSSession {
 }
 
 extension PQSSession {
-    /// Automatically rotates PQKem keys if the scheduled rotation date has passed.
+    /// Automatically rotates MLKEM keys if the scheduled rotation date has passed.
     ///
-    /// This method checks if the PQKem keys need rotation based on the `rotateKeysDate` stored in
+    /// This method checks if the MLKEM keys need rotation based on the `rotateKeysDate` stored in
     /// the session context. Keys are rotated if the last rotation date is older than one week.
     /// This provides automatic key freshness without requiring manual intervention.
     ///
     /// ## Rotation Criteria
     /// - Keys are rotated if the last rotation date is ≥7 days old
-    /// - Only PQKem keys are rotated (Curve25519 and signing keys remain unchanged)
+    /// - Only MLKEM keys are rotated (Curve25519 and signing keys remain unchanged)
     /// - The rotation date is updated to the current date after successful rotation
     ///
     /// ## Usage Example
     /// ```swift
     /// // Call periodically (e.g., daily) to check for rotation
-    /// let wasRotated = try await session.rotatePQKemKeysIfNeeded()
+    /// let wasRotated = try await session.rotateMLKEMKeysIfNeeded()
     /// if wasRotated {
-    ///     print("PQKem keys were automatically rotated")
+    ///     print("MLKEM keys were automatically rotated")
     /// } else {
-    ///     print("PQKem keys are still fresh")
+    ///     print("MLKEM keys are still fresh")
     /// }
     /// ```
     ///
@@ -187,11 +193,11 @@ extension PQSSession {
     ///   - `SessionErrors.sessionEncryptionError` if session context cannot be encrypted
     ///   - `SessionErrors.transportNotInitialized` if transport delegate is not set
     ///
-    /// - Important: This method only rotates PQKem keys, not Curve25519 or signing keys.
+    /// - Important: This method only rotates MLKEM keys, not Curve25519 or signing keys.
     ///   For complete key rotation, use `rotateKeysOnPotentialCompromise()`.
     /// - Note: The rotation date is automatically updated to the current date after successful rotation.
     /// - Performance: This method is lightweight and safe to call frequently.
-    func rotatePQKemKeysIfNeeded() async throws -> Bool {
+    func rotateMLKEMKeysIfNeeded() async throws -> Bool {
         if let rotateKeyDate = await sessionContext?.sessionUser.deviceKeys.rotateKeysDate {
             // Get the current date
             let currentDate = Date()
@@ -203,7 +209,7 @@ extension PQSSession {
             if let oneWeekAgo = calendar.date(byAdding: .weekOfYear, value: -1, to: currentDate) {
                 // Check if rotateKeyDate is older than or equal to one week ago
                 if rotateKeyDate <= oneWeekAgo {
-                    try await rotatePQKemFinalKey()
+                    try await rotateMLKEMFinalKey()
 
                     guard let cache else {
                         throw SessionErrors.databaseNotInitialized
@@ -263,23 +269,24 @@ private extension PQSSession {
         }
 
         try await cache.updateLocalSessionContext(encryptedConfig)
+        logger.log(level: .debug, message: "Updated session context during key rotation")
     }
 
-    func rotatePQKemFinalKey() async throws {
-        let kyber = try crypto.generateKyber1024PrivateSigningKey()
+    func rotateMLKEMFinalKey() async throws {
+        let mlKEM = try crypto.generateMLKem1024PrivateKey()
 
         var sessionContext = try await getSessionContext()
 
-        let kyberId = UUID()
-        let kyberPrivateKey = try PQKemPrivateKey(id: kyberId, kyber.encode())
-        let kyberPublicKey = try PQKemPublicKey(id: kyberId, kyber.publicKey.rawRepresentation)
+        let mlKEMId = UUID()
+        let mlKEMPrivateKey = try MLKEMPrivateKey(id: mlKEMId, mlKEM.encode())
+        let mlKEMPublicKey = try MLKEMPublicKey(id: mlKEMId, mlKEM.publicKey.rawRepresentation)
 
-        sessionContext.sessionUser.deviceKeys.finalPQKemPrivateKey = kyberPrivateKey
+        sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey = mlKEMPrivateKey
 
         let signingKeyData = sessionContext.activeUserConfiguration.signingPublicKey
-        let signingKey = try Curve25519SigningPublicKey(rawRepresentation: signingKeyData)
+        let signingKey = try Curve25519.Signing.PublicKey(rawRepresentation: signingKeyData)
         let signingPrivateKeyData = sessionContext.sessionUser.deviceKeys.signingPrivateKey
-        let signingPrivateKey = try Curve25519SigningPrivateKey(rawRepresentation: signingPrivateKeyData)
+        let signingPrivateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: signingPrivateKeyData)
 
         guard let index = sessionContext
             .activeUserConfiguration
@@ -298,7 +305,7 @@ private extension PQSSession {
             throw SessionErrors.invalidSignature
         }
 
-        await device.updateFinalPQKemPublicKey(kyberPublicKey)
+        await device.updateFinalMLKEMPublicKey(mlKEMPublicKey)
         let reSigned = try UserConfiguration.SignedDeviceConfiguration(device: device, signingKey: signingPrivateKey)
         sessionContext.activeUserConfiguration.signedDevices[index] = reSigned
 

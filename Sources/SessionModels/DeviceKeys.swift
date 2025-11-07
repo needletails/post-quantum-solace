@@ -14,22 +14,23 @@
 //  post-quantum cryptographic session management capabilities.
 //
 //
+
 import DoubleRatchetKit
 import Foundation
-import SwiftKyber
+import NeedleTailCrypto
 
 /// A struct representing the cryptographic keys associated with a device in the post-quantum secure messaging system.
 ///
 /// `DeviceKeys` encapsulates all the cryptographic material needed for a device to participate in secure
 /// communications, including both classical and post-quantum cryptographic keys. This struct supports
-/// the hybrid approach combining traditional elliptic curve cryptography with post-quantum Kyber KEM.
+/// the hybrid approach combining traditional elliptic curve cryptography with post-quantum MLKEM KEM.
 ///
 /// ## Key Components:
 /// - **Device Identity**: Unique identifier for the device
 /// - **Signing Keys**: For message authentication and digital signatures
 /// - **Long-term Keys**: For establishing persistent secure channels
 /// - **One-time Keys**: For forward secrecy and ephemeral key exchange
-/// - **Post-Quantum Keys**: Kyber KEM keys for quantum-resistant encryption
+/// - **Post-Quantum Keys**: MLKEM KEM keys for quantum-resistant encryption
 ///
 /// ## Conformance:
 /// - `Codable`: Supports serialization for storage and transmission
@@ -51,8 +52,8 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
         case signingPrivateKey = "b" // Private signing key
         case longTermPrivateKey = "c" // Private long-term key
         case oneTimePrivateKeys = "d" // Private one-time keys
-        case pqKemOneTimePrivateKeys = "e" // Post-Quantum private keys
-        case finalPQKemPrivateKey = "f" // Final Post-Quantum private key
+        case mlKEMOneTimePrivateKeys = "e" // Post-Quantum private keys
+        case finalMLKEMPrivateKey = "f" // Final Post-Quantum private key
         case rotateKeysDate = "g" // Date to rotate the keys
     }
 
@@ -84,19 +85,19 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     /// security. Each key is used for a single cryptographic operation.
     public var oneTimePrivateKeys: [CurvePrivateKey]
 
-    /// Array of private Kyber one-time keys for the device.
+    /// Array of private MLKEM one-time keys for the device.
     ///
     /// These post-quantum keys provide quantum-resistant forward secrecy. Like
     /// classical one-time keys, they should be consumed and replaced regularly.
     /// They are used in combination with classical keys for hybrid security.
-    public var pqKemOneTimePrivateKeys: [PQKemPrivateKey]
+    public var mlKEMOneTimePrivateKeys: [MLKEMPrivateKey]
 
-    /// Final private Kyber key for the device.
+    /// Final private MLKEM key for the device.
     ///
     /// This is the last resort post-quantum key used when all one-time keys have
     /// been consumed. It should be replaced with new one-time keys as soon as
     /// possible to maintain optimal security.
-    public var finalPQKemPrivateKey: PQKemPrivateKey
+    public var finalMLKEMPrivateKey: MLKEMPrivateKey
 
     /// Date to rotate the keys, if applicable.
     ///
@@ -116,24 +117,24 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     ///   - signingPrivateKey: Private key used for digital signatures and message authentication.
     ///   - longTermPrivateKey: Private key used for establishing persistent secure channels.
     ///   - oneTimePrivateKeys: Array of ephemeral private keys for forward secrecy.
-    ///   - pqKemOneTimePrivateKeys: Array of post-quantum ephemeral private keys for quantum-resistant forward secrecy.
-    ///   - finalPQKemPrivateKey: Fallback post-quantum private key used when one-time keys are exhausted.
+    ///   - mlKEMOneTimePrivateKeys: Array of post-quantum ephemeral private keys for quantum-resistant forward secrecy.
+    ///   - finalMLKEMPrivateKey: Fallback post-quantum private key used when one-time keys are exhausted.
     ///   - rotateKeysDate: Optional date when keys should be rotated for security maintenance.
     public init(
         deviceId: UUID,
         signingPrivateKey: Data,
         longTermPrivateKey: Data,
         oneTimePrivateKeys: [CurvePrivateKey],
-        pqKemOneTimePrivateKeys: [PQKemPrivateKey],
-        finalPQKemPrivateKey: PQKemPrivateKey,
+        mlKEMOneTimePrivateKeys: [MLKEMPrivateKey],
+        finalMLKEMPrivateKey: MLKEMPrivateKey,
         rotateKeysDate: Date? = nil
     ) {
         self.deviceId = deviceId
         self.signingPrivateKey = signingPrivateKey
         self.longTermPrivateKey = longTermPrivateKey
         self.oneTimePrivateKeys = oneTimePrivateKeys
-        self.pqKemOneTimePrivateKeys = pqKemOneTimePrivateKeys
-        self.finalPQKemPrivateKey = finalPQKemPrivateKey
+        self.mlKEMOneTimePrivateKeys = mlKEMOneTimePrivateKeys
+        self.finalMLKEMPrivateKey = finalMLKEMPrivateKey
         self.rotateKeysDate = rotateKeysDate
     }
 

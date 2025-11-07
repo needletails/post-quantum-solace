@@ -174,9 +174,12 @@ public actor TaskProcessor {
     /// - Parameter logger: Custom logger instance, defaults to a basic logger.
     ///   The logger is used for debugging, telemetry, and audit trails.
     /// - Note: The processor is not ready for use until a session is set and the delegate is configured.
-    public init(logger: NeedleTailLogger = NeedleTailLogger()) {
+    public init(logger: NeedleTailLogger = NeedleTailLogger(), ratchetConfiguration: RatchetConfiguration? = nil) {
         self.logger = logger
-        ratchetManager = RatchetStateManager<SHA256>(executor: cryptoExecutor, logger: logger)
+        ratchetManager = RatchetStateManager<SHA256>(
+            executor: cryptoExecutor,
+            logger: logger,
+            ratchetConfiguration: ratchetConfiguration)
         jobConsumer = NeedleTailAsyncConsumer<JobModel>(logger: logger, executor: cryptoExecutor)
     }
 

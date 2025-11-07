@@ -31,7 +31,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         case signingPublicKey = "a" // Key for the public signing key
         case signedDevices = "b" // Key for the signed devices
         case signedOneTimePublicKeys = "c" // Key for the signed public one-time keys
-        case signedPQKemOneTimePublicKeys = "d" // Key for the signed public one-time keys
+        case signedMLKEMOneTimePublicKeys = "d" // Key for the signed public one-time keys
     }
 
     /// The public signing key used for signing device configurations.
@@ -44,7 +44,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
     public var signedOneTimePublicKeys: [SignedOneTimePublicKey]
 
     /// An array of signed post-quantum KEM one-time public keys associated with the user.
-    public var signedPQKemOneTimePublicKeys: [SignedPQKemOneTimeKey]
+    public var signedMLKEMOneTimePublicKeys: [SignedMLKEMOneTimeKey]
 
     /// Initializes a new instance of `UserConfiguration`.
     ///
@@ -52,17 +52,17 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
     ///   - signingPublicKey: The public signing key used for signing device configurations.
     ///   - signedDevices: An array of signed device configurations associated with the user.
     ///   - signedOneTimePublicKeys: An array of signed Curve25519 one-time public keys associated with the user.
-    ///   - signedPQKemOneTimePublicKeys: An array of signed post-quantum KEM one-time public keys associated with the user.
+    ///   - signedMLKEMOneTimePublicKeys: An array of signed post-quantum KEM one-time public keys associated with the user.
     public init(
         signingPublicKey: Data,
         signedDevices: [SignedDeviceConfiguration],
         signedOneTimePublicKeys: [SignedOneTimePublicKey],
-        signedPQKemOneTimePublicKeys: [SignedPQKemOneTimeKey]
+        signedMLKEMOneTimePublicKeys: [SignedMLKEMOneTimeKey]
     ) {
         self.signingPublicKey = signingPublicKey
         self.signedDevices = signedDevices
         self.signedOneTimePublicKeys = signedOneTimePublicKeys
-        self.signedPQKemOneTimePublicKeys = signedPQKemOneTimePublicKeys
+        self.signedMLKEMOneTimePublicKeys = signedMLKEMOneTimePublicKeys
     }
 
     /// Retrieves verified devices from the signed device configurations.
@@ -89,10 +89,10 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
     ///
     /// - Parameter deviceId: The unique identifier of the device for which to retrieve keys.
     /// - Throws: An error if verification fails.
-    /// - Returns: An array of verified `PQKemPublicKey` instances.
-    public func getVerifiedPQKemKeys(deviceId: UUID) throws -> [PQKemPublicKey] {
+    /// - Returns: An array of verified `MLKEMPublicKey` instances.
+    public func getVerifiedMLKEMKeys(deviceId: UUID) throws -> [MLKEMPublicKey] {
         let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: signingPublicKey)
-        let filteredKeys = signedPQKemOneTimePublicKeys.filter { $0.deviceId == deviceId }
+        let filteredKeys = signedMLKEMOneTimePublicKeys.filter { $0.deviceId == deviceId }
         return try filteredKeys.compactMap { try $0.verified(using: publicKey) }
     }
 
@@ -189,7 +189,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
     }
 
     /// A struct representing a signed post-quantum KEM one-time public key.
-    public struct SignedPQKemOneTimeKey: Codable, Sendable {
+    public struct SignedMLKEMOneTimeKey: Codable, Sendable {
         /// The unique identifier for the one-time key.
         public let id: UUID
 
@@ -209,15 +209,15 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             case signature = "d"
         }
 
-        /// Initializes a new `SignedPQKemOneTimeKey` instance.
+        /// Initializes a new `SignedMLKEMOneTimeKey` instance.
         ///
         /// - Parameters:
-        ///   - key: The `PQKemPublicKey` to be signed.
+        ///   - key: The `MLKEMPublicKey` to be signed.
         ///   - deviceId: The unique identifier for the device associated with the key.
         ///   - signingKey: The private signing key used for signing.
         /// - Throws: An error if the signing process fails.
         public init(
-            key: PQKemPublicKey,
+            key: MLKEMPublicKey,
             deviceId: UUID,
             signingKey: Curve25519.Signing.PrivateKey
         ) throws {
@@ -231,11 +231,11 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         /// Verifies the signature of the public one-time key data.
         ///
         /// - Parameter publicKey: The public signing key used for verification.
-        /// - Returns: An optional `PQKemPublicKey` if verification is successful.
+        /// - Returns: An optional `MLKEMPublicKey` if verification is successful.
         /// - Throws: An error if verification fails.
-        public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> PQKemPublicKey? {
+        public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> MLKEMPublicKey? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BSONDecoder().decodeData(PQKemPublicKey.self, from: data)
+            return try BSONDecoder().decodeData(MLKEMPublicKey.self, from: data)
         }
     }
 
@@ -256,5 +256,5 @@ public enum KeysType: Sendable {
     /// Curve25519 elliptic curve keys for classical cryptography.
     case curve
     /// Post-quantum KEM keys for quantum-resistant cryptography.
-    case kyber
+    case mlKEM
 }

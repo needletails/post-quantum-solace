@@ -185,7 +185,7 @@ public protocol SessionTransport: Sendable {
     /// - Parameters:
     ///   - secretName: The secret name of the user
     ///   - deviceId: The device identifier for which to fetch key identities
-    ///   - type: The type of keys to fetch (e.g., Curve25519, PQKEM)
+    ///   - type: The type of keys to fetch (e.g., Curve25519, MLKEM)
     /// - Returns: An array of UUIDs representing the available one-time key identities
     /// - Throws: An error if the key identities could not be retrieved
     func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID]
@@ -213,7 +213,7 @@ public protocol SessionTransport: Sendable {
     ///   - deviceId: The device identifier for which to update keys
     ///   - keys: An array of signed post-quantum KEM one-time keys to add
     /// - Throws: An error if the keys could not be updated
-    func updateOneTimePQKemKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedPQKemOneTimeKey]) async throws
+    func updateOneTimeMLKEMKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedMLKEMOneTimeKey]) async throws
 
     /// Deletes multiple one-time keys in a batch operation.
     ///
@@ -223,7 +223,7 @@ public protocol SessionTransport: Sendable {
     /// - Parameters:
     ///   - secretName: The secret name of the user
     ///   - id: The identifier for the batch of keys to delete
-    ///   - type: The type of keys to delete (e.g., Curve25519, PQKEM)
+    ///   - type: The type of keys to delete (e.g., Curve25519, MLKEM)
     /// - Throws: An error if the keys could not be deleted
     func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
 
@@ -235,7 +235,7 @@ public protocol SessionTransport: Sendable {
     /// - Parameters:
     ///   - secretName: The secret name of the user
     ///   - id: The identifier of the specific key to delete
-    ///   - type: The type of key to delete (e.g., Curve25519, PQKEM)
+    ///   - type: The type of key to delete (e.g., Curve25519, MLKEM)
     /// - Throws: An error if the key could not be deleted
     func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
 
