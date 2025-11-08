@@ -308,7 +308,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         var remoteOneTimePublicKey: CurvePublicKey?
         var remoteMLKEMPublicKey: MLKEMPublicKey
         var needsRemoteDeletion = false
-        var identities: SynchronizationKeyIdentities?
+//        var identities: SynchronizationKeyIdentities?
 
         if props.state == nil {
             if let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last {
@@ -364,14 +364,21 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         }
 
         // If we are intially attempting communication with a contact, we need to first send a session identity created message for the contact to delete their one time keys from being used again, the recipient can know what keys via key identities that are sent. This call also needs to send the sender's one time key identities so that the recipient also knows what one times to create their session with. We get the sender's next.
+        var transportEvent: TransportEvent?
         if let data = outboundTask.message.transportInfo {
             do {
-                var info = try BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: data)
-                info.senderCurveId = localOneTimePrivateKey?.id.uuidString
-                info.senderMLKEMId = localMLKEMPrivateKey.id.uuidString
-                identities = info
-                let encodedData = try BSONEncoder().encodeData(info)
-                outboundTask.message.transportInfo = encodedData
+                let event = try BSONDecoder().decodeData(TransportEvent.self, from: data)
+                transportEvent = event
+                switch event {
+                case .sessionReestablishment:
+                    break
+                case .synchronizeOneTimeKeys(var info):
+                    info.senderCurveId = localOneTimePrivateKey?.id.uuidString
+                    info.senderMLKEMId = localMLKEMPrivateKey.id.uuidString
+                    let encodedData = try BSONEncoder().encodeData(info)
+                    await session.setAddingContact(encodedData)
+                    outboundTask.message.transportInfo = encodedData
+                }
             } catch {}
         }
 
@@ -405,7 +412,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             recipient: outboundTask.message.recipient,
             transportMetadata: outboundTask.message.transportInfo,
             sharedMessageId: outboundTask.sharedId,
-            synchronizationKeyIds: identities))
+            transportEvent: transportEvent))
 
         // Perform remote key deletion only after a successful send
         if needsRemoteDeletion {
@@ -476,12 +483,21 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     senderSecretName: inboundTask.senderSecretName,
                     senderDeviceId: inboundTask.senderDeviceId)
             }
-            
-            if let transportInfo = decodedMessage.transportInfo, let keys = try? BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: transportInfo) {
-                try await removeKeys(
-                    session: session,
-                    curveId: keys.recipientCurveId,
-                    mlKEMId: keys.recipientMLKEMId)
+
+            if let transportInfo = decodedMessage.transportInfo {
+                do {
+                    let event = try BSONDecoder().decodeData(TransportEvent.self, from: transportInfo)
+                    switch event {
+                    case .sessionReestablishment:
+                        canSaveMessage = false
+                    case .synchronizeOneTimeKeys(let info):
+                        try await removeKeys(
+                            session: session,
+                            curveId: info.recipientCurveId,
+                            mlKEMId: info.recipientMLKEMId)
+                        canSaveMessage = false
+                    }
+                } catch {}
             }
             
             if canSaveMessage {

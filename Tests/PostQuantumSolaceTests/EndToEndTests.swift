@@ -29,6 +29,24 @@ import Crypto
 @testable import SessionEvents
 @testable import SessionModels
 
+// Global probe to assert control frames observed during tests
+actor SessionEventProbe {
+    static let shared = SessionEventProbe()
+    private var reestablishmentBySession: Set<UUID> = []
+    
+    func markReestablishment(for sessionId: UUID) {
+        reestablishmentBySession.insert(sessionId)
+    }
+    
+    func hasReestablishment(for sessionId: UUID) -> Bool {
+        reestablishmentBySession.contains(sessionId)
+    }
+    
+    func reset() {
+        reestablishmentBySession.removeAll()
+    }
+}
+
 @Suite(.serialized)
 actor EndToEndTests {
     let crypto = NeedleTailCrypto()
@@ -309,10 +327,10 @@ actor EndToEndTests {
         
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-		let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
 			bobTransport.continuation = continuation
-		}
-		let bobStream = AsyncStream<ReceivedMessage> { continuation in
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
 
@@ -394,6 +412,202 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .seconds(2))
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
+    }
+    
+    @Test("Auto Sync After Rotation - No Manual Send")
+    func testAutoSyncAfterRotationNoManualSend() async throws {
+        // Expect an automatic sync/control message after both sides rotate
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        var receivedAutoSync = false
+        await SessionEventProbe.shared.reset()
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+        
+        let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+        
+        let sd = SessionDelegate(session: _senderMaxSkipSession)
+        let rsd = SessionDelegate(session: _recipientMaxSkipSession)
+        try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderMaxSkipSession,
+            sd: sd,
+            bobSession: _recipientMaxSkipSession,
+            rsd: rsd)
+        
+        // Start receive loops (no manual sends in this test)
+        aliceTask = Task {
+            await #expect(throws: Never.self) {
+                for await received in aliceStream {
+                    if await self._senderMaxSkipSession.sessionContext == nil { continue }
+                    let myName = await self._senderMaxSkipSession.sessionContext?.sessionUser.secretName
+                    if received.sender == myName { continue }
+                    do {
+                        try await self._senderMaxSkipSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId
+                        )
+                    } catch {
+                        return
+                    }
+                }
+            }
+        }
+        bobTask = Task {
+            await #expect(throws: Never.self) {
+                for await received in bobStream {
+                    if await self._recipientMaxSkipSession.sessionContext == nil { continue }
+                    let myName = await self._recipientMaxSkipSession.sessionContext?.sessionUser.secretName
+                    if received.sender == myName { continue }
+                    do {
+                        try await self._recipientMaxSkipSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId
+                        )
+                        // Only finish once the sessionReestablishment frame has been observed
+                        if await SessionEventProbe.shared.hasReestablishment(for: self._recipientMaxSkipSession.id) {
+                            receivedAutoSync = true
+                            aliceTransport.continuation?.finish()
+                            bobTransport.continuation?.finish()
+                            return
+                        }
+                    } catch {
+                        return
+                    }
+                }
+            }
+        }
+        
+        // Rotate both sides; if implementation auto-sends a sync, Bob should receive it
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await self._senderMaxSkipSession.rotateKeysOnPotentialCompromise()
+            }
+            group.addTask {
+                try await self._recipientMaxSkipSession.rotateKeysOnPotentialCompromise()
+            }
+            try await group.waitForAll()
+        }
+        
+        try await Task.sleep(until: .now + .seconds(1))
+        #expect(receivedAutoSync, "Expected an automatic sync/control message after rotations without manual sends")
+        #expect(await SessionEventProbe.shared.hasReestablishment(for: _recipientMaxSkipSession.id), "Recipient should observe sessionReestablishment control frame")
+    }
+    
+    @Test("Immediate Post-Rotation Decrypt - No Delay")
+    func testImmediatePostRotationDecryptNoDelay() async throws {
+        // After both rotate, send immediately and expect decrypt (auto re-handshake in place)
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        var bobDecrypted = false
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+        
+        let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+        
+        let sd = SessionDelegate(session: _senderMaxSkipSession)
+        let rsd = SessionDelegate(session: _recipientMaxSkipSession)
+        try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderMaxSkipSession,
+            sd: sd,
+            bobSession: _recipientMaxSkipSession,
+            rsd: rsd)
+        
+        // Receive loops
+        aliceTask = Task {
+            await #expect(throws: Never.self) {
+                for await received in aliceStream {
+                    if await self._senderMaxSkipSession.sessionContext == nil { continue }
+                    let myName = await self._senderMaxSkipSession.sessionContext?.sessionUser.secretName
+                    if received.sender == myName { continue }
+                    do {
+                        try await self._senderMaxSkipSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId
+                        )
+                    } catch {
+                        return
+                    }
+                }
+            }
+        }
+        bobTask = Task {
+            await #expect(throws: Never.self) {
+                for await received in bobStream {
+                    if await self._recipientMaxSkipSession.sessionContext == nil { continue }
+                    let myName = await self._recipientMaxSkipSession.sessionContext?.sessionUser.secretName
+                    if received.sender == myName { continue }
+                    do {
+                        try await self._recipientMaxSkipSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId
+                        )
+                        bobDecrypted = true
+                        aliceTransport.continuation?.finish()
+                        bobTransport.continuation?.finish()
+                        return
+                    } catch {
+                        return
+                    }
+                }
+            }
+        }
+        
+        // Simultaneous rotations
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await self._senderMaxSkipSession.rotateKeysOnPotentialCompromise()
+            }
+            group.addTask {
+                try await self._recipientMaxSkipSession.rotateKeysOnPotentialCompromise()
+            }
+            try await group.waitForAll()
+        }
+        
+        // Immediately send without delay
+        try await _senderMaxSkipSession.writeTextMessage(
+            recipient: .nickname("bob"),
+            text: "immediate",
+            metadata: [:]
+        )
+        
+        try await Task.sleep(until: .now + .seconds(1))
+        #expect(bobDecrypted, "Bob should decrypt immediate post-rotation message without delay if auto re-handshake is working")
     }
     
     @Test
@@ -634,49 +848,49 @@ actor EndToEndTests {
             // 3) Prepare 79 distinct messages
             let messages = (0..<79).map { "Out‑of‑order Message \($0)" }
             
-			// 4) Send them all (in-order) from Alice → Bob
-			for text in messages {
-				try await self._senderSession.writeTextMessage(
-					recipient: .nickname("bob"),
-					text: text,
-					metadata: [:]
-				)
-			}
-			
+            // 4) Send them all (in-order) from Alice → Bob
+            for text in messages {
+                try await self._senderSession.writeTextMessage(
+                    recipient: .nickname("bob"),
+                    text: text,
+                    metadata: [:]
+                )
+            }
+            
 			// 5) Collect exactly 79 ReceivedMessage frames destined for Bob
-			var collected: [ReceivedMessage] = []
+            var collected: [ReceivedMessage] = []
 			for await received in bobStream {
-				collected.append(received)
-				if collected.count == messages.count {
-					// Once we have all 79, stop listening
-					aliceTransport.continuation?.finish()
+                collected.append(received)
+                if collected.count == messages.count {
+                    // Once we have all 79, stop listening
+                    aliceTransport.continuation?.finish()
 					bobTransport.continuation?.finish()
-					break
-				}
-			}
-			
+                    break
+                }
+            }
+            
 			// 6) Feed Bob's ratchet out‑of‑order: first the very first message…
-			let first = collected.removeFirst()
+            let first = collected.removeFirst()
 			let aliceSecretName = await self._senderSession.sessionContext!.sessionUser.secretName
 			let aliceDeviceId = await self._senderSession.sessionContext!.sessionUser.deviceId
-			try await self._recipientSession.receiveMessage(
-				message: first.message,
+            try await self._recipientSession.receiveMessage(
+                message: first.message,
 				sender: aliceSecretName,
 				deviceId: aliceDeviceId,
-				messageId: first.messageId
-			)
-			
+                messageId: first.messageId
+            )
+            
 			// …then the rest in a random order
-			for msg in collected.shuffled() {
-				try await self._recipientSession.receiveMessage(
-					message: msg.message,
+            for msg in collected.shuffled() {
+                try await self._recipientSession.receiveMessage(
+                    message: msg.message,
 					sender: aliceSecretName,
 					deviceId: aliceDeviceId,
-					messageId: msg.messageId
-				)
-			}
+                    messageId: msg.messageId
+                )
+            }
 			
-			await shutdownSessions()
+            await shutdownSessions()
         }
     }
     
@@ -720,11 +934,11 @@ actor EndToEndTests {
                 for await received in aliceStream {
                     aliceIterations += 1
                     do {
-                        try await self._senderSession.receiveMessage(
-                            message: received.message,
-                            sender: received.sender,
-                            deviceId: received.deviceId,
-                            messageId: received.messageId)
+                    try await self._senderSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId)
                     } catch PQSSession.SessionErrors.databaseNotInitialized {
                         return
                     }
@@ -747,39 +961,39 @@ actor EndToEndTests {
         }
         // Bob's receive loop
         Task {
-            var bobIterations = 0
-            for await received in bobStream {
-                bobIterations += 1
-                await #expect(
-                    throws: Never.self,
-                    "Bob's message processing loop should handle received messages, replies, and key rotation without errors"
-                ) {
+        var bobIterations = 0
+        for await received in bobStream {
+            bobIterations += 1
+            await #expect(
+                throws: Never.self,
+                "Bob's message processing loop should handle received messages, replies, and key rotation without errors"
+            ) {
                     do {
-                        try await self._recipientSession.receiveMessage(
-                            message: received.message,
-                            sender: received.sender,
-                            deviceId: received.deviceId,
-                            messageId: received.messageId)
+                try await self._recipientSession.receiveMessage(
+                    message: received.message,
+                    sender: received.sender,
+                    deviceId: received.deviceId,
+                    messageId: received.messageId)
                     } catch PQSSession.SessionErrors.databaseNotInitialized {
                         return
                     }
-                    // First user message (after protocol message)
-                    if bobIterations == 1 {
-                        await self.bobProcessedRotated.signal()
-                        try await self._recipientSession.writeTextMessage(
-                            recipient: .nickname("alice"), text: "Message Two", metadata: [:])
-                    }
-                    // After Alice's post-rotation message
-                    if bobIterations == 2 {
-                        try await self._recipientSession.rotateKeysOnPotentialCompromise()
-                        try await self._recipientSession.writeTextMessage(
-                            recipient: .nickname("alice"), text: "Message Four", metadata: [:])
-                        await self.aliceProcessedBobRotation.wait()
-                        aliceTransport.continuation?.finish()
-                        bobTransport.continuation?.finish()
-                    }
+                // First user message (after protocol message)
+                if bobIterations == 1 {
+                    await self.bobProcessedRotated.signal()
+                    try await self._recipientSession.writeTextMessage(
+                        recipient: .nickname("alice"), text: "Message Two", metadata: [:])
+                }
+                // After Alice's post-rotation message
+                if bobIterations == 2 {
+                    try await self._recipientSession.rotateKeysOnPotentialCompromise()
+                    try await self._recipientSession.writeTextMessage(
+                        recipient: .nickname("alice"), text: "Message Four", metadata: [:])
+                    await self.aliceProcessedBobRotation.wait()
+                    aliceTransport.continuation?.finish()
+                    bobTransport.continuation?.finish()
                 }
             }
+        }
         }
         // Kick off the flow after loops are active
         try await self._senderSession.writeTextMessage(
@@ -803,12 +1017,12 @@ actor EndToEndTests {
             aliceTransport.continuation = continuation
         }
         
-        // 2) Initialize sessions
-        let sd = SessionDelegate(session: _senderSession)
-        let rsd = SessionDelegate(session: _recipientSession)
-        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-        
+            // 2) Initialize sessions
+            let sd = SessionDelegate(session: _senderSession)
+            let rsd = SessionDelegate(session: _recipientSession)
+            try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+            try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+            
         // 3) Start receive loops to process protocol messages
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
@@ -852,11 +1066,11 @@ actor EndToEndTests {
         }
         
         // 4) Create friendship (creates contacts via protocol)
-        try await createFriendship(
-            aliceSession: _senderSession,
-            sd: sd,
-            bobSession: _recipientSession,
-            rsd: rsd)
+            try await createFriendship(
+                aliceSession: _senderSession,
+                sd: sd,
+                bobSession: _recipientSession,
+                rsd: rsd)
         
         // 5) Allow protocol to settle, then close streams
         try await Task.sleep(until: .now + .milliseconds(300))
@@ -877,11 +1091,11 @@ actor EndToEndTests {
             #expect(props.secretName == "bob")
             #expect(props.metadata["friendshipMetadata"] != nil)
         }
-        if let bobContact = bobContacts.first,
-           let props = try await bobContact.props(
-            symmetricKey: self._recipientSession.getDatabaseSymmetricKey())
-        {
-            #expect(props.secretName == "alice")
+            if let bobContact = bobContacts.first,
+               let props = try await bobContact.props(
+                symmetricKey: self._recipientSession.getDatabaseSymmetricKey())
+            {
+                #expect(props.secretName == "alice")
             #expect(props.metadata["friendshipMetadata"] != nil)
         }
         
@@ -1072,12 +1286,12 @@ actor EndToEndTests {
                     // Skip until session context is available
                     if await self._senderSession.sessionContext == nil { continue }
                     do {
-                        try await self._senderSession.receiveMessage(
-                            message: received.message,
-                            sender: received.sender,
-                            deviceId: received.deviceId,
-                            messageId: received.messageId
-                        )
+                    try await self._senderSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
                     } catch {
                         // Tolerate teardown/transition errors in this test
                         return
@@ -1102,12 +1316,12 @@ actor EndToEndTests {
                 // Skip until session context is available
                 if await self._recipientSession.sessionContext == nil { continue }
                 do {
-                    try await self._recipientSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId
-                    )
+                try await self._recipientSession.receiveMessage(
+                    message: received.message,
+                    sender: received.sender,
+                    deviceId: received.deviceId,
+                    messageId: received.messageId
+                )
                 } catch {
                     // Tolerate teardown/transition errors in this test
                     return
@@ -1991,28 +2205,28 @@ actor EndToEndTests {
         }
     }
     
-    // Setup two devices with their own sessions
-    let senderStore = createSenderStore()
-    let recipientStore = createRecipientStore()
-    let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
-    let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        // Setup two devices with their own sessions
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
     // Route Alice -> Bob by wiring Alice's continuation to Bob's stream
     let bobStream = AsyncStream<ReceivedMessage> { continuation in
         aliceTransport.continuation = continuation
     }
-    
-    let sd = SessionDelegate(session: _senderSession)
-    let rsd = SessionDelegate(session: _recipientSession)
-    
-    try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-    try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-    
-    try await createFriendship(
-        aliceSession: _senderSession,
-        sd: sd,
-        bobSession: _recipientSession,
-        rsd: rsd)
-    
+        
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+        
     let total = 10
     var processed = 0
     var authenticationFailures = 0
@@ -2052,28 +2266,28 @@ actor EndToEndTests {
     }
     
     // Warmup to establish session
-    for i in 1...4 {
-        try await _senderSession.writeTextMessage(
-            recipient: .nickname("bob"),
-            text: "Initial message \(i)",
-            metadata: Document()
-        )
+        for i in 1...4 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
         try await Task.sleep(until: .now + .milliseconds(50))
     }
     
     // Send a rapid burst intended to reproduce the real-world scenario
     for i in 5...total {
-        try await _senderSession.writeTextMessage(
-            recipient: .nickname("bob"),
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
             text: "Message \(i)",
-            metadata: Document()
-        )
-        try await Task.sleep(until: .now + .milliseconds(5))
-    }
-    
+                metadata: Document()
+            )
+            try await Task.sleep(until: .now + .milliseconds(5))
+        }
+        
     // Allow processing and then assert
-    try await Task.sleep(until: .now + .seconds(2))
-    
+        try await Task.sleep(until: .now + .seconds(2))
+        
     // Proper assertion: there should be no authentication failures in a correct flow
     #expect(authenticationFailures == 0, "No authentication failures expected, found: \(authenticationFailures)")
     }
@@ -2088,28 +2302,28 @@ actor EndToEndTests {
         }
     }
     
-    // Setup two devices with their own sessions
-    let senderStore = createSenderStore()
-    let recipientStore = createRecipientStore()
-    let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
-    let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        // Setup two devices with their own sessions
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
     // Route Alice -> Bob by wiring Alice's continuation to Bob's stream
     let bobStream = AsyncStream<ReceivedMessage> { continuation in
         aliceTransport.continuation = continuation
     }
-    
-    let sd = SessionDelegate(session: _senderSession)
-    let rsd = SessionDelegate(session: _recipientSession)
-    
-    try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-    try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-    
-    try await createFriendship(
-        aliceSession: _senderSession,
-        sd: sd,
-        bobSession: _recipientSession,
-        rsd: rsd)
-    
+        
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+        
     // Total messages Bob will process (4 warmup + 11 burst)
     let total = 15
     var processed = 0
@@ -2149,22 +2363,22 @@ actor EndToEndTests {
     }
     
     // Warmup to establish session
-    for i in 1...4 {
-        try await _senderSession.writeTextMessage(
-            recipient: .nickname("bob"),
-            text: "Initial message \(i)",
-            metadata: Document()
-        )
+        for i in 1...4 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "Initial message \(i)",
+                metadata: Document()
+            )
         try await Task.sleep(until: .now + .milliseconds(50))
     }
     
     // Rapid burst intended to stress ratchet state
-    for i in 5...15 {
-        try await _senderSession.writeTextMessage(
-            recipient: .nickname("bob"),
+        for i in 5...15 {
+                try await _senderSession.writeTextMessage(
+                    recipient: .nickname("bob"),
             text: "Message \(i)",
-            metadata: Document()
-        )
+                    metadata: Document()
+                )
         // tiny delay to vary arrival order
         try await Task.sleep(until: .now + .milliseconds(5))
     }
@@ -2405,11 +2619,11 @@ actor EndToEndTests {
                 for await received in aliceStream {
                     do {
                         try await self._senderMaxSkipSession.receiveMessage(
-                            message: received.message,
-                            sender: received.sender,
-                            deviceId: received.deviceId,
-                            messageId: received.messageId
-                        )
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
                         aliceProcessed += 1
                         if aliceProcessed >= total {
                             aliceTransport.continuation?.finish()
@@ -2427,11 +2641,11 @@ actor EndToEndTests {
                 for await received in bobStream {
                     do {
                         try await self._recipientMaxSkipSession.receiveMessage(
-                            message: received.message,
-                            sender: received.sender,
-                            deviceId: received.deviceId,
-                            messageId: received.messageId
-                        )
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
                         bobProcessed += 1
                         if bobProcessed >= total {
                             bobTransport.continuation?.finish()
@@ -2446,7 +2660,7 @@ actor EndToEndTests {
         
 		
 			Task {
-                for i in 1...total {
+            for i in 1...total {
                     try await self._senderMaxSkipSession.writeTextMessage(
                         recipient: .nickname("bob"),
                         text: "A->B #\(i)",
@@ -2457,12 +2671,12 @@ actor EndToEndTests {
 			Task {
                 for i in 1...total {
 				try await self._recipientMaxSkipSession.writeTextMessage(
-					recipient: .nickname("alice"),
-					text: "B->A #\(i)",
-					metadata: Document()
-				)
-			}
-		}
+                        recipient: .nickname("alice"),
+                        text: "B->A #\(i)",
+                        metadata: Document()
+                    )
+                }
+            }
         try await Task.sleep(until: .now + .seconds(5))
     }
     
@@ -2818,6 +3032,18 @@ struct SessionDelegate: PQSSessionDelegate {
     ) async -> SessionModels.EncryptedMessage { message }
     func shouldFinishCommunicationSynchronization(_: Data?) -> Bool { false }
     func processMessage(_ message: CryptoMessage, senderSecretName: String, senderDeviceId: UUID) async -> Bool {
+        
+        // Detect control frames for test assertions
+        if let info = message.transportInfo {
+            if let event = try? BSONDecoder().decodeData(TransportEvent.self, from: info) {
+                switch event {
+                case .sessionReestablishment:
+                    await SessionEventProbe.shared.markReestablishment(for: session.id)
+                case .synchronizeOneTimeKeys(_):
+                    break
+                }
+            }
+        }
 
         if let meta = message.metadata["friendshipMetadata"] as? Document {
             var decodedMetadata = try! BSONDecoder().decode(FriendshipMetadata.self, from: meta)
@@ -3143,12 +3369,12 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     
     func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
         
-        if let ids = metadata.synchronizationKeyIds {
-            do {
-                let idsData = try BSONEncoder().encodeData(ids)
-                await session.setAddingContact(idsData)
-            } catch {}
-        }
+//        if let ids = metadata.synchronizationKeyIds {
+//            do {
+//                let idsData = try BSONEncoder().encodeData(ids)
+//                await session.setAddingContact(idsData)
+//            } catch {}
+//        }
         
         // Determine actual sender from the bound session, not from metadata
         guard let sessionContext = await session.sessionContext else { return }
@@ -3177,7 +3403,7 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
             peer.continuation?.yield(received)
         } else {
             // Fallback for tests that didn't register peers
-            continuation?.yield(received)
+        continuation?.yield(received)
         }
     }
     

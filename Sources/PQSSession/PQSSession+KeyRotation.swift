@@ -149,6 +149,30 @@ extension PQSSession {
                 for: sessionContext.sessionUser.secretName,
                 deviceId: sessionContext.sessionUser.deviceId.uuidString,
                 rotated: .init(pskData: device.signingPublicKey, signedDevice: reSigned))
+            
+            guard let cache else {
+                throw SessionErrors.databaseNotInitialized
+            }
+     
+            let metadata = try BSONEncoder().encode(TransportEvent.sessionReestablishment)
+            
+            //Re-establish sessions for self and contacts. Channel recipients are in essences contacts we have a relationship with so sending to their individual nick is sufficient.
+            try await writeTextMessage(
+                recipient: .personalMessage,
+                transportInfo: metadata.makeData(),
+                metadata: [:])
+            
+            for secretName in try await cache
+                .fetchContacts()
+                .asyncMap(transform: { try? await $0.props(symmetricKey: getDatabaseSymmetricKey())?.secretName }) {
+                guard let secretName else { continue }
+                try await writeTextMessage(
+                    recipient: .nickname(secretName),
+                    transportInfo: metadata.makeData(),
+                    metadata: [:])
+            }
+            
+
             logger.log(level: .debug, message: "Completed rotating keys")
         } catch {
             await setRotatingKeys(false)

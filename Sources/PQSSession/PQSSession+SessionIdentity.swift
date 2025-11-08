@@ -540,7 +540,7 @@ public extension PQSSession {
             recipientCurveId: curveId,
             recipientMLKEMId: mlKEMId
         )
-        let metadata = try BSONEncoder().encode(identityInfo)
+        let metadata = try BSONEncoder().encode(TransportEvent.synchronizeOneTimeKeys(identityInfo))
 
         try await writeTextMessage(
             recipient: .nickname(secretName),

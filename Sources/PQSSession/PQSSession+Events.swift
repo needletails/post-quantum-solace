@@ -212,8 +212,20 @@ public extension PQSSession {
         let symmetricKey = try await getDatabaseSymmetricKey()
         let mySecretName = sessionContext.sessionUser.secretName
 
-        let shouldPersist = sessionDelegate?.shouldPersist(transportInfo: message.transportInfo) == false ? false : true
+        var shouldPersist = sessionDelegate?.shouldPersist(transportInfo: message.transportInfo) == false ? false : true
 
+        if let data = message.transportInfo {
+            do {
+                let event = try BSONDecoder().decodeData(TransportEvent.self, from: data)
+                switch event {
+                case .sessionReestablishment:
+                    shouldPersist = false
+                case .synchronizeOneTimeKeys(_):
+                    shouldPersist = false
+                }
+            } catch {}
+        }
+        
         try await taskProcessor.outboundTask(
             message: message,
             cache: cache,

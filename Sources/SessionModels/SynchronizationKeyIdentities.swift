@@ -96,3 +96,13 @@ public struct SynchronizationKeyIdentities: Sendable, Codable {
         self.recipientMLKEMId = recipientMLKEMId
     }
 }
+
+public enum TransportEvent: Sendable, Codable {
+    case sessionReestablishment
+    case synchronizeOneTimeKeys(SynchronizationKeyIdentities)
+    
+    enum CodingKeys: String, CodingKey {
+        case sessionReestablishment = "a"
+        case synchronizeOneTimeKeys = "b"
+    }
+}

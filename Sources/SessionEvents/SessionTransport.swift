@@ -71,7 +71,9 @@ public struct SignedRatchetMessageMetadata: Sendable {
     /// different devices and sessions.
     public let sharedMessageId: String
 
-    public var synchronizationKeyIds: SynchronizationKeyIdentities?
+    /// An enum contains events that PQSSession needs to communicate with the transport
+    ///
+    public let transportEvent: TransportEvent?
 
     /// Initializes a new instance of `SignedRatchetMessageMetadata`.
     ///
@@ -87,14 +89,14 @@ public struct SignedRatchetMessageMetadata: Sendable {
         recipient: MessageRecipient,
         transportMetadata: Data?,
         sharedMessageId: String,
-        synchronizationKeyIds: SynchronizationKeyIdentities?
+        transportEvent: TransportEvent?
     ) {
         self.secretName = secretName
         self.deviceId = deviceId
         self.recipient = recipient
         self.transportMetadata = transportMetadata
         self.sharedMessageId = sharedMessageId
-        self.synchronizationKeyIds = synchronizationKeyIds
+        self.transportEvent = transportEvent
     }
 }
 
