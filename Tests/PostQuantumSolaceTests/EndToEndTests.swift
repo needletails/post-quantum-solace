@@ -13,17 +13,13 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import BSON
+
 import DoubleRatchetKit
 import Foundation
 import NeedleTailAsyncSequence
 import NeedleTailCrypto
 import Testing
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 @testable import PQSSession
 @testable import SessionEvents
@@ -312,6 +308,111 @@ actor EndToEndTests {
     
     // MARK: - Test Methods
     
+    @Test("End-to-End Channel Messaging")
+    func testEndToEndChannelMessaging() async throws {
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+        
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        _ = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+        
+        
+        // Init sessions
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        
+        // Create a third participant "joe" so identity refresh for joe succeeds during channel outbound
+        var joeSession = PQSSession()
+        let joeStore = MockIdentityStore(mockUserData: MockUserData(session: joeSession), session: joeSession, isSender: false)
+        let joeTransport = _MockTransportDelegate(session: joeSession, store: store)
+        let joeReceiver = ReceiverDelegate(session: joeSession)
+        let joeDelegate = SessionDelegate(session: joeSession)
+        await joeSession.setLogLevel(.trace)
+        await joeSession.setDatabaseDelegate(conformer: joeStore)
+        await joeSession.setTransportDelegate(conformer: joeTransport)
+        await joeSession.setPQSSessionDelegate(conformer: joeDelegate)
+        await joeSession.setReceiverDelegate(conformer: joeReceiver)
+        joeSession.isViable = true
+        await self.store.setPublishableName("joe")
+        joeSession = try await joeSession.createSession(secretName: "joe", appPassword: "123") {}
+        await joeSession.setAppPassword("123")
+        joeSession = try await joeSession.startSession(appPassword: "123")
+        try await joeReceiver.setKey(joeSession.getDatabaseSymmetricKey())
+        
+        // Pre-create channel communication on both caches so inbound channel can resolve it
+       let channelName = "general"
+       let info = ChannelInfo(
+            name: channelName,
+            administrator: "alice",
+            members: ["alice", "bob", "joe"],
+            operators: ["alice"])
+        let metadata = try BinaryEncoder().encode(info)
+        let senderKey = try await _senderSession.getDatabaseSymmetricKey()
+        let recipientKey = try await _recipientSession.getDatabaseSymmetricKey()
+        let props = BaseCommunication.UnwrappedProps(
+            messageCount: 0,
+            administrator: "alice",
+            operators: ["alice"],
+            members: ["alice", "bob", "joe"],
+            metadata: metadata,
+            blockedMembers: [],
+            communicationType: .channel(channelName)
+        )
+        let commId = UUID()
+        let senderComm = try BaseCommunication(id: commId, props: props, symmetricKey: senderKey)
+        let recipientComm = try BaseCommunication(id: commId, props: props, symmetricKey: recipientKey)
+        try await senderStore.createCommunication(senderComm)
+        try await recipientStore.createCommunication(recipientComm)
+        
+        // Bob receive loop: process one channel message
+        var bobReceived = 0
+        bobTask = Task {
+            await #expect(throws: Never.self) {
+                for await received in bobStream {
+                    guard received.recipient == "bob" else { continue }
+                    bobReceived += 1
+                    try await self._recipientSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
+                    if bobReceived == 2 {
+                        aliceTransport.continuation?.finish()
+                        bobTransport.continuation?.finish()
+                    }
+                }
+            }
+        }
+        
+        // Send a channel message from Alice
+        try await _senderSession.writeTextMessage(
+            recipient: .channel(channelName),
+            text: "hello channel",
+            metadata: metadata
+        )
+        try await Task.sleep(until: .now + .seconds(3))
+        // Assertions
+        #expect(bobReceived == 2, "Bob should receive one channel message")
+        await #expect(recipientStore.createdMessages.count >= 1, "Recipient should persist the channel message")
+    }
+    
     @Test("Manual Key Rotation Then Immediate Send")
     func testManualKeyRotationThenImmediateSend() async throws {
         var aliceTask: Task<Void, Never>?
@@ -390,26 +491,22 @@ actor EndToEndTests {
                         try await self._senderSession.rotateKeysOnPotentialCompromise()
                         try await self._senderSession.writeTextMessage(
                             recipient: .nickname("bob"),
-                            text: "post-rotate",
-                            metadata: [:]
-                        )
+                            text: "post-rotate")
                     } else if processed == 2 {
                         // Reply from Bob after receiving Alice's post-rotation message
                         try await self._recipientSession.writeTextMessage(
                             recipient: .nickname("alice"),
-                            text: "ack post-rotate",
-                            metadata: [:]
-                        )
+                            text: "ack post-rotate")
                     }
                 }
             }
         }
         
         // Warm-up to establish identity/ratchet
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup", metadata: [:])
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
         
         // Give tasks time to run
-        try await Task.sleep(until: .now + .seconds(2))
+        try await Task.sleep(until: .now + .seconds(1))
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
     }
@@ -602,9 +699,7 @@ actor EndToEndTests {
         // Immediately send without delay
         try await _senderMaxSkipSession.writeTextMessage(
             recipient: .nickname("bob"),
-            text: "immediate",
-            metadata: [:]
-        )
+            text: "immediate")
         
         try await Task.sleep(until: .now + .seconds(1))
         #expect(bobDecrypted, "Bob should decrypt immediate post-rotation message without delay if auto re-handshake is working")
@@ -644,7 +739,7 @@ actor EndToEndTests {
                 rsd: rsd)
             
             try await _senderSession.writeTextMessage(
-                recipient: .nickname("bob"), text: "Message One", metadata: [:])
+                recipient: .nickname("bob"), text: "Message One")
         }
         
         aliceTask = Task {
@@ -667,9 +762,9 @@ actor EndToEndTests {
                     
                     if aliceIterations == 2 {
                         try await _senderSession.writeTextMessage(
-                            recipient: .nickname("bob"), text: "Message Four", metadata: [:])
+                            recipient: .nickname("bob"), text: "Message Four")
                         try await _senderSession.writeTextMessage(
-                            recipient: .nickname("bob"), text: "Message Five", metadata: [:])
+                            recipient: .nickname("bob"), text: "Message Five")
                     }
                 }
             }
@@ -691,9 +786,9 @@ actor EndToEndTests {
                 
                 if bobIterations == 1 {
                     try await _recipientSession.writeTextMessage(
-                        recipient: .nickname("alice"), text: "Message Two", metadata: [:])
+                        recipient: .nickname("alice"), text: "Message Two")
                     try await _recipientSession.writeTextMessage(
-                        recipient: .nickname("alice"), text: "Message Three", metadata: [:])
+                        recipient: .nickname("alice"), text: "Message Three")
                 }
                 
                 if bobIterations == 3 {
@@ -746,9 +841,7 @@ actor EndToEndTests {
             // 3) Kick off the very first message from Alice → Bob
             try await self._senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "1",
-                metadata: [:]
-            )
+                text: "1")
         }
         // 4) Bob's receive‑and‑reply loop
         Task {
@@ -773,9 +866,7 @@ actor EndToEndTests {
                         let next = bobReceivedCount * 2  // Bob sends even‑numbered msgs
                         try await self._recipientSession.writeTextMessage(
                             recipient: .nickname("alice"),
-                            text: "\(next)",
-                            metadata: [:]
-                        )
+                            text: "\(next)")
                     } else {
                         // Bob got all his 1 000; close his stream
                         aliceTransport.continuation?.finish()
@@ -806,9 +897,7 @@ actor EndToEndTests {
                     let next = aliceReceivedCount * 2 + 1  // Alice sends odd‑numbered msgs
                     try await self._senderSession.writeTextMessage(
                         recipient: .nickname("bob"),
-                        text: "\(next)",
-                        metadata: [:]
-                    )
+                        text: "\(next)")
                 }
             }
         }
@@ -852,9 +941,7 @@ actor EndToEndTests {
             for text in messages {
                 try await self._senderSession.writeTextMessage(
                     recipient: .nickname("bob"),
-                    text: text,
-                    metadata: [:]
-                )
+                    text: text)
             }
             
 			// 5) Collect exactly 79 ReceivedMessage frames destined for Bob
@@ -946,7 +1033,7 @@ actor EndToEndTests {
                     if aliceIterations == 1 {
                         try await self._senderSession.rotateKeysOnPotentialCompromise()
                         try await self._senderSession.writeTextMessage(
-                            recipient: .nickname("bob"), text: "Message Three", metadata: [:])
+                            recipient: .nickname("bob"), text: "Message Three")
                         await self.bobProcessedRotated.wait()
                     }
                     // After Bob's post-rotation message
@@ -981,13 +1068,13 @@ actor EndToEndTests {
                 if bobIterations == 1 {
                     await self.bobProcessedRotated.signal()
                     try await self._recipientSession.writeTextMessage(
-                        recipient: .nickname("alice"), text: "Message Two", metadata: [:])
+                        recipient: .nickname("alice"), text: "Message Two")
                 }
                 // After Alice's post-rotation message
                 if bobIterations == 2 {
                     try await self._recipientSession.rotateKeysOnPotentialCompromise()
                     try await self._recipientSession.writeTextMessage(
-                        recipient: .nickname("alice"), text: "Message Four", metadata: [:])
+                        recipient: .nickname("alice"), text: "Message Four")
                     await self.aliceProcessedBobRotation.wait()
                     aliceTransport.continuation?.finish()
                     bobTransport.continuation?.finish()
@@ -997,7 +1084,7 @@ actor EndToEndTests {
         }
         // Kick off the flow after loops are active
         try await self._senderSession.writeTextMessage(
-            recipient: .nickname("bob"), text: "Message One", metadata: [:])
+            recipient: .nickname("bob"), text: "Message One")
         try await Task.sleep(until: .now + .seconds(3))
         await shutdownSessions()
     }
@@ -1271,7 +1358,7 @@ actor EndToEndTests {
                 newRecipientConfig.getVerifiedDevices())
             
             try await self._senderSession.writeTextMessage(
-                recipient: .nickname("bob"), text: "Message One", metadata: [:])
+                recipient: .nickname("bob"), text: "Message One")
             
         }
         
@@ -1329,9 +1416,9 @@ actor EndToEndTests {
                 
                 if bobIterations == 1 {
                     try await self._recipientSession.writeTextMessage(
-                        recipient: .nickname("alice"), text: "Message Two", metadata: [:])
+                        recipient: .nickname("alice"), text: "Message Two")
                     try await self._recipientSession.writeTextMessage(
-                        recipient: .nickname("alice"), text: "Message Three", metadata: [:])
+                        recipient: .nickname("alice"), text: "Message Three")
                 }
                 
                 if bobIterations == 3 {
@@ -1368,9 +1455,7 @@ actor EndToEndTests {
         for i in 1...5 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Initial message \(i)",
-                metadata: Document()
-            )
+                text: "Initial message \(i)")
             
             // Small delay to allow processing
             try await Task.sleep(until: .now + .milliseconds(100))
@@ -1385,9 +1470,7 @@ actor EndToEndTests {
             do {
                 try await _senderSession.writeTextMessage(
                     recipient: .nickname("bob"),
-                    text: "Rapid message \(i)",
-                    metadata: Document()
-                )
+                    text: "Rapid message \(i)")
                 successfulMessages += 1
             } catch {
                 if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
@@ -1441,15 +1524,11 @@ actor EndToEndTests {
         for i in 1...3 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Alice message \(i)",
-                metadata: Document()
-            )
+                text: "Alice message \(i)")
             
             try await _recipientSession.writeTextMessage(
                 recipient: .nickname("alice"),
-                text: "Bob message \(i)",
-                metadata: Document()
-            )
+                text: "Bob message \(i)")
             
             // Small delay to allow processing
             try await Task.sleep(until: .now + .milliseconds(50))
@@ -1466,9 +1545,7 @@ actor EndToEndTests {
             do {
                 try await _senderSession.writeTextMessage(
                     recipient: .nickname("bob"),
-                    text: "Alice rapid \(i)",
-                    metadata: Document()
-                )
+                    text: "Alice rapid \(i)")
                 aliceSuccess += 1
             } catch {
                 if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
@@ -1482,9 +1559,7 @@ actor EndToEndTests {
             do {
                 try await _recipientSession.writeTextMessage(
                     recipient: .nickname("alice"),
-                    text: "Bob rapid \(i)",
-                    metadata: Document()
-                )
+                    text: "Bob rapid \(i)")
                 bobSuccess += 1
             } catch {
                 if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
@@ -1536,9 +1611,7 @@ actor EndToEndTests {
         for i in 1...3 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Initial message \(i)",
-                metadata: Document()
-            )
+                text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
         }
         
@@ -1556,9 +1629,7 @@ actor EndToEndTests {
                     
                     try await _senderSession.writeTextMessage(
                         recipient: .nickname("bob"),
-                        text: "Timing test message \(i)",
-                        metadata: Document()
-                    )
+                        text: "Timing test message \(i)")
                     return MessageResult.success
                 } catch {
                     if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
@@ -1618,9 +1689,7 @@ actor EndToEndTests {
         for i in 1...3 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Initial message \(i)",
-                metadata: Document()
-            )
+                text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
         }
         
@@ -1643,9 +1712,7 @@ actor EndToEndTests {
             do {
                 try await _senderSession.writeTextMessage(
                     recipient: .nickname("bob"),
-                    text: "State corruption test \(i)",
-                    metadata: Document()
-                )
+                    text: "State corruption test \(i)")
                 successfulMessages += 1
             } catch {
                 if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
@@ -1691,9 +1758,7 @@ actor EndToEndTests {
         for i in 1...3 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Initial message \(i)",
-                metadata: Document()
-            )
+                text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
         }
         
@@ -1709,9 +1774,7 @@ actor EndToEndTests {
                     do {
                         try await _senderSession.writeTextMessage(
                             recipient: .nickname("bob"),
-                            text: "Transport test burst \(burst) message \(i)",
-                            metadata: Document()
-                        )
+                            text: "Transport test burst \(burst) message \(i)")
                         return MessageResult.success
                     } catch {
                         if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
@@ -1772,9 +1835,7 @@ actor EndToEndTests {
         for i in 1...3 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Initial message \(i)",
-                metadata: Document()
-            )
+                text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
         }
         
@@ -1791,9 +1852,7 @@ actor EndToEndTests {
                 
                 try await _senderSession.writeTextMessage(
                     recipient: .nickname("bob"),
-                    text: "Sync test message \(i)",
-                    metadata: Document()
-                )
+                    text: "Sync test message \(i)")
                 successfulMessages += 1
                 
                 // Simulate device being busy with other tasks
@@ -1841,9 +1900,7 @@ actor EndToEndTests {
         for i in 1...3 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Initial message \(i)",
-                metadata: Document()
-            )
+                text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
         }
         
@@ -1862,9 +1919,7 @@ actor EndToEndTests {
                     
                     try await _senderSession.writeTextMessage(
                         recipient: .nickname("bob"),
-                        text: "Race condition test \(i)",
-                        metadata: Document()
-                    )
+                        text: "Race condition test \(i)")
                     return MessageResult.success
                 } catch {
                     if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
@@ -1937,14 +1992,10 @@ actor EndToEndTests {
         for i in 1...3 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Initial message \(i)",
-                metadata: Document()
-            )
+                text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
         }
-        
-        // Simulate the exact scenario from the logs: ICE candidate messages arriving simultaneously
-        // This creates the "RECEIVED______ ice_candidate" pattern with concurrent job creation
+
         var authenticationFailures = 0
         var successfulMessages = 0
         
@@ -1958,17 +2009,17 @@ actor EndToEndTests {
                     try await Task.sleep(until: .now + .milliseconds(arrivalDelay))
                     
                     // Simulate the ICE candidate message content
-                    let iceData = Document(dictionary: [
+                    let iceData: [String: String] = [
                         "type": "ice-candidate",
                         "candidate": "candidate:\(i) 1 udp 2122260223 192.168.1.\(i) 54321 typ host",
-                        "sdpMLineIndex": i,
+                        "sdpMLineIndex": "\(i)",
                         "sdpMid": "0"
-                    ])
-                    
+                    ]
+                    let metadata = try BinaryEncoder().encode(iceData)
                     try await _senderSession.writeTextMessage(
                         recipient: .nickname("bob"),
                         text: "ICE candidate \(i)",
-                        metadata: iceData
+                        metadata: metadata
                     )
                     return MessageResult.success
                 } catch {
@@ -2051,9 +2102,7 @@ actor EndToEndTests {
         for i in 1...4 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Initial message \(i)",
-                metadata: Document()
-            )
+                text: "Initial message \(i)")
             // Small delay to allow processing
             try await Task.sleep(until: .now + .milliseconds(100))
         }
@@ -2072,9 +2121,7 @@ actor EndToEndTests {
             do {
                 try await _senderSession.writeTextMessage(
                     recipient: .nickname("bob"),
-                    text: "Message \(i) - should cause skipped keys",
-                    metadata: Document()
-                )
+                    text: "Message \(i) - should cause skipped keys")
                 successfulMessages += 1
             } catch {
                 if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
@@ -2162,7 +2209,7 @@ actor EndToEndTests {
                         } else if case PQSSession.SessionErrors.databaseNotInitialized = error {
                             break
                         } else {
-                            #expect(false, "Unexpected receive error: \(error)")
+                            #expect(Bool(false), "Unexpected receive error: \(error)")
                             break
                         }
                     }
@@ -2174,9 +2221,7 @@ actor EndToEndTests {
         for i in 1...4 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Initial message \(i)",
-                metadata: Document()
-            )
+                text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
         }
         
@@ -2184,9 +2229,7 @@ actor EndToEndTests {
         for i in 5...10 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Message \(i)",
-                metadata: Document()
-            )
+                text: "Message \(i)")
             try await Task.sleep(until: .now + .milliseconds(5))
         }
         
@@ -2257,7 +2300,7 @@ actor EndToEndTests {
                         break
                     } else {
                         // Unexpected error; fail this loop
-                        #expect(false, "Unexpected receive error: \(error)")
+                        #expect(Bool(false), "Unexpected receive error: \(error)")
                         break
                     }
                 }
@@ -2269,9 +2312,7 @@ actor EndToEndTests {
         for i in 1...4 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Initial message \(i)",
-                metadata: Document()
-            )
+                text: "Initial message \(i)")
         try await Task.sleep(until: .now + .milliseconds(50))
     }
     
@@ -2279,9 +2320,7 @@ actor EndToEndTests {
     for i in 5...total {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-            text: "Message \(i)",
-                metadata: Document()
-            )
+            text: "Message \(i)")
             try await Task.sleep(until: .now + .milliseconds(5))
         }
         
@@ -2354,7 +2393,7 @@ actor EndToEndTests {
                     } else if case PQSSession.SessionErrors.databaseNotInitialized = error {
                         break
                     } else {
-                        #expect(false, "Unexpected receive error: \(error)")
+                        #expect(Bool(false), "Unexpected receive error: \(error)")
                         break
                     }
                 }
@@ -2366,9 +2405,7 @@ actor EndToEndTests {
         for i in 1...4 {
             try await _senderSession.writeTextMessage(
                 recipient: .nickname("bob"),
-                text: "Initial message \(i)",
-                metadata: Document()
-            )
+                text: "Initial message \(i)")
         try await Task.sleep(until: .now + .milliseconds(50))
     }
     
@@ -2376,9 +2413,7 @@ actor EndToEndTests {
         for i in 5...15 {
                 try await _senderSession.writeTextMessage(
                     recipient: .nickname("bob"),
-            text: "Message \(i)",
-                    metadata: Document()
-                )
+            text: "Message \(i)")
         // tiny delay to vary arrival order
         try await Task.sleep(until: .now + .milliseconds(5))
     }
@@ -2464,13 +2499,13 @@ actor EndToEndTests {
         
         // 3) Round‑robin messages from all devices on both sides
         for i in 1...10 {
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Alice(master) #\(i)", metadata: Document())
-            try await _senderChildSession1.writeTextMessage(recipient: .nickname("bob"), text: "Alice(child1) #\(i)", metadata: Document())
-            try await _senderChildSession2.writeTextMessage(recipient: .nickname("bob"), text: "Alice(child2) #\(i)", metadata: Document())
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Alice(master) #\(i)")
+            try await _senderChildSession1.writeTextMessage(recipient: .nickname("bob"), text: "Alice(child1) #\(i)")
+            try await _senderChildSession2.writeTextMessage(recipient: .nickname("bob"), text: "Alice(child2) #\(i)")
             
-            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Bob(master) #\(i)", metadata: Document())
-            try await _recipientChildSession1.writeTextMessage(recipient: .nickname("alice"), text: "Bob(child1) #\(i)", metadata: Document())
-            try await _recipientChildSession2.writeTextMessage(recipient: .nickname("alice"), text: "Bob(child2) #\(i)", metadata: Document())
+            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Bob(master) #\(i)")
+            try await _recipientChildSession1.writeTextMessage(recipient: .nickname("alice"), text: "Bob(child1) #\(i)")
+            try await _recipientChildSession2.writeTextMessage(recipient: .nickname("alice"), text: "Bob(child2) #\(i)")
             
             try await Task.sleep(until: .now + .milliseconds(10))
         }
@@ -2545,8 +2580,8 @@ actor EndToEndTests {
         
         // Initial warm‑up exchange
         for i in 1...5 {
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup alice #\(i)", metadata: Document())
-            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "warmup bob #\(i)", metadata: Document())
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup alice #\(i)")
+            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "warmup bob #\(i)")
             try await Task.sleep(until: .now + .milliseconds(20))
         }
         
@@ -2554,8 +2589,8 @@ actor EndToEndTests {
         try await _senderSession.rotateKeysOnPotentialCompromise()
         
         for i in 6...10 {
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice post-rotate #\(i)", metadata: Document())
-            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob steady #\(i)", metadata: Document())
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice post-rotate #\(i)")
+            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob steady #\(i)")
             try await Task.sleep(until: .now + .milliseconds(15))
         }
         
@@ -2563,8 +2598,8 @@ actor EndToEndTests {
         try await _recipientSession.rotateKeysOnPotentialCompromise()
         
         for i in 11...15 {
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice steady #\(i)", metadata: Document())
-            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob post-rotate #\(i)", metadata: Document())
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice steady #\(i)")
+            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob post-rotate #\(i)")
             try await Task.sleep(until: .now + .milliseconds(15))
         }
         
@@ -2663,18 +2698,14 @@ actor EndToEndTests {
             for i in 1...total {
                     try await self._senderMaxSkipSession.writeTextMessage(
                         recipient: .nickname("bob"),
-                        text: "A->B #\(i)",
-                        metadata: Document()
-                    )
+                        text: "A->B #\(i)")
                 }
 			}
 			Task {
                 for i in 1...total {
 				try await self._recipientMaxSkipSession.writeTextMessage(
                         recipient: .nickname("alice"),
-                        text: "B->A #\(i)",
-                        metadata: Document()
-                    )
+                        text: "B->A #\(i)")
                 }
             }
         try await Task.sleep(until: .now + .seconds(5))
@@ -2717,9 +2748,7 @@ actor EndToEndTests {
                     if currentMessage == 13 {
                         try await self._senderMaxSkipSession.writeTextMessage(
                             recipient: .nickname("bob"),
-                            text: "A->B #\(currentMessage)",
-                            metadata: Document()
-                        )
+                            text: "A->B #\(currentMessage)")
                     }
                 }
             }
@@ -2730,9 +2759,7 @@ actor EndToEndTests {
                 group.addTask {
                     try await self._senderMaxSkipSession.writeTextMessage(
                         recipient: .nickname("bob"),
-                        text: "A->B #\(i)",
-                        metadata: Document()
-                    )
+                        text: "A->B #\(i)")
                 }
             }
             try await group.waitForAll()
@@ -2786,16 +2813,14 @@ actor EndToEndTests {
                         try await Task.sleep(nanoseconds: 50_000)
                         try await self._senderMaxSkipSession.writeTextMessage(
                             recipient: .nickname("bob"),
-                            text: "A2->B2",
-                            metadata: Document())
+                            text: "A2->B2")
                     }
                     
                     if messageCount == 2 {
                         
                         try! await self._recipientMaxSkipSession.writeTextMessage(
                             recipient: .nickname("alice"),
-                            text: "B->A",
-                            metadata: Document())
+                            text: "B->A")
                     }
                 }
             }
@@ -2815,8 +2840,7 @@ actor EndToEndTests {
         
         try await self._senderMaxSkipSession.writeTextMessage(
             recipient: .nickname("bob"),
-            text: "A->B",
-            metadata: Document())
+            text: "A->B")
         
         try await Task.sleep(until: .now + .seconds(3))
         aliceTransport.continuation?.finish()
@@ -2833,14 +2857,17 @@ actor EndToEndTests {
         var aliceFriendship = FriendshipMetadata()
         aliceFriendship.setRequestedState()  // Alice is requesting friendship
         
-        let contactMetadata: Document = [
+        let contactMetadata: [String: String] = [
             "nickname": "Bob",
             "trustLevel": "high",
-            "createdAt": Date(),
-            "friendshipMetadata": try BSONEncoder().encode(aliceFriendship),
+            "createdAt": "\(Date())"
         ]
                 
-        _ = try await aliceSession.createContact(secretName: "bob", metadata: contactMetadata, requestFriendship: true)
+        _ = try await aliceSession.createContact(
+            secretName: "bob",
+            metadata: try BinaryEncoder().encode(contactMetadata),
+            friendshipMetadata: aliceFriendship,
+            requestFriendship: true)
 
         try await Task.sleep(nanoseconds: 50_000)
     }
@@ -2894,15 +2921,13 @@ actor EndToEndTests {
                     if bobMessageCount == 2 {
                         try await self._recipientMaxSkipSession.writeTextMessage(
                             recipient: .nickname("alice"),
-                            text: "B->A",
-                            metadata: Document())
+                            text: "B->A")
                     }
                     //
                     if bobMessageCount == 3 {
                         try await self._recipientMaxSkipSession.writeTextMessage(
                             recipient: .nickname("alice"),
-                            text: "B2->A2",
-                            metadata: Document())
+                            text: "B2->A2")
                     }
                     
                     if bobMessageCount == 4 {
@@ -2910,8 +2935,7 @@ actor EndToEndTests {
                         try await Task.sleep(nanoseconds: 50_000)
                         try await self._recipientMaxSkipSession.writeTextMessage(
                             recipient: .nickname("alice"),
-                            text: "B3->A3",
-                            metadata: Document())
+                            text: "B3->A3")
                     }
                 }
             }
@@ -2932,15 +2956,13 @@ actor EndToEndTests {
                         try await Task.sleep(nanoseconds: 50_000)
                         try await self._senderMaxSkipSession.writeTextMessage(
                             recipient: .nickname("bob"),
-                            text: "A2->B2",
-                            metadata: Document())
+                            text: "A2->B2")
                     }
                     
                     if aliceMessageCount == 3 {
                         try await self._senderMaxSkipSession.writeTextMessage(
                             recipient: .nickname("bob"),
-                            text: "A3->B3",
-                            metadata: Document())
+                            text: "A3->B3")
                     }
                 }
             }
@@ -2948,13 +2970,12 @@ actor EndToEndTests {
         
         try await self._senderMaxSkipSession.writeTextMessage(
             recipient: .nickname("bob"),
-            text: "A->B",
-            metadata: Document())
+            text: "A->B")
         
         try await Task.sleep(until: .now + .seconds(1))
         
-        #expect(bobMessageCount == 5)
-        #expect(aliceMessageCount == 3)
+        #expect(bobMessageCount == 6)
+        #expect(aliceMessageCount == 6)
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
     }
@@ -2995,17 +3016,17 @@ struct SessionDelegate: PQSSessionDelegate {
         self.session = session
     }
     
-    public func synchronizeCommunication(recipient: SessionModels.MessageRecipient, sharedIdentifier: String) async throws {
+    public func synchronizeCommunication(recipient: SessionModels.MessageRecipient, sharedIdentifier: String, metadata: Data) async throws {
         try await session.writeTextMessage(
             recipient: recipient,
             text: sharedIdentifier,
-            metadata: [:])
+            metadata: metadata)
     }
     
     public func requestFriendshipStateChange(
         recipient: SessionModels.MessageRecipient,
         blockData: Data?,
-        metadata: BSON.Document,
+        metadata: Data,
         currentState: SessionModels.FriendshipMetadata.State
     ) async throws {
         try await session.writeTextMessage(
@@ -3014,11 +3035,11 @@ struct SessionDelegate: PQSSessionDelegate {
     }
     
     func deliveryStateChanged(
-        recipient _: SessionModels.MessageRecipient, metadata _: BSON.Document
+        recipient _: SessionModels.MessageRecipient, metadata _: Data
     ) async throws {}
     func contactCreated(recipient _: SessionModels.MessageRecipient) async throws {}
     func requestMetadata(recipient _: SessionModels.MessageRecipient) async throws {}
-    func editMessage(recipient _: SessionModels.MessageRecipient, metadata _: BSON.Document)
+    func editMessage(recipient _: SessionModels.MessageRecipient, metadata _: Data)
     async throws
     {}
     func shouldPersist(transportInfo _: Data?) -> Bool { true }
@@ -3035,7 +3056,7 @@ struct SessionDelegate: PQSSessionDelegate {
         
         // Detect control frames for test assertions
         if let info = message.transportInfo {
-            if let event = try? BSONDecoder().decodeData(TransportEvent.self, from: info) {
+            if let event = try? BinaryDecoder().decode(TransportEvent.self, from: info) {
                 switch event {
                 case .sessionReestablishment:
                     await SessionEventProbe.shared.markReestablishment(for: session.id)
@@ -3045,8 +3066,7 @@ struct SessionDelegate: PQSSessionDelegate {
             }
         }
 
-        if let meta = message.metadata["friendshipMetadata"] as? Document {
-            var decodedMetadata = try! BSONDecoder().decode(FriendshipMetadata.self, from: meta)
+        if var decodedMetadata = try? BinaryDecoder().decode(FriendshipMetadata.self, from: message.metadata) {
             
             decodedMetadata.swapUserPerspectives()
             
@@ -3075,7 +3095,6 @@ struct SessionDelegate: PQSSessionDelegate {
                 break
             }
             
-            let encodedMetadata = try! BSONEncoder().encode(decodedMetadata)
             guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return false }
             
             let isMe = senderSecretName == mySecretName
@@ -3083,7 +3102,7 @@ struct SessionDelegate: PQSSessionDelegate {
             //Create or update contact including new metadata
             _ = try! await session.createContact(
                 secretName: isMe ? message.recipient.nicknameDescription : senderSecretName,
-                metadata: ["friendshipMetadata": encodedMetadata],
+                friendshipMetadata: decodedMetadata,
                 requestFriendship: false)
         }
         return true
@@ -3100,7 +3119,7 @@ final class MockDeviceLinkingDelegate: DeviceLinkingDelegate, @unchecked Sendabl
     func generateDeviceCryptographic(_ data: Data, password: String) async -> LinkDeviceInfo? {
         // Decode the device configuration from the data parameter
         guard
-            let deviceConfig = try? BSONDecoder().decodeData(
+            let deviceConfig = try? BinaryDecoder().decode(
                 UserDeviceConfiguration.self, from: data)
         else {
             return nil
@@ -3116,6 +3135,7 @@ final class MockDeviceLinkingDelegate: DeviceLinkingDelegate, @unchecked Sendabl
 }
 
 final class MockSessionIdentityTransport: SessionTransport, @unchecked Sendable {
+
     var configurations: [String: UserConfiguration] = [:]
     var oneTimeKeys: [String: OneTimeKeys] = [:]
     var shouldThrowError = false
@@ -3126,7 +3146,7 @@ final class MockSessionIdentityTransport: SessionTransport, @unchecked Sendable 
     }
     
     func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] { [] }
-    func publishUserConfiguration(_ configuration: UserConfiguration, recipient identity: UUID) async throws {}
+    func publishUserConfiguration(_ configuration: SessionModels.UserConfiguration, recipient secretName: String, recipient identity: UUID) async throws {}
     func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {}
     
     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
@@ -3160,7 +3180,7 @@ final class MockSessionIdentityTransport: SessionTransport, @unchecked Sendable 
         
     }
     func createUploadPacket(
-        secretName: String, deviceId: UUID, recipient: MessageRecipient, metadata: Document
+        secretName: String, deviceId: UUID, recipient: MessageRecipient, metadata: Data
     ) async throws {}
 }
 
@@ -3185,6 +3205,8 @@ actor ReceiverDelegate: EventReceiver {
     func deletedMessage(_: SessionModels.EncryptedMessage) async {}
     func createdContact(_: SessionModels.Contact) async throws {}
     func removedContact(_: String) async throws {}
+    func removedCommunication(_ type: SessionModels.MessageRecipient) async throws {}
+    func createdChannel(_ model: SessionModels.BaseCommunication) async {}
     func synchronize(contact: Contact, requestFriendship: Bool) async throws {
         if requestFriendship {
             //This only happens on the requesters end
@@ -3203,6 +3225,7 @@ actor ReceiverDelegate: EventReceiver {
 struct ReceivedMessage {
     let message: SignedRatchetMessage
     let sender: String
+    let recipient: String
     let deviceId: UUID
     let messageId: String
 }
@@ -3343,7 +3366,6 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     var continuation: AsyncStream<ReceivedMessage>.Continuation?
     let session: PQSSession
     let store: TransportStore
-    var peers: [String: _MockTransportDelegate] = [:]
     
     init(session: PQSSession, store: TransportStore) {
         self.session = session
@@ -3360,51 +3382,24 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
         try await store.fetchOneTimeKeyIdentities(for: secretName, deviceId: deviceId, type: type)
     }
     
-    func publishUserConfiguration(
-        _ configuration: SessionModels.UserConfiguration, recipient identity: UUID
-    ) async throws {
+    func publishUserConfiguration(_ configuration: SessionModels.UserConfiguration, recipient secretName: String, recipient identity: UUID) async throws {
         try await store.publishUserConfiguration(configuration, recipient: identity)
         
     }
     
     func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
-        
-//        if let ids = metadata.synchronizationKeyIds {
-//            do {
-//                let idsData = try BSONEncoder().encodeData(ids)
-//                await session.setAddingContact(idsData)
-//            } catch {}
-//        }
-        
+
         // Determine actual sender from the bound session, not from metadata
         guard let sessionContext = await session.sessionContext else { return }
         
-        // Determine recipient from metadata
-        var recipientName: String?
-        switch metadata.recipient {
-        case let .nickname(name):
-            recipientName = name
-        case .personalMessage:
-            // No self-messaging in tests; route to the other user
-            recipientName = await store.userConfigurations.first(where: { $0.secretName != sessionContext.sessionUser.secretName })?.secretName
-        case .channel, .broadcast:
-            recipientName = await store.userConfigurations.first(where: { $0.secretName != sessionContext.sessionUser.secretName })?.secretName
-        }
-        guard let to = recipientName else { return }
-        print("RECIPIENT: \(to)")
-        print("ME: \(sessionContext.sessionUser.secretName)")
         let received = ReceivedMessage(
             message: message,
             sender: sessionContext.sessionUser.secretName,
+            recipient: metadata.secretName,
             deviceId: sessionContext.sessionUser.deviceId,
             messageId: metadata.sharedMessageId
         )
-        if let peer = peers[to] {
-            peer.continuation?.yield(received)
-        } else {
-            // Fallback for tests that didn't register peers
         continuation?.yield(received)
-        }
     }
     
     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
@@ -3440,16 +3435,17 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     {}
     func createUploadPacket(
         secretName _: String, deviceId _: UUID, recipient _: SessionModels.MessageRecipient,
-        metadata _: BSON.Document
+        metadata _: Data
     ) async throws {}
     func notifyIdentityCreation(for _: String, keys _: SessionModels.OneTimeKeys) async throws {}
 }
 
 actor MockIdentityStore: PQSSessionStore {
     // MARK: - Properties
-    
+    let id = UUID()
     var sessionContext: Data?
     var identities = [SessionIdentity]()
+    var communications = [BaseCommunication]()
     let crypto = NeedleTailCrypto()
     var mockUserData: MockUserData
     let session: PQSSession
@@ -3523,9 +3519,19 @@ actor MockIdentityStore: PQSSessionStore {
             contacts[index] = contact
         }
     }
-    func fetchCommunications() async throws -> [SessionModels.BaseCommunication] { [] }
-    func createCommunication(_: SessionModels.BaseCommunication) async throws {}
-    func updateCommunication(_: SessionModels.BaseCommunication) async throws {}
+    func fetchCommunications() async throws -> [SessionModels.BaseCommunication] {
+        communications
+    }
+    func createCommunication(_ communication: SessionModels.BaseCommunication) async throws {
+        communications.append(communication)
+    }
+    func updateCommunication(_ communication: SessionModels.BaseCommunication) async throws {
+        if let idx = communications.firstIndex(where: { $0.id == communication.id }) {
+            communications[idx] = communication
+        } else {
+            communications.append(communication)
+        }
+    }
     func removeCommunication(_: SessionModels.BaseCommunication) async throws {}
     func deleteCommunication(_: SessionModels.BaseCommunication) async throws {}
     func fetchMessages(sharedCommunicationId _: UUID) async throws -> [MessageRecord] { [] }
@@ -3544,6 +3550,11 @@ actor MockIdentityStore: PQSSessionStore {
     func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {
         createdMessages.append(message)
     }
+    
+    func getAllMessages() async -> [EncryptedMessage] {
+        return createdMessages
+    }
+    
     func updateMessage(_: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws
     {}
     func removeMessage(_: SessionModels.EncryptedMessage) async throws {}
@@ -3608,7 +3619,6 @@ struct MockUserData {
     let lid = UUID()
     let ntm = CryptoMessage(
         text: "Some Message",
-        metadata: [:],
         recipient: .nickname("bob"),
         sentDate: Date(),
         destructionTime: nil

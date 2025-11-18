@@ -14,15 +14,8 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
-import BSON
-import DoubleRatchetKit
 import Foundation
-import NeedleTailCrypto
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
-import Crypto
-#endif
+import DoubleRatchetKit
 
 /// A protocol that defines the requirements for communication models in the messaging system.
 ///
@@ -49,44 +42,44 @@ public protocol CommunicationProtocol: Codable & Sendable {
 public struct Communication: Sendable & Codable {
     /// The unique identifier for this communication channel.
     public let id: UUID
-
+    
     /// An optional shared identifier that can be used to group related communications.
     ///
     /// This is typically used when multiple communication channels are part of the same
     /// logical conversation or workspace.
     public let sharedId: UUID?
-
+    
     /// The total number of messages that have been sent in this communication.
     ///
     /// This counter is used for message ordering and synchronization purposes.
     public var messageCount: Int
-
+    
     /// The identifier of the user who has administrative privileges for this communication.
     ///
     /// Administrators can typically modify channel settings, add/remove members, and manage permissions.
     public var administrator: String?
-
+    
     /// A set of user identifiers who have operator privileges in this communication.
     ///
     /// Operators have elevated permissions compared to regular members but less than administrators.
     public var operators: Set<String>?
-
+    
     /// The set of user identifiers who are active members of this communication.
     ///
     /// Members can send and receive messages in this communication channel.
     public var members: Set<String>
-
+    
     /// The set of user identifiers who have been blocked from participating in this communication.
     ///
     /// Blocked members cannot send messages or view communication content.
     public let blockedMembers: Set<String>
-
+    
     /// Additional metadata associated with this communication.
     ///
     /// This can include custom properties, settings, or other contextual information
     /// specific to the communication channel.
-    public var metadata: Document
-
+    public var metadata: Data
+    
     /// The type of message recipient this communication represents.
     ///
     /// This determines how messages are routed and who can participate in the communication.
@@ -108,18 +101,18 @@ public struct Communication: Sendable & Codable {
 public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     /// The unique identifier for this communication.
     public let id: UUID
-
+    
     /// The encrypted data containing all communication properties.
     ///
     /// This data is encrypted using the symmetric key provided during initialization
     /// and can only be decrypted with the same key.
     public var data: Data
-
+    
     /// Coding keys for serialization, using obfuscated names for security.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case id, data = "a"
     }
-
+    
     /// Asynchronously retrieves the decrypted properties of the communication model.
     ///
     /// This method decrypts the stored data using the provided symmetric key and returns
@@ -140,7 +133,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
             return nil
         }
     }
-
+    
     /// A struct representing the unwrapped properties of a communication model.
     ///
     /// This struct contains all the decrypted properties of a communication channel,
@@ -162,31 +155,31 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
             case metadata = "g"
             case communicationType = "h"
         }
-
+        
         /// An optional shared identifier for grouping related communications.
         public var sharedId: UUID?
-
+        
         /// The total number of messages in this communication.
         public var messageCount: Int
-
+        
         /// The identifier of the administrator for this communication.
         public var administrator: String?
-
+        
         /// The set of user identifiers with operator privileges.
         public var operators: Set<String>?
-
+        
         /// The set of active member identifiers.
         public var members: Set<String>
-
+        
         /// The set of blocked member identifiers.
         public let blockedMembers: Set<String>
-
+        
         /// Additional metadata for the communication.
-        public var metadata: Document
-
+        public var metadata: Data
+        
         /// The type of message recipient this communication represents.
         public var communicationType: MessageRecipient
-
+        
         /// Initializes a new instance of `UnwrappedProps` with the specified values.
         ///
         /// - Parameters:
@@ -207,7 +200,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
             administrator: String? = nil,
             operators: Set<String>? = nil,
             members: Set<String>,
-            metadata: Document,
+            metadata: Data,
             blockedMembers: Set<String>,
             communicationType: MessageRecipient
         ) {
@@ -221,7 +214,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
             self.communicationType = communicationType
         }
     }
-
+    
     /// Initializes a new instance of `BaseCommunication` with encrypted properties.
     ///
     /// This initializer creates a new communication object by encrypting the provided
@@ -249,13 +242,13 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ) throws {
         self.id = id
         let crypto = NeedleTailCrypto()
-        let data = try BSONEncoder().encodeData(props)
+        let data = try BinaryEncoder().encode(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.encryptionFailed
         }
         self.data = encryptedData
     }
-
+    
     /// Initializes a new instance of `BaseCommunication` with existing encrypted data.
     ///
     /// This initializer is used when loading an existing communication from storage
@@ -279,7 +272,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
         self.id = id
         self.data = data
     }
-
+    
     /// Asynchronously decrypts the properties of the communication model.
     ///
     /// This method decrypts the stored encrypted data using the provided symmetric key
@@ -300,9 +293,9 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
         guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.decryptionFailed
         }
-        return try BSONDecoder().decodeData(UnwrappedProps.self, from: decrypted)
+        return try BinaryDecoder().decode(UnwrappedProps.self, from: decrypted)
     }
-
+    
     /// Asynchronously updates the properties of the communication model.
     ///
     /// This method encrypts the new properties using the provided symmetric key and
@@ -323,14 +316,14 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ///   used to verify that the update was applied correctly.
     public func updateProps(symmetricKey: SymmetricKey, props: Codable & Sendable) async throws -> UnwrappedProps? {
         let crypto = NeedleTailCrypto()
-        let data = try BSONEncoder().encodeData(props)
+        let data = try BinaryEncoder().encode(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.encryptionFailed
         }
         self.data = encryptedData
         return try await decryptProps(symmetricKey: symmetricKey)
     }
-
+    
     /// Creates a decrypted model of the specified type from the communication properties.
     ///
     /// This method decrypts the communication properties and creates an instance of
@@ -358,6 +351,8 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
             id: id,
             sharedId: props.sharedId,
             messageCount: props.messageCount,
+            administrator: props.administrator,
+            operators: props.operators,
             members: props.members,
             blockedMembers: props.blockedMembers,
             metadata: props.metadata,
@@ -385,7 +380,7 @@ public enum MessageRecipient: Codable, Sendable, Equatable {
     /// typically visible across all of that user's devices. These messages may also be
     /// visible to other users on the network depending on the system's privacy settings.
     case personalMessage
-
+    
     /// A recipient identified by a nickname.
     ///
     /// This case is used when sending a message to a user identified by their chosen nickname.
@@ -394,7 +389,7 @@ public enum MessageRecipient: Codable, Sendable, Equatable {
     ///
     /// - Parameter String: The nickname of the intended recipient.
     case nickname(String)
-
+    
     /// A recipient identified by a channel name.
     ///
     /// This case is used when sending a message to a specific channel where multiple users
@@ -403,14 +398,14 @@ public enum MessageRecipient: Codable, Sendable, Equatable {
     ///
     /// - Parameter String: The name of the channel where the message should be sent.
     case channel(String)
-
+    
     /// A recipient for broadcast messages sent to multiple users.
     ///
     /// This case is used for messages intended to be sent to all users in the network
     /// or a specific group. Broadcast messages are typically used for system announcements,
     /// notifications, or general communications to a wide audience.
     case broadcast
-
+    
     /// Computed property to derive the nickname string if applicable.
     ///
     /// This property extracts the nickname string from the `.nickname` case. It will

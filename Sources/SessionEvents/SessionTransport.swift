@@ -13,15 +13,11 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import BSON
+
 import DoubleRatchetKit
 import Foundation
 import SessionModels
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 /// Metadata structure for signed ratchet messages that contains sensitive information
 /// used to prepare messages for network transmission.
@@ -164,7 +160,7 @@ public protocol SessionTransport: Sendable {
     ///   - configuration: The user configuration to be published to the network
     ///   - identity: The UUID of the recipient identity for the configuration
     /// - Throws: An error if the configuration could not be published
-    func publishUserConfiguration(_ configuration: UserConfiguration, recipient identity: UUID) async throws
+    func publishUserConfiguration(_ configuration: UserConfiguration, recipient secretName: String, recipient identity: UUID) async throws
 
     /// Fetches one-time keys for a specific user and device.
     ///
@@ -272,6 +268,6 @@ public protocol SessionTransport: Sendable {
         secretName: String,
         deviceId: UUID,
         recipient: MessageRecipient,
-        metadata: Document
+        metadata: Data
     ) async throws
 }

@@ -40,7 +40,7 @@
 /// All properties are immutable or use value semantics for thread safety.
 ///
 /// ## Serialization
-/// Uses obfuscated coding keys for BSON serialization to enhance security
+/// Uses obfuscated coding keys for Binary serialization to enhance security
 /// and reduce payload size during network transmission.
 public struct SynchronizationKeyIdentities: Sendable, Codable {
     /// Optional identifier for the sender's Curve25519 public key.
@@ -69,7 +69,7 @@ public struct SynchronizationKeyIdentities: Sendable, Codable {
     /// should use for post-quantum key exchange. It is required for proper message routing.
     public let recipientMLKEMId: String
 
-    /// Coding keys for BSON serialization with obfuscated field names.
+    /// Coding keys for Binary serialization with obfuscated field names.
     private enum CodingKeys: String, CodingKey, Codable, Sendable {
         case senderCurveId = "a"
         case senderMLKEMId = "b"

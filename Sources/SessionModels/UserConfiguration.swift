@@ -14,14 +14,10 @@
 //  post-quantum cryptographic session management capabilities.
 //
 //
-import BSON
+
 import DoubleRatchetKit
 import Foundation
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 /// A struct representing the configuration of a user, including the signing identity
 /// and auxiliary devices.
@@ -120,7 +116,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         ///   - signingKey: The private signing key used for signing.
         /// - Throws: An error if the signing process fails.
         public init(device: UserDeviceConfiguration, signingKey: Curve25519.Signing.PrivateKey) throws {
-            let encoded = try BSONEncoder().encodeData(device)
+            let encoded = try BinaryEncoder().encode(device)
             id = device.deviceId
             data = encoded
             signature = try signingKey.signature(for: encoded)
@@ -133,7 +129,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         /// - Throws: An error if verification fails.
         public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> UserDeviceConfiguration? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BSONDecoder().decodeData(UserDeviceConfiguration.self, from: data)
+            return try BinaryDecoder().decode(UserDeviceConfiguration.self, from: data)
         }
     }
 
@@ -170,7 +166,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             deviceId: UUID,
             signingKey: Curve25519.Signing.PrivateKey
         ) throws {
-            let encoded = try BSONEncoder().encodeData(key)
+            let encoded = try BinaryEncoder().encode(key)
             id = key.id
             self.deviceId = deviceId
             data = encoded
@@ -184,7 +180,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         /// - Throws: An error if verification fails.
         public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> CurvePublicKey? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BSONDecoder().decodeData(CurvePublicKey.self, from: data)
+            return try BinaryDecoder().decode(CurvePublicKey.self, from: data)
         }
     }
 
@@ -221,7 +217,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             deviceId: UUID,
             signingKey: Curve25519.Signing.PrivateKey
         ) throws {
-            let encoded = try BSONEncoder().encodeData(key)
+            let encoded = try BinaryEncoder().encode(key)
             id = key.id
             self.deviceId = deviceId
             data = encoded
@@ -235,7 +231,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         /// - Throws: An error if verification fails.
         public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> MLKEMPublicKey? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BSONDecoder().decodeData(MLKEMPublicKey.self, from: data)
+            return try BinaryDecoder().decode(MLKEMPublicKey.self, from: data)
         }
     }
 

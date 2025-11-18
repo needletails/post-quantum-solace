@@ -19,7 +19,8 @@ let package = Package(
     dependencies: [
         .package(path: "/Users/cartisim/Developer/NeedleTailsOrganization/SDKs/NeedleTailSDKProject/double-ratchet-kit"),
 //        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "1.0.5"),
-        .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.1")
+        .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.1"),
+        .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.4")
     ],
     targets: [
         .target(
@@ -36,6 +37,7 @@ let package = Package(
         ]),
         .target(name: "SessionModels", dependencies: [
             .product(name: "DoubleRatchetKit", package: "double-ratchet-kit"),
+            .product(name: "NeedleTailAlgorithms", package: "needletail-algorithms")
         ]),
         .testTarget(
             name: "PostQuantumSolaceTests",

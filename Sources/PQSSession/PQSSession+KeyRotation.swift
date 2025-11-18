@@ -13,7 +13,7 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import BSON
+
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
@@ -154,13 +154,12 @@ extension PQSSession {
                 throw SessionErrors.databaseNotInitialized
             }
      
-            let metadata = try BSONEncoder().encode(TransportEvent.sessionReestablishment)
+            let metadata = try BinaryEncoder().encode(TransportEvent.sessionReestablishment)
             
             //Re-establish sessions for self and contacts. Channel recipients are in essences contacts we have a relationship with so sending to their individual nick is sufficient.
             try await writeTextMessage(
                 recipient: .personalMessage,
-                transportInfo: metadata.makeData(),
-                metadata: [:])
+                transportInfo: metadata)
             
             for secretName in try await cache
                 .fetchContacts()
@@ -168,8 +167,7 @@ extension PQSSession {
                 guard let secretName else { continue }
                 try await writeTextMessage(
                     recipient: .nickname(secretName),
-                    transportInfo: metadata.makeData(),
-                    metadata: [:])
+                    transportInfo: metadata)
             }
             
 
@@ -245,7 +243,7 @@ extension PQSSession {
                     }
 
                     // Decode the session context from the decrypted data
-                    var sessionContext = try BSONDecoder().decodeData(SessionContext.self, from: configurationData)
+                    var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
                     await sessionContext.sessionUser.deviceKeys.updateRotateKeysDate(Date())
                     try await updateRotatedKeySessionContext(sessionContext: sessionContext)
                     return true
@@ -273,7 +271,7 @@ private extension PQSSession {
         }
 
         // Decode the session context from the decrypted data
-        return try BSONDecoder().decodeData(SessionContext.self, from: configurationData)
+        return try BinaryDecoder().decode(SessionContext.self, from: configurationData)
     }
 
     func updateRotatedKeySessionContext(sessionContext: SessionContext) async throws {
@@ -287,8 +285,8 @@ private extension PQSSession {
         await setSessionContext(sessionContext)
 
         // Encrypt and persist
-        let encodedData = try BSONEncoder().encode(sessionContext)
-        guard let encryptedConfig = try await crypto.encrypt(data: encodedData.makeData(), symmetricKey: getAppSymmetricKey()) else {
+        let encodedData = try BinaryEncoder().encode(sessionContext)
+        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
             throw PQSSession.SessionErrors.sessionEncryptionError
         }
 

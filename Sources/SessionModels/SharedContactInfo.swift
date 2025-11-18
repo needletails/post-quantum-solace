@@ -14,7 +14,7 @@
 //  post-quantum cryptographic session management capabilities.
 //
 //
-import struct BSON.Document
+
 import Foundation
 
 /// A structure representing shared contact information for secure communication.
@@ -28,7 +28,7 @@ import Foundation
 /// - `secretName`: The secret name associated with the shared contact, used for
 ///   privacy-preserving identification.
 /// - `metadata`: Additional metadata associated with the shared contact, represented
-///   as a BSON `Document` for flexible data storage.
+///   as Foundation Data for flexible data storage.
 /// - `sharedCommunicationId`: An optional unique identifier for shared communication
 ///   channels related to the contact.
 ///
@@ -51,13 +51,13 @@ public struct SharedContactInfo: Codable, Sendable {
     /// information and not exposed in logs or error messages.
     public let secretName: String
 
-    /// The metadata associated with the shared contact, represented as a BSON `Document`.
+    /// The metadata associated with the shared contact, represented as Foundation Data .
     ///
     /// This field provides flexible storage for additional contact-related information
     /// such as profile data, preferences, or other metadata that may be associated
-    /// with the contact. The BSON format allows for efficient serialization and
+    /// with the contact. The Binary format allows for efficient serialization and
     /// flexible schema evolution.
-    public let metadata: Document
+    public let metadata: [String: Data]
 
     /// An optional unique identifier for shared communication related to the contact.
     ///
@@ -72,11 +72,11 @@ public struct SharedContactInfo: Codable, Sendable {
     ///   - secretName: The secret name associated with the shared contact. This
     ///     should be a unique, privacy-preserving identifier for the contact.
     ///   - metadata: The metadata associated with the shared contact. This can
-    ///     contain any additional information about the contact in BSON format.
+    ///     contain any additional information about the contact in Binary format.
     ///   - sharedCommunicationId: An optional unique identifier for shared
     ///     communication channels related to the contact. Use `nil` if no
     ///     shared communication is associated with this contact.
-    public init(secretName: String, metadata: Document, sharedCommunicationId: UUID?) {
+    public init(secretName: String, metadata: [String: Data], sharedCommunicationId: UUID?) {
         self.secretName = secretName
         self.metadata = metadata
         self.sharedCommunicationId = sharedCommunicationId

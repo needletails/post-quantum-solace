@@ -13,7 +13,7 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import BSON
+
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
@@ -226,8 +226,9 @@ public extension PQSSession {
         forceRefresh: Bool = false,
         sendOneTimeIdentities: Bool = false
     ) async throws -> [SessionIdentity] {
+        logger.log(level: .info, message: "LOOKING FOR \(secretName)")
         let existingIdentities = try await getSessionIdentities(with: secretName)
-        
+        logger.log(level: .info, message: "existingIdentities \(existingIdentities)")
         // Check if we have valid identities for this specific recipient
         let hasValidIdentities = await hasValidIdentitiesForRecipient(existingIdentities, secretName: secretName)
         
@@ -277,7 +278,7 @@ public extension PQSSession {
     private func extractSynchronizationKeys() async throws -> (curveId: String?, mlKEMId: String?)? {
         guard let addingContactData else { return nil }
         
-        let keys = try BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: addingContactData)
+        let keys = try BinaryDecoder().decode(SynchronizationKeyIdentities.self, from: addingContactData)
         await setAddingContact(nil)
         
         return (curveId: keys.senderCurveId, mlKEMId: keys.senderMLKEMId)
@@ -331,10 +332,10 @@ public extension PQSSession {
     ) async throws -> [SessionIdentity] {
         
         if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= 10 {
-            async let _ = await refreshOneTimeKeysTask()
+            await refreshOneTimeKeysTask()
         }
         if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= 10 {
-            async let _ = await refreshOneTimeKeysTask()
+            await refreshMLKEMOneTimeKeysTask()
         }
         
         var identities = existingIdentities
@@ -540,12 +541,12 @@ public extension PQSSession {
             recipientCurveId: curveId,
             recipientMLKEMId: mlKEMId
         )
-        let metadata = try BSONEncoder().encode(TransportEvent.synchronizeOneTimeKeys(identityInfo))
+        let metadata = try BinaryEncoder().encode(TransportEvent.synchronizeOneTimeKeys(identityInfo))
 
         try await writeTextMessage(
             recipient: .nickname(secretName),
             text: "",
-            transportInfo: metadata.makeData(),
+            transportInfo: metadata,
             metadata: metadata)
     }
 }

@@ -55,7 +55,7 @@ import Foundation
 /// The `Codable` conformance allows this struct to be easily serialized for:
 /// - Database storage
 /// - Network transmission
-/// - JSON/BSON encoding
+/// - JSON/Binary encoding
 /// - Message synchronization between devices
 public struct MessageMetadata: Sendable, Codable {
     /// A Boolean value indicating whether the user has marked the message as pinned.

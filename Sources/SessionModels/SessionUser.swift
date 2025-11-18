@@ -105,7 +105,7 @@ public struct SessionUser: Codable & Sendable {
         secretName: String,
         deviceId: UUID,
         deviceKeys: DeviceKeys,
-        metadata: ContactMetadata
+        metadata: ContactMetadata = .init()
     ) {
         self.secretName = secretName
         self.deviceId = deviceId

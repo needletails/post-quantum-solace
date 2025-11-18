@@ -14,20 +14,48 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
-import BSON
 import DoubleRatchetKit
 import Foundation
 import SessionModels
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 /// Extension providing cache management and model creation capabilities for the TaskProcessor.
 /// This extension handles the creation and management of communication models, message models,
 /// and job models used throughout the cryptographic session lifecycle.
 extension TaskProcessor {
+    /// Creates a new communication model including optional administrator and operators for roles.
+    ///
+    /// - Parameters:
+    ///   - administrator: The channel administrator's secret name, if any.
+    ///   - operators: Optional set of operator secret names.
+    ///   - recipients: A set of user identifiers that are part of this communication.
+    ///   - communicationType: The type of communication (e.g., personal, nickname, channel).
+    ///   - metadata: Additional communication metadata stored as a Foundation Data
+    ///   - symmetricKey: The key used to encrypt communication data.
+    /// - Returns: A new `BaseCommunication` object.
+    /// - Throws: `CryptoError` if encryption fails.
+    func createCommunicationModel(
+        administrator: String? = nil,
+        operators: Set<String>? = nil,
+        recipients: Set<String>,
+        communicationType: MessageRecipient,
+        metadata: Data = .init(),
+        symmetricKey: SymmetricKey
+    ) async throws -> BaseCommunication {
+        try BaseCommunication(
+            id: UUID(),
+            props: .init(
+                messageCount: 0,
+                administrator: administrator,
+                operators: operators,
+                members: recipients,
+                metadata: metadata,
+                blockedMembers: [],
+                communicationType: communicationType
+            ),
+            symmetricKey: symmetricKey
+        )
+    }
     /// Creates a new communication model for a given recipient group and type.
     ///
     /// This method initializes a new `BaseCommunication` object with encrypted properties
@@ -54,30 +82,13 @@ extension TaskProcessor {
     ///                 Each identifier should be a valid secret name.
     ///   - communicationType: The type of communication (e.g., personal, nickname, channel).
     ///                        Determines how messages are routed and processed.
-    ///   - metadata: Additional communication metadata stored as a BSON document.
+    ///   - metadata: Additional communication metadata stored as a Foundation Data
     ///               This data is encrypted and can include admin info, settings, etc.
     ///   - symmetricKey: The key used to encrypt communication data. Must be the same
     ///                   key used for all operations within this session.
     /// - Returns: A new `BaseCommunication` object ready to be stored or used.
-    /// - Throws: `CryptoError` if encryption fails, `BSONError` if metadata encoding fails.
-    func createCommunicationModel(
-        recipients: Set<String>,
-        communicationType: MessageRecipient,
-        metadata: Document,
-        symmetricKey: SymmetricKey
-    ) async throws -> BaseCommunication {
-        try BaseCommunication(
-            id: UUID(),
-            props: .init(
-                messageCount: 0,
-                members: recipients,
-                metadata: metadata,
-                blockedMembers: [],
-                communicationType: communicationType
-            ),
-            symmetricKey: symmetricKey
-        )
-    }
+    /// - Throws: `CryptoError` if encryption fails, `BinaryCodableError` if metadata encoding fails.
+    // (Note: the simplified createCommunicationModel signature is merged into the overload above)
 
     /// Creates a message model from a received and decrypted message.
     ///
@@ -286,7 +297,7 @@ extension TaskProcessor {
     ///   - task: The encryptable task to execute, containing the actual work to be performed.
     ///   - symmetricKey: Key used to encrypt job metadata and task data.
     /// - Returns: A `JobModel` suitable for enqueuing in the `AsyncConsumer`.
-    /// - Throws: `CryptoError` if encryption fails, `BSONError` if task encoding fails.
+    /// - Throws: `CryptoError` if encryption fails, `BinaryCodableError` if task encoding fails.
     func createJobModel(
         sequenceId: Int,
         task: EncryptableTask,

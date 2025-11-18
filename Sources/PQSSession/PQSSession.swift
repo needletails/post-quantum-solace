@@ -14,7 +14,6 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
-import BSON
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
@@ -199,7 +198,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     func synchronizeLocalConfiguration(_ data: Data) async throws {
         let symmetricKey = try await getAppSymmetricKey()
         guard let decryptedData = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else { return }
-        let context = try BSONDecoder().decodeData(SessionContext.self, from: decryptedData)
+        let context = try! BinaryDecoder().decode(SessionContext.self, from: decryptedData)
         await setSessionContext(context)
     }
 
@@ -276,6 +275,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         case invalidKeyId = "The Key ID is invalid."
         case drainedKeys = "The Local Keys are drained."
         case longTermKeyRotationFailed = "Failed to rotate the long-term key."
+        case invalidOperatorCount = "The number of operators must be greater than 0."
+        case invalidMemberCount = "The number of members must be greater than 2."
     }
 
     /// A struct representing a bundle of cryptographic data for a device.
@@ -460,9 +461,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let sessionUser = SessionUser(
             secretName: secretName,
             deviceId: bundle.deviceKeys.deviceId,
-            deviceKeys: bundle.deviceKeys,
-            metadata: .init()
-        )
+            deviceKeys: bundle.deviceKeys)
 
         var sessionContext = SessionContext(
             sessionUser: sessionUser,
@@ -512,13 +511,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 // UserConfiguration does not contain Private keys/info... so it should be safe to store publicly.
                 try await transportDelegate?.publishUserConfiguration(
                     bundle.userConfiguration,
+                    recipient: secretName,
                     recipient: bundle.deviceKeys.deviceId
                 )
 
                 sessionContext.registrationState = .registered
                 await setSessionContext(sessionContext)
 
-                let encodedData = try BSONEncoder().encodeData(sessionContext)
+                let encodedData = try BinaryEncoder().encode(sessionContext)
                 guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: appSymmetricKey) else {
                     throw SessionErrors.sessionEncryptionError
                 }
@@ -532,7 +532,6 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 let communicationModel = try await taskProcessor.createCommunicationModel(
                     recipients: [secretName],
                     communicationType: .personalMessage,
-                    metadata: [:],
                     symmetricKey: databaseEncryptionKey
                 )
 
@@ -596,7 +595,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         )
 
         // Encode the device configuration to prepare for QR code generation
-        let data = try BSONEncoder().encodeData(linkConfig)
+        let data = try BinaryEncoder().encode(linkConfig)
 
         // Generate cryptographic credentials for device linking
         if let credentials = await linkDelegate?.generateDeviceCryptographic(data, password: password) {
@@ -611,9 +610,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             let sessionUser = SessionUser(
                 secretName: credentials.secretName,
                 deviceId: bundle.deviceKeys.deviceId,
-                deviceKeys: bundle.deviceKeys,
-                metadata: .init()
-            )
+                deviceKeys: bundle.deviceKeys)
 
             // Generate a symmetric key for encrypting local database models
             let databaseEncryptionKey = generateDatabaseEncryptionKey()
@@ -653,7 +650,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             await setSessionContext(sessionContext)
 
             // Encode the updated session context for encryption
-            let encodedData = try BSONEncoder().encode(sessionContext).makeData()
+            let encodedData = try BinaryEncoder().encode(sessionContext)
 
             // Encrypt the session context using the derived symmetric key
             guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: symmetricKey) else {
@@ -669,7 +666,6 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             let communicationModel = try await taskProcessor.createCommunicationModel(
                 recipients: [credentials.secretName],
                 communicationType: .personalMessage,
-                metadata: [:],
                 symmetricKey: databaseSymmetricKey)
 
             // Update properties of the communication model
@@ -721,7 +717,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
 
         // Decode the session context from the decrypted data
-        var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
 
         // Create a new user configuration with the updated devices
         let userConfiguration = try await createNewUser(
@@ -739,7 +735,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         await setSessionContext(sessionContext)
 
         // Encode the updated session context to prepare for encryption
-        let encodedData = try BSONEncoder().encode(sessionContext).makeData()
+        let encodedData = try BinaryEncoder().encode(sessionContext)
 
         // Encrypt the updated session context using the app's symmetric key
         guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
@@ -776,7 +772,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
 
         // Decode the session context from the decrypted data
-        var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
 
         // Create a new UserConfiguration with the updated public one-time keys
         let userConfiguration = UserConfiguration(
@@ -793,7 +789,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         await setSessionContext(sessionContext)
 
         // Encode the updated session context to prepare for encryption
-        let encodedData = try BSONEncoder().encode(sessionContext).makeData()
+        let encodedData = try BinaryEncoder().encode(sessionContext)
 
         // Encrypt the updated session context using the app's symmetric key
         guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
@@ -934,7 +930,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             }
 
             // Decode the session context from the decrypted data
-            let sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+            let sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
             await setSessionContext(sessionContext)
             return self
         } catch {
@@ -951,12 +947,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     public func refreshOneTimeKeysTask() async {
-        // Cancel any existing task before creating a new one
         refreshOTKeysTask?.cancel()
-
+        
         refreshOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
             guard let self else { return }
-
             do {
                 try await refreshOneTimeKeys(refreshType: .curve)
             } catch {
@@ -967,10 +961,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             // Clean up the task reference after completion
             await removeExpiredOTKeys()
         }
+        
+        _ = await refreshOTKeysTask?.value
     }
 
     public func refreshMLKEMOneTimeKeysTask() async {
-        // Cancel any existing task before creating a new one
         refreshMLKEMOTKeysTask?.cancel()
 
         refreshMLKEMOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
@@ -986,6 +981,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             // Clean up the task reference after completion
             await removeExpiredMLKEMOTKeys()
         }
+        _ = await refreshMLKEMOTKeysTask?.value
     }
 
     func refreshOneTimeKeys(refreshType: KeysType) async throws {
@@ -1009,7 +1005,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 }
 
                 // Decode the session context from the decrypted data
-                var sessionContext = try BSONDecoder().decodeData(SessionContext.self, from: configurationData)
+                var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
 
                 logger.log(level: .info, message: "Creating Key Pairs, count: \(100 - publicKeysCount)")
                 switch refreshType {
@@ -1072,8 +1068,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 await setSessionContext(sessionContext)
 
                 // Encrypt and persist
-                let encodedData = try BSONEncoder().encode(sessionContext)
-                guard let encryptedConfig = try await crypto.encrypt(data: encodedData.makeData(), symmetricKey: getAppSymmetricKey()) else {
+                let encodedData = try BinaryEncoder().encode(sessionContext)
+                guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
                     throw PQSSession.SessionErrors.sessionEncryptionError
                 }
 
@@ -1088,7 +1084,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             throw SessionErrors.sessionDecryptionError
         }
 
-        var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
         var didUpdate = false
 
         switch type {
@@ -1126,8 +1122,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 sessionContext.updateSessionUser(sessionContext.sessionUser)
                 await setSessionContext(sessionContext)
 
-                let encodedData = try BSONEncoder().encode(sessionContext)
-                guard let encryptedConfig = try await crypto.encrypt(data: encodedData.makeData(), symmetricKey: getAppSymmetricKey()) else {
+                let encodedData = try BinaryEncoder().encode(sessionContext)
+                guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
                     throw PQSSession.SessionErrors.sessionEncryptionError
                 }
 
@@ -1173,8 +1169,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 sessionContext.updateSessionUser(sessionContext.sessionUser)
                 await setSessionContext(sessionContext)
 
-                let encodedData = try BSONEncoder().encode(sessionContext)
-                guard let encryptedConfig = try await crypto.encrypt(data: encodedData.makeData(), symmetricKey: getAppSymmetricKey()) else {
+                let encodedData = try BinaryEncoder().encode(sessionContext)
+                guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
                     throw PQSSession.SessionErrors.sessionEncryptionError
                 }
 
@@ -1248,7 +1244,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             throw SessionErrors.sessionDecryptionError
         }
         // Decode the session context from the decrypted data
-        let sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
+        let sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
         try await cache.deleteLocalDeviceSalt()
 
         guard let passwordData = newPassword.data(using: .utf8) else {
@@ -1263,7 +1259,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             salt: saltData
         )
 
-        let encodedData = try BSONEncoder().encodeData(sessionContext)
+        let encodedData = try BinaryEncoder().encode(sessionContext)
         guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: symmetricKey) else {
             throw SessionErrors.sessionEncryptionError
         }

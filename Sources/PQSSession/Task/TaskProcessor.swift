@@ -13,21 +13,13 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 
-import struct BSON.BSONDecoder
-import struct BSON.Document
 import DequeModule
 import DoubleRatchetKit
 import Foundation
 import NeedleTailAsyncSequence
-import NeedleTailCrypto
-import NeedleTailLogger
 import SessionEvents
 import SessionModels
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 /// `TaskProcessor` manages the asynchronous execution of encryption and decryption tasks
 /// using Double Ratchet and other cryptographic mechanisms. It handles inbound and outbound
@@ -266,8 +258,7 @@ public actor TaskProcessor {
         case .nickname(let nickname):
             var sendOneTimeIdentities = false
             var createIdentity = true
-            if let document = message.metadata["friendshipMetadata"] as? Document {
-                let state = try BSONDecoder().decode(FriendshipMetadata.self, from: document)
+            if let state = try? BinaryDecoder().decode(FriendshipMetadata.self, from: message.metadata) {
                 if state.myState == .requested {
                     sendOneTimeIdentities = true
                 }
@@ -285,15 +276,47 @@ public actor TaskProcessor {
             )
             recipients.formUnion([sender, nickname])
         case .channel:
-            let (channelIdentities, members) = try await gatherChannelIdentities(
-                cache: cache,
-                session: session,
-                symmetricKey: symmetricKey,
-                type: type,
-                logger: logger
-            )
-            identities = channelIdentities
-            recipients.formUnion(members)
+            do {
+                
+                let (channelIdentities, members) = try await gatherChannelIdentities(
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey,
+                    type: type,
+                    logger: logger
+                )
+                identities = channelIdentities
+                recipients.formUnion(members)
+                
+            } catch let sessionError as PQSSession.SessionErrors where sessionError == .cannotFindCommunication {
+                
+                let info = try BinaryDecoder().decode(ChannelInfo.self, from: message.metadata)
+
+                try await createChannelCommuncation(
+                    sender: sender,
+                    recipient: type,
+                    channelName: info.name,
+                    administrator: info.administrator,
+                    members: info.members,
+                    operators: info.operators,
+                    symmetricKey: symmetricKey,
+                    session: session,
+                    cache: cache,
+                    metadata: message.metadata)
+                
+                let (channelIdentities, gatheredMembers) = try await gatherChannelIdentities(
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey,
+                    type: type,
+                    logger: logger)
+                
+                identities = channelIdentities
+                recipients.formUnion(gatheredMembers)
+                
+            } catch {
+                throw error
+            }
         case .broadcast:
             break
         }
@@ -342,8 +365,67 @@ public actor TaskProcessor {
             sender: sender,
             recipients: recipients,
             shouldPersist: shouldPersist,
-            logger: logger
-        )
+            logger: logger)
+    }
+    
+    public func createChannelCommuncation(
+        sender: String,
+        recipient: MessageRecipient,
+        channelName: String,
+        administrator: String,
+        members: Set<String>,
+        operators: Set<String>,
+        symmetricKey: SymmetricKey,
+        session: PQSSession,
+        cache: SessionCache,
+        metadata: Data,
+        shouldSynchronize: Bool = true
+    ) async throws {
+        var members = members
+        var operators = operators
+        members.insert(sender)
+        operators.insert(sender)
+        guard !members.isEmpty else {
+            throw PQSSession.SessionErrors.missingMetadata
+        }
+        guard !operators.isEmpty else {
+            throw PQSSession.SessionErrors.missingMetadata
+        }
+
+        guard operators.count >= 1 else {
+            throw PQSSession.SessionErrors.invalidOperatorCount
+        }
+        guard members.count >= 3 else {
+            throw PQSSession.SessionErrors.invalidMemberCount
+        }
+
+        let communicationModel = try await createCommunicationModel(
+            administrator: administrator,
+            operators: operators,
+            recipients: members,
+            communicationType: .channel(channelName),
+            metadata: metadata,
+            symmetricKey: symmetricKey)
+        
+        try await cache.createCommunication(communicationModel)
+        await session.receiverDelegate?.updatedCommunication(
+            communicationModel,
+            members: members)
+        await session.receiverDelegate?.createdChannel(communicationModel)
+        
+        if shouldSynchronize {
+            let params = try await session.requireSessionParametersWithoutTransportDelegate()
+            
+            try await session.sendCommunicationSynchronization(
+                recipient: recipient,
+                metadata: metadata,
+                sessionContext: params.sessionContext,
+                sessionDelegate: params.sessionDelegate,
+                cache: params.cache,
+                receiver: params.receiverDelegate,
+                symmetricKey: params.symmetricKey,
+                logger: logger)
+        }
     }
 
     // MARK: - Identity Resolution
@@ -420,19 +502,15 @@ public actor TaskProcessor {
         logger: NeedleTailLogger
     ) async throws -> ([SessionIdentity], Set<String>) {
         let communicationModel = try await findCommunicationType(cache: cache, communicationType: type, session: session)
-        guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
+        guard let props = await communicationModel.props(symmetricKey: symmetricKey) else {
             throw PQSSession.SessionErrors.propsError
         }
-
-        props.messageCount += 1
-        _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
 
         let members = props.members
         var identities = [SessionIdentity]()
         for member in members {
-            try await identities.append(contentsOf: session.refreshIdentities(secretName: member))
+            try await identities.append(contentsOf: session.refreshIdentities(secretName: member, forceRefresh: true))
         }
-
         logger.log(level: .info, message: "Gathered \(identities.count) Channel Session Identities")
         return (identities, members)
     }
@@ -491,7 +569,11 @@ public actor TaskProcessor {
             var shouldUpdateCommunication = false
 
             do {
-                communicationModel = try await findCommunicationType(cache: cache, communicationType: message.recipient, session: session)
+                communicationModel = try await findCommunicationType(
+                    cache: cache,
+                    communicationType: message.recipient,
+                    session: session)
+                
                 guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
                     throw PQSSession.SessionErrors.propsError
                 }

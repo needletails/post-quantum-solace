@@ -17,11 +17,7 @@ import DoubleRatchetKit
 import Foundation
 import SessionEvents
 import SessionModels
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 /// A protocol defining the requirements for a cache synchronizer.
 protocol SessionCacheSynchronizer: Sendable {

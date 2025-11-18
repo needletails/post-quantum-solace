@@ -17,11 +17,7 @@
 import DoubleRatchetKit
 import Foundation
 import SessionModels
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 // MARK: - Ordering Enum
 
