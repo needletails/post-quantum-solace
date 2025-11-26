@@ -140,9 +140,41 @@ public struct UnwrappedProps: Codable & Sendable {
 
 ## Error Handling
 
-The class handles decryption failures gracefully:
+The class handles decryption failures gracefully. All cryptographic errors conform to `LocalizedError` and provide detailed information:
 
 ```swift
+do {
+    try await communication.updateProps(symmetricKey: symmetricKey, props: newProps)
+} catch let error as CryptoError {
+    // Access localized error information
+    if let localizedError = error as? LocalizedError {
+        print("Error: \(localizedError.errorDescription ?? "")")
+        if let reason = localizedError.failureReason {
+            print("Reason: \(reason)")
+        }
+        if let suggestion = localizedError.recoverySuggestion {
+            print("Suggestion: \(suggestion)")
+        }
+    }
+    
+    // Handle specific error types
+    switch error {
+    case .encryptionFailed:
+        // Handle encryption failure
+        logger.error("Failed to encrypt communication properties")
+    case .decryptionFailed:
+        // Handle decryption failure
+        logger.error("Failed to decrypt communication properties")
+    case .propsError:
+        // Handle property access error
+        logger.error("Failed to access communication properties")
+    }
+} catch {
+    // Handle other errors
+    logger.error("Unexpected error: \(error)")
+}
+
+// Graceful handling with nil return
 if let props = await communication.props(symmetricKey: symmetricKey) {
     // Use decrypted properties
 } else {
@@ -151,6 +183,14 @@ if let props = await communication.props(symmetricKey: symmetricKey) {
     // Implement fallback behavior
 }
 ```
+
+### Error Types
+
+- **`CryptoError.encryptionFailed`**: Encryption operation failed
+- **`CryptoError.decryptionFailed`**: Decryption operation failed
+- **`CryptoError.propsError`**: Error accessing encrypted properties
+
+All errors provide `errorDescription`, `failureReason`, and `recoverySuggestion` through `LocalizedError` conformance.
 
 ## Integration with Other Components
 

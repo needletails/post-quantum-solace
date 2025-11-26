@@ -256,9 +256,17 @@ extension TaskProcessor {
 
 
     /// Errors specific to job processing operations.
-    enum JobProcessorErrors: Error {
+    enum JobProcessorErrors: Error, LocalizedError {
         /// Indicates that a job references a missing session identity.
         case missingIdentity
+        
+        public var errorDescription: String? {
+            "Job references a missing session identity"
+        }
+        
+        public var recoverySuggestion: String? {
+            "Ensure the session identity exists before processing the job"
+        }
     }
 }
 

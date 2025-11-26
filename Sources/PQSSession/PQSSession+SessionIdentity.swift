@@ -226,9 +226,8 @@ public extension PQSSession {
         forceRefresh: Bool = false,
         sendOneTimeIdentities: Bool = false
     ) async throws -> [SessionIdentity] {
-        logger.log(level: .info, message: "LOOKING FOR \(secretName)")
         let existingIdentities = try await getSessionIdentities(with: secretName)
-        logger.log(level: .info, message: "existingIdentities \(existingIdentities)")
+        logger.log(level: .info, message: "existingIdentities \(existingIdentities.count)")
         // Check if we have valid identities for this specific recipient
         let hasValidIdentities = await hasValidIdentitiesForRecipient(existingIdentities, secretName: secretName)
         
@@ -331,10 +330,10 @@ public extension PQSSession {
         oneTime mlKEMId: String?
     ) async throws -> [SessionIdentity] {
         
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= 10 {
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
             await refreshOneTimeKeysTask()
         }
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= 10 {
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
             await refreshMLKEMOneTimeKeysTask()
         }
         

@@ -17,10 +17,43 @@ import DoubleRatchetKit
 import Foundation
 
 /// Errors that can occur during signing operations.
-enum SigningErrors: Error {
+enum SigningErrors: Error, LocalizedError {
     case invalidSignature // Indicates that the signature is invalid.
     case missingSignedObject // Indicates that a signed object is missing.
     case signingFailedOnVerification // Indicates that signing failed during verification.
+    
+    public var errorDescription: String? {
+        switch self {
+        case .invalidSignature:
+            return "The signature is invalid"
+        case .missingSignedObject:
+            return "A signed object is missing"
+        case .signingFailedOnVerification:
+            return "Signing failed during verification"
+        }
+    }
+    
+    public var failureReason: String? {
+        switch self {
+        case .invalidSignature:
+            return "The cryptographic signature verification failed"
+        case .missingSignedObject:
+            return "The expected signed object was not found"
+        case .signingFailedOnVerification:
+            return "The signing operation failed during the verification process"
+        }
+    }
+    
+    public var recoverySuggestion: String? {
+        switch self {
+        case .invalidSignature:
+            return "Verify the signing keys are correct and the data has not been tampered with"
+        case .missingSignedObject:
+            return "Ensure the signed object is provided before verification"
+        case .signingFailedOnVerification:
+            return "Check that the signing keys match and the data is valid"
+        }
+    }
 }
 
 /// A struct representing the configuration of a user device, including its identity,

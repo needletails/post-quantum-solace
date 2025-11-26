@@ -351,9 +351,17 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     /// An enumeration representing possible errors that can occur within the `ContactModel`.
     ///
     /// Defines the specific error types that can be thrown by the contact model operations.
-    private enum Errors: Error {
+    private enum Errors: Error, LocalizedError {
         /// Indicates an error occurred while retrieving or updating properties.
         /// This typically happens when decryption fails or properties cannot be accessed.
         case propsError
+        
+        public var errorDescription: String? {
+            "Error occurred while retrieving or updating properties"
+        }
+        
+        public var failureReason: String? {
+            "Decryption failed or properties cannot be accessed"
+        }
     }
 }

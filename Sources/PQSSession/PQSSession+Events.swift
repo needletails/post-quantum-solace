@@ -38,7 +38,7 @@ public extension PQSSession {
     ///
     /// This method handles the complete message lifecycle including automatic key refresh, message encryption,
     /// and delivery through the transport layer. It automatically refreshes one-time keys if the supply is low
-    /// (≤10 keys) to ensure continuous communication capability.
+    /// (see `PQSSessionConstants.oneTimeKeyLowWatermark`) to ensure continuous communication capability.
     ///
     /// ## Message Flow
     /// 1. **Key Refresh**: Automatically refreshes one-time keys if supply is low
@@ -89,8 +89,7 @@ public extension PQSSession {
                 recipient: recipient,
                 transportInfo: transportInfo,
                 sentDate: Date(),
-                destructionTime: destructionTime
-            )
+                destructionTime: destructionTime)
 
             try await processWrite(message: message, session: self)
         } catch {
@@ -103,7 +102,7 @@ public extension PQSSession {
     ///
     /// This method handles the complete inbound message lifecycle including automatic key refresh,
     /// message decryption, and processing through the task processor. It automatically refreshes
-    /// one-time keys if the supply is low (≤10 keys) to ensure continuous communication capability.
+    /// one-time keys if the supply is low (see `PQSSessionConstants.oneTimeKeyLowWatermark`) to ensure continuous communication capability.
     ///
     /// ## Message Processing Flow
     /// 1. **Key Refresh**: Automatically refreshes one-time keys if supply is low
@@ -146,11 +145,11 @@ public extension PQSSession {
         deviceId: UUID,
         messageId: String
     ) async throws {
-        // We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less that 10 local keys.
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= 10 {
+        // We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less than the low watermark.
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
             async let _ = await refreshOneTimeKeysTask()
         }
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= 10 {
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
             async let _ = await refreshOneTimeKeysTask()
         }
 
@@ -257,7 +256,7 @@ public extension PQSSession {
         
         let metadata = try BinaryEncoder().encode(info)
         
-        try await taskProcessor.createChannelCommuncation(
+        try await taskProcessor.createChannelCommunication(
             sender: sender,
             recipient: recipient,
             channelName: channelName,
@@ -280,7 +279,7 @@ public extension PQSSession {
         }
     }
     
-    func createChannelCommuncation(
+    func createChannelCommunication(
         sender: String,
         recipient: MessageRecipient,
         channelName: String,
@@ -292,7 +291,7 @@ public extension PQSSession {
         cache: SessionCache,
         metadata: Data
     ) async throws {
-        try await taskProcessor.createChannelCommuncation(
+        try await taskProcessor.createChannelCommunication(
             sender: sender,
             recipient: recipient,
             channelName: channelName,

@@ -340,7 +340,15 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
     }
 
     /// Private error types for internal use within the JobModel.
-    private enum Errors: Error {
+    private enum Errors: Error, LocalizedError {
         case propsError
+        
+        public var errorDescription: String? {
+            "Error occurred while retrieving or updating job properties"
+        }
+        
+        public var failureReason: String? {
+            "Decryption failed or properties cannot be accessed"
+        }
     }
 }

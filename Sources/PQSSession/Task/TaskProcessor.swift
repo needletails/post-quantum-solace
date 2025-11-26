@@ -106,7 +106,7 @@ public actor TaskProcessor {
 
     /// Manages the Double Ratchet state for secure messaging.
     /// Handles key derivation, message encryption/decryption, and ratchet advancement.
-    let ratchetManager: RatchetStateManager<SHA256>
+    let ratchetManager: DoubleRatchetStateManager<SHA256>
 
     /// Internal message sequence tracker for job ordering.
     /// Ensures that jobs are processed in the correct order to maintain cryptographic properties.
@@ -168,7 +168,7 @@ public actor TaskProcessor {
     /// - Note: The processor is not ready for use until a session is set and the delegate is configured.
     public init(logger: NeedleTailLogger = NeedleTailLogger(), ratchetConfiguration: RatchetConfiguration? = nil) {
         self.logger = logger
-        ratchetManager = RatchetStateManager<SHA256>(
+        ratchetManager = DoubleRatchetStateManager<SHA256>(
             executor: cryptoExecutor,
             logger: logger,
             ratchetConfiguration: ratchetConfiguration)
@@ -292,7 +292,7 @@ public actor TaskProcessor {
                 
                 let info = try BinaryDecoder().decode(ChannelInfo.self, from: message.metadata)
 
-                try await createChannelCommuncation(
+                try await createChannelCommunication(
                     sender: sender,
                     recipient: type,
                     channelName: info.name,
@@ -341,7 +341,7 @@ public actor TaskProcessor {
         if let sessionDelegate = await session.sessionDelegate {
             if let (secretName, deviceId) = await sessionDelegate.retrieveUserInfo(message.transportInfo) {
                 if !deviceId.isEmpty {
-                    let resolvedIdentity = await getIdentity(secretName: secretName.isEmpty ? type.nicknameDescription : secretName, deviceId: deviceId)
+                    let resolvedIdentity = await getIdentity(secretName: secretName.isEmpty ? type.recipientDescription : secretName, deviceId: deviceId)
                     if let offerIdentity = resolvedIdentity {
                         identities = [offerIdentity]
                     } else {
@@ -368,7 +368,7 @@ public actor TaskProcessor {
             logger: logger)
     }
     
-    public func createChannelCommuncation(
+    public func createChannelCommunication(
         sender: String,
         recipient: MessageRecipient,
         channelName: String,
@@ -392,10 +392,10 @@ public actor TaskProcessor {
             throw PQSSession.SessionErrors.missingMetadata
         }
 
-        guard operators.count >= 1 else {
+        guard operators.count >= PQSSessionConstants.minimumChannelOperators else {
             throw PQSSession.SessionErrors.invalidOperatorCount
         }
-        guard members.count >= 3 else {
+        guard members.count >= PQSSessionConstants.minimumChannelMembers else {
             throw PQSSession.SessionErrors.invalidMemberCount
         }
 
@@ -634,8 +634,7 @@ public actor TaskProcessor {
                         let communicationModel = try await findCommunicationType(
                             cache: cache,
                             communicationType: message.recipient,
-                            session: session
-                        )
+                            session: session)
 
                         var props = await communicationModel.props(symmetricKey: symmetricKey)
                         props?.sharedId = UUID(uuidString: message.text)
@@ -656,7 +655,7 @@ public actor TaskProcessor {
                 }
                 try await feedTask(task, session: session)
             } catch {
-                logger.log(level: .error, message: "Error handling recipient identity \(identity): \(error)")
+                logger.log(level: .error, message: "Error handling recipient identity: \(error)")
             }
         }
     }

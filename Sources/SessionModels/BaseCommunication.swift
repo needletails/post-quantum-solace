@@ -293,7 +293,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
         guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.decryptionFailed
         }
-        return try BinaryDecoder().decode(UnwrappedProps.self, from: decrypted)
+        return try BinaryDecoder().decode(SessionModels.BaseCommunication.UnwrappedProps.self, from: decrypted)
     }
     
     /// Asynchronously updates the properties of the communication model.
@@ -365,6 +365,67 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     }
 }
 
+/// Errors that can occur during cryptographic operations
+///
+/// This enum represents errors that may occur during encryption, decryption,
+/// or property access operations in the SDK. All errors conform to `LocalizedError`
+/// and provide detailed descriptions, failure reasons, and recovery suggestions.
+///
+/// ## Usage
+///
+/// ```swift
+/// do {
+///     try await communication.updateProps(symmetricKey: key, props: newProps)
+/// } catch let error as CryptoError {
+///     if let localizedError = error as? LocalizedError {
+///         print("Error: \(localizedError.errorDescription ?? "")")
+///         if let suggestion = localizedError.recoverySuggestion {
+///             print("Suggestion: \(suggestion)")
+///         }
+///     }
+/// }
+/// ```
+///
+/// - Note: This error type is specific to cryptographic operations in
+///   `BaseCommunication`, `EncryptedMessage`, `ContactModel`, and `JobModel`.
+///   For Double Ratchet operations, see `DoubleRatchetKit.CryptoError`.
+public enum CryptoError: Error, LocalizedError {
+    case encryptionFailed
+    case decryptionFailed
+    case propsError
+    
+    public var errorDescription: String? {
+        switch self {
+        case .encryptionFailed:
+            return "Encryption operation failed"
+        case .decryptionFailed:
+            return "Decryption operation failed"
+        case .propsError:
+            return "Error occurred while accessing properties"
+        }
+    }
+    
+    public var failureReason: String? {
+        switch self {
+        case .encryptionFailed:
+            return "The encryption process failed, possibly due to invalid key or data"
+        case .decryptionFailed:
+            return "The decryption process failed, possibly due to incorrect key, corrupted data, or authentication failure"
+        case .propsError:
+            return "Failed to decrypt or access the encrypted properties"
+        }
+    }
+    
+    public var recoverySuggestion: String? {
+        switch self {
+        case .encryptionFailed, .decryptionFailed:
+            return "Verify that the symmetric key is correct and the data is valid"
+        case .propsError:
+            return "Ensure the symmetric key matches the one used for encryption"
+        }
+    }
+}
+
 /// An enumeration representing the different types of message recipients in a messaging network.
 ///
 /// This enumeration defines the various ways that messages can be addressed and routed
@@ -406,21 +467,23 @@ public enum MessageRecipient: Codable, Sendable, Equatable {
     /// notifications, or general communications to a wide audience.
     case broadcast
     
-    /// Computed property to derive the nickname string if applicable.
+    /// Computed property to derive the description string if applicable.
     ///
-    /// This property extracts the nickname string from the `.nickname` case. It will
+    /// This property extracts the nickname string from the `.nickname` or `.channel` case. It will
     /// cause a fatal error if called on any other case, so it should only be used
-    /// when you are certain that the recipient is of type `.nickname`.
+    /// when you are certain that the recipient is of type `.nickname` or `.channel`.
     ///
-    /// - Returns: The nickname string associated with the `.nickname` case.
-    /// - Warning: This property will cause a fatal error if called on any case other than `.nickname`.
+    /// - Returns: The name string associated with the `.nickname`or `.channel` case.
+    /// - Warning: This property will cause a fatal error if called on any case other than `.nickname`or `.channel`.
     ///   Always check the case type before accessing this property.
-    public var nicknameDescription: String {
+    public var recipientDescription: String {
         switch self {
         case let .nickname(name):
             name
+        case let .channel(name):
+            name
         default:
-            fatalError("Invalid Recipient Type")
+            fatalError("Invalid Recipient Type \(self)")
         }
     }
 }

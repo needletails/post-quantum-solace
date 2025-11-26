@@ -4,6 +4,7 @@
 
 [![Swift](https://img.shields.io/badge/Swift-6.1+-orange.svg)](https://swift.org)
 [![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20macOS%2015%2B%20%7C%20Linux%20%7C%20Android-blue.svg)](https://developer.apple.com)
+[![Version](https://img.shields.io/badge/Version-2.0.0-blue.svg)](https://github.com/needletails/post-quantum-solace)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-green.svg)](LICENSE)
 
 A secure, post-quantum cryptographic messaging SDK with end-to-end encryption, built for the quantum-resistant future.
@@ -36,7 +37,14 @@ Add the Post-Quantum Solace SDK to your project:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "1.0.0")
+    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "2.0.0")
+]
+```
+
+For version 1.x:
+```swift
+dependencies: [
+    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "1.0.0", upToNextMajor: "2.0.0")
 ]
 ```
 
@@ -45,6 +53,112 @@ dependencies: [
 ```swift
 import PostQuantumSolace
 ```
+
+## 🆕 What's New in 2.0.0
+
+Version 2.0.0 introduces significant improvements to the API surface, error handling, and developer experience:
+
+### ✨ New Features
+
+- **`SessionConfiguration`**: Simplified session setup with a single configuration struct
+  - Configure all delegates in one call
+  - Type-safe initialization
+  - Reduced boilerplate code
+
+- **Enhanced Error Handling**: All error types now conform to `LocalizedError`
+  - Detailed error descriptions
+  - Failure reasons with context
+  - Actionable recovery suggestions
+  - Better integration with Swift error handling
+
+- **`PQSSessionConstants`**: Centralized configuration constants
+  - No more magic numbers
+  - `Sendable` for concurrency safety
+  - Easy to reference and customize
+
+- **`CryptoError`**: New error type for cryptographic operations
+  - Specific errors for encryption/decryption failures
+  - Consistent error handling across all crypto operations
+
+### 🔄 Migration from 1.x to 2.0.0
+
+#### Recommended: Use SessionConfiguration
+
+**Before (1.x):**
+```swift
+await session.setTransportDelegate(conformer: myTransport)
+await session.setDatabaseDelegate(conformer: myStore)
+session.setReceiverDelegate(conformer: myReceiver)
+await session.setPQSSessionDelegate(conformer: myDelegate)
+await session.setSessionEventDelegate(conformer: myEventDelegate)
+```
+
+**After (2.0.0):**
+```swift
+let config = SessionConfiguration(
+    transport: myTransport,
+    store: myStore,
+    receiver: myReceiver,
+    delegate: myDelegate,
+    eventDelegate: myEventDelegate
+)
+try await session.configure(with: config)
+```
+
+#### Error Handling Updates
+
+**Before (1.x):**
+```swift
+catch let error as PQSSession.SessionErrors {
+    print("Error: \(error.rawValue)")
+}
+```
+
+**After (2.0.0):**
+```swift
+catch let error as PQSSession.SessionErrors {
+    if let localizedError = error as? LocalizedError {
+        print("Error: \(localizedError.errorDescription ?? "")")
+        if let suggestion = localizedError.recoverySuggestion {
+            print("Suggestion: \(suggestion)")
+        }
+    }
+}
+```
+
+#### Using Constants
+
+**Before (1.x):**
+```swift
+if keyCount < 10 {  // Magic number
+    await refreshKeys()
+}
+```
+
+**After (2.0.0):**
+```swift
+if keyCount < PQSSessionConstants.oneTimeKeyLowWatermark {
+    await refreshKeys()
+}
+```
+
+### ⚠️ Breaking Changes
+
+- **Error Types**: All error enums now conform to `LocalizedError`. While this is backward compatible, accessing `rawValue` directly is no longer recommended. Use `errorDescription` instead.
+
+- **CacheErrors**: The custom `description`, `reason`, and `suggestion` properties have been replaced with `LocalizedError` properties (`errorDescription`, `failureReason`, `recoverySuggestion`).
+
+### 📝 Backward Compatibility
+
+- All existing APIs remain functional
+- Individual delegate setters still work (not deprecated)
+- Error types maintain their original cases
+- No changes to protocol definitions
+
+### 🔗 See Also
+
+- [Migration Guide](Sources/PQSSession/Documentation.docc/GettingStarted.md#migration-from-1x)
+- [API Reference](Sources/PQSSession/Documentation.docc/)
 
 ## 🌐 Cross-Platform Support
 
@@ -99,6 +213,24 @@ let session = PQSSession.shared
 ```
 
 ### 2. Set Up Delegates
+
+**Recommended: Using SessionConfiguration (Simplified Setup)**
+
+```swift
+// Create a configuration with all required delegates
+let config = SessionConfiguration(
+    transport: myTransport,
+    store: myStore,
+    receiver: myReceiver,
+    delegate: mySessionDelegate,        // Optional
+    eventDelegate: myEventDelegate      // Optional
+)
+
+// Configure the session in one call
+try await session.configure(with: config)
+```
+
+**Alternative: Individual Delegate Setup**
 
 ```swift
 // Set up transport delegate for network communication
@@ -244,26 +376,80 @@ class AppEventReceiver: EventReceiver {
 - **Efficient Caching**: Two-tier cache system for optimal performance
 - **Batch Operations**: Key generation and updates in batches
 
+### Configuration Constants
+
+The SDK provides centralized constants for configuration values via `PQSSessionConstants`:
+
+```swift
+// Key refresh threshold (default: 10)
+PQSSessionConstants.oneTimeKeyLowWatermark
+
+// Batch size for key generation (default: 100)
+PQSSessionConstants.oneTimeKeyBatchSize
+
+// Key rotation interval in days (default: 7)
+PQSSessionConstants.keyRotationIntervalDays
+
+// Channel requirements
+PQSSessionConstants.minimumChannelOperators  // Default: 1
+PQSSessionConstants.minimumChannelMembers     // Default: 3
+```
+
+These constants are `Sendable` and can be safely accessed from any concurrent context.
+
 ## 🛠️ Error Handling
 
-The SDK provides comprehensive error handling with detailed error types:
+The SDK provides comprehensive error handling with `LocalizedError` conformance, offering detailed error descriptions, failure reasons, and recovery suggestions:
 
 ```swift
 do {
-    try await session.writeTextMessage(...)
+    try await session.writeTextMessage(
+        recipient: .nickname("bob"),
+        text: "Hello, world!"
+    )
 } catch let error as PQSSession.SessionErrors {
+    // Access localized error information
+    if let localizedError = error as? LocalizedError {
+        print("Error: \(localizedError.errorDescription ?? "Unknown error")")
+        
+        if let reason = localizedError.failureReason {
+            print("Reason: \(reason)")
+        }
+        
+        if let suggestion = localizedError.recoverySuggestion {
+            print("Suggestion: \(suggestion)")
+        }
+    }
+    
+    // Pattern matching for specific error handling
     switch error {
     case .sessionNotInitialized:
         // Handle session setup issues
+        print("Session not properly initialized")
     case .databaseNotInitialized:
         // Handle storage issues
+        print("Database not configured")
     case .transportNotInitialized:
         // Handle network issues
+        print("Transport layer not ready")
+    case .cannotFindOneTimeKey, .drainedKeys:
+        // Keys will be automatically refreshed
+        print("Waiting for key refresh...")
     default:
         // Handle other errors
+        print("Unexpected error: \(error)")
     }
 }
 ```
+
+### Error Types
+
+All error enums conform to `LocalizedError`:
+- `PQSSession.SessionErrors` - Session-related errors
+- `SessionCache.CacheErrors` - Cache and storage errors
+- `CryptoError` - Cryptographic operation errors
+- `EventErrors` - Event handling errors
+- `SigningErrors` - Signature verification errors
 
 ## 🧪 Testing
 
@@ -294,6 +480,11 @@ For detailed documentation, see:
 - [API Reference](Sources/PQSSession/Documentation.docc/)
 - [Getting Started Guide](Sources/PQSSession/Documentation.docc/GettingStarted.md)
 - [Architecture Overview](Sources/PQSSession/Documentation.docc/Documentation.md)
+
+### Version History
+
+- **2.0.0** (Current): Enhanced error handling with `LocalizedError`, `SessionConfiguration` for simplified setup, `PQSSessionConstants` for centralized configuration, `CryptoError` for cryptographic operations, and comprehensive documentation updates
+- **1.x**: Initial release with core post-quantum cryptographic messaging functionality
 
 ## 🤝 Contributing
 

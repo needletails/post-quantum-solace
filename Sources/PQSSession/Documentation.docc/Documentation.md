@@ -58,10 +58,13 @@ import PostQuantumSolace
 // Initialize the session
 let session = PQSSession.shared
 
-// Set up delegates
-await session.setTransportDelegate(conformer: myTransport)
-await session.setDatabaseDelegate(conformer: myStore)
-session.setReceiverDelegate(conformer: myReceiver)
+// Set up delegates using SessionConfiguration (recommended)
+let config = SessionConfiguration(
+    transport: myTransport,
+    store: myStore,
+    receiver: myReceiver
+)
+try await session.configure(with: config)
 
 // Create a new session
 try await session.createSession(
@@ -112,12 +115,27 @@ try await session.writeTextMessage(
 
 ## Error Handling
 
-The SDK provides comprehensive error handling with detailed error types:
+The SDK provides comprehensive error handling with `LocalizedError` conformance. All error types include detailed descriptions, failure reasons, and recovery suggestions:
 
 ```swift
 do {
-    try await session.writeTextMessage(...)
+    try await session.writeTextMessage(
+        recipient: .nickname("bob"),
+        text: "Hello, world!"
+    )
 } catch let error as PQSSession.SessionErrors {
+    // Access localized error information
+    if let localizedError = error as? LocalizedError {
+        print("Error: \(localizedError.errorDescription ?? "Unknown")")
+        if let reason = localizedError.failureReason {
+            print("Reason: \(reason)")
+        }
+        if let suggestion = localizedError.recoverySuggestion {
+            print("Suggestion: \(suggestion)")
+        }
+    }
+    
+    // Pattern matching for specific error handling
     switch error {
     case .sessionNotInitialized:
         // Handle session setup issues
@@ -130,6 +148,15 @@ do {
     }
 }
 ```
+
+### Error Types
+
+All error enums conform to `LocalizedError`:
+- `PQSSession.SessionErrors` - Session-related errors
+- `SessionCache.CacheErrors` - Cache and storage errors
+- `CryptoError` - Cryptographic operation errors
+- `EventErrors` - Event handling errors
+- `SigningErrors` - Signature verification errors
 
 ## Thread Safety
 

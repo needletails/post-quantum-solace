@@ -280,21 +280,39 @@ await session.receiverDelegate?.createdMessage(message)
 
 ## Error Handling
 
-Implement proper error handling for message operations:
+Implement proper error handling for message operations. All cryptographic errors conform to `LocalizedError`:
 
 ```swift
 func processMessage(_ message: EncryptedMessage) async {
     do {
         guard let props = await message.props(symmetricKey: sessionKey) else {
-            throw MessageError.decryptionFailed
+            throw CryptoError.decryptionFailed
         }
         
         // Process the message
         await handleMessage(props)
         
-    } catch MessageError.decryptionFailed {
-        logger.error("Failed to decrypt message: \(message.id)")
-        await showDecryptionError()
+    } catch let error as CryptoError {
+        // Access localized error information
+        if let localizedError = error as? LocalizedError {
+            print("Error: \(localizedError.errorDescription ?? "")")
+            if let suggestion = localizedError.recoverySuggestion {
+                print("Suggestion: \(suggestion)")
+            }
+        }
+        
+        // Handle specific error types
+        switch error {
+        case .decryptionFailed:
+            logger.error("Failed to decrypt message: \(message.id)")
+            await showDecryptionError()
+        case .encryptionFailed:
+            logger.error("Failed to encrypt message: \(message.id)")
+            await showEncryptionError()
+        case .propsError:
+            logger.error("Failed to access message properties: \(message.id)")
+            await showPropertyError()
+        }
         
     } catch {
         logger.error("Failed to process message: \(error)")
@@ -302,6 +320,14 @@ func processMessage(_ message: EncryptedMessage) async {
     }
 }
 ```
+
+### Error Types
+
+- **`CryptoError.encryptionFailed`**: Message encryption failed
+- **`CryptoError.decryptionFailed`**: Message decryption failed
+- **`CryptoError.propsError`**: Error accessing message properties
+
+All errors provide `errorDescription`, `failureReason`, and `recoverySuggestion` through `LocalizedError` conformance.
 
 ## Thread Safety
 

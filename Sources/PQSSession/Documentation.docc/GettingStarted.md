@@ -42,7 +42,27 @@ let session = PQSSession.shared
 
 ### 2. Set Up Delegates
 
-Configure the required delegates for your application:
+**Recommended: Using SessionConfiguration (Simplified Setup)**
+
+The easiest way to configure your session is using `SessionConfiguration`, which allows you to set up all delegates in a single call:
+
+```swift
+// Create a configuration with all required delegates
+let config = SessionConfiguration(
+    transport: myTransport,      // Required: Network communication
+    store: myStore,               // Required: Persistent storage
+    receiver: myReceiver,          // Required: Event handling
+    delegate: mySessionDelegate,        // Optional: Custom session logic
+    eventDelegate: myEventDelegate      // Optional: Override default event handling
+)
+
+// Configure the session in one call
+try await session.configure(with: config)
+```
+
+**Alternative: Individual Delegate Setup**
+
+You can also set up delegates individually if you prefer more granular control:
 
 ```swift
 // Set up transport delegate for network communication
@@ -53,6 +73,12 @@ await session.setDatabaseDelegate(conformer: myStore)
 
 // Set up receiver delegate for event handling
 session.setReceiverDelegate(conformer: myReceiver)
+
+// Optional: Set session delegate for custom behavior
+await session.setPQSSessionDelegate(conformer: mySessionDelegate)
+
+// Optional: Set event delegate to override default event handling
+await session.setSessionEventDelegate(conformer: myEventDelegate)
 ```
 
 ### 3. Create a Session
@@ -211,11 +237,34 @@ if try await session.rotateMLKEMKeysIfNeeded() {
 
 ### One-Time Key Management
 
+The SDK automatically manages one-time keys, but you can also trigger manual refresh:
+
 ```swift
 // Refresh one-time keys when needed
 await session.refreshOneTimeKeysTask()
 await session.refreshMLKEMOneTimeKeysTask()
 ```
+
+### Configuration Constants
+
+The SDK provides centralized constants for configuration values via `PQSSessionConstants`:
+
+```swift
+// Key refresh threshold - keys are automatically refreshed when count drops below this
+let lowWatermark = PQSSessionConstants.oneTimeKeyLowWatermark  // Default: 10
+
+// Batch size for key generation
+let batchSize = PQSSessionConstants.oneTimeKeyBatchSize  // Default: 100
+
+// Key rotation interval in days
+let rotationInterval = PQSSessionConstants.keyRotationIntervalDays  // Default: 7
+
+// Channel requirements
+let minOperators = PQSSessionConstants.minimumChannelOperators  // Default: 1
+let minMembers = PQSSessionConstants.minimumChannelMembers      // Default: 3
+```
+
+These constants are `Sendable` and can be safely accessed from any concurrent context. They're used throughout the SDK to ensure consistent behavior.
 
 ## Device Management
 
@@ -241,12 +290,31 @@ try await session.updateUseroneTimePublicKeys(newKeys)
 
 ## Error Handling
 
-The SDK provides comprehensive error handling:
+The SDK provides comprehensive error handling with `LocalizedError` conformance. All error types include detailed descriptions, failure reasons, and recovery suggestions:
+
+### Using LocalizedError Features
 
 ```swift
 do {
-    try await session.writeTextMessage(...)
+    try await session.writeTextMessage(
+        recipient: .nickname("bob"),
+        text: "Hello, world!"
+    )
 } catch let error as PQSSession.SessionErrors {
+    // Access localized error information
+    if let localizedError = error as? LocalizedError {
+        print("Error: \(localizedError.errorDescription ?? "Unknown error")")
+        
+        if let reason = localizedError.failureReason {
+            print("Reason: \(reason)")
+        }
+        
+        if let suggestion = localizedError.recoverySuggestion {
+            print("Suggestion: \(suggestion)")
+        }
+    }
+    
+    // Pattern matching for specific error handling
     switch error {
     case .sessionNotInitialized:
         // Handle session setup issues
@@ -260,6 +328,10 @@ do {
         // Handle network issues
         print("Transport layer not ready")
         
+    case .cannotFindOneTimeKey, .drainedKeys:
+        // Keys will be automatically refreshed
+        print("Waiting for automatic key refresh...")
+        
     case .invalidSignature:
         // Handle cryptographic verification failures
         print("Message signature verification failed")
@@ -270,6 +342,22 @@ do {
     }
 }
 ```
+
+### Error Types
+
+The SDK provides several error types, all conforming to `LocalizedError`:
+
+- **`PQSSession.SessionErrors`** - Session lifecycle and operation errors
+- **`SessionCache.CacheErrors`** - Cache and storage errors
+- **`CryptoError`** - Cryptographic operation errors (encryption/decryption)
+- **`EventErrors`** - Event handling errors
+- **`SigningErrors`** - Signature verification errors
+- **`JobProcessorErrors`** - Task processing errors
+
+Each error type provides:
+- `errorDescription` - Human-readable error message
+- `failureReason` - Detailed explanation of what went wrong
+- `recoverySuggestion` - Actionable steps to resolve the issue
 
 ## Best Practices
 

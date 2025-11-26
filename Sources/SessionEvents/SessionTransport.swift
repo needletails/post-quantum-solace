@@ -136,7 +136,6 @@ public protocol SessionTransport: Sendable {
     ///   - metadata: Metadata containing recipient information and routing details
     /// - Throws: An error if the message could not be sent (e.g., network failure, invalid recipient)
     func sendMessage(_ message: SignedRatchetMessage,
-
                      metadata: SignedRatchetMessageMetadata) async throws
 
     /// Retrieves the user configuration for a given secret name from the network.

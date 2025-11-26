@@ -271,7 +271,6 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         self.session = session
         var outboundTask = outboundTask
         
-        
         guard let sessionContext = await session.sessionContext else {
             throw PQSSession.SessionErrors.sessionNotInitialized
         }
@@ -328,7 +327,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             
         } else {
             guard let state = props.state else {
-                throw CryptoError.propsError
+                throw DoubleRatchetKit.CryptoError.propsError
             }
             
             if await session.rotatingKeys {
@@ -599,7 +598,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         var localOneTimePrivateKey: CurvePrivateKey?
         var localMLKEMPrivateKey: MLKEMPrivateKey
         guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else {
-            throw CryptoError.propsError
+            throw DoubleRatchetKit.CryptoError.propsError
         }
         
         //         If we do not have state we need to set this device's keys on state. This is inbound, so the sender sent the one-time keyids it used of the recipient. We will find and use the same key.
@@ -618,7 +617,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             try await session.cache?.updateSessionIdentity(sessionIdentity)
         } else {
             guard let state = props.state else {
-                throw CryptoError.propsError
+                throw DoubleRatchetKit.CryptoError.propsError
             }
             localOneTimePrivateKey = state.localOneTimePrivateKey
             localMLKEMPrivateKey = state.localMLKEMPrivateKey

@@ -685,6 +685,7 @@ actor TaskProcessorSequenceTests {
     private func createTestMessage(_ text: String) -> CryptoMessage {
         CryptoMessage(
             text: text,
+            metadata: .init(),
             recipient: .nickname("bob"),
             sentDate: Date(),
             destructionTime: nil)

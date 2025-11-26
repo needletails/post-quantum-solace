@@ -92,18 +92,44 @@ import SessionModels
 ///
 /// ## Error Handling
 ///
-/// All methods throw specific `SessionErrors` that provide clear information about
-/// what went wrong and how to recover. Common errors include:
+/// All methods throw specific `SessionErrors` that conform to `LocalizedError`,
+/// providing clear information about what went wrong and how to recover.
+///
+/// ### Error Information
+///
+/// Each error provides:
+/// - `errorDescription` - Human-readable error message
+/// - `failureReason` - Detailed explanation of what went wrong
+/// - `recoverySuggestion` - Actionable steps to resolve the issue
+///
+/// ### Common Errors
 ///
 /// - `SessionErrors.sessionNotInitialized` - Session not properly set up
 /// - `SessionErrors.databaseNotInitialized` - Storage not configured
 /// - `SessionErrors.transportNotInitialized` - Network layer not ready
 /// - `SessionErrors.invalidSignature` - Cryptographic verification failed
+/// - `SessionErrors.cannotFindOneTimeKey` - No available keys for recipient
+/// - `SessionErrors.drainedKeys` - All local keys have been used
+///
+/// ### Example
+///
+/// ```swift
+/// do {
+///     try await session.writeTextMessage(...)
+/// } catch let error as SessionErrors {
+///     if let localizedError = error as? LocalizedError {
+///         print("Error: \(localizedError.errorDescription ?? "")")
+///         if let suggestion = localizedError.recoverySuggestion {
+///             print("Suggestion: \(suggestion)")
+///         }
+///     }
+/// }
+/// ```
 ///
 /// ## Performance Considerations
 ///
 /// - Key generation is performed asynchronously
-/// - One-time keys are pre-generated in batches of 100
+/// - One-time keys are pre-generated in batches (see `PQSSessionConstants.oneTimeKeyBatchSize`)
 /// - Automatic key refresh when supply is low
 /// - Efficient caching of session identities
 ///
@@ -148,27 +174,45 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     private(set) var eventDelegate: (any SessionEvents)?
     private var refreshOTKeysTask: Task<Void, Never>?
     private var refreshMLKEMOTKeysTask: Task<Void, Never>?
+    /// Optional delegate for device linking operations
     public nonisolated(unsafe) weak var linkDelegate: DeviceLinkingDelegate?
+    
+    /// The session cache instance for data storage and retrieval
     public var cache: SessionCache?
+    
     let crypto = NeedleTailCrypto()
     var logger = NeedleTailLogger("[PQSSession]")
     var sessionIdentities = Set<String>()
     var rotatingKeys = false
     var addingContactData: Data?
-
-    // Asynchronously retrieves the current session context
+    
+    //MARK: Media Encryption
+    var currentMessageIndex = 0
+    
+    /// Asynchronously retrieves the current session context
+    ///
+    /// The session context contains all the information needed to restore and maintain
+    /// a session, including user information, cryptographic keys, and session state.
+    ///
+    /// - Returns: The current session context, or `nil` if no session has been created
     public var sessionContext: SessionContext? {
         get async {
             _sessionContext
         }
     }
 
-    // Sets the session context
+    /// Sets the session context
+    ///
+    /// - Parameter context: The session context to set
     public func setSessionContext(_ context: SessionContext) async {
         _sessionContext = context
     }
 
-    // Asynchronously retrieves the application password
+    /// Asynchronously retrieves the application password
+    ///
+    /// The application password is used to derive encryption keys for session data.
+    ///
+    /// - Returns: The current application password
     public var appPassword: String {
         get async {
             _appPassword
@@ -180,16 +224,27 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         _appPassword = password
     }
 
-    // Sets the logger log level
+    /// Sets the logger log level for both the session and task processor
+    ///
+    /// - Parameter level: The log level to set (e.g., `.debug`, `.info`, `.error`)
     public func setLogLevel(_ level: Level) async {
         logger.setLogLevel(level)
         await taskProcessor.setLogLevel(level)
     }
 
+    /// Sets the data to be used when adding a new contact
+    ///
+    /// - Parameter data: Optional data to associate with contact addition
     public func setAddingContact(_ data: Data?) async {
         addingContactData = data
     }
     
+    /// Removes a session identity for the specified secret name
+    ///
+    /// This method removes the session identity from the internal tracking set,
+    /// effectively disconnecting from that user's devices.
+    ///
+    /// - Parameter secretName: The secret name of the user whose identity should be removed
     public func removeIdentity(with secretName: String) {
         sessionIdentities.remove(secretName)
     }
@@ -198,7 +253,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     func synchronizeLocalConfiguration(_ data: Data) async throws {
         let symmetricKey = try await getAppSymmetricKey()
         guard let decryptedData = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else { return }
-        let context = try! BinaryDecoder().decode(SessionContext.self, from: decryptedData)
+        let context = try BinaryDecoder().decode(SessionContext.self, from: decryptedData)
         await setSessionContext(context)
     }
 
@@ -237,8 +292,40 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
 
-    // Enum representing various session-related errors
-    public enum SessionErrors: String, Error {
+    /// Configures the session with all required delegates in a single call.
+    ///
+    /// This convenience method allows you to set up all session delegates at once,
+    /// ensuring proper initialization order and reducing boilerplate code.
+    ///
+    /// - Parameter configuration: The session configuration containing all delegates.
+    ///   Must include at minimum: transport, store, and receiver.
+    /// - Throws: An error if configuration fails (currently no errors are thrown,
+    ///   but this is reserved for future validation).
+    ///
+    /// ## Usage Example
+    /// ```swift
+    /// try await session.configure(with: SessionConfiguration(
+    ///     transport: myTransport,
+    ///     store: myStore,
+    ///     receiver: myReceiver,
+    ///     delegate: myDelegate,
+    ///     eventDelegate: myEventDelegate
+    /// ))
+    /// ```
+    public func configure(with configuration: SessionConfiguration) async throws {
+        await setTransportDelegate(conformer: configuration.transport)
+        await setDatabaseDelegate(conformer: configuration.store)
+        setReceiverDelegate(conformer: configuration.receiver)
+        if let delegate = configuration.delegate {
+            await setPQSSessionDelegate(conformer: delegate)
+        }
+        if let eventDelegate = configuration.eventDelegate {
+            await setSessionEventDelegate(conformer: eventDelegate)
+        }
+    }
+
+    /// Enum representing various session-related errors
+    public enum SessionErrors: String, Error, LocalizedError {
         case saltError = "Salt error occurred."
         case databaseNotInitialized = "Database is not initialized."
         case sessionNotInitialized = "Session is not initialized."
@@ -277,6 +364,66 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         case longTermKeyRotationFailed = "Failed to rotate the long-term key."
         case invalidOperatorCount = "The number of operators must be greater than 0."
         case invalidMemberCount = "The number of members must be greater than 2."
+        
+        public var errorDescription: String? {
+            rawValue
+        }
+        
+        public var failureReason: String? {
+            switch self {
+            case .databaseNotInitialized:
+                return "The database delegate has not been configured"
+            case .sessionNotInitialized:
+                return "The session has not been created or started"
+            case .transportNotInitialized:
+                return "The transport delegate has not been configured"
+            case .sessionDecryptionError:
+                return "Failed to decrypt the session data"
+            case .sessionEncryptionError:
+                return "Failed to encrypt the session data"
+            case .cannotFindOneTimeKey:
+                return "No available one-time keys for the recipient"
+            case .drainedKeys:
+                return "All local one-time keys have been used"
+            case .invalidKeyId:
+                return "The provided key identifier is invalid or expired"
+            case .invalidSignature:
+                return "The cryptographic signature verification failed"
+            case .missingSignature:
+                return "The expected signature was not found"
+            case .invalidPassword:
+                return "The provided password is incorrect or invalid"
+            case .saltError:
+                return "Failed to retrieve or generate the device salt"
+            default:
+                return nil
+            }
+        }
+        
+        public var recoverySuggestion: String? {
+            switch self {
+            case .databaseNotInitialized:
+                return "Configure the database delegate using configure(with:) or setDatabaseDelegate(conformer:)"
+            case .sessionNotInitialized:
+                return "Call createSession() and startSession(appPassword:) before performing operations"
+            case .transportNotInitialized:
+                return "Configure the transport delegate using configure(with:) or setTransportDelegate(conformer:)"
+            case .cannotFindOneTimeKey, .drainedKeys:
+                return "Wait for the system to automatically generate new one-time keys, or manually trigger key refresh"
+            case .invalidKeyId:
+                return "Verify the key identifier and ensure keys are properly synchronized"
+            case .sessionDecryptionError, .sessionEncryptionError:
+                return "Verify the session is properly initialized and keys are valid"
+            case .receiverDelegateNotSet:
+                return "Configure the receiver delegate using setReceiverDelegate(conformer:)"
+            case .invalidPassword:
+                return "Verify the password is correct and try again"
+            case .saltError:
+                return "Ensure the device salt is properly initialized"
+            default:
+                return nil
+            }
+        }
     }
 
     /// A struct representing a bundle of cryptographic data for a device.
@@ -335,8 +482,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     public func createDeviceCryptographicBundle(isMaster: Bool) async throws -> CryptographicBundle {
         let longTerm = try createLongTermKeys()
 
-        // Generate 100 private one-time key pairs
-        let curveOneTimeKeyPairs: [KeyPair] = try (0 ..< 100).map { _ in
+        // Generate one-time key pairs
+        let curveOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
             let id = UUID()
             let privateKey = crypto.generateCurve25519PrivateKey()
             let privateKeyRep = try CurvePrivateKey(id: id, privateKey.rawRepresentation)
@@ -344,7 +491,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
         }
 
-        let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< 100).map { _ in
+        let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
             let id = UUID()
             let privateKey = try crypto.generateMLKem1024PrivateKey()
             let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
@@ -686,7 +833,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             logger.log(level: .debug, message: "Created Communication Model")
 
             // Start the session and return the PQSSession
-            return try! await startSession(appPassword: credentials.password)
+            return try await startSession(appPassword: credentials.password)
         } else {
             throw SessionErrors.registrationError
         }
@@ -946,6 +1093,15 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         refreshMLKEMOTKeysTask = nil
     }
 
+    /// Manually triggers a refresh of Curve25519 one-time keys
+    ///
+    /// This method cancels any existing refresh task and starts a new one to generate
+    /// a batch of one-time keys. Keys are automatically refreshed when the count drops
+    /// below `PQSSessionConstants.oneTimeKeyLowWatermark`, but this method allows
+    /// manual triggering if needed.
+    ///
+    /// - Note: The refresh task runs asynchronously and generates
+    ///   `PQSSessionConstants.oneTimeKeyBatchSize` keys.
     public func refreshOneTimeKeysTask() async {
         refreshOTKeysTask?.cancel()
         
@@ -965,6 +1121,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         _ = await refreshOTKeysTask?.value
     }
 
+    /// Manually triggers a refresh of MLKEM one-time keys
+    ///
+    /// This method cancels any existing refresh task and starts a new one to generate
+    /// a batch of post-quantum MLKEM one-time keys. Keys are automatically refreshed
+    /// when needed, but this method allows manual triggering if needed.
+    ///
+    /// - Note: The refresh task runs asynchronously and generates
+    ///   `PQSSessionConstants.oneTimeKeyBatchSize` keys.
     public func refreshMLKEMOneTimeKeysTask() async {
         refreshMLKEMOTKeysTask?.cancel()
 
@@ -995,7 +1159,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
         if !keys.isEmpty {
             let publicKeysCount = try await synchronizeLocalKeys(cache: cache, keys: keys, type: refreshType)
-            if publicKeysCount <= 10 {
+            if publicKeysCount <= PQSSessionConstants.oneTimeKeyLowWatermark {
                 // 1. Delete all local keys that are not on the server
                 let config = try await cache.fetchLocalSessionContext()
 
@@ -1007,11 +1171,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 // Decode the session context from the decrypted data
                 var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
 
-                logger.log(level: .info, message: "Creating Key Pairs, count: \(100 - publicKeysCount)")
+                logger.log(level: .info, message: "Creating Key Pairs, count: \(PQSSessionConstants.oneTimeKeyBatchSize - publicKeysCount)")
                 switch refreshType {
                 case .curve:
                     // Create needed key pairs
-                    let privateOneTimeKeyPairs: [KeyPair] = try (0 ..< 100 - publicKeysCount).map { _ in
+                    let privateOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize - publicKeysCount).map { _ in
                         let id = UUID()
                         let privateKey = crypto.generateCurve25519PrivateKey()
                         let privateKeyRep = try CurvePrivateKey(id: id, privateKey.rawRepresentation)
@@ -1038,7 +1202,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
                 case .mlKEM:
                     // Create needed key pairs
-                    let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< 100).map { _ in
+                    let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
                         let id = UUID()
                         let privateKey = try crypto.generateMLKem1024PrivateKey()
                         let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
@@ -1194,6 +1358,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// Derives the symmetric key from the application password.
+    ///
+    /// This key is used to encrypt/decrypt the session context. It's derived from
+    /// the application password and device salt using a key derivation function.
+    ///
+    /// - Returns: The symmetric key derived from the application password
+    /// - Throws:
+    ///   - `SessionErrors.invalidPassword` if the password cannot be converted to data
+    ///   - `SessionErrors.saltError` if the device salt cannot be retrieved
     public func getAppSymmetricKey() async throws -> SymmetricKey {
         guard let passwordData = await appPassword.data(using: .utf8) else {
             throw SessionErrors.invalidPassword
@@ -1209,6 +1381,13 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// Verifies an input password against stored session context.
+    ///
+    /// This method attempts to decrypt the stored session context using the provided
+    /// password. If decryption succeeds, the password is correct.
+    ///
+    /// - Parameter appPassword: The password to verify
+    /// - Returns: `true` if the password is correct and can decrypt the session context,
+    ///            `false` otherwise
     public func verifyAppPassword(_ appPassword: String) async -> Bool {
         do {
             guard let passwordData = appPassword.data(using: .utf8) else {
@@ -1234,6 +1413,17 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// Changes the application password and re-encrypts the session context.
+    ///
+    /// This method decrypts the current session context, generates a new device salt,
+    /// and re-encrypts the session context with the new password. All session data
+    /// remains intact, only the encryption key changes.
+    ///
+    /// - Parameter newPassword: The new application password
+    /// - Throws:
+    ///   - `SessionErrors.databaseNotInitialized` if the cache is not available
+    ///   - `SessionErrors.sessionDecryptionError` if the current session cannot be decrypted
+    ///   - `SessionErrors.appPasswordError` if the new password cannot be converted to data
+    ///   - `SessionErrors.sessionEncryptionError` if the session cannot be re-encrypted
     public func changeAppPassword(_ newPassword: String) async throws {
         guard let cache else {
             throw SessionErrors.databaseNotInitialized
@@ -1271,6 +1461,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// Resumes processing of any pending tasks in the queue.
+    ///
+    /// This method loads all pending tasks from the cache and resumes their processing.
+    /// Useful after session restoration or when tasks may have been paused.
+    ///
+    /// - Throws: `SessionErrors.databaseNotInitialized` if the cache is not available
     public func resumeJobQueue() async throws {
         guard let cache else {
             throw SessionErrors.databaseNotInitialized
@@ -1284,6 +1479,19 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// Shuts down the session, clearing sensitive state.
+    ///
+    /// This method performs a complete shutdown of the session, including:
+    /// - Shutting down the ratchet manager
+    /// - Clearing all delegates
+    /// - Resetting session state
+    /// - Clearing sensitive data from memory
+    ///
+    /// After shutdown, the session is no longer viable and must be reinitialized
+    /// before use. All cached data remains in persistent storage and can be restored
+    /// by calling `startSession(appPassword:)`.
+    ///
+    /// - Important: This method clears sensitive data from memory. Ensure all
+    ///   operations are complete before calling this method.
     public func shutdown() async {
         do {
             try await taskProcessor.ratchetManager.shutdown()
@@ -1308,35 +1516,13 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         await taskProcessor.setIsRunning(false)
     }
 
-    #if os(iOS)
-        private func getModelIdentifier() -> String {
-            var systemInfo = utsname()
-            uname(&systemInfo)
-
-            // Use Mirror to access the machine field and convert it to a String
-            let machineMirror = Mirror(reflecting: systemInfo.machine)
-            let identifier = machineMirror.children.reduce("") { identifier, element in
-                guard let value = element.value as? Int8, value != 0 else { return identifier }
-                return identifier + String(UnicodeScalar(UInt8(value)))
-            }
-
-            return identifier
-        }
-
-    #elseif os(macOS)
-        private func getModelIdentifier() -> String {
-            var size = 0
-            sysctlbyname("hw.model", nil, &size, nil, 0)
-
-            var model = [CChar](repeating: 0, count: size)
-            sysctlbyname("hw.model", &model, &size, nil, 0)
-
-            let data = Data(bytes: model, count: size)
-            return String(data: data, encoding: .utf8) ?? "Uknown Model"
-        }
-
-    #endif
-
+    /// Returns a human-readable device name for the current platform
+    ///
+    /// On iOS and macOS, this returns a friendly device name (e.g., "iPhone 15 Pro")
+    /// by mapping model identifiers to readable names. On other platforms, it returns
+    /// a generic identifier.
+    ///
+    /// - Returns: A string representing the device name
     public func getDeviceName() -> String {
         #if os(iOS) || os(macOS)
             let modelIdentifier = getModelIdentifier()
@@ -1420,6 +1606,9 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 "iMac19,2": "iMac (2019)",
                 "iMac20,1": "iMac (2020)",
                 "iMac21,1": "iMac (2021)",
+                "iMac21,2": "iMac 24-inch (M1, 2021)",
+                "iMac22,1": "iMac 24-inch (M3, 2024)",
+                "iMac22,2": "iMac 24-inch (M3, 2024)",
 
                 // iMac Pro
                 "iMacPro1,1": "iMac Pro (2017)",
@@ -1427,35 +1616,103 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 // MacBook Air (2020 and later)
                 "MacBookAir8,1": "MacBook Air (Retina, 2018)",
                 "MacBookAir9,1": "MacBook Air (M1, 2020)",
-                "Mac14,7": "MacBook Air (2023)",
+                "Mac14,2": "MacBook Air (M2, 2022)",
+                "Mac14,7": "MacBook Air (M3, 2023)",
+                "Mac15,1": "MacBook Air (M4, 2024)",
 
                 // MacBook Pro (2017 and later)
                 "MacBookPro14,1": "MacBook Pro (2017)",
                 "MacBookPro14,3": "MacBook Pro (2017)",
                 "MacBookPro15,1": "MacBook Pro (2019)",
+                "MacBookPro15,2": "MacBook Pro (2019)",
+                "MacBookPro15,3": "MacBook Pro (2019)",
+                "MacBookPro15,4": "MacBook Pro (2019)",
                 "MacBookPro16,1": "MacBook Pro (2021)",
+                "MacBookPro16,2": "MacBook Pro (2021)",
+                "MacBookPro16,3": "MacBook Pro (2021)",
+                "MacBookPro16,4": "MacBook Pro (2021)",
+                "MacBookPro17,1": "MacBook Pro (2021)",
                 "MacBookPro18,1": "MacBook Pro (2021)",
-                "MacBookPro18,3": "MacBook Pro (2021)",
                 "MacBookPro18,2": "MacBook Pro (M1, 2020)",
+                "MacBookPro18,3": "MacBook Pro (2021)",
+                "MacBookPro18,4": "MacBook Pro (2021)",
+                "Mac14,5": "MacBook Pro (M2, 2022)",
+                "Mac14,6": "MacBook Pro (M2, 2022)",
                 "Mac14,8": "MacBook Air/Pro (M2, 2023)",
                 "Mac14,9": "MacBook Pro (M2, 2023)",
-                "Mac16,5": "MacBook Pro (M4 Max 2024)",
+                "Mac14,10": "MacBook Pro (M3, 2023)",
+                "Mac14,11": "MacBook Pro (M3, 2023)",
+                "Mac14,13": "MacBook Pro (M3, 2023)",
+                "Mac14,14": "MacBook Pro (M3, 2023)",
+                "Mac14,15": "MacBook Pro (M3, 2023)",
+                "Mac15,2": "MacBook Pro (M4, 2024)",
+                "Mac15,3": "MacBook Pro (M4, 2024)",
+                "Mac15,4": "MacBook Pro (M4, 2024)",
+                "Mac15,5": "MacBook Pro (M4, 2024)",
+                "Mac15,6": "MacBook Pro (M4, 2024)",
+                "Mac15,7": "MacBook Pro (M4, 2024)",
+                "Mac16,1": "MacBook Pro (M4 Pro, 2024)",
+                "Mac16,2": "MacBook Pro (M4 Pro, 2024)",
+                "Mac16,3": "MacBook Pro (M4 Pro, 2024)",
+                "Mac16,4": "MacBook Pro (M4 Pro, 2024)",
+                "Mac16,5": "MacBook Pro (M4 Max, 2024)",
+                "Mac16,6": "MacBook Pro (M4 Max, 2024)",
+                "Mac16,7": "MacBook Pro (M4 Max, 2024)",
+                "Mac16,8": "MacBook Pro (M4 Max, 2024)",
 
                 // Mac Pro (2019 and later)
                 "MacPro7,1": "Mac Pro (2019)",
+                "Mac14,1": "Mac Pro (M2 Ultra, 2023)",
 
                 // Mac Studio (2022 and later)
-                "Mac13,1": "Mac Studio (2022)",
+                "Mac13,1": "Mac Studio (M1 Max, 2022)",
+                "Mac13,2": "Mac Studio (M1 Ultra, 2022)",
+                "Mac14,3": "Mac Studio (M2 Max, 2023)",
+                "Mac14,16": "Mac Studio (M2 Ultra, 2023)",
+                "Mac15,8": "Mac Studio (M4, 2024)",
+                "Mac15,9": "Mac Studio (M4, 2024)",
+                "Mac15,10": "Mac Studio (M4, 2024)",
+                "Mac15,11": "Mac Studio (M4, 2024)",
 
                 // Mac mini (2018 and later)
                 "Macmini8,1": "Mac mini (2018)",
                 "Macmini9,1": "Mac mini (M1, 2020)",
                 "Mac14,4": "Mac mini (M2, 2022)",
+                "Mac14,12": "Mac mini (M2 Pro, 2023)",
             ]
 
             return deviceNames[modelIdentifier] ?? modelIdentifier
         #else
-            return "Unkown Device Model"
+            return "Unknown Device"
         #endif
     }
+
+    #if os(iOS)
+        private func getModelIdentifier() -> String {
+            var systemInfo = utsname()
+            uname(&systemInfo)
+
+            // Use Mirror to access the machine field and convert it to a String
+            let machineMirror = Mirror(reflecting: systemInfo.machine)
+            let identifier = machineMirror.children.reduce("") { identifier, element in
+                guard let value = element.value as? Int8, value != 0 else { return identifier }
+                return identifier + String(UnicodeScalar(UInt8(value)))
+            }
+
+            return identifier
+        }
+
+    #elseif os(macOS)
+        private func getModelIdentifier() -> String {
+            var size = 0
+            sysctlbyname("hw.model", nil, &size, nil, 0)
+
+            var model = [CChar](repeating: 0, count: size)
+            sysctlbyname("hw.model", &model, &size, nil, 0)
+
+            let data = Data(bytes: model, count: size)
+            return String(data: data, encoding: .utf8) ?? "Unknown Model"
+        }
+
+    #endif
 }

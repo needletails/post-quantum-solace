@@ -1910,7 +1910,6 @@ actor EndToEndTests {
         var successfulMessages = 0
         
         // Create multiple concurrent tasks to send messages simultaneously
-        // This simulates the "RECEIVED______ ice_candidate" messages arriving at the same time
         let concurrentTasks = (1...10).map { i in
             Task {
                 do {
@@ -3016,7 +3015,11 @@ struct SessionDelegate: PQSSessionDelegate {
         self.session = session
     }
     
-    public func synchronizeCommunication(recipient: SessionModels.MessageRecipient, sharedIdentifier: String, metadata: Data) async throws {
+    func synchronizeCommunication(
+        recipient: MessageRecipient,
+        sharedIdentifier: String,
+        metadata: Data
+    ) async throws {
         try await session.writeTextMessage(
             recipient: recipient,
             text: sharedIdentifier,
@@ -3101,7 +3104,7 @@ struct SessionDelegate: PQSSessionDelegate {
             
             //Create or update contact including new metadata
             _ = try! await session.createContact(
-                secretName: isMe ? message.recipient.nicknameDescription : senderSecretName,
+                secretName: isMe ? message.recipient.recipientDescription : senderSecretName,
                 friendshipMetadata: decodedMetadata,
                 requestFriendship: false)
         }
@@ -3619,6 +3622,7 @@ struct MockUserData {
     let lid = UUID()
     let ntm = CryptoMessage(
         text: "Some Message",
+        metadata: .init(),
         recipient: .nickname("bob"),
         sentDate: Date(),
         destructionTime: nil

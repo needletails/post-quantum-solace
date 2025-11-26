@@ -227,10 +227,10 @@ extension PQSSession {
             // Create a Calendar instance
             let calendar = Calendar.current
 
-            // Calculate the date one week ago from the current date
-            if let oneWeekAgo = calendar.date(byAdding: .weekOfYear, value: -1, to: currentDate) {
-                // Check if rotateKeyDate is older than or equal to one week ago
-                if rotateKeyDate <= oneWeekAgo {
+            // Calculate the date for key rotation based on the configured interval
+            if let rotationDate = calendar.date(byAdding: .day, value: -PQSSessionConstants.keyRotationIntervalDays, to: currentDate) {
+                // Check if rotateKeyDate is older than or equal to the rotation interval
+                if rotateKeyDate <= rotationDate {
                     try await rotateMLKEMFinalKey()
 
                     guard let cache else {
