@@ -117,11 +117,12 @@ catch let error as PQSSession.SessionErrors {
 **After (2.0.0):**
 ```swift
 catch let error as PQSSession.SessionErrors {
-    if let localizedError = error as? LocalizedError {
-        print("Error: \(localizedError.errorDescription ?? "")")
-        if let suggestion = localizedError.recoverySuggestion {
-            print("Suggestion: \(suggestion)")
-        }
+    print("Error: \(error.errorDescription ?? "")")
+    if let reason = error.failureReason {
+        print("Reason: \(reason)")
+    }
+    if let suggestion = error.recoverySuggestion {
+        print("Suggestion: \(suggestion)")
     }
 }
 ```
@@ -286,6 +287,132 @@ try await session.writeTextMessage(
 )
 ```
 
+### Message Types Explained
+
+The SDK supports three main message types, each with different use cases and privacy characteristics:
+
+#### 📝 Personal Messages
+
+Personal messages are notes you send to yourself, synchronized across all your devices. They're useful for:
+- **Cross-device synchronization**: Access the same notes on your phone, tablet, and computer
+- **Private notes**: Store sensitive information that only you can access
+- **Device-to-device communication**: Send reminders or data between your own devices
+
+```swift
+// Send a personal note that syncs across all your devices
+try await session.writeTextMessage(
+    recipient: .personalMessage,
+    text: "Meeting at 3pm tomorrow",
+    metadata: ["category": "reminder"],
+    destructionTime: 86400 // Auto-delete after 24 hours
+)
+```
+
+**Privacy**: Personal messages are encrypted and only accessible to your devices. They may be visible to other users on the network depending on your system's privacy settings, but the content remains encrypted.
+
+#### 🔒 Private Messages (Nickname-based)
+
+Private messages are end-to-end encrypted direct messages between two users. They provide:
+- **One-to-one communication**: Direct, private conversations with another user
+- **Perfect forward secrecy**: Each message uses unique encryption keys
+- **Device synchronization**: Messages are delivered to all of the recipient's devices
+- **Identity verification**: Messages are cryptographically signed to verify authenticity
+
+```swift
+// Send a private message to another user
+try await session.writeTextMessage(
+    recipient: .nickname("alice"),
+    text: "Can we schedule a meeting?",
+    metadata: ["priority": "high"],
+    destructionTime: 3600 // Self-destruct after 1 hour
+)
+```
+
+**Security Features**:
+- Messages are encrypted using the Double Ratchet protocol
+- Each message uses unique session keys for forward secrecy
+- Cryptographic signatures verify message authenticity
+- Automatic key rotation ensures long-term security
+
+**Privacy**: Only you and the recipient can decrypt and read the messages. Even if someone intercepts the encrypted messages, they cannot decrypt them without the private keys.
+
+#### 📢 Channel Messages
+
+Channels are group communication spaces where multiple users can participate. They support:
+- **Group conversations**: Multiple participants in a single channel
+- **Role-based permissions**: Administrators and operators with elevated privileges
+- **Member management**: Add/remove members, block users
+- **Channel metadata**: Store channel-specific information and settings
+
+```swift
+// Send a message to a channel
+try await session.writeTextMessage(
+    recipient: .channel("engineering"),
+    text: "New feature deployed!",
+    metadata: ["deployment": "v2.0.0"],
+    destructionTime: nil // Permanent message
+)
+```
+
+**Channel Structure**:
+- **Administrator**: The user who created the channel (typically one)
+- **Operators**: Users with elevated permissions (minimum 1 required)
+- **Members**: Regular participants who can send/receive messages (minimum 3 required)
+- **Blocked Members**: Users who have been blocked from the channel
+
+**Channel Requirements** (configurable via `PQSSessionConstants`):
+- Minimum operators: 1 (default)
+- Minimum members: 3 (default)
+
+**Channel Management**:
+Channels are automatically created when you send the first message. The SDK handles:
+- Member synchronization across all devices
+- Operator and administrator role management
+- Message delivery to all channel members
+- Automatic channel metadata updates
+
+**Privacy**: Channel messages are encrypted and delivered to all members. Each member receives an encrypted copy that only they can decrypt with their private keys. Channel membership and metadata are also encrypted.
+
+### Choosing the Right Message Type
+
+| Feature | Personal | Private (Nickname) | Channel |
+|---------|----------|-------------------|---------|
+| **Recipients** | Your devices only | One other user | Multiple users |
+| **Encryption** | End-to-end | End-to-end | End-to-end |
+| **Forward Secrecy** | ✅ | ✅ | ✅ |
+| **Group Support** | ❌ | ❌ | ✅ |
+| **Role Management** | ❌ | ❌ | ✅ |
+| **Use Case** | Notes, reminders | Direct messages | Team discussions |
+
+### Receiving Messages
+
+All message types are received through the `EventReceiver` protocol:
+
+```swift
+class AppEventReceiver: EventReceiver {
+    func createdMessage(_ message: EncryptedMessage) async {
+        // Decrypt and handle the message
+        if let props = await message.props(symmetricKey: sessionKey) {
+            switch props.recipient {
+            case .personalMessage:
+                await handlePersonalMessage(props)
+            case .nickname(let sender):
+                await handlePrivateMessage(props, from: sender)
+            case .channel(let channelName):
+                await handleChannelMessage(props, in: channelName)
+            case .broadcast:
+                await handleBroadcastMessage(props)
+            }
+        }
+    }
+    
+    func updatedCommunication(_ model: BaseCommunication, members: Set<String>) async {
+        // Handle channel updates, member changes, etc.
+        await refreshChannelList()
+    }
+}
+```
+
 ## 🔧 Implementation Examples
 
 ### SessionTransport Protocol
@@ -408,17 +535,15 @@ do {
         text: "Hello, world!"
     )
 } catch let error as PQSSession.SessionErrors {
-    // Access localized error information
-    if let localizedError = error as? LocalizedError {
-        print("Error: \(localizedError.errorDescription ?? "Unknown error")")
-        
-        if let reason = localizedError.failureReason {
-            print("Reason: \(reason)")
-        }
-        
-        if let suggestion = localizedError.recoverySuggestion {
-            print("Suggestion: \(suggestion)")
-        }
+    // Access localized error information directly (SessionErrors conforms to LocalizedError)
+    print("Error: \(error.errorDescription ?? "Unknown error")")
+    
+    if let reason = error.failureReason {
+        print("Reason: \(reason)")
+    }
+    
+    if let suggestion = error.recoverySuggestion {
+        print("Suggestion: \(suggestion)")
     }
     
     // Pattern matching for specific error handling
