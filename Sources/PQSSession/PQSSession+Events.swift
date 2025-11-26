@@ -13,16 +13,12 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import BSON
+
 import Foundation
 import NeedleTailAsyncSequence
 import SessionEvents
 import SessionModels
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 /// Extension to `PQSSession` providing all event-driven messaging, contact management, and protocol conformance for session events.
 ///
@@ -42,7 +38,7 @@ public extension PQSSession {
     ///
     /// This method handles the complete message lifecycle including automatic key refresh, message encryption,
     /// and delivery through the transport layer. It automatically refreshes one-time keys if the supply is low
-    /// (≤10 keys) to ensure continuous communication capability.
+    /// (see `PQSSessionConstants.oneTimeKeyLowWatermark`) to ensure continuous communication capability.
     ///
     /// ## Message Flow
     /// 1. **Key Refresh**: Automatically refreshes one-time keys if supply is low
@@ -83,7 +79,7 @@ public extension PQSSession {
         recipient: MessageRecipient,
         text: String = "",
         transportInfo: Data? = nil,
-        metadata: Document,
+        metadata: Data = .init(),
         destructionTime: TimeInterval? = nil
     ) async throws {
         do {
@@ -93,8 +89,7 @@ public extension PQSSession {
                 recipient: recipient,
                 transportInfo: transportInfo,
                 sentDate: Date(),
-                destructionTime: destructionTime
-            )
+                destructionTime: destructionTime)
 
             try await processWrite(message: message, session: self)
         } catch {
@@ -107,7 +102,7 @@ public extension PQSSession {
     ///
     /// This method handles the complete inbound message lifecycle including automatic key refresh,
     /// message decryption, and processing through the task processor. It automatically refreshes
-    /// one-time keys if the supply is low (≤10 keys) to ensure continuous communication capability.
+    /// one-time keys if the supply is low (see `PQSSessionConstants.oneTimeKeyLowWatermark`) to ensure continuous communication capability.
     ///
     /// ## Message Processing Flow
     /// 1. **Key Refresh**: Automatically refreshes one-time keys if supply is low
@@ -150,11 +145,11 @@ public extension PQSSession {
         deviceId: UUID,
         messageId: String
     ) async throws {
-        // We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less that 10 local keys.
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= 10 {
+        // We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less than the low watermark.
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
             async let _ = await refreshOneTimeKeysTask()
         }
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.count <= 10 {
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
             async let _ = await refreshOneTimeKeysTask()
         }
 
@@ -212,8 +207,20 @@ public extension PQSSession {
         let symmetricKey = try await getDatabaseSymmetricKey()
         let mySecretName = sessionContext.sessionUser.secretName
 
-        let shouldPersist = sessionDelegate?.shouldPersist(transportInfo: message.transportInfo) == false ? false : true
+        var shouldPersist = sessionDelegate?.shouldPersist(transportInfo: message.transportInfo) == false ? false : true
 
+        if let data = message.transportInfo {
+            do {
+                let event = try BinaryDecoder().decode(TransportEvent.self, from: data)
+                switch event {
+                case .sessionReestablishment:
+                    shouldPersist = false
+                case .synchronizeOneTimeKeys(_):
+                    shouldPersist = false
+                }
+            } catch {}
+        }
+        
         try await taskProcessor.outboundTask(
             message: message,
             cache: cache,
@@ -222,14 +229,86 @@ public extension PQSSession {
             sender: mySecretName,
             type: message.recipient,
             shouldPersist: shouldPersist,
-            logger: logger
-        )
+            logger: logger)
+    }
+    
+    func createCommunicationChannel(
+        sender: String,
+        recipient: MessageRecipient,
+        channelName: String,
+        administrator: String,
+        members: Set<String>,
+        operators: Set<String>,
+        welcomeMessage: String? = nil,
+        transportInfo: Data? = nil,
+        shouldSynchronize: Bool = true
+    ) async throws {
+        
+        guard let cache else {
+            throw SessionErrors.databaseNotInitialized
+        }
+
+        let info = ChannelInfo(
+            name: channelName,
+            administrator: administrator,
+            members: members,
+            operators: operators)
+        
+        let metadata = try BinaryEncoder().encode(info)
+        
+        try await taskProcessor.createChannelCommunication(
+            sender: sender,
+            recipient: recipient,
+            channelName: channelName,
+            administrator: administrator,
+            members: members,
+            operators: operators,
+            symmetricKey: getDatabaseSymmetricKey(),
+            session: self,
+            cache: cache,
+            metadata: metadata,
+            shouldSynchronize: shouldSynchronize)
+        
+        if let welcomeMessage, let transportInfo {
+            try await writeTextMessage(
+                recipient: recipient,
+                text: welcomeMessage,
+                transportInfo: transportInfo,
+                metadata: metadata,
+                destructionTime: nil)
+        }
+    }
+    
+    func createChannelCommunication(
+        sender: String,
+        recipient: MessageRecipient,
+        channelName: String,
+        administrator: String,
+        members: Set<String>,
+        operators: Set<String>,
+        symmetricKey: SymmetricKey,
+        session: PQSSession,
+        cache: SessionCache,
+        metadata: Data
+    ) async throws {
+        try await taskProcessor.createChannelCommunication(
+            sender: sender,
+            recipient: recipient,
+            channelName: channelName,
+            administrator: administrator,
+            members: members,
+            operators: operators,
+            symmetricKey: getDatabaseSymmetricKey(),
+            session: self,
+            cache: cache,
+            metadata: metadata)
     }
 }
 
 // MARK: - PQSSession SessionEvents Protocol Conformance
 
 extension PQSSession: SessionEvents {
+    
     /// Requires all necessary session parameters for processing.
     /// - Returns: A tuple containing all required session parameters.
     /// - Throws: An error if any of the required parameters are not initialized.
@@ -263,7 +342,7 @@ extension PQSSession: SessionEvents {
     /// Requires session parameters excluding the transport delegate.
     /// - Returns: A tuple containing the required session parameters.
     /// - Throws: An error if any of the required parameters are not initialized.
-    private func requireSessionParametersWithoutTransportDelegate() async throws -> (sessionContext: SessionContext,
+    func requireSessionParametersWithoutTransportDelegate() async throws -> (sessionContext: SessionContext,
                                                                                      cache: PQSSessionStore,
                                                                                      receiverDelegate: EventReceiver,
                                                                                      sessionDelegate: PQSSessionDelegate,
@@ -328,7 +407,8 @@ extension PQSSession: SessionEvents {
     /// - Throws: An error if the operation fails.
     public func createContact(
         secretName: String,
-        metadata: Document = [:],
+        metadata: Data = .init(),
+        friendshipMetadata: FriendshipMetadata? = nil,
         requestFriendship: Bool
     ) async throws -> ContactModel {
         let params = try await requireAllSessionParameters()
@@ -336,6 +416,7 @@ extension PQSSession: SessionEvents {
             return try await eventDelegate.createContact(
                 secretName: secretName,
                 metadata: metadata,
+                friendshipMetadata: friendshipMetadata,
                 requestFriendship: requestFriendship,
                 sessionContext: params.sessionContext,
                 cache: params.cache,
@@ -348,6 +429,7 @@ extension PQSSession: SessionEvents {
             return try await createContact(
                 secretName: secretName,
                 metadata: metadata,
+                friendshipMetadata: friendshipMetadata,
                 requestFriendship: requestFriendship,
                 sessionContext: params.sessionContext,
                 cache: params.cache,
@@ -368,24 +450,22 @@ extension PQSSession: SessionEvents {
         _ = try await refreshIdentities(secretName: secretName, forceRefresh: true)
         if let eventDelegate {
             return try await eventDelegate.sendCommunicationSynchronization(
-                contact: secretName,
+                recipient: .nickname(secretName),
                 sessionContext: params.sessionContext,
                 sessionDelegate: params.sessionDelegate,
                 cache: params.cache,
                 receiver: params.receiverDelegate,
                 symmetricKey: params.symmetricKey,
-                logger: logger
-            )
+                logger: logger)
         } else {
             return try await sendCommunicationSynchronization(
-                contact: secretName,
+                recipient: .nickname(secretName),
                 sessionContext: params.sessionContext,
                 sessionDelegate: params.sessionDelegate,
                 cache: params.cache,
                 receiver: params.receiverDelegate,
                 symmetricKey: params.symmetricKey,
-                logger: logger
-            )
+                logger: logger)
         }
     }
 

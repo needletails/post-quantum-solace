@@ -21,11 +21,7 @@
 
 import NeedleTailAsyncSequence
 import SessionModels
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 /// Extension to NeedleTailAsyncConsumer providing task management capabilities
 /// for the Post-Quantum Solace session system.

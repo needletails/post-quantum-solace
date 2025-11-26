@@ -14,11 +14,7 @@
 //  post-quantum cryptographic session management capabilities.
 //
 import DequeModule
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 public extension Deque {
     /// Asynchronously finds the index of the first element in the deque that satisfies the given predicate.

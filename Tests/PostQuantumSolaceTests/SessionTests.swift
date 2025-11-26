@@ -14,7 +14,7 @@
 //  post-quantum cryptographic session management capabilities.
 //
 //
-import BSON
+
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
@@ -22,11 +22,7 @@ import NeedleTailCrypto
 import SessionEvents
 import SessionModels
 import Testing
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 // MARK: - Test Suite
 
@@ -106,14 +102,14 @@ actor SessionTests {
                 )
             }
 
-            let kyberOneTimeKeyPairs: [PQSSession.KeyPair] = try (0 ..< 100).map { _ in
+            let mlKEMOneTimeKeyPairs: [PQSSession.KeyPair] = try (0 ..< 100).map { _ in
                 let id = UUID()
-                let privateKey = try self.crypto.generateKyber1024PrivateSigningKey()
-                let privateKeyRep = try PQKemPrivateKey(id: id, privateKey.encode())
-                let publicKey = try PQKemPublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                let privateKey = try self.crypto.generateMLKem1024PrivateKey()
+                let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
+                let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
                 return PQSSession.KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
             }
-            let finalKyber1024Key = try self.crypto.generateKyber1024PrivateSigningKey()
+            let finalMLKEM1024Key = try self.crypto.generateMLKem1024PrivateKey()
 
             let sessionUser = try SessionUser(
                 secretName: "user1",
@@ -123,14 +119,12 @@ actor SessionTests {
                     signingPrivateKey: senderspk.rawRepresentation,
                     longTermPrivateKey: senderltpk.rawRepresentation,
                     oneTimePrivateKeys: validKeys.map(\.privateKey),
-                    pqKemOneTimePrivateKeys: kyberOneTimeKeyPairs.map(\.privateKey),
-                    finalPQKemPrivateKey: .init(finalKyber1024Key.encode())
-                ),
-                metadata: .init()
-            )
+                    mlKEMOneTimePrivateKeys: mlKEMOneTimeKeyPairs.map(\.privateKey),
+                    finalMLKEMPrivateKey: .init(finalMLKEM1024Key.encode())
+                ))
 
-            let signedPublicKyberOneTimeKeys: [UserConfiguration.SignedPQKemOneTimeKey] = try kyberOneTimeKeyPairs.map { keyPair in
-                try UserConfiguration.SignedPQKemOneTimeKey(
+            let signedPublicMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
+                try UserConfiguration.SignedMLKEMOneTimeKey(
                     key: keyPair.publicKey,
                     deviceId: did,
                     signingKey: senderspk
@@ -145,7 +139,7 @@ actor SessionTests {
                     signingPublicKey: senderspk.publicKey.rawRepresentation,
                     signedDevices: [],
                     signedOneTimePublicKeys: signedOneTimePublicKeys,
-                    signedPQKemOneTimePublicKeys: signedPublicKyberOneTimeKeys
+                    signedMLKEMOneTimePublicKeys: signedPublicMLKEMOneTimeKeys
                 ),
                 registrationState: .registered
             )
@@ -155,7 +149,7 @@ actor SessionTests {
             let saltData = try await store.fetchLocalDeviceSalt(keyData: passwordData)
             let symmetricKey = await self.crypto.deriveStrictSymmetricKey(data: passwordData, salt: saltData)
 
-            let data = try BSONEncoder().encodeData(context)
+            let data = try BinaryEncoder().encode(context)
             let encryptedData = try self.crypto.encrypt(data: data, symmetricKey: symmetricKey)
             try await store.createLocalSessionContext(encryptedData!)
             await self.session.setDatabaseDelegate(conformer: store)
@@ -166,7 +160,7 @@ actor SessionTests {
 
             let updatedData = try await store.fetchLocalSessionContext()
             let decrypted = try self.crypto.decrypt(data: updatedData, symmetricKey: symmetricKey)
-            let decoded = try BSONDecoder().decode(SessionContext.self, from: Document(data: decrypted!))
+            let decoded = try BinaryDecoder().decode(SessionContext.self, from: decrypted!)
             #expect(decoded.sessionUser.deviceKeys.oneTimePrivateKeys.count == 10, "Should keep only the matching private keys.")
             #expect(decoded.activeUserConfiguration.signedOneTimePublicKeys.count == 10, "Should keep only the matching public keys.")
 
@@ -175,7 +169,7 @@ actor SessionTests {
 
             let updatedDataFinal = try await store.fetchLocalSessionContext()
             let decryptedFinal = try self.crypto.decrypt(data: updatedDataFinal, symmetricKey: symmetricKey)
-            let decodedFinal = try BSONDecoder().decode(SessionContext.self, from: Document(data: decryptedFinal!))
+            let decodedFinal = try BinaryDecoder().decode(SessionContext.self, from: decryptedFinal!)
             #expect(decodedFinal.sessionUser.deviceKeys.oneTimePrivateKeys.count == 0, "All private keys should be removed.")
             #expect(decodedFinal.activeUserConfiguration.signedOneTimePublicKeys.count == 0, "All public keys should be removed.")
             
@@ -202,9 +196,7 @@ actor SessionTests {
             let sessionUser = SessionUser(
                 secretName: "u1",
                 deviceId: bundle.deviceKeys.deviceId,
-                deviceKeys: bundle.deviceKeys,
-                metadata: .init()
-            )
+                deviceKeys: bundle.deviceKeys)
             let sessionContext = SessionContext(
                 sessionUser: sessionUser,
                 databaseEncryptionKey: generateDatabaseEncryptionKey(),
@@ -218,7 +210,7 @@ actor SessionTests {
                 publicKeys: bundle.userConfiguration.signedOneTimePublicKeys
             )
 
-            let data = try! BSONEncoder().encodeData(sessionContext)
+            let data = try! BinaryEncoder().encode(sessionContext)
             let encrypted = try self.crypto.encrypt(data: data, symmetricKey: appSymmetricKey)!
             try await mockCache.createLocalSessionContext(encrypted)
             await session.setSessionContext(sessionContext)
@@ -230,7 +222,7 @@ actor SessionTests {
             let configurationData = try self.crypto.decrypt(data: config, symmetricKey: appSymmetricKey)!
 
             // Decode the session context from the decrypted data
-            let foundContext = try BSONDecoder().decodeData(SessionContext.self, from: configurationData)
+            let foundContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
 
             // Run
             try await session.refreshOneTimeKeys(refreshType: .curve)
@@ -267,7 +259,7 @@ actor SessionTests {
             let configurationData2 = try self.crypto.decrypt(data: config2, symmetricKey: appSymmetricKey)!
 
             // Decode the session context from the decrypted data
-            let foundContext3 = try BSONDecoder().decodeData(SessionContext.self, from: configurationData2)
+            let foundContext3 = try BinaryDecoder().decode(SessionContext.self, from: configurationData2)
 
             await #expect(mockTransport.publicKeys.count == 205)
             #expect(foundContext3.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
@@ -378,7 +370,7 @@ actor MockTransport: SessionTransport {
 
     // Generate 100 private one-time key pairs
     let privateOneTimeKeyPairs: [PQSSession.KeyPair<CurvePublicKey, CurvePrivateKey>]
-    let kyberOneTimeKeyPairs: [PQSSession.KeyPair<PQKemPublicKey, PQKemPrivateKey>]
+    let mlKEMOneTimeKeyPairs: [PQSSession.KeyPair<MLKEMPublicKey, MLKEMPrivateKey>]
 
     init(cache: MockCache, appKey: SymmetricKey, publicKeys: [UserConfiguration.SignedOneTimePublicKey]) {
         self.cache = cache
@@ -394,12 +386,12 @@ actor MockTransport: SessionTransport {
             return PQSSession.KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
         }
 
-        kyberOneTimeKeyPairs = try! (0 ..< 100).map { _ in
+        mlKEMOneTimeKeyPairs = try! (0 ..< 100).map { _ in
             let crypto = NeedleTailCrypto()
             let id = UUID()
-            let privateKey = try crypto.generateKyber1024PrivateSigningKey()
-            let privateKeyRep = try PQKemPrivateKey(id: id, privateKey.encode())
-            let publicKey = try PQKemPublicKey(id: id, privateKey.publicKey.rawRepresentation)
+            let privateKey = try crypto.generateMLKem1024PrivateKey()
+            let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
+            let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
             return PQSSession.KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
         }
     }
@@ -410,12 +402,12 @@ actor MockTransport: SessionTransport {
     func findConfiguration(for _: String) async throws -> SessionModels.UserConfiguration {
         let context = try await cache.fetchLocalSessionContext()
         let decrypted = try crypto.decrypt(data: context, symmetricKey: appKey)
-        let decoded = try BSONDecoder().decode(SessionContext.self, from: Document(data: decrypted!))
+        let decoded = try BinaryDecoder().decode(SessionContext.self, from: decrypted!)
         return decoded.activeUserConfiguration
     }
 
-    func publishUserConfiguration(_: SessionModels.UserConfiguration, recipient _: UUID) async throws {}
-    func createUploadPacket(secretName _: String, deviceId _: UUID, recipient _: SessionModels.MessageRecipient, metadata _: BSON.Document) async throws {}
+    func publishUserConfiguration(_ configuration: SessionModels.UserConfiguration, recipient secretName: String, recipient identity: UUID) async throws {}
+    func createUploadPacket(secretName _: String, deviceId _: UUID, recipient _: SessionModels.MessageRecipient, metadata _: Data) async throws {}
     func notifyIdentityCreation(for _: String, keys _: SessionModels.OneTimeKeys) async throws {}
     func publishRotatedKeys(for _: String, deviceId _: String, rotated _: SessionModels.RotatedPublicKeys) async throws {}
 
@@ -428,7 +420,7 @@ actor MockTransport: SessionTransport {
     func fetchOneTimeKey(for _: String, deviceId _: String, senderSecretName _: String, sender _: String) async throws -> DoubleRatchetKit.CurvePublicKey {
         let context = try await cache.fetchLocalSessionContext()
         let decrypted = try crypto.decrypt(data: context, symmetricKey: appKey)
-        let decoded = try BSONDecoder().decode(SessionContext.self, from: Document(data: decrypted!))
+        let decoded = try BinaryDecoder().decode(SessionContext.self, from: decrypted!)
         let publicKey = try Curve25519.Signing.PublicKey(rawRepresentation: decoded.activeUserConfiguration.signingPublicKey)
         return try publicKeys.removeLast().verified(using: publicKey)!
     }
@@ -442,14 +434,14 @@ actor MockTransport: SessionTransport {
 
     func fetchOneTimeKeys(for _: String, deviceId _: String) async throws -> SessionModels.OneTimeKeys {
         guard let privateKey = privateOneTimeKeyPairs.last else { fatalError() }
-        guard let privateKyberKey = kyberOneTimeKeyPairs.last else { fatalError() }
-        return SessionModels.OneTimeKeys(curve: privateKey.publicKey, kyber: privateKyberKey.publicKey)
+        guard let privateMLKEMKey = mlKEMOneTimeKeyPairs.last else { fatalError() }
+        return SessionModels.OneTimeKeys(curve: privateKey.publicKey, mlKEM: privateMLKEMKey.publicKey)
     }
 
     func fetchOneTimeKeyIdentities(for _: String, deviceId _: String, type _: KeysType) async throws -> [UUID] {
         privateOneTimeKeyPairs.map(\.publicKey.id)
     }
 
-    func updateOneTimePQKemKeys(for _: String, deviceId _: String, keys _: [SessionModels.UserConfiguration.SignedPQKemOneTimeKey]) async throws {}
+    func updateOneTimeMLKEMKeys(for _: String, deviceId _: String, keys _: [SessionModels.UserConfiguration.SignedMLKEMOneTimeKey]) async throws {}
     func deleteOneTimeKeys(for _: String, with _: String, type _: KeysType) async throws {}
 }

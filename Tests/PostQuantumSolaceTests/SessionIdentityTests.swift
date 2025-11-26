@@ -14,7 +14,6 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
-import BSON
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
@@ -22,11 +21,7 @@ import NeedleTailCrypto
 import SessionEvents
 import SessionModels
 import Testing
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 // MARK: - Test Suite
 
@@ -121,17 +116,18 @@ actor SessionIdentityTests {
     // MARK: - Mock Transport
     
     final class MockSessionIdentityTransport: SessionTransport, @unchecked Sendable {
+
         var configurations: [String: UserConfiguration] = [:]
         var oneTimeKeys: [String: OneTimeKeys] = [:]
         var shouldThrowError = false
         
         func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys {
             if shouldThrowError { throw PQSSession.SessionErrors.userNotFound }
-            return oneTimeKeys[secretName] ?? OneTimeKeys(curve: nil, kyber: nil)
+            return oneTimeKeys[secretName] ?? OneTimeKeys(curve: nil, mlKEM: nil)
         }
         
         func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] { [] }
-        func publishUserConfiguration(_ configuration: UserConfiguration, recipient identity: UUID) async throws {}
+        func publishUserConfiguration(_ configuration: SessionModels.UserConfiguration, recipient secretName: String, recipient identity: UUID) async throws {}
         func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {}
         
         func findConfiguration(for secretName: String) async throws -> UserConfiguration {
@@ -152,11 +148,11 @@ actor SessionIdentityTests {
         
         // Required SessionTransport methods
         func updateOneTimeKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedOneTimePublicKey]) async throws {}
-        func updateOneTimePQKemKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedPQKemOneTimeKey]) async throws {}
+        func updateOneTimeMLKEMKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedMLKEMOneTimeKey]) async throws {}
         func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
         func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
         func publishRotatedKeys(for secretName: String, deviceId: String, rotated keys: RotatedPublicKeys) async throws {}
-        func createUploadPacket(secretName: String, deviceId: UUID, recipient: MessageRecipient, metadata: Document) async throws {}
+        func createUploadPacket(secretName: String, deviceId: UUID, recipient: MessageRecipient, metadata: Data) async throws {}
     }
     
     // MARK: - Helper Methods
@@ -181,9 +177,7 @@ actor SessionIdentityTests {
         let sessionUser = SessionUser(
             secretName: "test-user",
             deviceId: bundle.deviceKeys.deviceId,
-            deviceKeys: bundle.deviceKeys,
-            metadata: .init()
-        )
+            deviceKeys: bundle.deviceKeys)
         
         let databaseEncryptionKey = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
         
@@ -201,7 +195,7 @@ actor SessionIdentityTests {
         let saltData = try await store.fetchLocalDeviceSalt(keyData: passwordData)
         let symmetricKey = await crypto.deriveStrictSymmetricKey(data: passwordData, salt: saltData)
         
-        let data = try BSONEncoder().encodeData(sessionContext)
+        let data = try BinaryEncoder().encode(sessionContext)
         let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey)
         try await store.createLocalSessionContext(encryptedData!)
         await session.setSessionContext(sessionContext)
@@ -220,20 +214,20 @@ actor SessionIdentityTests {
         
         // Get one-time keys if available
         let oneTimeKey = bundle.userConfiguration.signedOneTimePublicKeys.first
-        let pqKemKey = bundle.userConfiguration.signedPQKemOneTimePublicKeys.first
+        let mlKEMKey = bundle.userConfiguration.signedMLKEMOneTimePublicKeys.first
         
         // Verify and extract the actual keys
         let verifiedOneTimeKey = oneTimeKey != nil ? try oneTimeKey!.verified(using: signingPublicKey) : nil
-        let verifiedPQKemKey = pqKemKey != nil ? try pqKemKey!.verified(using: signingPublicKey) : nil
+        let verifiedMLKEMKey = mlKEMKey != nil ? try mlKEMKey!.verified(using: signingPublicKey) : nil
         
-        guard let verifiedPQKemKey = verifiedPQKemKey else {
+        guard let verifiedMLKEMKey = verifiedMLKEMKey else {
             throw PQSSession.SessionErrors.configurationError
         }
         
         return try await session.createEncryptableSessionIdentityModel(
             with: deviceConfig,
             oneTimePublicKey: verifiedOneTimeKey,
-            pqKemPublicKey: verifiedPQKemKey,
+            mlKEMPublicKey: verifiedMLKEMKey,
             for: secretName,
             associatedWith: bundle.deviceKeys.deviceId,
             new: 123
@@ -253,13 +247,13 @@ actor SessionIdentityTests {
         
         // Get one-time keys if available
         let oneTimeKey = bundle.userConfiguration.signedOneTimePublicKeys.first
-        let pqKemKey = bundle.userConfiguration.signedPQKemOneTimePublicKeys.first
+        let mlKEMKey = bundle.userConfiguration.signedMLKEMOneTimePublicKeys.first
         
         // Verify and extract the actual keys
         let verifiedOneTimeKey = oneTimeKey != nil ? try oneTimeKey!.verified(using: signingPublicKey) : nil
-        let verifiedPQKemKey = pqKemKey != nil ? try pqKemKey!.verified(using: signingPublicKey) : nil
+        let verifiedMLKEMKey = mlKEMKey != nil ? try mlKEMKey!.verified(using: signingPublicKey) : nil
         
-        guard let verifiedPQKemKey = verifiedPQKemKey else {
+        guard let verifiedMLKEMKey = verifiedMLKEMKey else {
             throw PQSSession.SessionErrors.configurationError
         }
         
@@ -275,7 +269,7 @@ actor SessionIdentityTests {
                 sessionContextId: 123,
                 longTermPublicKey: deviceConfig.longTermPublicKey,
                 signingPublicKey: deviceConfig.signingPublicKey,
-                pqKemPublicKey: verifiedPQKemKey,
+                mlKEMPublicKey: verifiedMLKEMKey,
                 oneTimePublicKey: verifiedOneTimeKey,
                 state: nil,
                 deviceName: deviceName,

@@ -82,17 +82,16 @@ public protocol EventReceiver: Sendable {
     ///   validation failures.
     func createdContact(_ contact: Contact) async throws
 
-    /// Called when a contact is removed from the system.
+    /// Call when a recipient(Contact, Channel) is removed from the system.
     ///
-    /// This method is invoked when a contact has been permanently removed from the
+    /// This method is invoked when a recipient wants to be permanently removed from the
     /// local contact database. Use this method to clean up contact-related UI components,
     /// remove cached data, or perform any necessary cleanup operations.
     ///
-    /// - Parameter secretName: The secret name of the contact that was removed. This
-    ///   identifier can be used to clean up any references to the contact.
+    /// - Parameter MessageRecipient: The the recipeint indicating the message type.
     /// - Throws: An error if the operation fails, such as database errors or
     ///   cleanup failures.
-    func removedContact(_ secretName: String) async throws
+    func removedCommunication(_ type: MessageRecipient) async throws
 
     /// Synchronizes a contact with the remote system, optionally requesting friendship.
     ///
@@ -157,4 +156,14 @@ public protocol EventReceiver: Sendable {
     ///     This set represents the current members of the communication channel.
     /// - Returns: An asynchronous operation that completes when the event has been processed.
     func updatedCommunication(_ model: BaseCommunication, members: Set<String>) async
+    
+    /// Called when a channel's BaseCommunication Model is created
+    ///
+    /// This method is invoked when a Channel's BaseCommunication  Model has been created.
+    ///
+    /// - Parameters:
+    ///   - model: The `BaseCommunication` model that was updated. Contains the
+    ///     updated communication information and settings.
+    /// - Returns: An asynchronous operation that completes when the event has been processed.
+    func createdChannel(_ model: BaseCommunication) async
 }

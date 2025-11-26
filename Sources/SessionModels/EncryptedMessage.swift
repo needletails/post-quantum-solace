@@ -14,16 +14,9 @@
 //  post-quantum cryptographic session management capabilities.
 //
 //
-import BSON
+
 import DoubleRatchetKit
 import Foundation
-import NeedleTailCrypto
-import NIOConcurrencyHelpers
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
-import Crypto
-#endif
 
 /// A model representing an encrypted message stored locally on a device.
 ///
@@ -33,7 +26,7 @@ import Crypto
 ///
 /// ## Key Features
 /// - **Local Storage**: Designed for device-local persistence, not network transmission
-/// - **Encrypted Content**: Message payload is encrypted using symmetric encryption with BSON serialization
+/// - **Encrypted Content**: Message payload is encrypted using symmetric encryption with Binary serialization
 /// - **Thread-Safe**: Uses locks to ensure thread safety during encryption/decryption operations
 /// - **Metadata Preservation**: Keeps essential metadata unencrypted for database operations
 /// - **Concurrency Support**: Implements `@unchecked Sendable` for safe concurrent access
@@ -88,12 +81,12 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     public var data: Data
 
     /// Thread-safe lock for protecting encryption/decryption operations.
-    private let lock = NIOLock()
+    private let lock = NSLock()
 
     /// Cryptographic operations handler.
     private let crypto = NeedleTailCrypto()
 
-    /// Coding keys for BSON serialization with obfuscated field names.
+    /// Coding keys for Binary serialization with obfuscated field names.
     enum CodingKeys: String, CodingKey, Codable, Sendable {
         case id
         case communicationId = "a"
@@ -164,7 +157,7 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
         /// The unique identifier for the sender's device identity.
         public let senderDeviceId: UUID
 
-        /// Coding keys for BSON serialization with obfuscated field names.
+        /// Coding keys for Binary serialization with obfuscated field names.
         private enum CodingKeys: String, CodingKey, Codable, Sendable {
             case id = "a"
             case base = "b"
@@ -210,7 +203,7 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     /// Initializes a new `EncryptedMessage` instance with properties to be encrypted.
     ///
     /// This initializer creates a new encrypted message by serializing the provided properties
-    /// to BSON format and then encrypting them using the specified symmetric key.
+    /// to Binary format and then encrypting them using the specified symmetric key.
     ///
     /// - Parameters:
     ///   - id: The unique identifier for the message.
@@ -236,7 +229,7 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
         self.sharedId = sharedId
         self.sequenceNumber = sequenceNumber
 
-        let data = try BSONEncoder().encodeData(props)
+        let data = try BinaryEncoder().encode(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.encryptionFailed
         }
@@ -275,27 +268,26 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     /// Asynchronously decrypts the properties of the message using the provided symmetric key.
     ///
     /// This method performs the actual decryption operation in a thread-safe manner. It decrypts
-    /// the BSON-serialized data and deserializes it back into `UnwrappedProps`.
+    /// the Binary-serialized data and deserializes it back into `UnwrappedProps`.
     ///
     /// - Parameter symmetricKey: The symmetric key used for decryption.
     /// - Returns: The decrypted properties of the message.
     /// - Throws: `CryptoError.decryptionFailed` if decryption fails.
     /// - Note: This method is thread-safe and uses locks to prevent concurrent access issues.
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
-        lock.lock()
-        defer {
-            lock.unlock()
+        try lock.withLock { [weak self] in
+            guard let self else { throw CryptoError.decryptionFailed }
+            guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
+                throw CryptoError.decryptionFailed
+            }
+            return try BinaryDecoder().decode(UnwrappedProps.self, from: decrypted)
         }
-        guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
-            throw CryptoError.decryptionFailed
-        }
-        return try BSONDecoder().decodeData(UnwrappedProps.self, from: decrypted)
     }
 
     /// Asynchronously updates the properties of the model using the provided symmetric key.
     ///
     /// This method re-encrypts the message with new properties. It's thread-safe and handles
-    /// the complete encryption cycle including BSON serialization.
+    /// the complete encryption cycle including Binary serialization.
     ///
     /// - Parameters:
     ///   - symmetricKey: The symmetric key used for encryption.
@@ -304,17 +296,17 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     /// - Throws: `CryptoError.encryptionFailed` if encryption fails.
     /// - Note: This method is thread-safe and uses locks to prevent concurrent access issues.
     public func updateProps(symmetricKey: SymmetricKey, props: UnwrappedProps) async throws -> UnwrappedProps? {
-        lock.lock()
         do {
-            let data = try BSONEncoder().encodeData(props)
-            guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-                throw CryptoError.encryptionFailed
+            try lock.withLock { [weak self] in
+                guard let self else { throw CryptoError.encryptionFailed }
+                let data = try BinaryEncoder().encode(props)
+                guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
+                    throw CryptoError.encryptionFailed
+                }
+                self.data = encryptedData
             }
-            self.data = encryptedData
-            lock.unlock()
             return try await decryptProps(symmetricKey: symmetricKey)
         } catch {
-            lock.unlock()
             throw error
         }
     }
@@ -331,16 +323,15 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     /// - Throws: `CryptoError.encryptionFailed` if encryption fails.
     /// - Note: This method is thread-safe and uses locks to prevent concurrent access issues.
     public func updateMessage(with props: UnwrappedProps, symmetricKey: SymmetricKey) async throws -> EncryptedMessage {
-        lock.lock()
-        defer {
-            lock.unlock()
+        try lock.withLock { [weak self] in
+            guard let self else { throw CryptoError.encryptionFailed }
+            let data = try BinaryEncoder().encode(props)
+            guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
+                throw CryptoError.encryptionFailed
+            }
+            self.data = encryptedData
+            return self
         }
-        let data = try BSONEncoder().encodeData(props)
-        guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-            throw CryptoError.encryptionFailed
-        }
-        self.data = encryptedData
-        return self
     }
 
     /// Creates a decrypted model of the specified type from the encrypted message.
@@ -382,11 +373,11 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     ///   - key: The key under which the metadata will be stored in the message's metadata dictionary.
     /// - Returns: The updated decrypted properties, or `nil` if the operation fails.
     /// - Throws: `CryptoError.decryptionFailed` or `CryptoError.encryptionFailed` if the operation fails.
-    public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Data, with key: String) async throws -> UnwrappedProps? {
-        var props = try await decryptProps(symmetricKey: symmetricKey)
-        props.message.metadata[key] = metadata
-        return try await updateProps(symmetricKey: symmetricKey, props: props)
-    }
+//    public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Data, with key: String) async throws -> UnwrappedProps? {
+//        var props = try await decryptProps(symmetricKey: symmetricKey)
+//        props.message.metadata = metadata
+//        return try await updateProps(symmetricKey: symmetricKey, props: props)
+//    }
 
     /// Asynchronously updates the metadata of the message properties and returns the updated `EncryptedMessage`.
     ///
@@ -399,11 +390,11 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     ///   - key: The key under which the metadata will be stored in the message's metadata dictionary.
     /// - Returns: The updated `EncryptedMessage` instance.
     /// - Throws: `CryptoError.decryptionFailed` or `CryptoError.encryptionFailed` if the operation fails.
-    public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Data, with key: String) async throws -> EncryptedMessage {
-        var props = try await decryptProps(symmetricKey: symmetricKey)
-        props.message.metadata[key] = metadata
-        return try await updateMessage(with: props, symmetricKey: symmetricKey)
-    }
+//    public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Data, with key: String) async throws -> EncryptedMessage {
+//        var props = try await decryptProps(symmetricKey: symmetricKey)
+//        props.message.metadata[key] = metadata
+//        return try await updateMessage(with: props, symmetricKey: symmetricKey)
+//    }
 
     /// Compares two `EncryptedMessage` instances for equality.
     ///
@@ -476,8 +467,8 @@ public struct CryptoMessage: Codable, Sendable {
     /// The text content of the message.
     public var text: String
 
-    /// Metadata associated with the message, stored as a BSON document for flexibility.
-    public var metadata: Document
+    /// Metadata associated with the message, stored as Foundation Data for flexibility.
+    public var metadata: Data
 
     /// The recipient of the message.
     public var recipient: MessageRecipient
@@ -496,7 +487,7 @@ public struct CryptoMessage: Codable, Sendable {
     /// The date and time when the message was last updated.
     public var updatedDate: Date?
 
-    /// Coding keys for BSON serialization with obfuscated field names.
+    /// Coding keys for Binary serialization with obfuscated field names.
     private enum CodingKeys: String, CodingKey, Codable, Sendable {
         case text = "a"
         case metadata = "b"
@@ -518,7 +509,7 @@ public struct CryptoMessage: Codable, Sendable {
     ///   - updatedDate: Optional date and time when the message was last updated.
     public init(
         text: String,
-        metadata: Document,
+        metadata: Data,
         recipient: MessageRecipient,
         transportInfo: Data? = nil,
         sentDate: Date,

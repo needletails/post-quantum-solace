@@ -14,10 +14,9 @@
 //  post-quantum cryptographic session management capabilities.
 //
 //
-import BSON
-import DoubleRatchetKit
+
 import Foundation
-import NeedleTailCrypto
+import DoubleRatchetKit
 
 /// A struct representing a signed ratchet message that provides cryptographic authenticity
 /// and integrity verification for ratchet messages in the post-quantum Solace protocol.
@@ -63,7 +62,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
     /// Initializes a new `SignedRatchetMessage` instance by signing the provided ratchet message.
     ///
     /// This initializer creates a digital signature of the ratchet message using the provided
-    /// private key. The signature is created over the BSON-encoded representation of the message
+    /// private key. The signature is created over the Binary-encoded representation of the message
     /// to ensure data integrity.
     ///
     /// - Parameters:
@@ -72,7 +71,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
     ///   - signingPrivateKey: The raw representation of the Curve25519 private signing key
     ///     used to create the digital signature. This key should correspond to the sender's identity.
     /// - Throws:
-    ///   - `BSONEncoderError` if the message cannot be encoded to BSON format
+    ///   - `BinaryEncoderError` if the message cannot be encoded to Binary format
     ///   - `CryptoError` if the signing operation fails due to invalid key or cryptographic issues
     ///   - `Curve25519Error` if the private key is invalid or corrupted
     public init(
@@ -81,7 +80,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
     ) throws {
         signed = try Signed(
             message: message,
-            signingPrivateKey: Curve25519SigningPrivateKey(rawRepresentation: data)
+            signingPrivateKey: Curve25519.Signing.PrivateKey(rawRepresentation: data)
         )
     }
 
@@ -91,7 +90,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
     /// This nested struct contains the encoded message data and its corresponding digital
     /// signature, providing methods to verify the authenticity and integrity of the message.
     public struct Signed: Codable & Sendable {
-        /// The BSON-encoded data of the original ratchet message.
+        /// The Binary-encoded data of the original ratchet message.
         ///
         /// This data represents the serialized form of the `RatchetMessage` that was signed.
         /// The signature was created over this exact data to ensure integrity.
@@ -114,20 +113,20 @@ public struct SignedRatchetMessage: Codable & Sendable {
         /// Initializes a new `Signed` instance by encoding and signing the provided message.
         ///
         /// This initializer performs two operations:
-        /// 1. Encodes the ratchet message to BSON format for serialization
+        /// 1. Encodes the ratchet message to Binary format for serialization
         /// 2. Creates a digital signature over the encoded data using the private key
         ///
         /// - Parameters:
         ///   - message: The `RatchetMessage` to be encoded and signed.
         ///   - signingPrivateKey: The Curve25519 private key used to create the signature.
         /// - Throws:
-        ///   - `BSONEncoderError` if the message cannot be encoded to BSON format
+        ///   - `BinaryEncoderError` if the message cannot be encoded to Binary format
         ///   - `CryptoError` if the signing operation fails
         init(
             message: RatchetMessage,
-            signingPrivateKey: Curve25519SigningPrivateKey
+            signingPrivateKey: Curve25519.Signing.PrivateKey
         ) throws {
-            data = try BSONEncoder().encodeData(message)
+            data = try BinaryEncoder().encode(message)
             signature = try signingPrivateKey.signature(for: data)
         }
 
@@ -142,7 +141,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
         /// - Returns: `true` if the signature is valid and the message data hasn't been
         ///   tampered with, `false` otherwise.
         /// - Throws: `CryptoError` if the verification process fails due to cryptographic issues
-        public func verifySignature(using publicKey: Curve25519SigningPublicKey) throws -> Bool {
+        public func verifySignature(using publicKey: Curve25519.Signing.PublicKey) throws -> Bool {
             publicKey.isValidSignature(signature, for: data)
         }
     }

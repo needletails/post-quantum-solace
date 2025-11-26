@@ -17,11 +17,7 @@
 import Foundation
 import NeedleTailAsyncSequence
 import SessionModels
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 extension TaskProcessor {
     /// Increments and returns the internal sequence identifier atomically.
@@ -57,6 +53,8 @@ extension TaskProcessor {
         try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
         try await cache.createJob(job)
         
+        // Start processing if not already running
+        // This ensures jobs are processed even if the previous processor finished
         if !isRunning {
             try await attemptTaskSequence(session: session)
         }
@@ -81,11 +79,13 @@ extension TaskProcessor {
                 try await attemptTaskSequence(session: session)
             }
         } else {
+            // Load all jobs first, then start processing once
             for job in try await cache.fetchJobs() {
                 try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
-                if let session {
-                    try await attemptTaskSequence(session: session)
-                }
+            }
+            // Start processing after all jobs are loaded
+            if let session {
+                try await attemptTaskSequence(session: session)
             }
         }
     }
@@ -212,28 +212,61 @@ extension TaskProcessor {
                 }
 
                 if await jobConsumer.deque.isEmpty {
-                    await jobConsumer.gracefulShutdown()
-                    await setIsRunning(false)
+                    // Check if there are more jobs in cache that need to be loaded
+                    let cachedJobs = try await cache.fetchJobs()
+                    if !cachedJobs.isEmpty {
+                        // Load remaining jobs from cache
+                        for job in cachedJobs {
+                            try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
+                        }
+                        // Continue processing - don't shut down yet
+                    } else {
+                        // No more jobs in cache or deque, safe to shut down
+                        await jobConsumer.gracefulShutdown()
+                        await setIsRunning(false)
+                    }
                 }
 
             case .consumed:
                 await setIsRunning(false)
-                try await loadTasks(nil, cache: cache, symmetricKey: symmetricKey)
+                try await loadTasks(nil, cache: cache, symmetricKey: symmetricKey, session: session)
             }
         }
 
+        // After loop ends, check if there are more jobs to process
         if await jobConsumer.deque.isEmpty {
-            await jobConsumer.gracefulShutdown()
-            await setIsRunning(false)
+            let cachedJobs = try await cache.fetchJobs()
+            if !cachedJobs.isEmpty {
+                // Load remaining jobs from cache
+                for job in cachedJobs {
+                    try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
+                }
+                // Restart processing if we loaded jobs
+                let dequeIsEmpty = await jobConsumer.deque.isEmpty
+                if !dequeIsEmpty {
+                    try await attemptTaskSequence(session: session)
+                }
+            } else {
+                await jobConsumer.gracefulShutdown()
+                await setIsRunning(false)
+            }
         }
     }
     
 
 
     /// Errors specific to job processing operations.
-    enum JobProcessorErrors: Error {
+    enum JobProcessorErrors: Error, LocalizedError {
         /// Indicates that a job references a missing session identity.
         case missingIdentity
+        
+        public var errorDescription: String? {
+            "Job references a missing session identity"
+        }
+        
+        public var recoverySuggestion: String? {
+            "Ensure the session identity exists before processing the job"
+        }
     }
 }
 

@@ -19,16 +19,10 @@
 //  encryptable tasks with priority and scheduling, and secure job models with
 //  encryption/decryption capabilities.
 //
-import BSON
-import DoubleRatchetKit
+
 import Foundation
+import DoubleRatchetKit
 import NeedleTailAsyncSequence
-import NeedleTailCrypto
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
-import Crypto
-#endif
 
 /// A struct representing an outbound task message to be sent to a recipient.
 ///
@@ -281,7 +275,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
     ) throws {
         self.id = id
         let crypto = NeedleTailCrypto()
-        let data = try BSONEncoder().encodeData(props)
+        let data = try BinaryEncoder().encode(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.encryptionFailed
         }
@@ -306,7 +300,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.decryptionFailed
         }
-        return try BSONDecoder().decodeData(UnwrappedProps.self, from: decrypted)
+        return try BinaryDecoder().decode(UnwrappedProps.self, from: decrypted)
     }
 
     /// Asynchronously updates the properties of the model with new encrypted data.
@@ -317,7 +311,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
     /// - Throws: An error if encryption fails.
     public func updateProps(symmetricKey: SymmetricKey, props: UnwrappedProps) async throws -> UnwrappedProps? {
         let crypto = NeedleTailCrypto()
-        let data = try BSONEncoder().encodeData(props)
+        let data = try BinaryEncoder().encode(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.encryptionFailed
         }
@@ -346,7 +340,15 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
     }
 
     /// Private error types for internal use within the JobModel.
-    private enum Errors: Error {
+    private enum Errors: Error, LocalizedError {
         case propsError
+        
+        public var errorDescription: String? {
+            "Error occurred while retrieving or updating job properties"
+        }
+        
+        public var failureReason: String? {
+            "Decryption failed or properties cannot be accessed"
+        }
     }
 }

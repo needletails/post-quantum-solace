@@ -18,20 +18,20 @@
 ///
 /// This struct contains the identifiers for both sender and recipient cryptographic keys
 /// used in the Double Ratchet protocol. It supports both classical (Curve25519) and
-/// post-quantum (Kyber) key types for secure message synchronization.
+/// post-quantum (MLKEM) key types for secure message synchronization.
 ///
 /// ## Key Components
-/// - **Sender Keys**: Optional identifiers for the sender's Curve25519 and Kyber keys
-/// - **Recipient Keys**: Required identifiers for the recipient's Curve25519 and Kyber keys
+/// - **Sender Keys**: Optional identifiers for the sender's Curve25519 and MLKEM keys
+/// - **Recipient Keys**: Required identifiers for the recipient's Curve25519 and MLKEM keys
 /// - **Synchronization**: Used to coordinate key updates and message ordering
 ///
 /// ## Usage
 /// ```swift
 /// let keyIds = SynchronizationKeyIdentities(
 ///     senderCurveId: "curve-sender-123",
-///     senderKyberId: "kyber-sender-456",
+///     senderMLKEMId: "mlKEM-sender-456",
 ///     recipientCurveId: "curve-recipient-789",
-///     recipientKyberId: "kyber-recipient-012"
+///     recipientMLKEMId: "mlKEM-recipient-012"
 /// )
 /// ```
 ///
@@ -40,7 +40,7 @@
 /// All properties are immutable or use value semantics for thread safety.
 ///
 /// ## Serialization
-/// Uses obfuscated coding keys for BSON serialization to enhance security
+/// Uses obfuscated coding keys for Binary serialization to enhance security
 /// and reduce payload size during network transmission.
 public struct SynchronizationKeyIdentities: Sendable, Codable {
     /// Optional identifier for the sender's Curve25519 public key.
@@ -50,12 +50,12 @@ public struct SynchronizationKeyIdentities: Sendable, Codable {
     /// or if using a different key type.
     public var senderCurveId: String?
 
-    /// Optional identifier for the sender's Kyber public key.
+    /// Optional identifier for the sender's MLKEM public key.
     ///
-    /// This identifier is used to track the specific Kyber key used by the sender
-    /// for post-quantum key exchange. It may be `nil` if the sender's Kyber key is not
+    /// This identifier is used to track the specific MLKEM key used by the sender
+    /// for post-quantum key exchange. It may be `nil` if the sender's MLKEM key is not
     /// yet established or if using a different key type.
-    public var senderKyberId: String?
+    public var senderMLKEMId: String?
 
     /// Required identifier for the recipient's Curve25519 public key.
     ///
@@ -63,36 +63,46 @@ public struct SynchronizationKeyIdentities: Sendable, Codable {
     /// should use for message decryption. It is required for proper message routing.
     public let recipientCurveId: String
 
-    /// Required identifier for the recipient's Kyber public key.
+    /// Required identifier for the recipient's MLKEM public key.
     ///
-    /// This identifier is used to identify the specific Kyber key that the recipient
+    /// This identifier is used to identify the specific MLKEM key that the recipient
     /// should use for post-quantum key exchange. It is required for proper message routing.
-    public let recipientKyberId: String
+    public let recipientMLKEMId: String
 
-    /// Coding keys for BSON serialization with obfuscated field names.
+    /// Coding keys for Binary serialization with obfuscated field names.
     private enum CodingKeys: String, CodingKey, Codable, Sendable {
         case senderCurveId = "a"
-        case senderKyberId = "b"
+        case senderMLKEMId = "b"
         case recipientCurveId = "c"
-        case recipientKyberId = "d"
+        case recipientMLKEMId = "d"
     }
 
     /// Initializes a new instance of `SynchronizationKeyIdentities`.
     ///
     /// - Parameters:
     ///   - senderCurveId: Optional identifier for the sender's Curve25519 key
-    ///   - senderKyberId: Optional identifier for the sender's Kyber key
+    ///   - senderMLKEMId: Optional identifier for the sender's MLKEM key
     ///   - recipientCurveId: Required identifier for the recipient's Curve25519 key
-    ///   - recipientKyberId: Required identifier for the recipient's Kyber key
+    ///   - recipientMLKEMId: Required identifier for the recipient's MLKEM key
     public init(
         senderCurveId: String? = nil,
-        senderKyberId: String? = nil,
+        senderMLKEMId: String? = nil,
         recipientCurveId: String,
-        recipientKyberId: String
+        recipientMLKEMId: String
     ) {
         self.senderCurveId = senderCurveId
-        self.senderKyberId = senderKyberId
+        self.senderMLKEMId = senderMLKEMId
         self.recipientCurveId = recipientCurveId
-        self.recipientKyberId = recipientKyberId
+        self.recipientMLKEMId = recipientMLKEMId
+    }
+}
+
+public enum TransportEvent: Sendable, Codable {
+    case sessionReestablishment
+    case synchronizeOneTimeKeys(SynchronizationKeyIdentities)
+    
+    enum CodingKeys: String, CodingKey {
+        case sessionReestablishment = "a"
+        case synchronizeOneTimeKeys = "b"
     }
 }

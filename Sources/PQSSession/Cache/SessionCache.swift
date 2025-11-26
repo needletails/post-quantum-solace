@@ -17,11 +17,7 @@ import DoubleRatchetKit
 import Foundation
 import SessionEvents
 import SessionModels
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 /// A protocol defining the requirements for a cache synchronizer.
 protocol SessionCacheSynchronizer: Sendable {
@@ -612,7 +608,7 @@ public actor SessionCache: PQSSessionStore {
 
     // MARK: - Error Handling
 
-    public enum CacheErrors: Error {
+    public enum CacheErrors: Error, LocalizedError {
         case localDeviceConfigurationIsNil
         case localDeviceSaltIsNil
         case sessionIdentityNotFound
@@ -624,68 +620,68 @@ public actor SessionCache: PQSSessionStore {
         case synchronizationFailed
         case invalidData
 
-        public var description: String {
+        public var errorDescription: String? {
             switch self {
             case .localDeviceConfigurationIsNil:
-                "Local device configuration is nil"
+                return "Local device configuration is nil"
             case .localDeviceSaltIsNil:
-                "Local device salt is nil"
+                return "Local device salt is nil"
             case .sessionIdentityNotFound:
-                "Session identity not found in cache"
+                return "Session identity not found in cache"
             case .messageNotFound:
-                "Message not found in cache"
+                return "Message not found in cache"
             case .contactNotFound:
-                "Contact not found in cache"
+                return "Contact not found in cache"
             case .communicationTypeNotFound:
-                "Communication type not found in cache"
+                return "Communication type not found in cache"
             case .jobNotFound:
-                "Job not found in cache"
+                return "Job not found in cache"
             case .mediaJobNotFound:
-                "Media job not found in cache"
+                return "Media job not found in cache"
             case .synchronizationFailed:
-                "Failed to synchronize with external system"
+                return "Failed to synchronize with external system"
             case .invalidData:
-                "Invalid data provided"
+                return "Invalid data provided"
             }
         }
 
-        public var reason: String {
+        public var failureReason: String? {
             switch self {
             case .localDeviceConfigurationIsNil:
-                "The local device configuration was not properly initialized"
+                return "The local device configuration was not properly initialized"
             case .localDeviceSaltIsNil:
-                "The local device salt was not found in the store"
+                return "The local device salt was not found in the store"
             case .sessionIdentityNotFound:
-                "The requested session identity does not exist in the cache"
+                return "The requested session identity does not exist in the cache"
             case .messageNotFound:
-                "The requested message does not exist in the cache"
+                return "The requested message does not exist in the cache"
             case .contactNotFound:
-                "The requested contact does not exist in the cache"
+                return "The requested contact does not exist in the cache"
             case .communicationTypeNotFound:
-                "The requested communication type does not exist in the cache"
+                return "The requested communication type does not exist in the cache"
             case .jobNotFound:
-                "The requested job does not exist in the cache"
+                return "The requested job does not exist in the cache"
             case .mediaJobNotFound:
-                "The requested media job does not exist in the cache"
+                return "The requested media job does not exist in the cache"
             case .synchronizationFailed:
-                "The synchronization operation failed due to network or system issues"
+                return "The synchronization operation failed due to network or system issues"
             case .invalidData:
-                "The provided data is invalid or corrupted"
+                return "The provided data is invalid or corrupted"
             }
         }
 
-        public var suggestion: String {
+        public var recoverySuggestion: String? {
             switch self {
             case .localDeviceConfigurationIsNil:
-                "Try creating a new local session context"
+                return "Try creating a new local session context"
             case .localDeviceSaltIsNil:
-                "Try regenerating the device salt"
+                return "Try regenerating the device salt"
             case .sessionIdentityNotFound, .messageNotFound, .contactNotFound, .communicationTypeNotFound, .jobNotFound, .mediaJobNotFound:
-                "Try refreshing the cache or checking if the item exists in the store"
+                return "Try refreshing the cache or checking if the item exists in the store"
             case .synchronizationFailed:
-                "Check your network connection and try again"
+                return "Check your network connection and try again"
             case .invalidData:
-                "Verify the data format and try again"
+                return "Verify the data format and try again"
             }
         }
     }

@@ -13,15 +13,11 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import BSON
+
 import DoubleRatchetKit
 import Foundation
 import SessionModels
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
 
 /// Metadata structure for signed ratchet messages that contains sensitive information
 /// used to prepare messages for network transmission.
@@ -71,7 +67,9 @@ public struct SignedRatchetMessageMetadata: Sendable {
     /// different devices and sessions.
     public let sharedMessageId: String
 
-    public var synchronizationKeyIds: SynchronizationKeyIdentities?
+    /// An enum contains events that PQSSession needs to communicate with the transport
+    ///
+    public let transportEvent: TransportEvent?
 
     /// Initializes a new instance of `SignedRatchetMessageMetadata`.
     ///
@@ -87,14 +85,14 @@ public struct SignedRatchetMessageMetadata: Sendable {
         recipient: MessageRecipient,
         transportMetadata: Data?,
         sharedMessageId: String,
-        synchronizationKeyIds: SynchronizationKeyIdentities?
+        transportEvent: TransportEvent?
     ) {
         self.secretName = secretName
         self.deviceId = deviceId
         self.recipient = recipient
         self.transportMetadata = transportMetadata
         self.sharedMessageId = sharedMessageId
-        self.synchronizationKeyIds = synchronizationKeyIds
+        self.transportEvent = transportEvent
     }
 }
 
@@ -138,7 +136,6 @@ public protocol SessionTransport: Sendable {
     ///   - metadata: Metadata containing recipient information and routing details
     /// - Throws: An error if the message could not be sent (e.g., network failure, invalid recipient)
     func sendMessage(_ message: SignedRatchetMessage,
-
                      metadata: SignedRatchetMessageMetadata) async throws
 
     /// Retrieves the user configuration for a given secret name from the network.
@@ -162,7 +159,7 @@ public protocol SessionTransport: Sendable {
     ///   - configuration: The user configuration to be published to the network
     ///   - identity: The UUID of the recipient identity for the configuration
     /// - Throws: An error if the configuration could not be published
-    func publishUserConfiguration(_ configuration: UserConfiguration, recipient identity: UUID) async throws
+    func publishUserConfiguration(_ configuration: UserConfiguration, recipient secretName: String, recipient identity: UUID) async throws
 
     /// Fetches one-time keys for a specific user and device.
     ///
@@ -185,7 +182,7 @@ public protocol SessionTransport: Sendable {
     /// - Parameters:
     ///   - secretName: The secret name of the user
     ///   - deviceId: The device identifier for which to fetch key identities
-    ///   - type: The type of keys to fetch (e.g., Curve25519, PQKEM)
+    ///   - type: The type of keys to fetch (e.g., Curve25519, MLKEM)
     /// - Returns: An array of UUIDs representing the available one-time key identities
     /// - Throws: An error if the key identities could not be retrieved
     func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID]
@@ -213,7 +210,7 @@ public protocol SessionTransport: Sendable {
     ///   - deviceId: The device identifier for which to update keys
     ///   - keys: An array of signed post-quantum KEM one-time keys to add
     /// - Throws: An error if the keys could not be updated
-    func updateOneTimePQKemKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedPQKemOneTimeKey]) async throws
+    func updateOneTimeMLKEMKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedMLKEMOneTimeKey]) async throws
 
     /// Deletes multiple one-time keys in a batch operation.
     ///
@@ -223,7 +220,7 @@ public protocol SessionTransport: Sendable {
     /// - Parameters:
     ///   - secretName: The secret name of the user
     ///   - id: The identifier for the batch of keys to delete
-    ///   - type: The type of keys to delete (e.g., Curve25519, PQKEM)
+    ///   - type: The type of keys to delete (e.g., Curve25519, MLKEM)
     /// - Throws: An error if the keys could not be deleted
     func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
 
@@ -235,7 +232,7 @@ public protocol SessionTransport: Sendable {
     /// - Parameters:
     ///   - secretName: The secret name of the user
     ///   - id: The identifier of the specific key to delete
-    ///   - type: The type of key to delete (e.g., Curve25519, PQKEM)
+    ///   - type: The type of key to delete (e.g., Curve25519, MLKEM)
     /// - Throws: An error if the key could not be deleted
     func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
 
@@ -270,6 +267,6 @@ public protocol SessionTransport: Sendable {
         secretName: String,
         deviceId: UUID,
         recipient: MessageRecipient,
-        metadata: Document
+        metadata: Data
     ) async throws
 }

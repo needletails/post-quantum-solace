@@ -14,7 +14,6 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
-import BSON
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
@@ -53,7 +52,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     public func updateSessionIdentity(_ identity: DoubleRatchetKit.SessionIdentity) async throws {
         try await session?.cache?.updateSessionIdentity(identity)
     }
-
+    
     /// Fetches a private one-time key by its identifier.
     ///
     /// This method retrieves a Curve25519 one-time private key from the current session
@@ -83,7 +82,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         }
         return key
     }
-
+    
     /// Updates the one-time key for the current session.
     ///
     /// This method performs key rotation by generating a new Curve25519 one-time key pair
@@ -121,43 +120,43 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 guard var sessionContext = await session.sessionContext else {
                     throw PQSSession.SessionErrors.sessionNotInitialized
                 }
-
+                
                 let newID = UUID()
                 let keypair = crypto.generateCurve25519PrivateKey()
                 let privateKeyRep = try CurvePrivateKey(id: newID, keypair.rawRepresentation)
                 let publicKey = try CurvePublicKey(id: newID, keypair.publicKey.rawRepresentation)
-
+                
                 var deviceKeys = sessionContext.sessionUser.deviceKeys
                 deviceKeys.oneTimePrivateKeys.removeAll { $0.id == id }
                 deviceKeys.oneTimePrivateKeys.append(privateKeyRep)
-
+                
                 sessionContext.sessionUser.deviceKeys = deviceKeys
                 sessionContext.updateSessionUser(sessionContext.sessionUser)
-
+                
                 guard var signedKeys = await session
                     .sessionContext?
                     .activeUserConfiguration
                     .signedOneTimePublicKeys
                 else { return }
-
-                let signingKey = try Curve25519SigningPrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
+                
+                let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
                 let newSignedKey = try UserConfiguration.SignedOneTimePublicKey(key: publicKey, deviceId: sessionContext.sessionUser.deviceId, signingKey: signingKey)
-
+                
                 signedKeys.removeAll { $0.id == id }
                 signedKeys.append(newSignedKey)
-
+                
                 // Update the user configuration with the new signed keys
                 sessionContext.activeUserConfiguration.signedOneTimePublicKeys = signedKeys
                 await session.setSessionContext(sessionContext)
-
+                
                 // Encrypt and persist
-                let encodedData = try BSONEncoder().encodeData(sessionContext)
+                let encodedData = try BinaryEncoder().encode(sessionContext)
                 guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: session.getAppSymmetricKey()) else {
                     throw PQSSession.SessionErrors.sessionEncryptionError
                 }
-
+                
                 try await session.cache?.updateLocalSessionContext(encryptedConfig)
-
+                
                 try await session.transportDelegate?.updateOneTimeKeys(
                     for: sessionContext.sessionUser.secretName,
                     deviceId: sessionContext.sessionUser.deviceId.uuidString,
@@ -170,19 +169,19 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             }
         })
     }
-
+    
     private func cancelAndRemoveUpdateKeyTasks() async {
         guard !updateKeyTasks.isEmpty else { return }
         let item = updateKeyTasks.removeFirst()
         item.cancel()
     }
-
+    
     private func cancelAndRemoveDeleteKeyTasks() async {
         guard !deleteKeyTasks.isEmpty else { return }
         let item = deleteKeyTasks.removeFirst()
         item.cancel()
     }
-
+    
     /// Performs a ratchet operation based on the specified task.
     ///
     /// This method is the main entry point for cryptographic operations, routing tasks
@@ -228,9 +227,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 session: session)
         }
     }
-
+    
     // MARK: - Outbound Message Handling
-
+    
     /// Handles writing a message and performing the necessary ratchet operations.
     ///
     /// This method implements the sender side of the Double Ratchet protocol for outbound
@@ -271,135 +270,159 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     ) async throws {
         self.session = session
         var outboundTask = outboundTask
-
-
+        
         guard let sessionContext = await session.sessionContext else {
             throw PQSSession.SessionErrors.sessionNotInitialized
         }
-
+        
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
-
-        guard let sessionIdentity = try await session.cache?.fetchSessionIdentities().first(where: { $0.id == outboundTask.recipientIdentity.id }) else {
+        guard var sessionIdentity = try await session.cache?.fetchSessionIdentities().first(where: { $0.id == outboundTask.recipientIdentity.id }) else {
             throw PQSSession.SessionErrors.missingSessionIdentity
         }
-
+        
+        // If rotating keys, refresh identities to ensure we have the latest recipient keys including one-time keys
+        if await session.rotatingKeys {
+            if let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) {
+                let recipientName = props.secretName
+                do {
+                    let refreshedIdentities = try await session.refreshIdentities(secretName: recipientName, forceRefresh: true)
+                    if let refreshed = refreshedIdentities.first(where: { $0.id == outboundTask.recipientIdentity.id }) {
+                        sessionIdentity = refreshed
+                    }
+                } catch {
+                    // If refresh fails, continue with existing identity
+                    logger.log(level: .warning, message: "Failed to refresh identities during rotation: \(error)")
+                }
+            }
+        }
+        
         guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else {
             throw PQSSession.SessionErrors.propsError
         }
-
+        
         var localOneTimePrivateKey: CurvePrivateKey?
-        var localPQKemPrivateKey: PQKemPrivateKey
+        var localMLKEMPrivateKey: MLKEMPrivateKey
         var remoteLongTermPublicKey: Data
         var remoteOneTimePublicKey: CurvePublicKey?
-        var remotePQKemPublicKey: PQKemPublicKey
+        var remoteMLKEMPublicKey: MLKEMPublicKey
         var needsRemoteDeletion = false
-        var identities: SynchronizationKeyIdentities?
-
+        
         if props.state == nil {
             if let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last {
                 localOneTimePrivateKey = privateOneTimeKey
             }
             
             remoteLongTermPublicKey = props.longTermPublicKey
-            remotePQKemPublicKey = props.pqKemPublicKey
-
+            remoteMLKEMPublicKey = props.mlKEMPublicKey
+            
             if let remoteOneTimePublicKeyData = props.oneTimePublicKey {
                 remoteOneTimePublicKey = remoteOneTimePublicKeyData
             }
-
-            if let pqKemOneTimePrivateKey = sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.last {
-                localPQKemPrivateKey = pqKemOneTimePrivateKey
+            
+            if let mlKEMOneTimePrivateKey = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last {
+                localMLKEMPrivateKey = mlKEMOneTimePrivateKey
             } else {
-                localPQKemPrivateKey = sessionContext.sessionUser.deviceKeys.finalPQKemPrivateKey
+                localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
             }
-
+            
         } else {
             guard let state = props.state else {
-                throw CryptoError.propsError
+                throw DoubleRatchetKit.CryptoError.propsError
             }
-
+            
             if await session.rotatingKeys {
                 needsRemoteDeletion = true
                 if let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last {
                     localOneTimePrivateKey = privateOneTimeKey
                 }
-                if let privateKyberOneTimeKey = sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.last {
-                    localPQKemPrivateKey = privateKyberOneTimeKey
+                if let privateMLKEMOneTimeKey = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last {
+                    localMLKEMPrivateKey = privateMLKEMOneTimeKey
                 } else {
-                    localPQKemPrivateKey = sessionContext.sessionUser.deviceKeys.finalPQKemPrivateKey
+                    localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
                 }
                 await session.setRotatingKeys(false)
-            }
-
-            if try await session.rotatePQKemKeysIfNeeded() {
-                needsRemoteDeletion = true
-                if let privateKyberOneTimeKey = sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.last {
-                    localPQKemPrivateKey = privateKyberOneTimeKey
-                } else {
-                    localPQKemPrivateKey = sessionContext.sessionUser.deviceKeys.finalPQKemPrivateKey
-                }
             } else {
-                localPQKemPrivateKey = state.localPQKemPrivateKey
+                localOneTimePrivateKey = state.localOneTimePrivateKey
+                localMLKEMPrivateKey = state.localMLKEMPrivateKey
             }
-            localOneTimePrivateKey = state.localOneTimePrivateKey
-            remoteLongTermPublicKey = state.remoteLongTermPublicKey
-            remoteOneTimePublicKey = state.remoteOneTimePublicKey
-            remotePQKemPublicKey = state.remotePQKemPublicKey
+            
+            if try await session.rotateMLKEMKeysIfNeeded() && !needsRemoteDeletion {
+                needsRemoteDeletion = true
+                localOneTimePrivateKey = state.localOneTimePrivateKey
+                if let privateMLKEMOneTimeKey = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last {
+                    localMLKEMPrivateKey = privateMLKEMOneTimeKey
+                } else {
+                    localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
+                }
+            }
+            remoteLongTermPublicKey = props.longTermPublicKey
+            remoteOneTimePublicKey = props.oneTimePublicKey
+            remoteMLKEMPublicKey = props.mlKEMPublicKey
         }
-
+        
         // If we are intially attempting communication with a contact, we need to first send a session identity created message for the contact to delete their one time keys from being used again, the recipient can know what keys via key identities that are sent. This call also needs to send the sender's one time key identities so that the recipient also knows what one times to create their session with. We get the sender's next.
+        var transportEvent: TransportEvent?
         if let data = outboundTask.message.transportInfo {
             do {
-                var info = try BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: data)
-                info.senderCurveId = localOneTimePrivateKey?.id.uuidString
-                info.senderKyberId = localPQKemPrivateKey.id.uuidString
-                identities = info
-                let encodedData = try BSONEncoder().encodeData(info)
-                outboundTask.message.transportInfo = encodedData
+                let event = try BinaryDecoder().decode(TransportEvent.self, from: data)
+                transportEvent = event
+                switch event {
+                case .sessionReestablishment:
+                    break
+                case .synchronizeOneTimeKeys(var info):
+                    info.senderCurveId = localOneTimePrivateKey?.id.uuidString
+                    info.senderMLKEMId = localMLKEMPrivateKey.id.uuidString
+                    let encodedData = try BinaryEncoder().encode(info)
+                    await session.setAddingContact(encodedData)
+                    outboundTask.message.transportInfo = encodedData
+                }
             } catch {}
         }
-
+        
         try await ratchetManager.senderInitialization(
             sessionIdentity: sessionIdentity,
             sessionSymmetricKey: databaseSymmetricKey,
             remoteKeys: RemoteKeys(
                 longTerm: .init(remoteLongTermPublicKey),
                 oneTime: remoteOneTimePublicKey,
-                pqKem: remotePQKemPublicKey),
+                mlKEM: remoteMLKEMPublicKey),
             localKeys: LocalKeys(
                 longTerm: .init(sessionContext.sessionUser.deviceKeys.longTermPrivateKey),
                 oneTime: localOneTimePrivateKey,
-                pqKem: localPQKemPrivateKey))
-
-        if needsRemoteDeletion {
-            try await removeKeys(
-                session: session,
-                curveId: localOneTimePrivateKey?.id.uuidString,
-                kyberId: localPQKemPrivateKey.id.uuidString)
-            needsRemoteDeletion = false
-        }
-
+                mlKEM: localMLKEMPrivateKey))
+        
         if let sessionDelegate = await session.sessionDelegate {
             outboundTask.message = sessionDelegate.updateCryptoMessageMetadata(
                 outboundTask.message,
                 sharedMessageId: outboundTask.sharedId)
         }
         
-        let encodedData = try BSONEncoder().encodeData(outboundTask.message)
-        let ratchetedMessage = try await ratchetManager.ratchetEncrypt(plainText: encodedData)
+        let encodedData = try BinaryEncoder().encode(outboundTask.message)
+        let ratchetedMessage = try await ratchetManager.ratchetEncrypt(
+            plainText: encodedData,
+            sessionId: sessionIdentity.id)
         let signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
-
+        
         try await session.transportDelegate?.sendMessage(signedMessage, metadata: SignedRatchetMessageMetadata(
             secretName: props.secretName,
             deviceId: props.deviceId,
             recipient: outboundTask.message.recipient,
             transportMetadata: outboundTask.message.transportInfo,
             sharedMessageId: outboundTask.sharedId,
-            synchronizationKeyIds: identities))
+            transportEvent: transportEvent))
+        
+        // Perform remote key deletion only after a successful send
+        if needsRemoteDeletion {
+            try await removeKeys(
+                session: session,
+                curveId: localOneTimePrivateKey?.id.uuidString,
+                mlKEMId: localMLKEMPrivateKey.id.uuidString)
+            needsRemoteDeletion = false
+        }
     }
-
+    
     // MARK: - Inbound Message Handling
-
+    
     /// Handles streaming a message and performing the necessary ratchet operations.
     ///
     /// This method implements the recipient side of the Double Ratchet protocol for inbound
@@ -438,16 +461,17 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         session: PQSSession
     ) async throws {
         
-        let (ratchetMessage, sessionIdentity) = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
-
+        let verificationResult = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
+        
         try await initializeRecipient(
-            sessionIdentity: sessionIdentity,
+            sessionIdentity: verificationResult.sessionIdentity,
             session: session,
-            ratchetMessage: ratchetMessage)
+            ratchetMessage: verificationResult.ratchetMessage)
         do {
-            let decryptedData = try await ratchetManager.ratchetDecrypt(ratchetMessage)
-            let decodedMessage = try BSONDecoder().decode(CryptoMessage.self, from: Document(data: decryptedData))
-            
+            let decryptedData = try await ratchetManager.ratchetDecrypt(
+                verificationResult.ratchetMessage,
+                sessionId: verificationResult.sessionIdentity.id)
+            let decodedMessage = try BinaryDecoder().decode(CryptoMessage.self, from: decryptedData)
             var canSaveMessage = true
             
             if let sessionDelegate = await session.sessionDelegate {
@@ -457,11 +481,20 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     senderDeviceId: inboundTask.senderDeviceId)
             }
             
-            if let transportInfo = decodedMessage.transportInfo, let keys = try? BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: transportInfo) {
-                try await removeKeys(
-                    session: session,
-                    curveId: keys.recipientCurveId,
-                    kyberId: keys.recipientKyberId)
+            if let transportInfo = decodedMessage.transportInfo {
+                do {
+                    let event = try BinaryDecoder().decode(TransportEvent.self, from: transportInfo)
+                    switch event {
+                    case .sessionReestablishment:
+                        canSaveMessage = false
+                    case .synchronizeOneTimeKeys(let info):
+                        try await removeKeys(
+                            session: session,
+                            curveId: info.recipientCurveId,
+                            mlKEMId: info.recipientMLKEMId)
+                        canSaveMessage = false
+                    }
+                } catch {}
             }
             
             if canSaveMessage {
@@ -470,8 +503,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     decodedMessage,
                     inboundTask: inboundTask,
                     session: session,
-                    sessionIdentity: sessionIdentity)
+                    sessionIdentity: verificationResult.sessionIdentity)
             }
+            
+        } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
+            try await session.rotateKeysOnPotentialCompromise()
         } catch {
 #if DEBUG
             logger.log(level: .error, message: "RatchetError during ratchet decryption: \(error)")
@@ -479,41 +515,41 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             throw error
         }
     }
-
-    private func removeKeys(session: PQSSession, curveId: String?, kyberId: String) async throws {
-
+    
+    private func removeKeys(session: PQSSession, curveId: String?, mlKEMId: String) async throws {
+        
         guard let cache = await session.cache else { return }
         let data = try await cache.fetchLocalSessionContext()
-
+        
         // Decrypt the session context data using the app's symmetric key
         guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: session.getAppSymmetricKey()) else {
             return
         }
-
+        
         // Decode the session context from the decrypted data
-        var sessionContext = try BSONDecoder().decode(SessionContext.self, from: Document(data: configurationData))
-
+        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+        
         if let curveId {
             try await delegate?.deleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: curveId, type: .curve)
         }
-        try await delegate?.deleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: kyberId, type: .kyber)
-        logger.log(level: .info, message: "Requested to Remove Remote Public Curve and Kyber One Time Keys")
-
+        try await delegate?.deleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: mlKEMId, type: .mlKEM)
+        logger.log(level: .info, message: "Requested to Remove Remote Public Curve and MLKEM One Time Keys")
+        
         sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll(where: { $0.id.uuidString == curveId })
-        sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.removeAll(where: { $0.id.uuidString == kyberId })
+        sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll(where: { $0.id.uuidString == mlKEMId })
         sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll(where: { $0.id.uuidString == curveId })
-        sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.removeAll(where: { $0.id.uuidString == kyberId })
-
+        sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll(where: { $0.id.uuidString == mlKEMId })
+        
         await session.setSessionContext(sessionContext)
-
-        let encodedData = try BSONEncoder().encodeData(sessionContext)
+        
+        let encodedData = try BinaryEncoder().encode(sessionContext)
         guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: session.getAppSymmetricKey()) else {
             throw PQSSession.SessionErrors.sessionEncryptionError
         }
         try await cache.updateLocalSessionContext(encryptedConfig)
-        logger.log(level: .info, message: "Removed Local Curve and Kyber One Time Keys")
+        logger.log(level: .info, message: "Removed Local Curve and MLKEM One Time Keys")
     }
-
+    
     /// Initializes the recipient for a session based on the provided ratchet message.
     ///
     /// This method sets up the recipient side of the Double Ratchet protocol by
@@ -556,47 +592,47 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         guard let sessionContext = await session.sessionContext else {
             throw PQSSession.SessionErrors.sessionNotInitialized
         }
-
+        
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
-
+        
         var localOneTimePrivateKey: CurvePrivateKey?
-        var localPQKemPrivateKey: PQKemPrivateKey
+        var localMLKEMPrivateKey: MLKEMPrivateKey
         guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else {
-            throw CryptoError.propsError
+            throw DoubleRatchetKit.CryptoError.propsError
         }
-
+        
+        //         If we do not have state we need to set this device's keys on state. This is inbound, so the sender sent the one-time keyids it used of the recipient. We will find and use the same key.
         if props.state == nil {
             if let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.first(where: { $0.id == ratchetMessage.header.oneTimeKeyId }) {
                 localOneTimePrivateKey = privateOneTimeKey
             }
-
-            if let privateKyberOneTimeKey = sessionContext.sessionUser.deviceKeys.pqKemOneTimePrivateKeys.first(where: { $0.id == ratchetMessage.header.pqKemOneTimeKeyId }) {
-                localPQKemPrivateKey = privateKyberOneTimeKey
+            
+            if let privateMLKEMOneTimeKey = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.first(where: { $0.id == ratchetMessage.header.mlKEMOneTimeKeyId }) {
+                localMLKEMPrivateKey = privateMLKEMOneTimeKey
             } else {
-                localPQKemPrivateKey = sessionContext.sessionUser.deviceKeys.finalPQKemPrivateKey
+                localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
             }
+            
+            try await sessionIdentity.updateIdentityProps(symmetricKey: databaseSymmetricKey, props: props)
+            try await session.cache?.updateSessionIdentity(sessionIdentity)
         } else {
             guard let state = props.state else {
-                throw CryptoError.propsError
+                throw DoubleRatchetKit.CryptoError.propsError
             }
             localOneTimePrivateKey = state.localOneTimePrivateKey
-            localPQKemPrivateKey = state.localPQKemPrivateKey
+            localMLKEMPrivateKey = state.localMLKEMPrivateKey
         }
-
         
         try await ratchetManager.recipientInitialization(
             sessionIdentity: sessionIdentity,
             sessionSymmetricKey: databaseSymmetricKey,
-            remoteKeys: RemoteKeys(
-                longTerm: .init(ratchetMessage.header.remoteLongTermPublicKey),
-                oneTime: ratchetMessage.header.remoteOneTimePublicKey,
-                pqKem: ratchetMessage.header.remotePQKemPublicKey),
-            localKeys: LocalKeys(
+            header: ratchetMessage.header,
+            localKeys: .init(
                 longTerm: .init(sessionContext.sessionUser.deviceKeys.longTermPrivateKey),
                 oneTime: localOneTimePrivateKey,
-                pqKem: localPQKemPrivateKey))
+                mlKEM: localMLKEMPrivateKey))
     }
-
+    
     /// Handles the processing of a decoded message, specifically for private messages,
     /// regardless of their communication type. This method utilizes the recipient information
     /// for reference when looking up communication models, but the recipient itself is not persisted.
@@ -636,14 +672,14 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     /// - Throws: An error if the message processing fails due to issues such as missing metadata,
     ///           session errors, or communication model errors.
     private func handleDecodedMessage(_ decodedMessage: CryptoMessage,
-
+                                      
                                       inboundTask: InboundTaskMessage,
                                       session: PQSSession,
                                       sessionIdentity: SessionIdentity) async throws
     {
         guard let cache = await session.cache else { throw PQSSession.SessionErrors.databaseNotInitialized }
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
-
+        
         switch decodedMessage.recipient {
         case let .nickname(recipient):
             var communicationModel: BaseCommunication
@@ -657,10 +693,10 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     communicationType: .nickname(isMe ? recipient : inboundTask.senderSecretName),
                     session: session
                 )
-
+                
                 var communication = try await communicationModel.makeDecryptedModel(of: Communication.self, symmetricKey: databaseSymmetricKey)
                 communication.messageCount += 1
-
+                
                 _ = try await communicationModel.updateProps(
                     symmetricKey: databaseSymmetricKey,
                     props: BaseCommunication.UnwrappedProps(
@@ -674,7 +710,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         communicationType: communication.communicationType
                     )
                 )
-
+                
                 shouldUpdateCommunication = true
             } catch {
                 // Need to flip recipient
@@ -687,7 +723,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 try await cache.createCommunication(communicationModel)
                 await session.receiverDelegate?.updatedCommunication(communicationModel, members: [recipient, inboundTask.senderSecretName])
             }
-
+            
             let messageModel = try await createInboundMessageModel(
                 decodedMessage: decodedMessage,
                 inboundTask: inboundTask,
@@ -697,22 +733,22 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 communication: communicationModel,
                 sessionIdentity: sessionIdentity
             )
-
+            
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
                 if let members = await communicationModel.props(symmetricKey: databaseSymmetricKey)?.members {
                     await session.receiverDelegate?.updatedCommunication(communicationModel, members: members)
                 }
             }
-
+            
             try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
-
+            
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
         case .personalMessage:
             let sender = inboundTask.senderSecretName
             guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return }
-
+            
             let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
             var communicationModel: BaseCommunication
             var shouldUpdateCommunication = false
@@ -722,10 +758,10 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     communicationType: decodedMessage.recipient,
                     session: session
                 )
-
+                
                 var communication = try await communicationModel.makeDecryptedModel(of: Communication.self, symmetricKey: databaseSymmetricKey)
                 communication.messageCount += 1
-
+                
                 _ = try await communicationModel.updateProps(
                     symmetricKey: databaseSymmetricKey,
                     props: BaseCommunication.UnwrappedProps(
@@ -739,7 +775,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         communicationType: communication.communicationType
                     )
                 )
-
+                
                 shouldUpdateCommunication = true
             } catch {
                 communicationModel = try await createCommunicationModel(
@@ -748,11 +784,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     metadata: decodedMessage.metadata,
                     symmetricKey: databaseSymmetricKey
                 )
-
+                
                 try await cache.createCommunication(communicationModel)
                 await session.receiverDelegate?.updatedCommunication(communicationModel, members: [mySecretName])
             }
-
+            
             let messageModel = try await createInboundMessageModel(
                 decodedMessage: decodedMessage,
                 inboundTask: inboundTask,
@@ -766,28 +802,49 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 try await cache.updateCommunication(communicationModel)
                 await session.receiverDelegate?.updatedCommunication(communicationModel, members: [mySecretName])
             }
-
+            
             try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
-
+            
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
         case .channel:
             let sender = inboundTask.senderSecretName
             var communicationModel: BaseCommunication
             var shouldUpdateCommunication = false
-
+            
             // Channel Models need to be created before a message is sent or received
-            communicationModel = try await findCommunicationType(
-                cache: cache,
-                communicationType: decodedMessage.recipient,
-                session: session
-            )
-
-            guard var newProps = await communicationModel.props(symmetricKey: databaseSymmetricKey) else { return }
-            newProps.messageCount += 1
-            _ = try await communicationModel.updateProps(symmetricKey: databaseSymmetricKey, props: newProps)
-            shouldUpdateCommunication = true
-
+            do {
+                communicationModel = try await findCommunicationType(
+                    cache: cache,
+                    communicationType: decodedMessage.recipient,
+                    session: session
+                )
+                
+                guard var newProps = await communicationModel.props(symmetricKey: databaseSymmetricKey) else { return }
+                newProps.messageCount += 1
+                _ = try await communicationModel.updateProps(symmetricKey: databaseSymmetricKey, props: newProps)
+                shouldUpdateCommunication = true
+            } catch {
+                // Create the communication if it doesn't exist for channel
+                guard case let .channel(channelName) = decodedMessage.recipient else {
+                    throw error
+                }
+               
+                let info = try BinaryDecoder().decode(ChannelInfo.self, from: decodedMessage.metadata)
+                
+                communicationModel = try await createCommunicationModel(
+                    administrator: info.administrator,
+                    operators: info.operators,
+                    recipients: info.members,
+                    communicationType: .channel(channelName),
+                    metadata: decodedMessage.metadata,
+                    symmetricKey: databaseSymmetricKey
+                )
+                try await cache.createCommunication(communicationModel)
+                await session.receiverDelegate?.updatedCommunication(communicationModel, members: info.members)
+                await session.receiverDelegate?.createdChannel(communicationModel)
+            }
+            
             let messageModel = try await createInboundMessageModel(
                 decodedMessage: decodedMessage,
                 inboundTask: inboundTask,
@@ -808,7 +865,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             break
         }
     }
-
+    
     /// Verifies and decrypts an encrypted message received in an inbound task.
     ///
     /// This method extracts the ratchet message and the associated session identity
@@ -847,16 +904,16 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     private func verifyEncryptedMessage(
         session: PQSSession,
         inboundTask: InboundTaskMessage
-    ) async throws -> (RatchetMessage, SessionIdentity) {
+    ) async throws -> VerificationResult {
         var identities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName)
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
-
+        
         var sessionIdentity = await identities.asyncFirst(where: { identity in
             guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else { return false }
             return props.deviceId == inboundTask.senderDeviceId
         })
         
-        if sessionIdentity == nil {
+        if sessionIdentity == nil { // SessionIdentity shouldn't be nil, but in case refresh never occured force it.
             identities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
             sessionIdentity = await identities.asyncFirst(where: { identity in
                 guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else { return false }
@@ -872,35 +929,60 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else {
             throw JobProcessorErrors.missingIdentity
         }
-        let currentKey = try Curve25519SigningPublicKey(rawRepresentation: props.signingPublicKey)
-
+        let currentKey = try Curve25519.Signing.PublicKey(rawRepresentation: props.signingPublicKey)
+        
         // Verify the signature
         guard let signedMessage = inboundTask.message.signed else {
             throw PQSSession.SessionErrors.missingSignature
         }
-
+        
         if try signedMessage.verifySignature(using: currentKey) {
             return try decode(signedMessage)
         } else {
+            // Signature verification failed with current key, likely due to key rotation
+            // Fetch fresh configuration to get rotated keys
             guard let config = try await session.transportDelegate?.findConfiguration(for: inboundTask.senderSecretName) else {
                 throw PQSSession.SessionErrors.cannotFindUserConfiguration
             }
-
-            let rotatedKey = try Curve25519SigningPublicKey(rawRepresentation: config.signingPublicKey)
-
+            
+            let rotatedKey = try Curve25519.Signing.PublicKey(rawRepresentation: config.signingPublicKey)
+            
             guard try signedMessage.verifySignature(using: rotatedKey) else {
                 throw PQSSession.SessionErrors.invalidSignature
             }
-          
+            
+            // Sender has rotated keys - refresh identities to get updated session identity with new keys
+            let refreshedIdentities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
+            if let refreshed = await refreshedIdentities.asyncFirst(where: { identity in
+                guard let refreshedProps = await identity.props(symmetricKey: databaseSymmetricKey) else { return false }
+                return refreshedProps.deviceId == inboundTask.senderDeviceId
+            }) {
+                
+                // Use refreshed identity with updated keys
+                return try decode(
+                    signedMessage,
+                    identity: refreshed)
+            }
+            
             return try decode(signedMessage)
         }
-        func decode(_ signedMessage: SignedRatchetMessage.Signed) throws -> (RatchetMessage, SessionIdentity) {
-            let document = Document(data: signedMessage.data)
-            let message = try BSONDecoder().decode(RatchetMessage.self, from: document)
-            return (message, sessionIdentity)
+        func decode(_
+                    signedMessage: SignedRatchetMessage.Signed,
+                    identity: SessionIdentity? = nil
+        ) throws -> VerificationResult {
+            let message = try BinaryDecoder().decode(RatchetMessage.self, from: signedMessage.data)
+            return VerificationResult(
+                ratchetMessage: message,
+                sessionIdentity: identity ?? sessionIdentity)
         }
     }
-
+    
+    /// The data need to result in from a message verification
+    private struct VerificationResult: Sendable {
+        let ratchetMessage: RatchetMessage
+        let sessionIdentity: SessionIdentity //Still will be the old session identity, this will get updated in the Double Ratchet.
+    }
+    
     /// Signs a ratchet message using the cryptographic session's signing capabilities.
     ///
     /// This method ensures the integrity and authenticity of the ratchet message by applying

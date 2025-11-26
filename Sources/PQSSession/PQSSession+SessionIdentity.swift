@@ -13,7 +13,7 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import BSON
+
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
@@ -30,7 +30,7 @@ import SessionModels
 /// Each session identity contains:
 /// - **Long-term Curve25519 key** (SPKB): For persistent identity verification
 /// - **Signing public key** (IKB): For message authentication
-/// - **PQKem public key** (PQSPKB): For post-quantum key exchange
+/// - **MLKEM public key** (PQSPKB): For post-quantum key exchange
 /// - **One-time Curve25519 key** (OPKBₙ): For immediate communication
 ///
 /// ## Identity Lifecycle
@@ -53,7 +53,7 @@ import SessionModels
 /// let identity = try await session.createEncryptableSessionIdentityModel(
 ///     with: deviceConfig,
 ///     oneTimePublicKey: oneTimeKey,
-///     pqKemPublicKey: pqKemKey,
+///     mlKEMPublicKey: mlKEMKey,
 ///     for: "alice",
 ///     associatedWith: deviceId,
 ///     new: sessionContextId
@@ -81,14 +81,14 @@ public extension PQSSession {
     ///
     /// This method creates a `SessionIdentity` object that contains all the cryptographic information
     /// needed to establish secure communication with another device. The identity includes both classical
-    /// (Curve25519) and post-quantum (Kyber1024) keys for maximum security.
+    /// (Curve25519) and post-quantum (MLKEM1024) keys for maximum security.
     ///
     /// ## Identity Components
     ///
     /// The created identity contains:
     /// - **Long-term Curve25519 key** (SPKB): For persistent identity verification
     /// - **Signing public key** (IKB): For message authentication and verification
-    /// - **PQKem public key** (PQSPKB): For post-quantum key exchange
+    /// - **MLKEM public key** (PQSPKB): For post-quantum key exchange
     /// - **One-time Curve25519 key** (OPKBₙ): For immediate communication (optional)
     ///
     /// ## Usage Example
@@ -96,7 +96,7 @@ public extension PQSSession {
     /// let identity = try await session.createEncryptableSessionIdentityModel(
     ///     with: deviceConfiguration,
     ///     oneTimePublicKey: oneTimeKey,
-    ///     pqKemPublicKey: pqKemKey,
+    ///     mlKEMPublicKey: mlKEMKey,
     ///     for: "alice",
     ///     associatedWith: deviceId,
     ///     new: sessionContextId
@@ -107,7 +107,7 @@ public extension PQSSession {
     ///   - device: The device configuration containing public keys and device metadata.
     ///   - oneTimePublicKey: Optional Curve25519 one-time pre-key for immediate communication.
     ///     If `nil`, the identity will be created without a one-time key.
-    ///   - pqKemPublicKey: The Kyber1024 post-quantum signed pre-key for secure key exchange.
+    ///   - mlKEMPublicKey: The MLKEM1024 post-quantum signed pre-key for secure key exchange.
     ///   - secretName: The secret name of the user associated with this identity.
     ///   - deviceId: The unique identifier of the device this identity represents.
     ///   - sessionContextId: A unique context identifier for this session identity.
@@ -124,7 +124,7 @@ public extension PQSSession {
     func createEncryptableSessionIdentityModel(
         with device: UserDeviceConfiguration,
         oneTimePublicKey: CurvePublicKey?,
-        pqKemPublicKey: PQKemPublicKey,
+        mlKEMPublicKey: MLKEMPublicKey,
         for secretName: String,
         associatedWith deviceId: UUID,
         new sessionContextId: Int
@@ -141,7 +141,7 @@ public extension PQSSession {
                 sessionContextId: sessionContextId,
                 longTermPublicKey: device.longTermPublicKey, // → SPKB
                 signingPublicKey: device.signingPublicKey, // → IKB
-                pqKemPublicKey: pqKemPublicKey, // → PQSPKB
+                mlKEMPublicKey: mlKEMPublicKey, // → PQSPKB
                 oneTimePublicKey: oneTimePublicKey, // → OPKBₙ
                 state: nil,
                 deviceName: deviceName,
@@ -227,7 +227,7 @@ public extension PQSSession {
         sendOneTimeIdentities: Bool = false
     ) async throws -> [SessionIdentity] {
         let existingIdentities = try await getSessionIdentities(with: secretName)
-        
+        logger.log(level: .info, message: "existingIdentities \(existingIdentities.count)")
         // Check if we have valid identities for this specific recipient
         let hasValidIdentities = await hasValidIdentitiesForRecipient(existingIdentities, secretName: secretName)
         
@@ -246,7 +246,7 @@ public extension PQSSession {
                     forceRefresh: forceRefresh,
                     sendOneTimeIdentities: sendOneTimeIdentities,
                     oneTime: syncKeys?.curveId,
-                    oneTime: syncKeys?.kyberId
+                    oneTime: syncKeys?.mlKEMId
                 )
             } catch {
                 logger.log(level: .error, message: "Error in refreshIdentities for \(secretName): \(error)")
@@ -273,14 +273,14 @@ public extension PQSSession {
     }
     
     /// Extracts synchronization keys from adding contact data if available
-    /// - Returns: Optional tuple containing curve and kyber key IDs
-    private func extractSynchronizationKeys() async throws -> (curveId: String?, kyberId: String?)? {
+    /// - Returns: Optional tuple containing curve and mlKEM key IDs
+    private func extractSynchronizationKeys() async throws -> (curveId: String?, mlKEMId: String?)? {
         guard let addingContactData else { return nil }
         
-        let keys = try BSONDecoder().decodeData(SynchronizationKeyIdentities.self, from: addingContactData)
+        let keys = try BinaryDecoder().decode(SynchronizationKeyIdentities.self, from: addingContactData)
         await setAddingContact(nil)
         
-        return (curveId: keys.senderCurveId, kyberId: keys.senderKyberId)
+        return (curveId: keys.senderCurveId, mlKEMId: keys.senderMLKEMId)
     }
     
     /// Retrieves session identities associated with a specified recipient name.
@@ -327,14 +327,14 @@ public extension PQSSession {
         forceRefresh: Bool,
         sendOneTimeIdentities: Bool = false,
         oneTime curveId: String?,
-        oneTime kyberId: String?
+        oneTime mlKEMId: String?
     ) async throws -> [SessionIdentity] {
         
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= 10 {
-            async let _ = await refreshOneTimeKeysTask()
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+            await refreshOneTimeKeysTask()
         }
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedPQKemOneTimePublicKeys.count <= 10 {
-            async let _ = await refreshOneTimeKeysTask()
+        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+            await refreshMLKEMOneTimeKeysTask()
         }
         
         var identities = existingIdentities
@@ -345,15 +345,18 @@ public extension PQSSession {
         guard let sessionUser = await sessionContext?.sessionUser else {
             throw PQSSession.SessionErrors.sessionNotInitialized
         }
+
+        let symmetricKey = try await getDatabaseSymmetricKey()
         
         if createIdentity, forceRefresh || sessionIdentities.isEmpty || !sessionIdentities.contains(secretName) {
+
             // Get the user configuration for the recipient
             let configuration = try await transportDelegate.findConfiguration(for: secretName)
             var verifiedDevices = try configuration.getVerifiedDevices()
             var collected = [UserDeviceConfiguration]()
             // Create a set of existing device IDs from the existing identities for quick lookup
             let existingDeviceIds = await Set(identities.asyncCompactMap {
-                try? await $0.props(symmetricKey: getDatabaseSymmetricKey())?.deviceId
+                await $0.props(symmetricKey: symmetricKey)?.deviceId
             })
 
             for device in verifiedDevices {
@@ -364,7 +367,7 @@ public extension PQSSession {
             }
 
             // Ensure that the identities of the user configuration are legitimate
-            let signingPublicKey = try Curve25519SigningPublicKey(rawRepresentation: configuration.signingPublicKey)
+            let signingPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: configuration.signingPublicKey)
 
             for device in configuration.signedDevices {
                 if try (device.verified(using: signingPublicKey) != nil) == false {
@@ -373,7 +376,6 @@ public extension PQSSession {
             }
 
             var generatedSessionContextIds = Set<Int>()
-
             for device in collected {
                 // Check if the device ID is already in the existing identities
                 if !existingDeviceIds.contains(device.deviceId), device.deviceId != sessionUser.deviceId {
@@ -383,35 +385,19 @@ public extension PQSSession {
                     } while generatedSessionContextIds.contains(sessionContextId)
 
                     generatedSessionContextIds.insert(sessionContextId)
-
-                    var curveId = curveId
-                    var kyberId = kyberId
-                    // On Contact Creation this will be nil for the requester. The recipient will contained the passed identities, thus containing values.
-                    if sendOneTimeIdentities {
-                        let keys = try await transportDelegate.fetchOneTimeKeys(for: secretName, deviceId: device.deviceId.uuidString)
-                        curveId = keys.curve?.id.uuidString
-                        kyberId = keys.kyber?.id.uuidString
-                    }
                     
-                    let signedOneTimePublicKey = try configuration.signedOneTimePublicKeys.first(where: { $0.id.uuidString == curveId })?.verified(using: signingPublicKey)
-
-                    var pqKemPublicKey: PQKemPublicKey
-                    if let signedKey = try configuration.signedPQKemOneTimePublicKeys.first(where: { $0.id.uuidString == kyberId })?.verified(using: signingPublicKey) {
-                        pqKemPublicKey = signedKey
-                    } else if let verifiedDevice = configuration.signedDevices.first(where: {
-                        (try? $0.verified(using: signingPublicKey))?.deviceId == device.deviceId
-                    }),
-                        let finalKey = try? verifiedDevice.verified(using: signingPublicKey)?.finalPQKemPublicKey
-                    {
-                        pqKemPublicKey = finalKey
-                    } else {
-                        throw PQSSession.SessionErrors.drainedKeys
-                    }
+                    let (curve, mlKEM) = try await createOneTimeKeys(
+                        secretName: secretName,
+                        deviceId: device.deviceId,
+                        curveId: curveId,
+                        mlKEMId: mlKEMId,
+                        configuration: configuration,
+                        fetchOneTimeKeys: sendOneTimeIdentities)
 
                     let identity = try await createEncryptableSessionIdentityModel(
                         with: device,
-                        oneTimePublicKey: signedOneTimePublicKey,
-                        pqKemPublicKey: pqKemPublicKey,
+                        oneTimePublicKey: curve,
+                        mlKEMPublicKey: mlKEM,
                         for: secretName,
                         associatedWith: device.deviceId,
                         new: sessionContextId
@@ -419,11 +405,11 @@ public extension PQSSession {
                     logger.log(level: .info, message: "Created Session Identity: \(identity)")
                     identities.append(identity)
 
-                    if let curveId, let kyberId {
+                    if let curveId = curve?.id {
                         try await notifyIdentityCreation(
                             for: secretName,
-                            curveId: curveId,
-                            kyberId: kyberId)
+                            curveId: curveId.uuidString,
+                            mlKEMId: mlKEM.id.uuidString)
                     }
                 }
             }
@@ -431,7 +417,7 @@ public extension PQSSession {
             // This will get all identities that are the recipient name and a child device.
             let newfilter = try await getSessionIdentities(with: secretName)
             let newDeviceIds = await Set(newfilter.asyncCompactMap {
-                try? await $0.props(symmetricKey: getDatabaseSymmetricKey())?.deviceId
+                await $0.props(symmetricKey: symmetricKey)?.deviceId
             })
 
             guard let myDevices = try await sessionContext?.activeUserConfiguration.getVerifiedDevices() else { return [] }
@@ -447,7 +433,7 @@ public extension PQSSession {
                     // If our current list in the DB contains a session identity that is not in the master list, we need to remove it.
                     if let identityToRemove = await identities.asyncFirst(where: { element in
                         // Try to get the properties for each element.
-                        guard let props = try? await element.props(symmetricKey: getDatabaseSymmetricKey()) else {
+                        guard let props = await element.props(symmetricKey: symmetricKey) else {
                             return false
                         }
                         // Compare the deviceIds; make sure deviceId is available in this scope.
@@ -469,9 +455,69 @@ public extension PQSSession {
                     }
                 }
             }
+
+            
+            for foundIdentity in await identities.asyncFilter( { await $0.props(symmetricKey: symmetricKey)?.secretName == secretName }) {
+                guard var props = await foundIdentity.props(symmetricKey: symmetricKey) else {
+                    continue
+                }
+                for device in verifiedDevices {
+                    if props.deviceId == device.deviceId {
+                        props.longTermPublicKey = device.longTermPublicKey
+                    }
+                }
+                try await foundIdentity.updateIdentityProps(symmetricKey: symmetricKey, props: props)
+                try await cache?.updateSessionIdentity(foundIdentity)
+                if let index = identities.firstIndex(where: { $0.id == foundIdentity.id }) {
+                    identities[index] = foundIdentity
+                }
+            }
+            
             sessionIdentities.insert(secretName)
         }
         return identities
+    }
+    
+    func createOneTimeKeys(
+        secretName: String,
+        deviceId: UUID,
+        curveId: String?,
+        mlKEMId: String?,
+        configuration: UserConfiguration,
+        fetchOneTimeKeys: Bool
+    ) async throws -> (curve: CurvePublicKey?, mlKEM: MLKEMPublicKey){
+        
+        var curveId: String?
+        var mlKEMId: String?
+        
+        let signingPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: configuration.signingPublicKey)
+        
+        guard let transportDelegate else {
+            throw PQSSession.SessionErrors.transportNotInitialized
+        }
+        
+            // On Contact Creation this will be false for the requester. The recipient will contained the passed identities, thus containing values.
+        if fetchOneTimeKeys {
+            let keys = try await transportDelegate.fetchOneTimeKeys(for: secretName, deviceId: deviceId.uuidString)
+            curveId = keys.curve?.id.uuidString
+            mlKEMId = keys.mlKEM?.id.uuidString
+        }
+        
+        let curvePublicKey = try configuration.signedOneTimePublicKeys.first(where: { $0.id.uuidString == curveId })?.verified(using: signingPublicKey)
+
+        var mlKEMPublicKey: MLKEMPublicKey
+        if let signedKey = try configuration.signedMLKEMOneTimePublicKeys.first(where: { $0.id.uuidString == mlKEMId })?.verified(using: signingPublicKey) {
+            mlKEMPublicKey = signedKey
+        } else if let verifiedDevice = configuration.signedDevices.first(where: {
+            (try? $0.verified(using: signingPublicKey))?.deviceId == deviceId
+        }),
+            let finalKey = try verifiedDevice.verified(using: signingPublicKey)?.finalMLKEMPublicKey
+        {
+            mlKEMPublicKey = finalKey
+        } else {
+            throw PQSSession.SessionErrors.drainedKeys
+        }
+        return (curvePublicKey, mlKEMPublicKey)
     }
 
     /// Notifies the network of identity creation with associated keys.
@@ -483,23 +529,23 @@ public extension PQSSession {
     /// - Parameters:
     ///   - secretName: The secret name of the newly created identity
     ///   - curveId: The initial one-time Curve Key Id associated with the new identity
-    ///   - kyberId: The initial one-time Kyber Key Id associated with the new identity
+    ///   - mlKEMId: The initial one-time MLKEM Key Id associated with the new identity
     /// - Throws: An error if the identity creation could not be notified
     private func notifyIdentityCreation(
         for secretName: String,
         curveId: String,
-        kyberId: String
+        mlKEMId: String
     ) async throws {
         let identityInfo = SynchronizationKeyIdentities(
             recipientCurveId: curveId,
-            recipientKyberId: kyberId
+            recipientMLKEMId: mlKEMId
         )
-        let metadata = try BSONEncoder().encode(identityInfo)
+        let metadata = try BinaryEncoder().encode(TransportEvent.synchronizeOneTimeKeys(identityInfo))
 
         try await writeTextMessage(
             recipient: .nickname(secretName),
             text: "",
-            transportInfo: metadata.makeData(),
+            transportInfo: metadata,
             metadata: metadata)
     }
 }

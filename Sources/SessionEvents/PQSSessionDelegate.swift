@@ -14,10 +14,8 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
-import struct BSON.BSONDecoder
-import struct BSON.Document
-import class DoubleRatchetKit.SessionIdentity
 import Foundation
+import class DoubleRatchetKit.SessionIdentity
 import SessionModels
 
 /// A delegate protocol that provides hooks for integrating application-specific
@@ -68,7 +66,8 @@ public protocol PQSSessionDelegate: Sendable {
     ///   propagated to the calling context and may affect session establishment.
     func synchronizeCommunication(
         recipient: MessageRecipient,
-        sharedIdentifier: String
+        sharedIdentifier: String,
+        metadata: Data
     ) async throws
 
     /// Called when friendshipstate changes. May block or unblock a contact
@@ -90,7 +89,7 @@ public protocol PQSSessionDelegate: Sendable {
     func requestFriendshipStateChange(
         recipient: MessageRecipient,
         blockData: Data?,
-        metadata: Document,
+        metadata: Data,
         currentState: FriendshipMetadata.State
     ) async throws
 
@@ -109,7 +108,7 @@ public protocol PQSSessionDelegate: Sendable {
     /// - Throws: Any error that occurs while processing the delivery state change.
     func deliveryStateChanged(
         recipient: MessageRecipient,
-        metadata: Document
+        metadata: Data
     ) async throws
 
     /// Called when a new contact is created and recognized in the messaging system.
@@ -152,7 +151,7 @@ public protocol PQSSessionDelegate: Sendable {
     /// - Throws: Any error that occurs while processing the message edit.
     func editMessage(
         recipient: MessageRecipient,
-        metadata: Document
+        metadata: Data
     ) async throws
 
     /// Determines whether a given transport message should be persisted.

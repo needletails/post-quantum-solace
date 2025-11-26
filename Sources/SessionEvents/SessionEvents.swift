@@ -13,45 +13,80 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 //
-import BSON
+
 import Foundation
 import NeedleTailLogger
 import SessionModels
-#if os(Android) || os(Linux)
-@preconcurrency import Crypto
-#else
 import Crypto
-#endif
+import BinaryCodable
 
 
 /// An enumeration representing various errors that can occur in session events.
-enum EventErrors: Error {
+enum EventErrors: Error, LocalizedError {
     /// Indicates that the session has not been initialized.
     case sessionNotInitialized
-
+    
     /// Indicates that the database has not been initialized.
     case databaseNotInitialized
-
+    
     /// Indicates that the transport layer has not been initialized.
     case transportNotInitialized
-
+    
     /// Indicates a generic properties error.
     case propsError
-
+    
     /// Indicates that the provided secret name is invalid.
     case invalidSecretName
-
+    
     /// Indicates that required metadata is missing.
     case missingMetadata
-
+    
     /// Indicates that a communication could not be found.
     case cannotFindCommunication
-
+    
     /// Indicates that a contact could not be found.
     case cannotFindContact
-
+    
     /// Indicates that the user is blocked.
     case userIsBlocked
+    
+    public var errorDescription: String? {
+        switch self {
+        case .sessionNotInitialized:
+            return "Session has not been initialized"
+        case .databaseNotInitialized:
+            return "Database has not been initialized"
+        case .transportNotInitialized:
+            return "Transport layer has not been initialized"
+        case .propsError:
+            return "Properties error"
+        case .invalidSecretName:
+            return "Invalid secret name"
+        case .missingMetadata:
+            return "Required metadata is missing"
+        case .cannotFindCommunication:
+            return "Cannot find communication"
+        case .cannotFindContact:
+            return "Cannot find contact"
+        case .userIsBlocked:
+            return "The user is blocked"
+        }
+    }
+    
+    public var recoverySuggestion: String? {
+        switch self {
+        case .sessionNotInitialized:
+            return "Ensure the session is properly initialized before use"
+        case .databaseNotInitialized:
+            return "Configure the database delegate"
+        case .transportNotInitialized:
+            return "Configure the transport delegate"
+        case .missingMetadata:
+            return "Provide the required metadata"
+        default:
+            return nil
+        }
+    }
 }
 
 /// A protocol that defines methods for handling session events in a post-quantum secure messaging system.
@@ -151,7 +186,7 @@ public protocol SessionEvents: Sendable {
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws
-
+    
     /// Updates or creates a contact.
     /// - Parameters:
     ///   - secretName: The secret name of the contact.
@@ -167,7 +202,8 @@ public protocol SessionEvents: Sendable {
     /// - Throws: An error if the operation fails.
     func createContact(
         secretName: String,
-        metadata: Document,
+        metadata: Data,
+        friendshipMetadata: FriendshipMetadata?,
         requestFriendship: Bool,
         sessionContext: SessionContext,
         cache: PQSSessionStore,
@@ -176,7 +212,7 @@ public protocol SessionEvents: Sendable {
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws -> ContactModel
-
+    
     /// Sends a communication synchronization request.
     /// - Parameters:
     ///   - secretName: The secret name of the contact.
@@ -188,7 +224,8 @@ public protocol SessionEvents: Sendable {
     ///   - logger: The logger for logging events.
     /// - Throws: An error if the operation fails.
     func sendCommunicationSynchronization(
-        contact secretName: String,
+        recipient: MessageRecipient,
+        metadata: Data,
         sessionContext: SessionContext,
         sessionDelegate: PQSSessionDelegate,
         cache: PQSSessionStore,
@@ -196,7 +233,7 @@ public protocol SessionEvents: Sendable {
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws
-
+    
     /// Requests a change in the friendship state for a specific contact.
     ///
     /// This method manages the complete lifecycle of friendship state changes, including:
@@ -255,7 +292,7 @@ public protocol SessionEvents: Sendable {
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws
-
+    
     /// Updates the delivery state of a message.
     /// - Parameters:
     ///   - message: The `EncryptedMessage` whose delivery state is being updated.
@@ -277,7 +314,7 @@ public protocol SessionEvents: Sendable {
         receiver: EventReceiver,
         symmetricKey: SymmetricKey
     ) async throws
-
+    
     /// Sends an acknowledgment that a contact was created.
     /// - Parameters:
     ///   - secretName: The secret name of the recipient contact.
@@ -289,7 +326,7 @@ public protocol SessionEvents: Sendable {
         sessionDelegate: PQSSessionDelegate,
         logger: NeedleTailLogger
     ) async throws
-
+    
     /// Requests metadata from a contact.
     /// - Parameters:
     ///   - secretName: The secret name of the contact from whom to request metadata.
@@ -301,7 +338,7 @@ public protocol SessionEvents: Sendable {
         sessionDelegate: PQSSessionDelegate,
         logger: NeedleTailLogger
     ) async throws
-
+    
     /// Requests the metadata for the current user.
     /// - Parameters:
     ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
@@ -311,7 +348,7 @@ public protocol SessionEvents: Sendable {
         sessionDelegate: PQSSessionDelegate,
         logger: NeedleTailLogger
     ) async throws
-
+    
     /// Edits the current message.
     /// - Parameters:
     ///   - message: The `EncryptedMessage` to be edited.
@@ -331,7 +368,7 @@ public protocol SessionEvents: Sendable {
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws
-
+    
     /// Finds a communication for a specific message recipient.
     /// - Parameters:
     ///   - messageRecipient: The recipient of the message.
@@ -382,7 +419,7 @@ public extension SessionEvents {
     ) async throws {
         let mySecretName = sessionContext.sessionUser.secretName
         let contacts = try await cache.fetchContacts()
-
+        
         let filteredContactInfos = await contactInfos.asyncFilter { contactInfo in
             // Check if contacts is not nil and does not contain the secretName
             let containsSecretName = await contacts.asyncContains { contact in
@@ -391,21 +428,20 @@ public extension SessionEvents {
                 }
                 return false
             }
-
+            
             // We want to include `contactInfo` only if `containsSecretName` is false
             return !containsSecretName
         }
-
+        
         for contactInfo in filteredContactInfos {
             let userConfiguration = try await transport.findConfiguration(for: contactInfo.secretName)
-
+            
             let contact = Contact(
                 id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
                 secretName: contactInfo.secretName,
                 configuration: userConfiguration,
-                metadata: contactInfo.metadata
-            )
-
+                metadata: contactInfo.metadata)
+            
             let contactModel = try ContactModel(
                 id: contact.id, // Use the same UUID
                 props: .init(
@@ -415,52 +451,48 @@ public extension SessionEvents {
                 ),
                 symmetricKey: symmetricKey
             )
-
+            
             try await cache.createContact(contactModel)
             try await receiver.createdContact(contact)
-
+            
             logger.log(level: .debug, message: "Creating Communication Model")
             // Create communication model
             let communicationModel = try await createCommunicationModel(
                 recipients: [mySecretName, contactInfo.secretName],
                 communicationType: .nickname(contactInfo.secretName),
-                metadata: [:],
-                symmetricKey: symmetricKey
-            )
-
+                symmetricKey: symmetricKey)
+            
             guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
                 throw EventErrors.propsError
             }
-
+            
             props.sharedId = contactInfo.sharedCommunicationId
-
+            
             _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
             try await cache.createCommunication(communicationModel)
             await receiver.updatedCommunication(communicationModel, members: [contactInfo.secretName])
             logger.log(level: .debug, message: "Created Communication Model for \(contactInfo.secretName)")
-
+            
             try await requestMetadata(
                 from: contact.secretName,
                 sessionDelegate: sessionDelegate,
-                logger: logger
-            )
-
+                logger: logger)
+            
             try await sendCommunicationSynchronization(
-                contact: contactInfo.secretName,
+                recipient: .nickname(contactInfo.secretName),
                 sessionContext: sessionContext,
                 sessionDelegate: sessionDelegate,
                 cache: cache,
                 receiver: receiver,
                 symmetricKey: symmetricKey,
-                logger: logger
-            )
+                logger: logger)
         }
-
+        
         try await requestMyMetadata(sessionDelegate: sessionDelegate, logger: logger)
-
+        
         // Synchronize with other devices if necessary
     }
-
+    
     /// Updates or creates a contact in the local cached database and notifies the client of the changes.
     ///
     /// This method performs the following actions:
@@ -482,7 +514,8 @@ public extension SessionEvents {
     /// - Throws: An error if the operation fails due to issues such as invalid parameters or database errors.
     func createContact(
         secretName: String,
-        metadata: Document = [:],
+        metadata: Data = .init(),
+        friendshipMetadata: FriendshipMetadata?,
         requestFriendship: Bool,
         sessionContext: SessionContext,
         cache: PQSSessionStore,
@@ -493,42 +526,47 @@ public extension SessionEvents {
     ) async throws -> ContactModel {
         let newContactSecretName = secretName.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let mySecretName = sessionContext.sessionUser.secretName
-
+        
         guard newContactSecretName != mySecretName else {
             throw EventErrors.invalidSecretName
         }
-
+        
         // Check if the contact already exists
         if let foundContact = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.secretName == newContactSecretName }) {
             guard let props = await foundContact.props(symmetricKey: symmetricKey) else {
                 throw EventErrors.propsError
             }
-
+            
             // Simplified metadata handling
             let configuration = props.configuration
-            let contactMetadata = metadata.isEmpty ? (props.metadata) : metadata
-
-            guard let friendshipMetadata = contactMetadata["friendshipMetadata"] as? Document else { throw EventErrors.missingMetadata }
-
+            var friendshipMetadata = friendshipMetadata
+            
+            if friendshipMetadata == nil, let metadata = props.metadata["friendshipMetadata"] {
+                friendshipMetadata = try BinaryDecoder().decode(FriendshipMetadata.self, from: metadata)
+            }
+            
+            guard let friendshipMetadata else {
+                throw EventErrors.missingMetadata
+            }
             let updatedProps = try await foundContact.updatePropsMetadata(
                 symmetricKey: symmetricKey,
-                metadata: friendshipMetadata,
+                metadata: try BinaryEncoder().encode(friendshipMetadata),
                 with: "friendshipMetadata"
             )
-
+            
             guard let updatedMetadata = updatedProps?.metadata else {
                 throw EventErrors.propsError
             }
-
+            
             let updatedContact = Contact(
                 id: foundContact.id,
                 secretName: newContactSecretName,
                 configuration: configuration,
                 metadata: updatedMetadata
             )
-
+            
             try await receiver.updateContact(updatedContact)
-
+            
             let contactModel = try ContactModel(
                 id: updatedContact.id, // Use the same UUID
                 props: .init(
@@ -538,54 +576,57 @@ public extension SessionEvents {
                 ),
                 symmetricKey: symmetricKey
             )
-
+            
             try await cache.updateContact(contactModel)
             return contactModel
         } else {
             var userConfiguration = try await transport.findConfiguration(for: newContactSecretName)
             // Not needed on the contact level
-            userConfiguration.signedPQKemOneTimePublicKeys.removeAll()
+            userConfiguration.signedMLKEMOneTimePublicKeys.removeAll()
             userConfiguration.signedOneTimePublicKeys.removeAll()
-
+            
+            var built: [String: Data] = [:]
+            built["contactMetadata"] = metadata
+            if let friendshipMetadata {
+                built["friendshipMetadata"] = try BinaryEncoder().encode(friendshipMetadata)
+            }
+            
             let contact = Contact(
                 id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
                 secretName: newContactSecretName,
                 configuration: userConfiguration,
-                metadata: metadata
-            )
-
+                metadata: built)
+            
             let contactModel = try ContactModel(
                 id: contact.id, // Use the same UUID
                 props: .init(
                     secretName: contact.secretName,
                     configuration: contact.configuration,
-                    metadata: contact.metadata
-                ),
+                    metadata: contact.metadata),
                 symmetricKey: symmetricKey
             )
-
+            
             try await cache.createContact(contactModel)
             try await receiver.createdContact(contact)
-
+            
             _ = try await updateOrCreateCommunication(
                 mySecretName: mySecretName,
-                theirSecretName: newContactSecretName,
+                recipient: .nickname(newContactSecretName),
                 cache: cache,
                 receiver: receiver,
                 symmetricKey: symmetricKey,
-                logger: logger
-            )
-
+                logger: logger)
+            
             try await receiver.synchronize(
                 contact: contact,
-                requestFriendship: requestFriendship
-            )
+                requestFriendship: requestFriendship)
+            
             return contactModel
         }
     }
-
+    
     // For Contact to Contact Communication Synchronization
-
+    
     /// Updates or creates a communication model between two contacts.
     ///
     /// This method checks if a communication model already exists for the given secret names.
@@ -606,7 +647,7 @@ public extension SessionEvents {
     ///   - `EventErrors.propsError` if there is an issue with the properties of the communication model.
     private func updateOrCreateCommunication(
         mySecretName: String,
-        theirSecretName: String,
+        recipient: MessageRecipient,
         cache: PQSSessionStore,
         receiver: EventReceiver,
         symmetricKey: SymmetricKey,
@@ -614,44 +655,61 @@ public extension SessionEvents {
     ) async throws -> String? {
         var communicationModel: BaseCommunication?
         var shouldUpdateCommunication = false
+        var members: Set<String> = []
+        var membersToUpdate: Set<String> = []
+        
+        switch recipient {
+        case .nickname(let theirSecretName):
+            guard theirSecretName != mySecretName else {
+                throw EventErrors.invalidSecretName
+            }
+            members = [mySecretName, theirSecretName]
+            membersToUpdate = Set(members.filter { $0 != mySecretName })
+        case .channel(_):
+            break
+        default:
+            return nil
+        }
         do {
             communicationModel = try await findCommunicationType(
                 cache: cache,
-                communicationType: .nickname(theirSecretName),
-                symmetricKey: symmetricKey
-            )
+                communicationType: recipient,
+                symmetricKey: symmetricKey)
             logger.log(level: .debug, message: "Found Communication Model")
             shouldUpdateCommunication = true
         } catch {
             logger.log(level: .debug, message: "Creating Communication Model")
             // Create communication model
             communicationModel = try await createCommunicationModel(
-                recipients: [mySecretName, theirSecretName],
-                communicationType: .nickname(theirSecretName),
-                metadata: [:],
-                symmetricKey: symmetricKey
-            )
+                recipients: members,
+                communicationType: recipient,
+                symmetricKey: symmetricKey)
         }
-
+        
         guard let communicationModel else {
             throw EventErrors.cannotFindCommunication
         }
         guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
             throw EventErrors.propsError
         }
-
+        
+        if case .channel(_) = recipient {
+            members = props.members
+            membersToUpdate = Set(props.members.filter { $0 != mySecretName })
+        }
+        
         if props.sharedId == nil {
             let sharedIdentifier = UUID()
             props.sharedId = sharedIdentifier
-
+            
             _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
-                await receiver.updatedCommunication(communicationModel, members: [theirSecretName])
+                await receiver.updatedCommunication(communicationModel, members: membersToUpdate)
                 logger.log(level: .debug, message: "Updated Communication Model")
             } else {
                 try await cache.createCommunication(communicationModel)
-                await receiver.updatedCommunication(communicationModel, members: [theirSecretName])
+                await receiver.updatedCommunication(communicationModel, members: membersToUpdate)
                 logger.log(level: .debug, message: "Created Communication Model")
             }
             return sharedIdentifier.uuidString
@@ -660,7 +718,7 @@ public extension SessionEvents {
             return nil
         }
     }
-
+    
     /// Sends a communication synchronization request to a specified contact.
     ///
     /// This method initiates a synchronization process for communication with the specified contact.
@@ -680,7 +738,8 @@ public extension SessionEvents {
     ///   - `EventErrors.invalidSecretName` if the provided secret name matches the current user's secret name.
     ///   - Any error that may occur during the process, such as issues with updating or creating the communication model.
     func sendCommunicationSynchronization(
-        contact secretName: String,
+        recipient: MessageRecipient,
+        metadata: Data = .init(),
         sessionContext: SessionContext,
         sessionDelegate: PQSSessionDelegate,
         cache: PQSSessionStore,
@@ -688,16 +747,12 @@ public extension SessionEvents {
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws {
-        logger.log(level: .debug, message: "Sending communication synchronization to \(secretName)")
+        logger.log(level: .debug, message: "Sending communication synchronization to \(recipient)")
         let mySecretName = sessionContext.sessionUser.secretName
-
-        guard secretName != mySecretName else {
-            throw EventErrors.invalidSecretName
-        }
-
+        
         guard let sharedIdentifier = try await updateOrCreateCommunication(
             mySecretName: mySecretName,
-            theirSecretName: secretName,
+            recipient: recipient,
             cache: cache,
             receiver: receiver,
             symmetricKey: symmetricKey,
@@ -705,11 +760,14 @@ public extension SessionEvents {
         ) else {
             return
         }
-
-        try await sessionDelegate.synchronizeCommunication(recipient: .nickname(secretName), sharedIdentifier: sharedIdentifier)
+        
+        try await sessionDelegate.synchronizeCommunication(
+            recipient: recipient,
+            sharedIdentifier: sharedIdentifier,
+            metadata: metadata)
         logger.log(level: .debug, message: "Sent communication synchronization")
     }
-
+    
     /// Requests a change in the friendship state for a specific contact.
     ///
     /// This method manages the complete lifecycle of friendship state changes, including:
@@ -769,24 +827,24 @@ public extension SessionEvents {
         logger: NeedleTailLogger
     ) async throws {
         logger.log(level: .info, message: "Requesting friendship state change for \(contact.secretName) to state \(state).")
-
+        
         guard let foundContact = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.secretName == contact.secretName }) else { throw EventErrors.cannotFindContact }
-
+        
         var currentMetadata: FriendshipMetadata?
-
-        if let friendshipDocument = contact.metadata["friendshipMetadata"] as? Document, !friendshipDocument.isEmpty {
-            currentMetadata = try contact.metadata.decode(forKey: "friendshipMetadata")
+        
+        if let friendshipData = contact.metadata["friendshipMetadata"], !friendshipData.isEmpty {
+            currentMetadata = try BinaryDecoder().decode(FriendshipMetadata.self, from: friendshipData)
         }
         if currentMetadata == nil {
             currentMetadata = FriendshipMetadata()
         }
-
+        
         if currentMetadata?.myState == .blocked {
             throw EventErrors.userIsBlocked
         }
-
+        
         guard var currentMetadata else { return }
-
+        
         // Do not allow state changes that are not different, i.e. my state is .accepted cannot acceptFriendRequest() again
         if currentMetadata.ourState == .accepted && state == .accepted { return }
         if currentMetadata.myState == .rejected { return }
@@ -804,55 +862,55 @@ public extension SessionEvents {
         case .rejectedByOther, .mutuallyRejected, .rejected:
             currentMetadata.rejectRequest()
         }
-
-        let metadata = try BSONEncoder().encode(currentMetadata)
+        
+        let metadata = try BinaryEncoder().encode(currentMetadata)
         let updatedProps = try await foundContact.updatePropsMetadata(
             symmetricKey: symmetricKey,
             metadata: metadata,
             with: "friendshipMetadata"
         )
-
+        
         try await cache.updateContact(foundContact)
-
+        
         guard let updatedMetadata = updatedProps?.metadata else {
             throw EventErrors.propsError
         }
-
+        
         let updatedContact = Contact(
             id: contact.id,
             secretName: contact.secretName,
             configuration: contact.configuration,
             metadata: updatedMetadata
         )
-
+        
         try await receiver.updateContact(updatedContact)
-
+        
         func convertBoolToData(_ value: Bool) -> Data {
             // Convert Bool to UInt8 (0 for false, 1 for true)
             let byte: UInt8 = value ? 1 : 0
             // Create Data from the byte
             return Data([byte])
         }
-
+        
         var blockUnblockData: Data?
         if currentMetadata.theirState == .blocked || currentMetadata.theirState == .blockedByOther {
             blockUnblockData = convertBoolToData(true)
         }
-
+        
         if currentMetadata.theirState == .unblocked {
             blockUnblockData = convertBoolToData(false)
         }
-
+        
         // Transport
         try await sessionDelegate.requestFriendshipStateChange(
             recipient: .nickname(contact.secretName),
             blockData: blockUnblockData,
-            metadata: ["friendshipMetadata": metadata],
+            metadata: metadata,
             currentState: currentMetadata.myState)
         
         logger.log(level: .info, message: "Sent Friendship State Change Request")
     }
-
+    
     /// Updates the delivery state of a message.
     ///
     /// This method updates the delivery state of a given `EncryptedMessage` and optionally allows for external updates.
@@ -888,11 +946,11 @@ public extension SessionEvents {
         await receiver.updatedMessage(updatedMessage)
         if allowExternalUpdate {
             let metadata = DeliveryStateMetadata(state: props.deliveryState, sharedId: updatedMessage.sharedId)
-            let encodedDeliveryState = try BSONEncoder().encode(metadata)
+            let encodedDeliveryState = try BinaryEncoder().encode(metadata)
             try await sessionDelegate.deliveryStateChanged(recipient: messageRecipient, metadata: encodedDeliveryState)
         }
     }
-
+    
     /// Sends a contact created acknowledgment to the specified recipient.
     ///
     /// This method sends an acknowledgment to the specified contact indicating that a new contact has been created.
@@ -912,7 +970,7 @@ public extension SessionEvents {
         try await sessionDelegate.contactCreated(recipient: .nickname(secretName))
         logger.log(level: .debug, message: "Sent Contact Created Acknowledgment")
     }
-
+    
     /// Requests metadata from a specified contact.
     ///
     /// This method sends a request for metadata to the specified contact.
@@ -932,7 +990,7 @@ public extension SessionEvents {
         try await sessionDelegate.requestMetadata(recipient: .nickname(secretName))
         logger.log(level: .debug, message: "Requested metadata from \(secretName)")
     }
-
+    
     /// Requests the current user's metadata.
     ///
     /// This method sends a request for the current user's metadata.
@@ -950,7 +1008,7 @@ public extension SessionEvents {
         try await sessionDelegate.requestMetadata(recipient: .personalMessage)
         logger.log(level: .debug, message: "Requested my metadata")
     }
-
+    
     /// Edits the current message with new text.
     ///
     /// This method updates the text of the specified `EncryptedMessage` and notifies the session delegate of the edit.
@@ -976,19 +1034,19 @@ public extension SessionEvents {
         logger _: NeedleTailLogger
     ) async throws {
         guard var props = await message.props(symmetricKey: symmetricKey) else { return }
-
+        
         props.message.text = newText
         _ = try await message.updateProps(symmetricKey: symmetricKey, props: props)
         let updatedMessage = try await message.updateMessage(with: props, symmetricKey: symmetricKey)
-
+        
         try await cache.updateMessage(updatedMessage, symmetricKey: symmetricKey)
         await receiver.updatedMessage(updatedMessage)
-
+        
         let editMetadata = EditMessageMetadata(value: newText, sharedId: message.sharedId, sender: "")
-        let metadata = try BSONEncoder().encode(editMetadata)
+        let metadata = try BinaryEncoder().encode(editMetadata)
         try await sessionDelegate.editMessage(recipient: props.message.recipient, metadata: metadata)
     }
-
+    
     /// Finds a communication model for a specified message recipient.
     ///
     /// This method retrieves the communication model associated with the given message recipient from the cache.
@@ -1012,7 +1070,7 @@ public extension SessionEvents {
             symmetricKey: symmetricKey
         )
     }
-
+    
     /// Finds a communication model of a specific type from the cache.
     ///
     /// This method retrieves the communication model associated with the specified communication type from the cache.
@@ -1041,10 +1099,10 @@ public extension SessionEvents {
         }) else {
             throw EventErrors.cannotFindCommunication
         }
-
+        
         return foundCommunication
     }
-
+    
     /// Creates a new communication model.
     ///
     /// This method initializes a new `BaseCommunication` instance with the specified recipients, communication type,
@@ -1061,7 +1119,7 @@ public extension SessionEvents {
     func createCommunicationModel(
         recipients: Set<String>,
         communicationType: MessageRecipient,
-        metadata: Document,
+        metadata: Data = .init(),
         symmetricKey: SymmetricKey
     ) async throws -> BaseCommunication {
         try BaseCommunication(
