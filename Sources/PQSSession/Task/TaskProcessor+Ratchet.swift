@@ -487,6 +487,12 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     switch event {
                     case .sessionReestablishment:
                         canSaveMessage = false
+                        // Explicitly refresh and update the cached identity for future sends
+                        do {
+                            _ = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
+                        } catch {
+                            logger.log(level: .warning, message: "Failed to refresh identities after sessionReestablishment: \(error)")
+                        }
                     case .synchronizeOneTimeKeys(let info):
                         try await removeKeys(
                             session: session,
@@ -940,31 +946,26 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             return try decode(signedMessage)
         } else {
             // Signature verification failed with current key, likely due to key rotation
-            // Fetch fresh configuration to get rotated keys
-            guard let config = try await session.transportDelegate?.findConfiguration(for: inboundTask.senderSecretName) else {
-                throw PQSSession.SessionErrors.cannotFindUserConfiguration
-            }
+            let refreshedIdentities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
             
-            let rotatedKey = try Curve25519.Signing.PublicKey(rawRepresentation: config.signingPublicKey)
-            
-            guard try signedMessage.verifySignature(using: rotatedKey) else {
+            // Find the refreshed identity with updated keys
+            guard let refreshed = await refreshedIdentities.asyncFirst(where: { identity in
+                guard let refreshedProps = await identity.props(symmetricKey: databaseSymmetricKey) else { return false }
+                return refreshedProps.deviceId == inboundTask.senderDeviceId
+            }) else {
                 throw PQSSession.SessionErrors.invalidSignature
             }
             
-            // Sender has rotated keys - refresh identities to get updated session identity with new keys
-            let refreshedIdentities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
-            if let refreshed = await refreshedIdentities.asyncFirst(where: { identity in
-                guard let refreshedProps = await identity.props(symmetricKey: databaseSymmetricKey) else { return false }
-                return refreshedProps.deviceId == inboundTask.senderDeviceId
-            }) {
-                
-                // Use refreshed identity with updated keys
-                return try decode(
-                    signedMessage,
-                    identity: refreshed)
+            guard let refreshedProps = await refreshed.props(symmetricKey: databaseSymmetricKey) else {
+                throw JobProcessorErrors.missingIdentity
+            }
+            let refreshedKey = try Curve25519.Signing.PublicKey(rawRepresentation: refreshedProps.signingPublicKey)
+            
+            guard try signedMessage.verifySignature(using: refreshedKey) else {
+                throw PQSSession.SessionErrors.invalidSignature
             }
             
-            return try decode(signedMessage)
+            return try decode(signedMessage, identity: refreshed)
         }
         func decode(_
                     signedMessage: SignedRatchetMessage.Signed,
