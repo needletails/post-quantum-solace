@@ -458,18 +458,20 @@ public extension PQSSession {
 
             
             for foundIdentity in await identities.asyncFilter( { await $0.props(symmetricKey: symmetricKey)?.secretName == secretName }) {
-                guard var props = await foundIdentity.props(symmetricKey: symmetricKey) else {
+                guard var currentProps = await foundIdentity.props(symmetricKey: symmetricKey) else {
                     continue
                 }
                 for device in verifiedDevices {
-                    if props.deviceId == device.deviceId {
-                        props.longTermPublicKey = device.longTermPublicKey
+                    if currentProps.deviceId == device.deviceId {
+                        currentProps.setLongTermPublicKey(device.longTermPublicKey)
+                        currentProps.setSigningPublicKey(device.signingPublicKey)
+                        try await foundIdentity.updateIdentityProps(symmetricKey: symmetricKey, props: currentProps)
+                        try await cache?.updateSessionIdentity(foundIdentity)
+                        if let index = identities.firstIndex(where: { $0.id == foundIdentity.id }) {
+                            identities[index] = foundIdentity
+                        }
+                        break
                     }
-                }
-                try await foundIdentity.updateIdentityProps(symmetricKey: symmetricKey, props: props)
-                try await cache?.updateSessionIdentity(foundIdentity)
-                if let index = identities.firstIndex(where: { $0.id == foundIdentity.id }) {
-                    identities[index] = foundIdentity
                 }
             }
             

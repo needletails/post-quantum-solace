@@ -161,16 +161,19 @@ extension PQSSession {
                 recipient: .personalMessage,
                 transportInfo: metadata)
             
-            for secretName in try await cache
-                .fetchContacts()
-                .asyncMap(transform: { try? await $0.props(symmetricKey: getDatabaseSymmetricKey())?.secretName }) {
-                guard let secretName else { continue }
+            let databaseSymmetricKey = try await getDatabaseSymmetricKey()
+            let allIdentities = try await cache.fetchSessionIdentities()
+
+            for identity in allIdentities {
+                guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else { continue }
+                // Skip our own identity
+                guard props.secretName != sessionContext.sessionUser.secretName else { continue }
+                
                 try await writeTextMessage(
-                    recipient: .nickname(secretName),
+                    recipient: .nickname(props.secretName),
                     transportInfo: metadata)
             }
             
-
             logger.log(level: .debug, message: "Completed rotating keys")
         } catch {
             await setRotatingKeys(false)
