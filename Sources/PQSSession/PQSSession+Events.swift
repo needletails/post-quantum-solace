@@ -150,7 +150,7 @@ public extension PQSSession {
             async let _ = await refreshOneTimeKeysTask()
         }
         if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-            async let _ = await refreshOneTimeKeysTask()
+            async let _ = await refreshMLKEMOneTimeKeysTask()
         }
 
         let message = InboundTaskMessage(

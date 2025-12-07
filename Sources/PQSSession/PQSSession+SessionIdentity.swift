@@ -489,8 +489,8 @@ public extension PQSSession {
         fetchOneTimeKeys: Bool
     ) async throws -> (curve: CurvePublicKey?, mlKEM: MLKEMPublicKey){
         
-        var curveId: String?
-        var mlKEMId: String?
+        var curveId = curveId
+        var mlKEMId = mlKEMId
         
         let signingPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: configuration.signingPublicKey)
         
