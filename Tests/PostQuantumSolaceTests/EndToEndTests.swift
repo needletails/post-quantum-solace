@@ -3497,8 +3497,160 @@ actor EndToEndTests {
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
     }
+    
+    @Test("One-Time Keys Not Rotated Per Message Send")
+    func testOneTimeKeysNotRotatedPerMessageSend() async throws {
+        // This test verifies that one-time keys are NOT rotated after each message send.
+        // One-time keys should only be used during initial session establishment,
+        // and should not trigger updateOneTimeKeys calls for subsequent messages.
+        
+        var bobTask: Task<Void, Never>?
+        var aliceTask: Task<Void, Never>?
+        defer {
+            Task {
+                bobTask?.cancel()
+                aliceTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+        
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        
+        // Reset call counters
+        await aliceTransport.resetCallTracking()
+        await bobTransport.resetCallTracking()
+        
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+        
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+        
+        var aliceReceivedCount = 0
+        var bobReceivedCount = 0
+        
+        // Bob's receive loop
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should receive messages") {
+                for await received in bobStream {
+                    try await self._recipientSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
+                    bobReceivedCount += 1
+                }
+            }
+        }
+        
+        // Alice's receive loop
+        aliceTask = Task {
+            await #expect(throws: Never.self, "Alice should receive messages") {
+                for await received in aliceStream {
+                    try await self._senderSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
+                    aliceReceivedCount += 1
+                }
+            }
+        }
+        
+        // Step 1: Initial warm-up message to establish session
+        // This may use one-time keys for initial session establishment
+        let initialAliceCallCount = await aliceTransport.updateOneTimeKeysCallCount
+        let initialBobCallCount = await bobTransport.updateOneTimeKeysCallCount
+        
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "initial message")
+        try await Task.sleep(until: .now + .milliseconds(200))
+        
+        // Step 2: Send multiple messages after session is established
+        // These should NOT trigger updateOneTimeKeys calls
+        let messagesToSend = 10
+        for i in 1...messagesToSend {
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "message \(i)")
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        // Step 3: Send messages from Bob to Alice as well
+        for i in 1...5 {
+            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob message \(i)")
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        // Wait for all messages to be processed
+        try await Task.sleep(until: .now + .seconds(1))
+        
+        // Finish streams
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        
+        // Verify that updateOneTimeKeys was NOT called per message
+        // It may be called during initial session setup, but not for subsequent messages
+        let finalAliceCallCount = await aliceTransport.updateOneTimeKeysCallCount
+        let finalBobCallCount = await bobTransport.updateOneTimeKeysCallCount
+        
+        // The key assertion: updateOneTimeKeys should NOT be called for each message send
+        // It may be called during initial setup (0-1 times), but not for the 10+ subsequent messages
+        #expect(
+            finalAliceCallCount <= initialAliceCallCount + 1,
+            "Alice's updateOneTimeKeys should not be called per message. Initial: \(initialAliceCallCount), Final: \(finalAliceCallCount)"
+        )
+        #expect(
+            finalBobCallCount <= initialBobCallCount + 1,
+            "Bob's updateOneTimeKeys should not be called per message. Initial: \(initialBobCallCount), Final: \(finalBobCallCount)"
+        )
+        
+        // Verify messages were received
+        #expect(bobReceivedCount >= messagesToSend, "Bob should have received all messages")
+        #expect(aliceReceivedCount >= 5, "Alice should have received Bob's messages")
+        
+        // Log the call details for debugging
+        if finalAliceCallCount > initialAliceCallCount {
+            let aliceCalls = await aliceTransport.updateOneTimeKeysCalls
+            print("Alice updateOneTimeKeys calls: \(aliceCalls)")
+        }
+        if finalBobCallCount > initialBobCallCount {
+            let bobCalls = await bobTransport.updateOneTimeKeysCalls
+            print("Bob updateOneTimeKeys calls: \(bobCalls)")
+        }
+    }
 }
 
+
+actor CallTracker {
+    private(set) var callCount: Int = 0
+    private(set) var calls: [(secretName: String, deviceId: String, keyCount: Int)] = []
+    
+    func record(secretName: String, deviceId: String, keyCount: Int) {
+        callCount += 1
+        calls.append((secretName: secretName, deviceId: deviceId, keyCount: keyCount))
+    }
+    
+    func reset() {
+        callCount = 0
+        calls = []
+    }
+}
 
 actor ContinuationSignal {
     private var continuation: CheckedContinuation<Void, Never>?
@@ -3889,6 +4041,21 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     let session: PQSSession
     let store: TransportStore
     
+    // Track updateOneTimeKeys calls for testing (thread-safe)
+    private let callTracker = CallTracker()
+    
+    var updateOneTimeKeysCallCount: Int {
+        get async { await callTracker.callCount }
+    }
+    
+    var updateOneTimeKeysCalls: [(secretName: String, deviceId: String, keyCount: Int)] {
+        get async { await callTracker.calls }
+    }
+    
+    func resetCallTracking() async {
+        await callTracker.reset()
+    }
+    
     init(session: PQSSession, store: TransportStore) {
         self.session = session
         self.store = store
@@ -3942,9 +4109,12 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     
     func receiveMessage() async throws -> String { "" }
     func updateOneTimeKeys(
-        for _: String, deviceId _: String,
-        keys _: [SessionModels.UserConfiguration.SignedOneTimePublicKey]
-    ) async throws {}
+        for secretName: String, deviceId: String,
+        keys: [SessionModels.UserConfiguration.SignedOneTimePublicKey]
+    ) async throws {
+        // Track calls for testing (thread-safe)
+        await callTracker.record(secretName: secretName, deviceId: deviceId, keyCount: keys.count)
+    }
     func updateOneTimeMLKEMKeys(
         for _: String, deviceId _: String,
         keys _: [SessionModels.UserConfiguration.SignedMLKEMOneTimeKey]
