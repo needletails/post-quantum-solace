@@ -122,11 +122,3 @@ jobs:
 
       - name: Test
         run: swift test
-
-      - name: Skip Android build (macOS)
-        if: ${{ runner.os == 'macOS' }}
-        run: skip android build
-
-      - name: Skip Android test (macOS)
-        if: ${{ runner.os == 'macOS' }}
-        run: skip android test
