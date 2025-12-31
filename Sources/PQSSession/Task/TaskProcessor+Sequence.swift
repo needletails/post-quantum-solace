@@ -52,12 +52,13 @@ extension TaskProcessor {
 
         try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
         try await cache.createJob(job)
-        
-        // Start processing if not already running
-        // This ensures jobs are processed even if the previous processor finished
-        if !isRunning {
-            try await attemptTaskSequence(session: session)
-        }
+
+        // Always ensure the processor is running after enqueuing.
+        // `attemptTaskSequence` uses an atomic check-and-set (`trySetRunning`) to
+        // prevent multiple concurrent processors, so calling it here is safe and
+        // avoids platform-dependent timing where `isRunning` can be false/true at
+        // the wrong moment and jobs end up stranded in the deque.
+        try await attemptTaskSequence(session: session)
     }
 
     /// Loads and optionally processes a job or all cached jobs using the provided session and symmetric key.

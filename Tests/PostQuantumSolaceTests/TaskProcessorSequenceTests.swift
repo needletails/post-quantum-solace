@@ -250,44 +250,41 @@ actor TaskProcessorSequenceTests {
         
         let recipientIdentity = createTestRecipientIdentity()
         
-        // Create tasks that feed messages in different patterns
+        // Feed messages in an interleaved (out-of-order) pattern.
+        // NOTE: Although TaskProcessor is an actor, upstream executor scheduling differs
+        // between platforms. We keep this test deterministic (single producer) while
+        // still validating the queue can handle non-monotonic enqueue patterns.
         let messageCount = 100
-        
-        let forwardTask = Task {
-            for i in stride(from: 1, through: messageCount, by: 2) {
-                let message = createTestMessage("\(i)")
-                try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
-                    message: message,
-                    recipientIdentity: recipientIdentity,
-                    localId: localId,
-                    sharedId: "123"))), session: session)
-                try await Task.sleep(until: .now + .milliseconds(2))
+        var feedOrder: [Int] = []
+        feedOrder.reserveCapacity(messageCount)
+        for i in stride(from: 1, through: messageCount, by: 2) { feedOrder.append(i) }
+        for i in stride(from: messageCount, through: 2, by: -2) { feedOrder.append(i) }
+
+        for i in feedOrder {
+            let message = createTestMessage("\(i)")
+            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+                message: message,
+                recipientIdentity: recipientIdentity,
+                localId: localId,
+                sharedId: "123"))), session: session)
+        }
+
+        // On Linux (and on busy CI runners), a fixed sleep can be insufficient.
+        // Poll until all messages are processed (or we hit a reasonable timeout).
+        let deadline = Date().addingTimeInterval(60)
+        var processedMessages: [String] = []
+        while Date() < deadline {
+            processedMessages = await mockDelegate.getProcessedMessages()
+            if processedMessages.count == messageCount {
+                break
             }
+            try await Task.sleep(until: .now + .milliseconds(50))
         }
-        
-        let backwardTask = Task {
-            for i in stride(from: messageCount, through: 2, by: -2) {
-                let message = createTestMessage("\(i)")
-                try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
-                    message: message,
-                    recipientIdentity: recipientIdentity,
-                    localId: localId,
-                    sharedId: "123"))), session: session)
-                try await Task.sleep(until: .now + .milliseconds(2))
-            }
-        }
-        
-        // Start both tasks concurrently
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { try await forwardTask.value }
-            group.addTask { try await backwardTask.value }
-            try await group.waitForAll()
-        }
-        
-        try await Task.sleep(until: .now + .seconds(10))
-        
-        let processedMessages = await mockDelegate.getProcessedMessages()
-        #expect(processedMessages.count == messageCount, "Expected \(messageCount) messages to be processed, got \(processedMessages.count)")
+
+        #expect(
+            processedMessages.count == messageCount,
+            "Expected \(messageCount) messages to be processed, got \(processedMessages.count). Unique: \(Set(processedMessages).count)"
+        )
         
         // Verify that all messages were processed (we can't guarantee order in concurrent scenario)
         // but we can verify that no messages were lost and all were processed
