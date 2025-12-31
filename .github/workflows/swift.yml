@@ -1,4 +1,4 @@
-name: NeedleTailKit CI
+name: PostQuantumSolace CI
 
 on:
   push:
