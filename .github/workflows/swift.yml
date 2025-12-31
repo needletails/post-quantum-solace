@@ -98,6 +98,13 @@ jobs:
           brew install skiptools/skip/skip
           skip version
 
+      - name: Install Swift Android SDK (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | skip android sdk install
+
       - name: Cache Swift packages
         uses: actions/cache@v4
         with:
@@ -113,8 +120,8 @@ jobs:
       - name: Build (Release)
         run: swift build --configuration release
 
-      - name: Test (Release)
-        run: swift test --configuration release
+      - name: Test
+        run: swift test
 
       - name: Skip Android build (macOS)
         if: ${{ runner.os == 'macOS' }}
