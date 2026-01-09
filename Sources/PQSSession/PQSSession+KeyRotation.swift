@@ -100,8 +100,14 @@ extension PQSSession {
     ///   using the `fingerprint(from:_)` method before communication can resume.
     /// - Warning: This operation may take several seconds to complete due to cryptographic operations.
     public func rotateKeysOnPotentialCompromise() async throws {
+        // Prevent concurrent rotations (e.g. many inbound jobs failing at once)
+        if rotatingKeys {
+            logger.log(level: .debug, message: "Key rotation already in progress, skipping duplicate rotation request")
+            return
+        }
         logger.log(level: .debug, message: "Rotating keys")
         await setRotatingKeys(true)
+        defer { rotatingKeys = false }
         do {
             let longTerm = try createLongTermKeys()
             let mlKEMId = UUID()
@@ -176,7 +182,6 @@ extension PQSSession {
             
             logger.log(level: .debug, message: "Completed rotating keys")
         } catch {
-            await setRotatingKeys(false)
             throw error
         }
     }

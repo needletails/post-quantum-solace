@@ -340,7 +340,6 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 } else {
                     localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
                 }
-                await session.setRotatingKeys(false)
             } else {
                 localOneTimePrivateKey = state.localOneTimePrivateKey
                 localMLKEMPrivateKey = state.localMLKEMPrivateKey
@@ -493,6 +492,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         } catch {
                             logger.log(level: .warning, message: "Failed to refresh identities after sessionReestablishment: \(error)")
                         }
+                        // A reestablishment control frame indicates sessions are being refreshed; allow
+                        // future maxSkipped incidents to trigger rotation again.
+                        hasRotatedForMaxSkipped = false
                     case .synchronizeOneTimeKeys(let info):
                         try await removeKeys(
                             session: session,
@@ -511,9 +513,23 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     session: session,
                     sessionIdentity: verificationResult.sessionIdentity)
             }
+
+            // If we previously rotated due to maxSkipped failures, successfully decrypting a message
+            // means normal operation has resumed; clear the guard.
+            if hasRotatedForMaxSkipped {
+                hasRotatedForMaxSkipped = false
+            }
             
         } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-            try await session.rotateKeysOnPotentialCompromise()
+            // Only trigger a single rotation for this "maxSkipped" incident. Subsequent backlog
+            // messages are unrecoverable and should be dropped/deleted by the job processor.
+            let isRotating = await session.rotatingKeys
+            if !isRotating && !hasRotatedForMaxSkipped {
+                hasRotatedForMaxSkipped = true
+                try await session.rotateKeysOnPotentialCompromise()
+            }
+            // Re-throw so the job is treated as failed and can be deleted.
+            throw ratchetError
         } catch {
 #if DEBUG
             logger.log(level: .error, message: "RatchetError during ratchet decryption: \(error)")

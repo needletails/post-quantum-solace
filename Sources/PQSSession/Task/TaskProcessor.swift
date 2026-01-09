@@ -116,6 +116,14 @@ public actor TaskProcessor {
     /// Used to prevent multiple concurrent job processing loops.
     var isRunning = false
 
+    /// Guard against repeated key rotations when a large offline backlog causes many inbound
+    /// messages to fail with `RatchetError.maxSkippedHeadersExceeded`.
+    ///
+    /// This is intentionally kept inside `TaskProcessor` (not `PQSSession`) to avoid changing
+    /// the session's public API surface. We clear this once we successfully decrypt a message
+    /// again (i.e., normal operation resumes).
+    var hasRotatedForMaxSkipped = false
+
     /// Delegate responsible for transport-level session communication.
     /// Handles the actual sending and receiving of encrypted messages over the network.
     var delegate: (any SessionTransport)?
