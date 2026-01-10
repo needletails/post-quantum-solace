@@ -209,51 +209,24 @@ extension TaskProcessor {
                     } catch {
                         logger.log(level: .warning, message: "Failed to delete job after session error: \(error)")
                     }
-                } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
-                    // Often recoverable (e.g. sender rotated keys; our cached identity is stale).
-                    // Attempt a forced identity refresh and retry a bounded number of times with backoff.
-                    let maxAttempts = 2
-                    if props.attempts < maxAttempts {
-                        if case .streamMessage(let inbound) = props.task.task {
-                            logger.log(level: .warning, message: "invalidSignature for inbound message; forcing identity refresh and retrying (attempt \(props.attempts + 1)/\(maxAttempts))")
-                            do {
-                                _ = try await session.refreshIdentities(secretName: inbound.senderSecretName, forceRefresh: true)
-                            } catch {
-                                logger.log(level: .warning, message: "Identity refresh failed after invalidSignature: \(error)")
-                            }
-                        } else {
-                            logger.log(level: .warning, message: "invalidSignature for outbound job; retrying (attempt \(props.attempts + 1)/\(maxAttempts))")
-                        }
-
-                        var updatedProps = props
-                        updatedProps.attempts += 1
-                        // Small backoff to allow identity/config propagation.
-                        updatedProps.delayedUntil = Date().addingTimeInterval(0.2 * Double(updatedProps.attempts))
-                        do {
-                            _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
-                            try await cache.updateJob(job)
-                        } catch {
-                            logger.log(level: .warning, message: "Failed to update job for retry after invalidSignature: \(error)")
-                        }
-                    } else {
-                        logger.log(level: .error, message: "Removing Job due to: \(sessionError) (exceeded retry budget)")
-                        do {
-                            try await cache.deleteJob(job)
-                        } catch {
-                            logger.log(level: .warning, message: "Failed to delete job after invalidSignature: \(error)")
-                        }
-                    }
                 } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-                    // Unrecoverable: the sender is too far ahead (skipped > maxSkippedMessageKeys).
-                    // Retrying will never succeed; delete the job to prevent infinite loops.
-                    logger.log(level: .error, message: "Removing Job due to: \(ratchetError)")
+                    logger.log(level: .warning, message: "Max skipped headers exceeded, messages should be deleted and resend requested")
                     do {
                         try await cache.deleteJob(job)
                     } catch {
-                        logger.log(level: .warning, message: "Failed to delete job after maxSkippedHeadersExceeded: \(error)")
+                        logger.log(level: .warning, message: "Failed to delete job after session error: \(error)")
                     }
+                  throw ratchetError
+                } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+                    logger.log(level: .warning, message: "Invalid signature, messages should be deleted and resend requested")
+                    do {
+                        try await cache.deleteJob(job)
+                    } catch {
+                        logger.log(level: .warning, message: "Failed to delete job after session error: \(error)")
+                    }
+                  throw sessionError
                 } catch {
-                    
+
                     logger.log(level: .error, message: "Job error \(error)")
 
                     if await jobConsumer.deque.isEmpty || Task.isCancelled {
