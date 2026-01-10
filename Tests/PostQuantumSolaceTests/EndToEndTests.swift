@@ -614,7 +614,7 @@ actor EndToEndTests {
             try await Task.sleep(until: .now + .milliseconds(100))
             attempts += 1
         }
-
+        
         // Production-critical assertion: rotation publishes rotated keys (i.e., rotation happened)
         // and does not enter a repeated rotation loop.
         let aliceRotations = await aliceTransport.publishRotatedKeysCallCount

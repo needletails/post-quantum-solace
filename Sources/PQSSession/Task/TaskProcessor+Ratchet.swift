@@ -526,7 +526,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             let isRotating = await session.rotatingKeys
             if !isRotating && !hasRotatedForMaxSkipped {
                 hasRotatedForMaxSkipped = true
-                try await session.rotateKeysOnPotentialCompromise()
+            try await session.rotateKeysOnPotentialCompromise()
             }
             // Re-throw so the job is treated as failed and can be deleted.
             throw ratchetError
