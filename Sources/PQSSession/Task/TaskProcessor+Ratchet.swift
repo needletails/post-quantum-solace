@@ -523,10 +523,14 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
             // Only trigger a single rotation for this "maxSkipped" incident. Subsequent backlog
             // messages are unrecoverable and should be dropped/deleted by the job processor.
-            let isRotating = await session.rotatingKeys
-            if !isRotating && !hasRotatedForMaxSkipped {
+            // Set the flag immediately (before await) to prevent concurrent rotations when
+            // multiple offline messages fail decryption simultaneously.
+            if !hasRotatedForMaxSkipped {
                 hasRotatedForMaxSkipped = true
-            try await session.rotateKeysOnPotentialCompromise()
+                let isRotating = await session.rotatingKeys
+                if !isRotating {
+                    try await session.rotateKeysOnPotentialCompromise()
+                }
             }
             // Re-throw so the job is treated as failed and can be deleted.
             throw ratchetError

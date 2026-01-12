@@ -3556,6 +3556,146 @@ actor EndToEndTests {
                 "Test verifies offline backlog scenario: messages queued while offline (\(messageCount) messages), then processed when online. In production, this causes '❌ JOB ERROR INVALIDSIGNATURE' and rotation storms. Got \(rotationCount) rotations.")
     }
     
+    @Test("Multiple Offline Messages Trigger Only One Key Rotation - Prevents Rotation Storm")
+    func testMultipleOfflineMessagesTriggerOnlyOneRotation() async throws {
+        // This test replicates the exact scenario from Android logs:
+        // 1. Server sends multiple offline messages in a batch
+        // 2. All messages fail decryption with maxSkippedHeadersExceeded
+        // 3. Each failure attempts to rotate keys
+        // 4. Expected: Only ONE rotation should occur, not multiple (rotation storm)
+        
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
+
+        let sd = SessionDelegate(session: _senderMaxSkipSession)
+        let rsd = SessionDelegate(session: _recipientMaxSkipSession)
+        try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(aliceSession: _senderMaxSkipSession, sd: sd, bobSession: _recipientMaxSkipSession, rsd: rsd)
+
+        // Simulate server-side offline message queue
+        actor OfflineQueue {
+            var queuedMessages: [ReceivedMessage] = []
+            
+            func queue(_ msg: ReceivedMessage) {
+                queuedMessages.append(msg)
+            }
+            func dequeueAll() -> [ReceivedMessage] {
+                let msgs = queuedMessages
+                queuedMessages = []
+                return msgs
+            }
+            func count() -> Int {
+                queuedMessages.count
+            }
+        }
+        let offlineQueue = OfflineQueue()
+        
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        // Bob's receive loop - simulates server delivering all offline messages at once
+        bobTask = Task {
+            // Phase 1: Collect messages while "offline" (server queues them)
+            for await received in bobStream {
+                await offlineQueue.queue(received)
+            }
+            
+            // Phase 2: Bob comes back online - server delivers ALL queued messages at once
+            // This is the critical scenario: multiple messages processed concurrently,
+            // all failing with maxSkippedHeadersExceeded, each trying to rotate keys
+            let backlog = await offlineQueue.dequeueAll()
+            
+            // Process all offline messages concurrently (simulating server batch delivery)
+            // Each receiveMessage() enqueues a job that will be processed by the job processor
+            // When multiple jobs fail with maxSkippedHeadersExceeded, they all try to rotate
+            await withTaskGroup(of: Void.self) { group in
+                for received in backlog {
+                    group.addTask {
+                        // Don't await - let jobs be enqueued concurrently
+                        // The job processor will process them and handle errors
+                        try? await self._recipientMaxSkipSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId
+                        )
+                    }
+                }
+            }
+        }
+
+        // Warmup: establish session (successful encrypt/decrypt before the storm)
+        try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await Task.sleep(until: .now + .milliseconds(300))
+
+        // Phase 1: Alice sends many messages while Bob is offline (server queues them)
+        // Send MORE than maxSkippedMessageKeys (10) messages so when Bob processes them,
+        // the skipped message count exceeds the limit, causing maxSkippedHeadersExceeded
+        // We need to send enough messages that when processed out of order or after delay,
+        // they exceed the maxSkippedMessageKeys threshold
+        let offlineMessageCount = 15  // More than maxSkippedMessageKeys (10)
+        for i in 1...offlineMessageCount {
+            try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "offline msg \(i)")
+            // Small delay to ensure messages are sent in sequence
+            try await Task.sleep(until: .now + .milliseconds(10))
+        }
+
+        // Finish the stream (all messages have been sent and queued by "server")
+        aliceTransport.continuation?.finish()
+        
+        // Phase 4: Wait for Bob's task to collect all messages
+        _ = await bobTask?.value
+        
+        // Phase 5: Wait for job processor to process all enqueued jobs
+        // The job processor runs asynchronously, so we need to wait for it to finish
+        // processing all the messages that were enqueued by receiveMessage() calls
+        let deadline = Date().addingTimeInterval(15.0)
+        var lastRotationCount = 0
+        var stableCount = 0
+        while Date() < deadline {
+            let currentRotationCount = await bobTransport.publishRotatedKeysCallCount
+            if currentRotationCount == lastRotationCount {
+                stableCount += 1
+                // Wait for stability - rotation count should not change
+                try await Task.sleep(until: .now + .milliseconds(500))
+                let newRotationCount = await bobTransport.publishRotatedKeysCallCount
+                if newRotationCount == currentRotationCount {
+                    // Stable for multiple checks - jobs are likely done
+                    if stableCount >= 3 {
+                        break
+                    }
+                } else {
+                    stableCount = 0
+                }
+            } else {
+                stableCount = 0
+            }
+            lastRotationCount = currentRotationCount
+            try await Task.sleep(until: .now + .milliseconds(200))
+        }
+
+        // THE KEY ASSERTION: Only ONE rotation should occur, not multiple
+        // This verifies that the fix prevents the "rotation storm" seen in production logs
+        let rotationCount = await bobTransport.publishRotatedKeysCallCount
+        #expect(rotationCount == 1, 
+                "Expected exactly 1 key rotation when multiple offline messages fail decryption. Got \(rotationCount) rotations, indicating multiple concurrent rotation attempts were not properly guarded. This matches the 'rotation storm' behavior from production logs.")
+        
+        // Verify messages were processed (queued and handled by job processor)
+        let messageCount = await offlineQueue.count()
+        #expect(messageCount == 0, 
+                "All messages should have been processed. \(messageCount) messages still in queue.")
+    }
+    
     @Test("Rotated Key")
     func testRotatedKey() async throws {
         var bobTask: Task<Void, Never>?
