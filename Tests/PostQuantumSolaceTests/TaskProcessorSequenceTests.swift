@@ -661,6 +661,231 @@ actor TaskProcessorSequenceTests {
         }
     }
     
+    // MARK: - Scheduling / Load / Viability Edge Cases
+
+    @Test("Edge Cases - delayedUntil does not execute early")
+    func testEdgeCasesDelayedUntilDoesNotExecuteEarly() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let mockDelegate = MockTaskDelegate()
+        await session.taskProcessor.setTaskDelegate(mockDelegate)
+
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        
+        let recipientIdentity = createTestRecipientIdentity()
+        let message = createTestMessage("delayed_until")
+        let task = EncryptableTask(
+            task: .writeMessage(.init(
+                message: message,
+                recipientIdentity: recipientIdentity,
+                localId: localId,
+                sharedId: "delayed_until_shared"
+            ))
+        )
+        
+        // Create a job, then set delayedUntil in the encrypted props.
+        let seq = await session.taskProcessor.incrementId()
+        let job = try await session.taskProcessor.createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
+        if var props = await job.props(symmetricKey: symmetricKey) {
+            props.delayedUntil = Date().addingTimeInterval(0.35)
+            _ = try await job.updateProps(symmetricKey: symmetricKey, props: props)
+        }
+        try await cache.createJob(job)
+
+        // Kick off processing in the background (resumeJobQueue blocks until the queue drains).
+        let runner = Task {
+            try await session.resumeJobQueue()
+        }
+        // Verify it doesn't run early.
+        try await Task.sleep(until: .now + .milliseconds(150))
+        #expect(await mockDelegate.getProcessedMessages().isEmpty, "Job should not execute before delayedUntil")
+
+        // Then verify it does execute after delayedUntil.
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let processed = await mockDelegate.getProcessedMessages()
+            if processed.contains("delayed_until") { break }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+
+        let processed = await mockDelegate.getProcessedMessages()
+        #expect(processed == ["delayed_until"], "Expected exactly one delayed execution, got \(processed)")
+        #expect(try await cache.fetchJobs().isEmpty, "Delayed job should be removed from cache after processing")
+        _ = try? await runner.value
+        
+        await session.shutdown()
+    }
+    
+    @Test("Edge Cases - cancellation during delayedUntil pauses and leaves job in cache")
+    func testEdgeCasesCancellationDuringDelayedUntilLeavesJobInCache() async throws {
+        // NOTE: cancellation of the caller does not cancel the internal processing task
+        // started by TaskProcessor, so this edge case is covered instead by toggling session viability
+        // while a delayed job is sleeping (which should pause and keep the job in cache).
+        try await testEdgeCasesNonViableDuringDelayedUntilPausesAndResumes()
+    }
+
+    @Test("Edge Cases - non-viable during delayedUntil pauses and leaves job in cache, then resumes")
+    func testEdgeCasesNonViableDuringDelayedUntilPausesAndResumes() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        
+        let mockDelegate = MockTaskDelegate()
+        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        
+        let recipientIdentity = createTestRecipientIdentity()
+        let message = createTestMessage("paused_during_delay")
+            let task = EncryptableTask(
+                task: .writeMessage(.init(
+                    message: message,
+                    recipientIdentity: recipientIdentity,
+                    localId: localId,
+                sharedId: "paused_during_delay_shared"
+            ))
+            )
+            
+            let seq = await session.taskProcessor.incrementId()
+        let job = try await session.taskProcessor.createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
+        guard var props = await job.props(symmetricKey: symmetricKey) else {
+            throw PQSSession.SessionErrors.propsError
+        }
+        props.delayedUntil = Date().addingTimeInterval(0.35)
+        _ = try await job.updateProps(symmetricKey: symmetricKey, props: props)
+            try await cache.createJob(job)
+
+        // Start processing; while it's sleeping for delayedUntil, flip session to non-viable.
+        let runner = Task {
+            try await session.resumeJobQueue()
+        }
+        try await Task.sleep(until: .now + .milliseconds(100))
+        session.isViable = false
+        _ = try? await runner.value
+
+        // After delayedUntil elapses, processor should pause (not execute) because session is not viable.
+        #expect(await mockDelegate.getProcessedMessages().isEmpty, "Job should not execute if session becomes non-viable during delayedUntil sleep")
+        #expect(try await cache.fetchJobs().count == 1, "Job should remain in cache when paused due to non-viable session")
+
+        // Resume and ensure it runs once.
+        session.isViable = true
+        try await session.resumeJobQueue()
+        
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let processed = await mockDelegate.getProcessedMessages()
+            if processed.contains("paused_during_delay") { break }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        let processed = await mockDelegate.getProcessedMessages()
+        #expect(processed == ["paused_during_delay"], "Expected exactly one execution after resume, got \(processed)")
+        #expect(try await cache.fetchJobs().isEmpty, "Job should be removed from cache after processing")
+        
+        await session.shutdown()
+    }
+    
+    @Test("Edge Cases - loadTasks seeding does not double-enqueue jobs")
+    func testEdgeCasesLoadTasksSeedingDoesNotDoubleEnqueue() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        
+        let mockDelegate = MockTaskDelegate()
+        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        
+        let recipientIdentity = createTestRecipientIdentity()
+        let count = 7
+        for i in 1...count {
+            let message = createTestMessage("seeded_\(i)")
+            let task = EncryptableTask(
+                task: .writeMessage(.init(
+                message: message,
+                recipientIdentity: recipientIdentity,
+                localId: localId,
+                    sharedId: "seeded_shared_\(i)"
+                ))
+            )
+            let seq = await session.taskProcessor.incrementId()
+            let job = try await session.taskProcessor.createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
+            try await cache.createJob(job)
+        }
+
+        // This call seeds the consumer with cache jobs then starts processing.
+        try await session.taskProcessor.loadTasks(nil, cache: cache, symmetricKey: symmetricKey, session: session)
+
+        // Poll until all jobs are processed (or timeout).
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let processed = await mockDelegate.getProcessedMessages()
+            if processed.count >= count { break }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+
+        let processed = await mockDelegate.getProcessedMessages()
+        #expect(processed.count == count, "Expected exactly \(count) processed jobs (no duplicates), got \(processed.count): \(processed)")
+        #expect(Set(processed).count == count, "Expected all processed job labels to be unique")
+        #expect(try await cache.fetchJobs().isEmpty, "All jobs should be removed from cache after processing")
+        
+        await session.shutdown()
+    }
+    
+    @Test("Edge Cases - feedTask while not viable pauses and processes after resume")
+    func testEdgeCasesFeedTaskWhileNotViablePausesAndResumes() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        
+        let mockDelegate = MockTaskDelegate()
+        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+
+        // Make the session non-viable and enqueue a task.
+        session.isViable = false
+        let recipientIdentity = createTestRecipientIdentity()
+        let message = createTestMessage("paused_nonviable")
+            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+                message: message,
+                recipientIdentity: recipientIdentity,
+                localId: localId,
+            sharedId: "paused_nonviable_shared"
+        ))), session: session)
+
+        // It should not have processed, and the job should remain in cache.
+        try await Task.sleep(until: .now + .milliseconds(150))
+        #expect(await mockDelegate.getProcessedMessages().isEmpty, "No tasks should execute while session is not viable")
+        #expect(try await cache.fetchJobs().count == 1, "Job should remain in cache while session is not viable")
+        
+        // Resume viability and explicitly resume the job queue.
+        session.isViable = true
+        try await session.resumeJobQueue()
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            let processed = await mockDelegate.getProcessedMessages()
+            if processed.contains("paused_nonviable") { break }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+
+        let processed = await mockDelegate.getProcessedMessages()
+        #expect(processed == ["paused_nonviable"], "Expected exactly one execution after resume, got \(processed)")
+        #expect(try await cache.fetchJobs().isEmpty, "Job should be removed from cache after processing")
+        
+        await session.shutdown()
+    }
+    
     // MARK: - Helper Methods
     
     private func createTestRecipientIdentity() -> SessionIdentity {
@@ -711,9 +936,9 @@ actor TaskProcessorSequenceTests {
         for i in (midBatch+1)...(midBatch*2) {
             let message = createTestMessage("second_\(i)")
             try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
-                message: message,
-                recipientIdentity: recipientIdentity,
-                localId: localId,
+                    message: message,
+                    recipientIdentity: recipientIdentity,
+                    localId: localId,
                 sharedId: "123"))), session: session)
         }
         try await Task.sleep(until: .now + .seconds(5))
@@ -740,9 +965,9 @@ actor TaskProcessorSequenceTests {
         for i in 1...10 {
             let message = createTestMessage("A_\(i)")
             try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
-                message: message,
-                recipientIdentity: recipientIdentity,
-                localId: localId,
+                    message: message,
+                    recipientIdentity: recipientIdentity,
+                    localId: localId,
                 sharedId: "123"))), session: session)
         }
         await session.shutdown()
@@ -754,12 +979,12 @@ actor TaskProcessorSequenceTests {
         let recipientIdentity2 = createTestRecipientIdentity()
         for i in 11...20 {
             let message = createTestMessage("B_\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
-                message: message,
+                try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+                    message: message,
                 recipientIdentity: recipientIdentity2,
-                localId: localId,
+                    localId: localId,
                 sharedId: "123"))), session: session)
-        }
+            }
         try await Task.sleep(until: .now + .seconds(5))
         let processedMessages = await mockDelegate.getProcessedMessages()
         #expect(processedMessages.count == 20, "Expected all messages to be processed after restart")

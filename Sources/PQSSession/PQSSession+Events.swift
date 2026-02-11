@@ -19,6 +19,7 @@ import NeedleTailAsyncSequence
 import SessionEvents
 import SessionModels
 import Crypto
+import DoubleRatchetKit
 
 /// Extension to `PQSSession` providing all event-driven messaging, contact management, and protocol conformance for session events.
 ///
@@ -145,24 +146,45 @@ public extension PQSSession {
         deviceId: UUID,
         messageId: String
     ) async throws {
-        // We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less than the low watermark.
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-            async let _ = await refreshOneTimeKeysTask()
-        }
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-            async let _ = await refreshMLKEMOneTimeKeysTask()
-        }
+        do {
+            // We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less than the low watermark.
+            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                async let _ = await refreshOneTimeKeysTask()
+            }
+            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                async let _ = await refreshMLKEMOneTimeKeysTask()
+            }
+            
+            let message = InboundTaskMessage(
+                message: message,
+                senderSecretName: sender,
+                senderDeviceId: deviceId,
+                sharedMessageId: messageId)
 
-        let message = InboundTaskMessage(
-            message: message,
-            senderSecretName: sender,
-            senderDeviceId: deviceId,
-            sharedMessageId: messageId
-        )
+            try await taskProcessor.inboundTask(
+                message,
+                session: self)
 
-        try await taskProcessor.inboundTask(
-            message,
-            session: self)
+        } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
+            logger.log(level: .warning, message: "MaxSkippedHeadersExceeded - rotation disabled, using resend recovery flow.")
+
+            let now = Date()
+            if let cooldownUntil = maxSkippedRotationCooldownUntil, now < cooldownUntil {
+                // Rotation already attempted recently; rethrow so SDK consumer can request resend.
+                throw ratchetError
+            }
+
+            // Gate rotations to prevent storms under offline backlog delivery.
+            // Set gate BEFORE awaiting rotation to prevent re-entrant calls from racing.
+            maxSkippedRotationCooldownUntil = now.addingTimeInterval(60)
+            hasRotatedForMaxSkipped = true
+            
+            // Rethrow the original error so the consumer can delete offline backlog and request resend.
+            throw ratchetError
+        } catch {
+            logger.log(level: .error, message: "Error during message processing: \(error)")
+            throw error
+        }
     }
 
     // MARK: Outbound

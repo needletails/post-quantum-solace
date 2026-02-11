@@ -117,11 +117,6 @@ actor KeyRotationTests {
     func testRotateMLKEMKeysIfNeeded_rotatesWhenDue() async throws {
         _ = try await setupRotatableSession()
 
-        guard let originalContext = await session.sessionContext else {
-            Issue.record("Session context should be initialized")
-            return
-        }
-
         let pastDate = Calendar.current.date(byAdding: .day, value: -(PQSSessionConstants.keyRotationIntervalDays + 1), to: Date())!
 
         if var context = await session.sessionContext {

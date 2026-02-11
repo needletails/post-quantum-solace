@@ -290,10 +290,16 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ///   graceful approach, consider using `props(symmetricKey:)` instead.
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         let crypto = NeedleTailCrypto()
+        guard !data.isEmpty else { throw CryptoError.decryptionFailed }
         guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
             throw CryptoError.decryptionFailed
         }
-        return try BinaryDecoder().decode(SessionModels.BaseCommunication.UnwrappedProps.self, from: decrypted)
+        guard !decrypted.isEmpty else { throw CryptoError.decryptionFailed }
+        do {
+            return try BinaryDecoder().decode(SessionModels.BaseCommunication.UnwrappedProps.self, from: decrypted)
+        } catch {
+            throw CryptoError.decryptionFailed
+        }
     }
     
     /// Asynchronously updates the properties of the communication model.

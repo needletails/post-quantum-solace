@@ -116,14 +116,6 @@ public actor TaskProcessor {
     /// Used to prevent multiple concurrent job processing loops.
     var isRunning = false
 
-    /// Guard against repeated key rotations when a large offline backlog causes many inbound
-    /// messages to fail with `RatchetError.maxSkippedHeadersExceeded`.
-    ///
-    /// This is intentionally kept inside `TaskProcessor` (not `PQSSession`) to avoid changing
-    /// the session's public API surface. We clear this once we successfully decrypt a message
-    /// again (i.e., normal operation resumes).
-    var hasRotatedForMaxSkipped = false
-
     /// Delegate responsible for transport-level session communication.
     /// Handles the actual sending and receiving of encrypted messages over the network.
     var delegate: (any SessionTransport)?
@@ -608,6 +600,16 @@ public actor TaskProcessor {
             await session.receiverDelegate?.createdMessage(savedMessage)
             encryptableMessage = savedMessage
         }
+
+        // When persisting, fetch message props once and reuse for all identities to avoid per-identity
+        // decrypt/props failures (e.g. PROPSERROR on second identity) which would skip recipients.
+        var persistedMessageProps: EncryptedMessage.UnwrappedProps?
+        if shouldPersist, let encryptableMessage {
+            persistedMessageProps = await encryptableMessage.props(symmetricKey: symmetricKey)
+            if persistedMessageProps == nil {
+                logger.log(level: .error, message: "Obtained encryptable message props failed for initial message")
+            }
+        }
         
         for identity in sessionIdentities {
             do {
@@ -622,7 +624,7 @@ public actor TaskProcessor {
 
                 if shouldPersist {
                     guard let encryptableMessage else { return }
-                    guard let messageProps = await encryptableMessage.props(symmetricKey: symmetricKey) else {
+                    guard let messageProps = persistedMessageProps else {
                         throw PQSSession.SessionErrors.propsError
                     }
                     logger.log(level: .debug, message: "Obtained encryptable message props for recipient \(identity)")

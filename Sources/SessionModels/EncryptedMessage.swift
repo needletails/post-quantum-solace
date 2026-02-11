@@ -277,10 +277,16 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         try lock.withLock { [weak self] in
             guard let self else { throw CryptoError.decryptionFailed }
+            guard !data.isEmpty else { throw CryptoError.decryptionFailed }
             guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
                 throw CryptoError.decryptionFailed
             }
-            return try BinaryDecoder().decode(UnwrappedProps.self, from: decrypted)
+            guard !decrypted.isEmpty else { throw CryptoError.decryptionFailed }
+            do {
+                return try BinaryDecoder().decode(UnwrappedProps.self, from: decrypted)
+            } catch {
+                throw CryptoError.decryptionFailed
+            }
         }
     }
 
@@ -360,41 +366,6 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
             senderDeviceId: props.senderDeviceId
         ) as! T
     }
-
-    /// Asynchronously updates the metadata of the message properties using the provided symmetric key.
-    ///
-    /// This method allows updating specific metadata within the message without needing to
-    /// reconstruct the entire `UnwrappedProps` object. It decrypts the current message,
-    /// updates the specified metadata, and re-encrypts the message.
-    ///
-    /// - Parameters:
-    ///   - symmetricKey: The symmetric key used for decryption and encryption.
-    ///   - metadata: The new metadata to be added.
-    ///   - key: The key under which the metadata will be stored in the message's metadata dictionary.
-    /// - Returns: The updated decrypted properties, or `nil` if the operation fails.
-    /// - Throws: `CryptoError.decryptionFailed` or `CryptoError.encryptionFailed` if the operation fails.
-//    public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Data, with key: String) async throws -> UnwrappedProps? {
-//        var props = try await decryptProps(symmetricKey: symmetricKey)
-//        props.message.metadata = metadata
-//        return try await updateProps(symmetricKey: symmetricKey, props: props)
-//    }
-
-    /// Asynchronously updates the metadata of the message properties and returns the updated `EncryptedMessage`.
-    ///
-    /// This method is similar to `updatePropsMetadata` but returns the updated `EncryptedMessage`
-    /// instance rather than the decrypted properties.
-    ///
-    /// - Parameters:
-    ///   - symmetricKey: The symmetric key used for decryption and encryption.
-    ///   - metadata: The new metadata to be added.
-    ///   - key: The key under which the metadata will be stored in the message's metadata dictionary.
-    /// - Returns: The updated `EncryptedMessage` instance.
-    /// - Throws: `CryptoError.decryptionFailed` or `CryptoError.encryptionFailed` if the operation fails.
-//    public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Data, with key: String) async throws -> EncryptedMessage {
-//        var props = try await decryptProps(symmetricKey: symmetricKey)
-//        props.message.metadata[key] = metadata
-//        return try await updateMessage(with: props, symmetricKey: symmetricKey)
-//    }
 
     /// Compares two `EncryptedMessage` instances for equality.
     ///

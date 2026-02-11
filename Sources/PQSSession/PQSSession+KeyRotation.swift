@@ -19,6 +19,16 @@ import Foundation
 import NeedleTailCrypto
 import SessionModels
 
+/// This should never be used in Production. PQS uses the NeedleTailLogger's debug loglevel which only logs under DEBUG mode. But for sanity we check for DEBUG also.
+@inline(__always)
+var shouldEmitKeyPayloadLogs: Bool {
+    #if DEBUG
+    return ProcessInfo.processInfo.environment["PQS_VERBOSE_KEY_LOGGING"] != nil
+    #else
+    return false
+    #endif
+}
+
 /// Extension to `PQSSession` providing comprehensive key rotation and compromise recovery capabilities.
 ///
 /// This extension implements both manual and automatic key rotation mechanisms to ensure long-term
@@ -100,14 +110,12 @@ extension PQSSession {
     ///   using the `fingerprint(from:_)` method before communication can resume.
     /// - Warning: This operation may take several seconds to complete due to cryptographic operations.
     public func rotateKeysOnPotentialCompromise() async throws {
-        // Prevent concurrent rotations (e.g. many inbound jobs failing at once)
-        if rotatingKeys {
+        if keyLoadingState == .rotating {
             logger.log(level: .debug, message: "Key rotation already in progress, skipping duplicate rotation request")
             return
         }
         logger.log(level: .debug, message: "Rotating keys")
-        await setRotatingKeys(true)
-        defer { rotatingKeys = false }
+        await setKeyLoadingState(.rotating)
         do {
             let longTerm = try createLongTermKeys()
             let mlKEMId = UUID()
@@ -172,22 +180,41 @@ extension PQSSession {
 
             for identity in allIdentities {
                 guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else { continue }
-                // Skip our own identity
+                // Skip our own identity and archived/inactive snapshot identities.
                 guard props.secretName != sessionContext.sessionUser.secretName else { continue }
-                
+                guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+                if shouldEmitKeyPayloadLogs {
+                    logger.log(level: .debug, message: """
+                        rotationReestablishment: recipient=\(props.secretName)\n
+                        identityId=\(identity.id.uuidString)\n
+                        remoteOTK=\(props.oneTimePublicKey?.id.uuidString ?? "nil")\n
+                        remoteMLKEM=\(props.mlKEMPublicKey.id.uuidString)\n
+                        contextId=\(props.sessionContextId)
+                        """)
+                }
                 try await writeTextMessage(
                     recipient: .nickname(props.secretName),
                     transportInfo: metadata)
             }
-            
+
+            // Key rotation and reestablishment can consume/delete one-time keys. Before we clear ratchet
+            // state and resume normal traffic, ensure our one-time key pools are replenished so
+            // immediate post-rotation messages can establish fresh sessions without delay.
+            if let updatedContext = await self.sessionContext {
+                if updatedContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                    await refreshOneTimeKeysTask()
+                }
+                if updatedContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                    await refreshMLKEMOneTimeKeysTask()
+                }
+            }
+
+            try await createInactiveSessionSnapshot(policy: .archive)
             logger.log(level: .debug, message: "Completed rotating keys")
         } catch {
+            await setKeyLoadingState(.complete)
             throw error
         }
-    }
-
-    func setRotatingKeys(_ rotating: Bool) async {
-        rotatingKeys = rotating
     }
 }
 

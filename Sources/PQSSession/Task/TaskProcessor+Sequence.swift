@@ -21,268 +21,288 @@ import Crypto
 import DoubleRatchetKit
 
 extension TaskProcessor {
-    /// Increments and returns the internal sequence identifier atomically.
-    /// Since TaskProcessor is an actor, this is already thread-safe.
-    ///
-    /// - Returns: The next sequence ID as an `Int`.
-    func incrementId() async -> Int {
+    
+    // MARK: - Atomic sequence
+    
+    func incrementId() -> Int {
         sequenceId += 1
         return sequenceId
     }
     
-    /// Feeds an encryptable task into the session's job queue for processing.
-    ///
-    /// This method prepares a job by encrypting and caching it, then attempts to execute the sequence of tasks.
-    /// Since TaskProcessor is an actor, all operations are automatically serialized.
-    ///
-    /// - Parameters:
-    ///   - task: The task to be encrypted and queued.
-    ///   - session: The `PQSSession` context for processing.
-    /// - Throws: An error if the cache is unavailable or task setup fails.
+    // MARK: - Public API
+    
     public func feedTask(
         _ task: EncryptableTask,
         session: PQSSession
     ) async throws {
+        
         guard let cache = await session.cache else {
             throw PQSSession.SessionErrors.databaseNotInitialized
         }
-
-        let sequenceId = await incrementId()
+        
+        let seq = incrementId()
         let symmetricKey = try await session.getDatabaseSymmetricKey()
-        let job = try createJobModel(sequenceId: sequenceId, task: task, symmetricKey: symmetricKey)
-
-        try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
+        let job = try createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
         try await cache.createJob(job)
-
-        // Always ensure the processor is running after enqueuing.
-        // `attemptTaskSequence` uses an atomic check-and-set (`trySetRunning`) to
-        // prevent multiple concurrent processors, so calling it here is safe and
-        // avoids platform-dependent timing where `isRunning` can be false/true at
-        // the wrong moment and jobs end up stranded in the deque.
-        try await attemptTaskSequence(session: session)
+        
+        // Important: `feedTask` can be called while the processor is already running.
+        // Persisting to cache alone is not enough because the active processing loop consumes
+        // from `jobConsumer`. If we don't enqueue here, the job may not run until a future
+        // cache reload happens (which can look like the task processor "stalled").
+        try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
+        
+        try await startProcessingIfNeeded(session)
     }
-
-    /// Loads and optionally processes a job or all cached jobs using the provided session and symmetric key.
-    ///
-    /// - Parameters:
-    ///   - job: An optional specific `JobModel` to load; if `nil`, all cached jobs will be loaded.
-    ///   - cache: The session's job cache.
-    ///   - symmetricKey: The symmetric key for decrypting job properties.
-    ///   - session: The optional `PQSSession` used to process the jobs after loading.
-    func loadTasks(
+    
+    public func loadTasks(
         _ job: JobModel? = nil,
         cache: SessionCache,
         symmetricKey: SymmetricKey,
         session: PQSSession? = nil
     ) async throws {
+        
         if let job {
             try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
-            if let session {
-                try await attemptTaskSequence(session: session)
-            }
         } else {
-            // Load all jobs first, then start processing once
             for job in try await cache.fetchJobs() {
                 try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
             }
-            // Start processing after all jobs are loaded
-            if let session {
-                try await attemptTaskSequence(session: session)
+        }
+        
+        if let session {
+            try await startProcessingIfNeeded(session)
+        }
+    }
+    
+    // MARK: - Running Lock
+    
+    private func tryStart() -> Bool {
+        if isRunning { return false }
+        isRunning = true
+        return true
+    }
+    
+    private func stop() {
+        isRunning = false
+    }
+    
+    // MARK: - Startup
+    
+    private func startProcessingIfNeeded(_ session: PQSSession) async throws {
+        guard tryStart() else {
+            return
+        }
+        
+        try await Task {
+            defer {
+                stop()
             }
-        }
+            do {
+                try await self.processingLoop(session)
+            } catch {
+                self.logger.log(level: .error, message: "Processor crashed: \(error)")
+                throw error
+            }
+        }.value
     }
-
-    /// Updates the task processor's internal running state.
-    ///
-    /// - Parameter isRunning: A boolean indicating if task processing is active.
-    func setIsRunning(_ isRunning: Bool) async {
-        self.isRunning = isRunning
-    }
+    // MARK: - Core loop
     
-    /// Atomically checks if not running and sets running to true.
-    /// Returns true if the operation was successful (was not running and now is running).
-    /// Returns false if already running.
-    func trySetRunning() async -> Bool {
-        if !isRunning {
-            isRunning = true
-            return true
-        }
-        return false
-    }
-    
-    /// Processes tasks from the job queue using a serial, cancellation-aware execution model.
-    ///
-    /// This function leverages `NeedleTailAsyncSequence` to manage job execution order and cancellation.
-    /// It handles error cases such as missing identities and authentication failures, and removes corrupted or outdated jobs.
-    ///
-    /// - Parameter session: The `PQSSession` context for executing jobs.
-    /// - Throws: Any error that occurs during task processing or session access.
-    func attemptTaskSequence(session: PQSSession) async throws {
+    private func processingLoop(_ session: PQSSession) async throws {
         guard let cache = await session.cache else {
             throw PQSSession.SessionErrors.databaseNotInitialized
         }
-
-        // Fix race condition: Use atomic check-and-set to prevent multiple concurrent job processors
-        guard await trySetRunning() else {
-            if await jobConsumer.deque.isEmpty {
-                await jobConsumer.gracefulShutdown()
-                await setIsRunning(false)
-            }
-            return
-        }
-
-        logger.log(level: .debug, message: "Starting job queue")
+        
         let symmetricKey = try await session.getDatabaseSymmetricKey()
-
-        for try await result in NeedleTailAsyncSequence(consumer: jobConsumer) {
-            switch result {
-            case let .success(job):
-                guard let props = await job.props(symmetricKey: symmetricKey) else {
-                    // Corrupt / undecryptable job payload. Keeping it will cause a permanent loop.
-                    logger.log(level: .error, message: "Removing Job due to: propsError")
-                    do {
-                        try await cache.deleteJob(job)
-                    } catch {
-                        logger.log(level: .warning, message: "Failed to delete job after propsError: \(error)")
-                    }
-                    continue
-                }
-
-                logger.log(level: .debug, message: "Running job \(props.sequenceId)")
-
-                // Check session viability before processing
-                guard session.isViable else {
-                    logger.log(level: .debug, message: "Skipping job \(props.sequenceId) as we are offline")
-                    // Job remains in cache for later processing when session becomes viable
+        // If `loadTasks(...)` already seeded the consumer, don't immediately re-load from cache,
+        // otherwise the same JobModel can be enqueued twice and processed twice.
+        if await jobConsumer.deque.isEmpty {
+            try await loadFromCache(cache: cache, symmetricKey: symmetricKey)
+        }
+        
+        func startLoop() async throws {
+            // If the session is not viable, pause processing to avoid busy-looping and
+            // repeatedly re-loading the same jobs from cache.
+            guard session.isViable else {
+                await jobConsumer.gracefulShutdown()
+                return
+            }
+            
+            if await jobConsumer.deque.isEmpty {
+                let remaining = try await cache.fetchJobs()
+                if remaining.isEmpty {
                     await jobConsumer.gracefulShutdown()
-                    await setIsRunning(false)
                     return
                 }
-
-                if let delayedUntil = props.delayedUntil, delayedUntil >= Date() {
-                    logger.log(level: .debug, message: "Task was delayed into the future")
-                    // Job remains in cache for later processing when delay expires
-
-                    if await jobConsumer.deque.isEmpty {
+                try await loadFromCache(cache: cache, symmetricKey: symmetricKey)
+            }
+            
+            for try await result in NeedleTailAsyncSequence(consumer: jobConsumer) {
+                switch result {
+                case let .success(job):
+                    do {
+                        let outcome = try await process(
+                            job,
+                            cache: cache,
+                            session: session,
+                            symmetricKey: symmetricKey)
+                        
+                        if outcome == .paused {
+                            await jobConsumer.gracefulShutdown()
+                            return
+                        }
+                        if await jobConsumer.deque.isEmpty {
+                            await jobConsumer.gracefulShutdown()
+                            return
+                        }
+                    } catch {
                         await jobConsumer.gracefulShutdown()
-                        await setIsRunning(false)
-                        return
+                        throw error
                     }
+                case .consumed:
                     break
                 }
-
-                do {
-                    logger.log(level: .debug, message: "Executing Job \(props.sequenceId)")
-                    // Custom task delegate may be used, but usually only for testing
-                    if let taskDelegate {
-                        try await taskDelegate.performRatchet(task: props.task.task, session: session)
-                    } else {
-                        try await performRatchet(task: props.task.task, session: session)
-                    }
-                    do {
-                        try await cache.deleteJob(job)
-                    } catch {
-                        logger.log(level: .warning, message: "Failed to delete job after successful execution: \(error)")
-                    }
-
-                } catch let jobError as JobProcessorErrors where jobError == .missingIdentity {
-                    logger.log(level: .error, message: "Removing Job due to: \(jobError)")
-                    do {
-                        try await cache.deleteJob(job)
-                    } catch {
-                        logger.log(level: .warning, message: "Failed to delete job after missing identity error: \(error)")
-                    }
-
-                } catch let cryptoError as CryptoKitError where cryptoError == .authenticationFailure {
-                    logger.log(level: .error, message: "Removing Job due to: \(cryptoError)")
-                    do {
-                        try await cache.deleteJob(job)
-                    } catch {
-                        logger.log(level: .warning, message: "Failed to delete job after authentication failure: \(error)")
-                    }
-
-                } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidKeyId || sessionError == .cannotFindOneTimeKey {
-                    // Note: If we are invalid due to a race condition between the server and client we can optionally resend
-                    logger.log(level: .error, message: "Removing Job due to: \(sessionError)")
-                    do {
-                        try await cache.deleteJob(job)
-                    } catch {
-                        logger.log(level: .warning, message: "Failed to delete job after session error: \(error)")
-                    }
-                } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-                    logger.log(level: .warning, message: "Max skipped headers exceeded, messages should be deleted and resend requested")
-                    do {
-                        try await cache.deleteJob(job)
-                    } catch {
-                        logger.log(level: .warning, message: "Failed to delete job after session error: \(error)")
-                    }
-                  throw ratchetError
-                } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
-                    logger.log(level: .warning, message: "Invalid signature, messages should be deleted and resend requested")
-                    do {
-                        try await cache.deleteJob(job)
-                    } catch {
-                        logger.log(level: .warning, message: "Failed to delete job after session error: \(error)")
-                    }
-                  throw sessionError
-                } catch {
-
-                    logger.log(level: .error, message: "Job error \(error)")
-
-                    if await jobConsumer.deque.isEmpty || Task.isCancelled {
-                        await jobConsumer.gracefulShutdown()
-                        await setIsRunning(false)
-                        return
-                    }
-                }
-
-                if await jobConsumer.deque.isEmpty {
-                    // Check if there are more jobs in cache that need to be loaded
-                    let cachedJobs = try await cache.fetchJobs()
-                    if !cachedJobs.isEmpty {
-                        // Load remaining jobs from cache
-                        for job in cachedJobs {
-                            try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
-                        }
-                        // Continue processing - don't shut down yet
-                    } else {
-                        // No more jobs in cache or deque, safe to shut down
-                        await jobConsumer.gracefulShutdown()
-                        await setIsRunning(false)
-                    }
-                }
-
-            case .consumed:
-                await setIsRunning(false)
-                try await loadTasks(nil, cache: cache, symmetricKey: symmetricKey, session: session)
             }
+            try await startLoop()
         }
-
-        // After loop ends, check if there are more jobs to process
-        if await jobConsumer.deque.isEmpty {
-            let cachedJobs = try await cache.fetchJobs()
-            if !cachedJobs.isEmpty {
-                // Load remaining jobs from cache
-                for job in cachedJobs {
-                    try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
-                }
-                // Restart processing if we loaded jobs
-                let dequeIsEmpty = await jobConsumer.deque.isEmpty
-                if !dequeIsEmpty {
-                    try await attemptTaskSequence(session: session)
-                }
-            } else {
-                await jobConsumer.gracefulShutdown()
-                await setIsRunning(false)
-            }
+        try await startLoop()
+    }
+    
+    // MARK: - Cache loading
+    
+    private func loadFromCache(
+        cache: SessionCache,
+        symmetricKey: SymmetricKey
+    ) async throws {
+        for job in try await cache.fetchJobs() {
+            try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
         }
     }
     
-
-
-    /// Errors specific to job processing operations.
+    // MARK: - Job execution
+    
+    private func process(
+        _ job: JobModel,
+        cache: SessionCache,
+        session: PQSSession,
+        symmetricKey: SymmetricKey
+    ) async throws -> JobProcessingOutcome {
+        
+        guard let props = await job.props(symmetricKey: symmetricKey) else {
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+        
+#if DEBUG
+        if let delayedUntil = props.delayedUntil {
+            logger.log(level: .debug, message: "Job \(job.id) has delayedUntil=\(delayedUntil) (now=\(Date()))")
+        }
+#endif
+        
+        if let delayedUntil = props.delayedUntil, delayedUntil > Date() {
+            let sleep = delayedUntil.timeIntervalSinceNow
+            do {
+                try await Task.sleep(nanoseconds: UInt64(sleep * 1_000_000_000))
+            } catch {
+                // If the task was cancelled while sleeping, just pause and let a future resume reload from cache.
+                return .paused
+            }
+        }
+        
+        guard session.isViable else {
+            // Leave the job in cache; we will reload it once the session becomes viable again.
+            return .paused
+        }
+        
+        do {
+            if let taskDelegate {
+                try await taskDelegate.performRatchet(task: props.task.task, session: session)
+            } else {
+                try await performRatchet(task: props.task.task, session: session)
+            }
+            
+            try await cache.deleteJob(job)
+            return .processed
+            
+        } catch let jobError as JobProcessorErrors where jobError == .missingIdentity {
+            try await cache.deleteJob(job)
+            return .deleted
+            
+        } catch let cryptoError as CryptoKitError where cryptoError == .authenticationFailure {
+            try await cache.deleteJob(job)
+            return .deleted
+            
+        } catch let sessionError as PQSSession.SessionErrors
+                    where sessionError == .invalidKeyId || sessionError == .cannotFindOneTimeKey {
+            try await cache.deleteJob(job)
+            return .deleted
+            
+        } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
+            try await cache.deleteJob(job)
+            // Treat as a critical job failure, but do not crash the whole processor / bubble to callers.
+            logger.log(level: .error, message: "Job ratchet error: \(ratchetError)")
+            throw ratchetError
+            
+        } catch let ratchetError as RatchetError where ratchetError == .stateUninitialized {
+            // Common right after key rotation / session reestablishment.
+            // Instead of crashing the whole processor, reschedule the job with a small bounded backoff.
+            //
+            // This enables "no delay" post-rotation delivery in practice by allowing convergence as
+            // identities/one-time keys propagate, while still bounding retries via `attempts`.
+            guard var currentProps = await job.props(symmetricKey: symmetricKey) else {
+                try await cache.deleteJob(job)
+                return .deleted
+            }
+            
+            currentProps.attempts += 1
+            
+            // Cap retries to avoid infinite loops.
+            if currentProps.attempts >= 8 {
+                try await cache.deleteJob(job)
+                logger.log(level: .error, message: "Job ratchet error (exceeded retries): \(ratchetError)")
+                return .deleted
+            }
+            
+            // Exponential backoff (50ms, 100ms, 200ms, 250ms, ...), capped at 250ms.
+            let base: TimeInterval = 0.05
+            let maxDelay: TimeInterval = 0.25
+            let delay = min(maxDelay, base * pow(2.0, Double(currentProps.attempts - 1)))
+            currentProps.delayedUntil = Date().addingTimeInterval(delay)
+            
+            _ = try await job.updateProps(symmetricKey: symmetricKey, props: currentProps)
+            try await cache.updateJob(job)
+            
+            logger.log(level: .warning, message: "Job ratchet error: \(ratchetError) (attempt \(currentProps.attempts)) - retrying after \(delay)s")
+            return .failed
+            
+        } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+            try await cache.deleteJob(job)
+            // Treat as a critical job failure, but do not crash the whole processor / bubble to callers.
+            logger.log(level: .error, message: "Job session error: \(sessionError)")
+            throw sessionError
+            
+        } catch {
+            logger.log(level: .error, message: "Job error: \(error)")
+            // Keep the job in cache for now (retry semantics are handled elsewhere / future improvements).
+            return .failed
+        }
+    }
+    
+    // MARK: - Job Processing Outcomes
+    
+    enum JobProcessingOutcome: Sendable, Equatable {
+        /// Job completed successfully and was removed from cache.
+        case processed
+        /// Job was removed from cache without running (e.g., invalid/missing identity).
+        case deleted
+        /// Processing should pause (e.g., session non-viable); job remains in cache to be reloaded later.
+        case paused
+        /// Job failed but was not deleted (best-effort retry semantics).
+        case failed
+    }
+    
+    // MARK: - Errors
+    
     enum JobProcessorErrors: Error, LocalizedError {
-        /// Indicates that a job references a missing session identity.
         case missingIdentity
         
         public var errorDescription: String? {
@@ -369,10 +389,10 @@ protocol TaskSequenceDelegate: Sendable {
     ///           guard let recipient = writeTask.recipientIdentity else {
     ///               throw TaskProcessor.JobProcessorErrors.missingIdentity
     ///           }
-    ///           
+    ///
     ///           // Perform the ratchet operation
     ///           try await session.writeMessage(writeTask)
-    ///           
+    ///
     ///       case .streamMessage(let streamTask):
     ///           // Handle stream message processing
     ///           try await session.streamMessage(streamTask)
