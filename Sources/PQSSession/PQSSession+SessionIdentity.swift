@@ -226,6 +226,7 @@ public extension PQSSession {
         forceRefresh: Bool = false,
         sendOneTimeIdentities: Bool = false
     ) async throws -> [SessionIdentity] {
+        // Hide inactive snapshot identities from normal identity refresh flows.
         let existingIdentities = try await getSessionIdentities(with: secretName)
         logger.log(level: .info, message: "existingIdentities \(existingIdentities.count)")
         // Check if we have valid identities for this specific recipient
@@ -239,15 +240,20 @@ public extension PQSSession {
         
         if needsRefresh {
             do {
-                return try await refreshSessionIdentities(
+                let refreshed = try await refreshSessionIdentities(
                     for: secretName,
                     from: existingIdentities,
                     createIdentity: createIdentity,
                     forceRefresh: forceRefresh,
                     sendOneTimeIdentities: sendOneTimeIdentities,
                     oneTime: syncKeys?.curveId,
-                    oneTime: syncKeys?.mlKEMId
-                )
+                    oneTime: syncKeys?.mlKEMId)
+                // Ensure we never return inactive snapshots.
+                let symmetricKey = try await getDatabaseSymmetricKey()
+                return await refreshed.asyncFilter { identity in
+                    guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
+                    return !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+                }
             } catch {
                 logger.log(level: .error, message: "Error in refreshIdentities for \(secretName): \(error)")
                 return existingIdentities
@@ -301,6 +307,8 @@ public extension PQSSession {
             do {
                 let symmetricKey = try await getDatabaseSymmetricKey()
                 guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
+                // Never surface inactive snapshot identities to callers.
+                if props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) { return false }
                 // Check if the identity is not the current user's identity
                 let myChildIdentity = props.secretName == sessionContext.sessionUser.secretName && props.deviceId != sessionContext.sessionUser.deviceId
                 // Return true if the secret name matches the recipient name or if it's a different identity
@@ -465,6 +473,42 @@ public extension PQSSession {
                     if currentProps.deviceId == device.deviceId {
                         currentProps.setLongTermPublicKey(device.longTermPublicKey)
                         currentProps.setSigningPublicKey(device.signingPublicKey)
+                        
+                        if forceRefresh {
+                            do {
+                                // Curve one-time keys are optional.
+                                let curveIds = try await transportDelegate.fetchOneTimeKeyIdentities(
+                                    for: secretName,
+                                    deviceId: device.deviceId.uuidString,
+                                    type: .curve)
+                                
+                                if let curveId = curveIds.last,
+                                   let signedCurve = try configuration.signedOneTimePublicKeys
+                                       .first(where: { $0.id == curveId })?
+                                       .verified(using: signingPublicKey) {
+                                    currentProps.oneTimePublicKey = signedCurve
+                                } else {
+                                    currentProps.oneTimePublicKey = nil
+                                }
+
+                                // MLKEM key is required; prefer one-time, fall back to final.
+                                let mlKEMIds = try await transportDelegate.fetchOneTimeKeyIdentities(
+                                    for: secretName,
+                                    deviceId: device.deviceId.uuidString,
+                                    type: .mlKEM)
+                                
+                                if let mlKEMId = mlKEMIds.last,
+                                   let signedMLKEM = try configuration.signedMLKEMOneTimePublicKeys
+                                       .first(where: { $0.id == mlKEMId })?
+                                       .verified(using: signingPublicKey) {
+                                    currentProps.mlKEMPublicKey = signedMLKEM
+                                } else {
+                                    currentProps.mlKEMPublicKey = device.finalMLKEMPublicKey
+                                }
+                            } catch {
+                                logger.log(level: .warning, message: "Failed to refresh one-time keys for \(secretName) (\(device.deviceId)): \(error)")
+                            }
+                        }
                         try await foundIdentity.updateIdentityProps(symmetricKey: symmetricKey, props: currentProps)
                         try await cache?.updateSessionIdentity(foundIdentity)
                         if let index = identities.firstIndex(where: { $0.id == foundIdentity.id }) {

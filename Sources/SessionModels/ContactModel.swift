@@ -241,30 +241,6 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         return try await updateProps(symmetricKey: symmetricKey, props: props)
     }
     
-    /// Asynchronously updates the metadata of the contact model using the provided symmetric key.
-    ///
-    /// Merges new metadata with existing metadata, updating only the keys that are present
-    /// in the new metadata while preserving all other existing metadata.
-    ///
-    /// - Parameters:
-    ///   - symmetricKey: The symmetric key used for encryption and decryption.
-    ///   - metadata: The new metadata to be merged with the existing metadata. Only keys present
-    ///     in this metadata will be updated.
-    /// - Returns: The updated decrypted properties as `UnwrappedProps` for verification.
-    /// - Throws: Various errors if decryption, encryption, or serialization fails.
-//    public func updatePropsMetadata(symmetricKey: SymmetricKey, metadata: Data) async throws -> UnwrappedProps? {
-//        var props = try await decryptProps(symmetricKey: symmetricKey)
-//        
-//        var newMetadata = props.metadata
-//        for key in metadata.keys {
-//            if let value = metadata[key] {
-//                newMetadata[key] = value
-//            }
-//        }
-//        props.metadata = newMetadata
-//        return try await updateProps(symmetricKey: symmetricKey, props: props)
-//    }
-    
     /// Creates a decrypted model of the specified type from the contact properties.
     ///
     /// This method creates a decrypted `Contact` object from the encrypted contact model.

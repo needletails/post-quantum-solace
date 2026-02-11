@@ -17,9 +17,9 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "2.0.2"),
-        .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.1"),
-        .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.4")
+        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "2.0.3"),
+        .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.4"),
+        .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.5")
     ],
     targets: [
         .target(

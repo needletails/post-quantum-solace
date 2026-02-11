@@ -183,8 +183,35 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     let crypto = NeedleTailCrypto()
     var logger = NeedleTailLogger("[PQSSession]")
     var sessionIdentities = Set<String>()
-    var rotatingKeys = false
     var addingContactData: Data?
+    var hasRotatedForMaxSkipped = false
+    /// Cooldown gate to prevent rotation storms when an offline backlog triggers repeated
+    /// `.maxSkippedHeadersExceeded` failures in rapid succession.
+    ///
+    /// This is intentionally internal state (actor-isolated) rather than a delegate callback.
+    /// The SDK will attempt rotation once per cooldown window, then rethrow the error so the
+    /// SDK consumer can delete offline backlog and request resend.
+    var maxSkippedRotationCooldownUntil: Date?
+
+    // MARK: - Sesame-style inactive session support (backward compatible)
+
+    /// Determines how ratchet invalidation is handled.
+    ///
+    /// - `archive`: Best-effort create a bounded inactive snapshot before clearing state.
+    /// - `drop`: Clear state and delete any inactive snapshots (compromise / hard reset).
+    enum RatchetInvalidationPolicy: Sendable {
+        case archive
+        case drop
+    }
+    
+    enum KeyLoadingState: Sendable {
+        case initial, rotating, complete
+    }
+    
+    var keyLoadingState: KeyLoadingState = .initial
+    func setKeyLoadingState(_ newState: KeyLoadingState) {
+        keyLoadingState = newState
+    }
     
     //MARK: Media Encryption
     var currentMessageIndex = 0
@@ -247,6 +274,126 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// - Parameter secretName: The secret name of the user whose identity should be removed
     public func removeIdentity(with secretName: String) {
         sessionIdentities.remove(secretName)
+    }
+
+    // MARK: - Inactive snapshot helpers
+
+    private func isInactiveSessionIdentity(deviceName: String) -> Bool {
+        deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+    }
+
+    /// Interprets `sessionContextId` as an archive timestamp (seconds since epoch) for inactive snapshots.
+    ///
+    /// Active identities use random `sessionContextId`s; we only call this for inactive identities.
+    private func archivedAtSeconds(fromSessionContextId sessionContextId: Int) -> TimeInterval {
+        TimeInterval(sessionContextId)
+    }
+
+    /// Deletes expired/excess inactive session snapshots for a given peer device.
+    private func cleanupInactiveSessionSnapshots(
+        cache: SessionCache,
+        symmetricKey: SymmetricKey,
+        secretName: String,
+        deviceId: UUID
+    ) async {
+        do {
+            let all = try await cache.fetchSessionIdentities()
+            let now = Date().timeIntervalSince1970
+
+            var inactive: [(identity: SessionIdentity, archivedAt: TimeInterval)] = []
+            for identity in all {
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+                guard props.secretName == secretName, props.deviceId == deviceId else { continue }
+                guard isInactiveSessionIdentity(deviceName: props.deviceName) else { continue }
+                inactive.append((identity, archivedAtSeconds(fromSessionContextId: props.sessionContextId)))
+            }
+
+            // Age bound
+            for item in inactive where (now - item.archivedAt) > PQSSessionConstants.inactiveSessionMaxAgeSeconds {
+                try await cache.deleteSessionIdentity(item.identity.id)
+            }
+
+            // Re-fetch and enforce count bound (newest-first by archivedAt)
+            let remaining = try await cache.fetchSessionIdentities()
+            var remainingInactive: [(identity: SessionIdentity, archivedAt: TimeInterval)] = []
+            for identity in remaining {
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+                guard props.secretName == secretName, props.deviceId == deviceId else { continue }
+                guard isInactiveSessionIdentity(deviceName: props.deviceName) else { continue }
+                remainingInactive.append((identity, archivedAtSeconds(fromSessionContextId: props.sessionContextId)))
+            }
+
+            remainingInactive.sort { $0.archivedAt > $1.archivedAt }
+            if remainingInactive.count > PQSSessionConstants.inactiveSessionMaxCountPerDevice {
+                for item in remainingInactive.dropFirst(PQSSessionConstants.inactiveSessionMaxCountPerDevice) {
+                    try await cache.deleteSessionIdentity(item.identity.id)
+                }
+            }
+        } catch {
+            logger.log(level: .warning, message: "Failed inactive session snapshot cleanup for \(secretName): \(error)")
+        }
+    }
+    
+    
+    /// Keeps a record of inactive session identities for authorized past messages
+    func createInactiveSessionSnapshot(
+        for secretName: String? = nil,
+        policy: RatchetInvalidationPolicy
+    ) async throws {
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let mySecretName = await sessionContext?.sessionUser.secretName
+        guard let cache else { return }
+        for identity in try await cache.fetchSessionIdentities() {
+            guard var props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            if let secretName, props.secretName != secretName { continue }
+            // Never invalidate archived/inactive snapshots.
+            if isInactiveSessionIdentity(deviceName: props.deviceName) { continue }
+            // When invalidating globally, avoid touching our own identities; those are not used for
+            // peer-to-peer ratchet reestablishment.
+            if secretName == nil, let mySecretName, props.secretName == mySecretName { continue }
+            guard props.state != nil else { continue }
+            guard let props = try await identity.props(symmetricKey: symmetricKey) else {
+                throw RatchetError.missingProps
+            }
+            switch policy {
+            case .archive:
+                // Creation: one new snapshot per matching active identity (no cap at create time).
+                // Retention: cleanupInactiveSessionSnapshots (called below) enforces count and age bounds
+                // (inactiveSessionMaxCountPerDevice, inactiveSessionMaxAgeSeconds) so we keep the newest N per device.
+                let archived = try SessionIdentity(
+                    id: UUID(),
+                    props: .init(
+                        secretName: props.secretName,
+                        deviceId: props.deviceId,
+                        sessionContextId: Int(Date().timeIntervalSince1970),
+                        longTermPublicKey: props.longTermPublicKey,
+                        signingPublicKey: props.signingPublicKey,
+                        mlKEMPublicKey: props.mlKEMPublicKey,
+                        oneTimePublicKey: props.oneTimePublicKey,
+                        state: props.state,
+                        deviceName: PQSSessionConstants.inactiveSessionDeviceNamePrefix + props.deviceName,
+                        isMasterDevice: props.isMasterDevice
+                    ),
+                    symmetricKey: symmetricKey)
+                try await cache.createSessionIdentity(archived)
+                logger.log(level: .debug, message: "Archived ratchet state for \(props.secretName) (\(props.deviceId))")
+                
+            case .drop:
+                for archived in try await cache.fetchSessionIdentities() {
+                    guard let aProps = await archived.props(symmetricKey: symmetricKey) else { continue }
+                    guard aProps.secretName == props.secretName, aProps.deviceId == props.deviceId else { continue }
+                    guard isInactiveSessionIdentity(deviceName: aProps.deviceName) else { continue }
+                    try await cache.deleteSessionIdentity(archived.id)
+                }
+            }
+            
+            // Opportunistic cleanup: bound inactive snapshots per device.
+            await cleanupInactiveSessionSnapshots(
+                cache: cache,
+                symmetricKey: symmetricKey,
+                secretName: props.secretName,
+                deviceId: props.deviceId)
+        }
     }
 
     // Synchronizes the local configuration with the provided data
@@ -1511,9 +1658,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         await setPQSSessionDelegate(conformer: nil)
         await setSessionEventDelegate(conformer: nil)
         sessionIdentities.removeAll()
-        
-        // Reset task processor state to ensure clean restart
-        await taskProcessor.setIsRunning(false)
+
     }
 
     /// Returns a human-readable device name for the current platform

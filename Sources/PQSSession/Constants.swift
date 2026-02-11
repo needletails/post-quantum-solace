@@ -14,6 +14,8 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
+import Foundation
+
 /// Constants used throughout the Post-Quantum Solace SDK
 ///
 /// This enum provides centralized configuration values for the SDK, ensuring
@@ -80,6 +82,29 @@ public enum PQSSessionConstants: Sendable {
     ///
     /// - Default: `3`
     /// - See also: `PQSSessionConstants.minimumChannelOperators`
-    public static let minimumChannelMembers = 3
+    public static let minimumChannelMembers = 2
+
+    // MARK: - Sesame-style inactive session support
+
+    /// Prefix used to mark "inactive session" identities in the local store.
+    ///
+    /// Inactive identities are **never** used for outbound encryption and are hidden from public
+    /// identity lists. They are only used as a bounded fallback for inbound decryption when the
+    /// active ratchet state has been invalidated (e.g. after reestablishment) and delayed/offline
+    /// messages arrive out-of-order.
+    ///
+    /// - Important: This must remain stable across versions for backward compatibility.
+    public static let inactiveSessionDeviceNamePrefix = "__pqs_inactive_session__:"
+
+    /// Maximum number of inactive ratchet states to retain **per (secretName, deviceId)**.
+    ///
+    /// This bounds storage and limits how many fallback attempts are performed.
+    public static let inactiveSessionMaxCountPerDevice = 5
+
+    /// Maximum age (in seconds) to retain inactive ratchet states.
+    ///
+    /// States older than this are deleted opportunistically during invalidation and on inbound recovery.
+    /// This should be aligned with your transport's offline mailbox retention window.
+    public static let inactiveSessionMaxAgeSeconds: TimeInterval = 60 * 60 * 48 // 48 hours
 }
 
