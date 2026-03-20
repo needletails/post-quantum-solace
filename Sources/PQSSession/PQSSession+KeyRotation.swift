@@ -127,42 +127,66 @@ extension PQSSession {
             let oldSigningKeyData = sessionContext.activeUserConfiguration.signingPublicKey
             let oldSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: oldSigningKeyData)
 
-            guard let index = sessionContext
-                .activeUserConfiguration
-                .signedDevices
-                .firstIndex(where: { signed in
-                    guard let verified = try? signed.verified(using: oldSigningKey) else { return false }
-                    return verified.deviceId == sessionContext.sessionUser.deviceId
-                })
+            guard sessionContext.activeUserConfiguration.signedDevices.contains(where: { signed in
+                guard let verified = try? signed.verified(using: oldSigningKey) else { return false }
+                return verified.deviceId == sessionContext.sessionUser.deviceId
+            })
             else {
                 throw PQSSession.SessionErrors.invalidDeviceIdentity
             }
-            guard var device = try sessionContext.activeUserConfiguration.signedDevices[index]
-                .verified(using: oldSigningKey)
-            else {
-                throw SessionErrors.invalidSignature
+
+            // Every `SignedDeviceConfiguration` is verified with `signingPublicKey`. When the account
+            // signing key rotates, we must re-sign *all* device blobs with the new key — not only this
+            // device — or peers' `refreshIdentities` will see `invalidSignature` on the server bundle.
+            var allReSigned: [UserConfiguration.SignedDeviceConfiguration] = []
+            allReSigned.reserveCapacity(sessionContext.activeUserConfiguration.signedDevices.count)
+            for signed in sessionContext.activeUserConfiguration.signedDevices {
+                guard var peerDevice = try signed.verified(using: oldSigningKey) else {
+                    throw SessionErrors.invalidSignature
+                }
+                if peerDevice.deviceId == sessionContext.sessionUser.deviceId {
+                    await peerDevice.updateSigningPublicKey(longTerm.signing.publicKey.rawRepresentation)
+                    await peerDevice.updateLongTermPublicKey(longTerm.curve.publicKey.rawRepresentation)
+                    await peerDevice.updateFinalMLKEMPublicKey(mlKEMPublicKey)
+                }
+                allReSigned.append(try UserConfiguration.SignedDeviceConfiguration(device: peerDevice, signingKey: longTerm.signing))
             }
-
-            await device.updateSigningPublicKey(longTerm.signing.publicKey.rawRepresentation)
-            await device.updateLongTermPublicKey(longTerm.curve.publicKey.rawRepresentation)
-            await device.updateFinalMLKEMPublicKey(mlKEMPublicKey)
-
-            let reSigned = try UserConfiguration.SignedDeviceConfiguration(device: device, signingKey: longTerm.signing)
 
             sessionContext.sessionUser.deviceKeys.signingPrivateKey = longTerm.signing.rawRepresentation
             sessionContext.activeUserConfiguration.signingPublicKey = longTerm.signing.publicKey.rawRepresentation
             sessionContext.sessionUser.deviceKeys.longTermPrivateKey = longTerm.curve.rawRepresentation
             sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey = mlKEMPrivateKey
-            sessionContext.activeUserConfiguration.signedDevices[index] = reSigned
+            sessionContext.activeUserConfiguration.signedDevices = allReSigned
+
+            guard let transportDelegate else {
+                throw SessionErrors.transportNotInitialized
+            }
+
+            // Publish to server *before* persisting local keys. If publish fails, local state stays unchanged
+            // and we avoid the INVALIDDEVICECONFIGURATION mismatch (server has old keys, local has new).
+            logger.log(level: .debug, message: "Publishing rotated keys to server")
+            let pskData = longTerm.signing.publicKey.rawRepresentation
+            guard let rotatingDeviceSigned = allReSigned.first(where: { $0.id == sessionContext.sessionUser.deviceId }) else {
+                throw PQSSession.SessionErrors.invalidDeviceIdentity
+            }
+            // Multiple PUTs each set `signingPublicKey` before every `signedDevices` entry is updated,
+            // leaving the stored bundle unverifiable between requests. Batch when we have >1 device.
+            if allReSigned.count > 1 {
+                try await transportDelegate.publishRotatedKeys(
+                    for: sessionContext.sessionUser.secretName,
+                    deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                    rotated: .init(
+                        pskData: pskData,
+                        signedDevice: rotatingDeviceSigned,
+                        allSignedDevices: allReSigned))
+            } else {
+                try await transportDelegate.publishRotatedKeys(
+                    for: sessionContext.sessionUser.secretName,
+                    deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                    rotated: .init(pskData: pskData, signedDevice: rotatingDeviceSigned))
+            }
 
             try await updateRotatedKeySessionContext(sessionContext: sessionContext)
-
-            logger.log(level: .debug, message: "Will publish rotated keys")
-            // Send Public Keys to server
-            try await transportDelegate?.publishRotatedKeys(
-                for: sessionContext.sessionUser.secretName,
-                deviceId: sessionContext.sessionUser.deviceId.uuidString,
-                rotated: .init(pskData: device.signingPublicKey, signedDevice: reSigned))
             
             guard let cache else {
                 throw SessionErrors.databaseNotInitialized
@@ -366,13 +390,25 @@ private extension PQSSession {
         let reSigned = try UserConfiguration.SignedDeviceConfiguration(device: device, signingKey: signingPrivateKey)
         sessionContext.activeUserConfiguration.signedDevices[index] = reSigned
 
-        try await updateRotatedKeySessionContext(sessionContext: sessionContext)
+        guard let transportDelegate else {
+            throw SessionErrors.transportNotInitialized
+        }
 
-        // Send Public Keys to server
-        try await transportDelegate?.publishRotatedKeys(
+        // Publish to server *before* persisting local keys (same as rotateKeysOnPotentialCompromise).
+        try await transportDelegate.publishRotatedKeys(
             for: sessionContext.sessionUser.secretName,
             deviceId: sessionContext.sessionUser.deviceId.uuidString,
             rotated: .init(pskData: device.signingPublicKey, signedDevice: reSigned)
         )
+
+        try await updateRotatedKeySessionContext(sessionContext: sessionContext)
+    }
+}
+
+extension PQSSession {
+    /// Publishes one bounded ML-KEM rotation (same path as scheduled ML-KEM refresh) when ratchet decrypt fails with `maxSkippedHeadersExceeded`.
+    /// `receiveMessage` sets the cooldown gate first, then calls this, then rethrows `.maxSkippedHeadersExceeded` so the app can drive resend.
+    internal func publishBoundedRotationAfterMaxSkipped() async throws {
+        try await rotateMLKEMFinalKey()
     }
 }

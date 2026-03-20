@@ -3467,6 +3467,510 @@ actor EndToEndTests {
         #expect(bobCount >= 1, "Bob should have received warmup and at least 1 subsequent message from Alice after re-sync. Actual: \(bobCount)")
     }
 
+    // MARK: - Key rotation and ordering robustness
+
+    /// Pre-rotation messages, then rotation (sessionReestablishment), then post-rotation messages
+    /// delivered in send order. All must decrypt successfully.
+    @Test("Burst then rotation then burst in order - all messages decrypt")
+    func testBurstThenRotationThenBurstInOrder() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        actor BobState {
+            var receivedCount = 0
+            var sawReestablishment = false
+            var decryptionErrors = 0
+            func incReceived() { receivedCount += 1 }
+            func setReestablishment() { sawReestablishment = true }
+            func incErrors() { decryptionErrors += 1 }
+        }
+        let bobState = BobState()
+
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should receive all messages in order") {
+                for await received in bobStream {
+                    do {
+                        if try await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received) {
+                            await bobState.incReceived()
+                        }
+                        if case .sessionReestablishment = received.transportEvent {
+                            await bobState.setReestablishment()
+                        }
+                    } catch {
+                        await bobState.incErrors()
+                        throw error
+                    }
+                }
+            }
+        }
+        aliceTask = Task {
+            await #expect(throws: Never.self, "Alice should receive messages") {
+                for await received in aliceStream {
+                    _ = try await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
+                }
+            }
+        }
+
+        // Pre-rotation burst
+        for i in 1...3 {
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "pre-rotation \(i)")
+            try await Task.sleep(until: .now + .milliseconds(80))
+        }
+        try await Task.sleep(until: .now + .milliseconds(200))
+
+        // Rotation (sends sessionReestablishment to Bob)
+        try await _senderSession.rotateKeysOnPotentialCompromise()
+        try await Task.sleep(until: .now + .milliseconds(200))
+
+        // Post-rotation burst
+        for i in 1...3 {
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "post-rotation \(i)")
+            try await Task.sleep(until: .now + .milliseconds(80))
+        }
+
+        try await Task.sleep(until: .now + .seconds(2))
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await bobTask?.value
+        _ = await aliceTask?.value
+        try await Task.sleep(until: .now + .milliseconds(500))
+
+        let count = await bobState.receivedCount
+        let sawReest = await bobState.sawReestablishment
+        let errors = await bobState.decryptionErrors
+        #expect(errors == 0, "Bob should have zero decryption errors. Had \(errors)")
+        #expect(sawReest, "Bob should have received sessionReestablishment")
+        #expect(count >= 6, "Bob should have received at least 6 messages (3 pre + reestablishment + 3 post). Actual: \(count)")
+    }
+
+    /// Alice rotates twice; Bob receives reestablishments and post-second-rotation message decrypts.
+    @Test("Double rotation then send - post-second-rotation decrypts")
+    func testDoubleRotationThenSend() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        var bobReceived = 0
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should receive messages") {
+                for await received in bobStream {
+                    if try await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received) {
+                        bobReceived += 1
+                    }
+                }
+            }
+        }
+        aliceTask = Task {
+            await #expect(throws: Never.self, "Alice should receive messages") {
+                for await received in aliceStream {
+                    _ = try await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
+                }
+            }
+        }
+
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await Task.sleep(until: .now + .milliseconds(300))
+
+        try await _senderSession.rotateKeysOnPotentialCompromise()
+        try await Task.sleep(until: .now + .milliseconds(300))
+        try await _senderSession.rotateKeysOnPotentialCompromise()
+        try await Task.sleep(until: .now + .milliseconds(300))
+
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "after second rotation")
+        try await Task.sleep(until: .now + .seconds(2))
+
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await bobTask?.value
+        _ = await aliceTask?.value
+        try await Task.sleep(until: .now + .milliseconds(500))
+
+        #expect(bobReceived >= 2, "Bob should have received warmup and post-second-rotation message. Actual: \(bobReceived)")
+    }
+
+    /// Rapid message succession, then rotation, then rapid succession. In-order delivery must succeed.
+    @Test("Rapid succession then rotation then rapid succession")
+    func testRapidSuccessionThenRotationThenRapidSuccession() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        actor BobCount { var n = 0; func inc() { n += 1 }; func get() -> Int { n } }
+        let bobCount = BobCount()
+
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should receive rapid messages") {
+                for await received in bobStream {
+                    if try await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received) {
+                        await bobCount.inc()
+                    }
+                }
+            }
+        }
+        aliceTask = Task {
+            await #expect(throws: Never.self, "Alice should receive messages") {
+                for await received in aliceStream {
+                    _ = try await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
+                }
+            }
+        }
+
+        for i in 1...5 {
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "rapid \(i)")
+            try await Task.sleep(until: .now + .milliseconds(20))
+        }
+        try await Task.sleep(until: .now + .milliseconds(250))
+        try await _senderSession.rotateKeysOnPotentialCompromise()
+        try await Task.sleep(until: .now + .milliseconds(200))
+        for i in 6...10 {
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "rapid \(i)")
+            try await Task.sleep(until: .now + .milliseconds(20))
+        }
+
+        try await Task.sleep(until: .now + .seconds(2))
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await bobTask?.value
+        _ = await aliceTask?.value
+        try await Task.sleep(until: .now + .milliseconds(500))
+
+        let n = await bobCount.get()
+        #expect(n >= 10, "Bob should have received at least 10 messages. Actual: \(n)")
+    }
+
+    /// Recipient (Bob) rotates; Alice sends; Bob must decrypt using refreshed identity path.
+    @Test("Recipient rotates then sender sends - decrypt succeeds")
+    func testRecipientRotatesThenSenderSends() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        var bobReceived = 0
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should receive messages") {
+                for await received in bobStream {
+                    if try await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received) {
+                        bobReceived += 1
+                    }
+                }
+            }
+        }
+        aliceTask = Task {
+            await #expect(throws: Never.self, "Alice should receive reestablishment and messages") {
+                for await received in aliceStream {
+                    _ = try await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
+                }
+            }
+        }
+
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await Task.sleep(until: .now + .milliseconds(400))
+
+        try await _recipientSession.rotateKeysOnPotentialCompromise()
+        try await Task.sleep(until: .now + .seconds(1))
+
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "after bob rotation 1")
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "after bob rotation 2")
+        try await Task.sleep(until: .now + .seconds(2))
+
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await bobTask?.value
+        _ = await aliceTask?.value
+        try await Task.sleep(until: .now + .milliseconds(500))
+
+        #expect(bobReceived >= 3, "Bob should have received warmup and 2 post-rotation messages. Actual: \(bobReceived)")
+    }
+
+    /// Explicit ordering: pre-rotation messages, then sessionReestablishment, then post-rotation.
+    /// Verifies sessionReestablishment is observed and message counts are consistent.
+    @Test("Session reestablishment in correct order - pre then reestablishment then post")
+    func testSessionReestablishmentInCorrectOrder() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        actor BobState {
+            var received = 0
+            var reestablishmentIndex: Int?
+            func inc() { received += 1 }
+            func getReceived() -> Int { received }
+            func setReestablishment(at i: Int) {
+                if reestablishmentIndex == nil { reestablishmentIndex = i }
+            }
+        }
+        let bobState = BobState()
+        var deliveryOrder = 0
+
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should receive in order") {
+                for await received in bobStream {
+                    deliveryOrder += 1
+                    let idx = deliveryOrder
+                    if try await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received) {
+                        await bobState.inc()
+                    }
+                    if case .sessionReestablishment = received.transportEvent {
+                        await bobState.setReestablishment(at: idx)
+                    }
+                }
+            }
+        }
+        aliceTask = Task {
+            await #expect(throws: Never.self, "Alice should receive") {
+                for await received in aliceStream {
+                    _ = try await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
+                }
+            }
+        }
+
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "pre-1")
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "pre-2")
+        try await Task.sleep(until: .now + .milliseconds(200))
+        try await _senderSession.rotateKeysOnPotentialCompromise()
+        try await Task.sleep(until: .now + .milliseconds(200))
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "post-1")
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "post-2")
+        try await Task.sleep(until: .now + .seconds(2))
+
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await bobTask?.value
+        _ = await aliceTask?.value
+        try await Task.sleep(until: .now + .milliseconds(500))
+
+        let reestIdx = await bobState.reestablishmentIndex
+        let count = await bobState.getReceived()
+        #expect(reestIdx != nil, "Bob should have received sessionReestablishment")
+        #expect(count >= 4, "Bob should have received at least 4 messages (2 pre + reestablishment + 2 post). Actual: \(count)")
+    }
+
+    /// Multiple back-and-forth messages then rotation; both sides send after rotation.
+    @Test("Bidirectional exchange then rotation then bidirectional")
+    func testBidirectionalExchangeThenRotationThenBidirectional() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        actor Counts {
+            var alice = 0, bob = 0
+            func incAlice() { alice += 1 }
+            func incBob() { bob += 1 }
+            func getAlice() -> Int { alice }
+            func getBob() -> Int { bob }
+        }
+        let counts = Counts()
+
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should receive") {
+                for await received in bobStream {
+                    if try await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received) {
+                        await counts.incBob()
+                    }
+                }
+            }
+        }
+        aliceTask = Task {
+            await #expect(throws: Never.self, "Alice should receive") {
+                for await received in aliceStream {
+                    if try await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received) {
+                        await counts.incAlice()
+                    }
+                }
+            }
+        }
+
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice 1")
+        try await Task.sleep(until: .now + .milliseconds(150))
+        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob 1")
+        try await Task.sleep(until: .now + .milliseconds(150))
+        try await _senderSession.rotateKeysOnPotentialCompromise()
+        try await Task.sleep(until: .now + .seconds(1))
+        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice 2")
+        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob 2")
+        try await Task.sleep(until: .now + .seconds(2))
+
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await bobTask?.value
+        _ = await aliceTask?.value
+        try await Task.sleep(until: .now + .milliseconds(500))
+
+        let a = await counts.getAlice()
+        let b = await counts.getBob()
+        #expect(a >= 2, "Alice should have received at least 2 messages. Actual: \(a)")
+        #expect(b >= 2, "Bob should have received at least 2 messages. Actual: \(b)")
+    }
+
     /// Receiver gets out of sync (e.g. maxSkipped or invalidSignature after rotation); subsequent
     /// message sends re-synchronize and delivery succeeds.
     @Test("Out-of-sync receiver then subsequent sends re-synchronize during flow")

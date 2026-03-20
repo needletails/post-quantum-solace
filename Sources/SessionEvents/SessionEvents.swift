@@ -940,6 +940,10 @@ public extension SessionEvents {
         symmetricKey: SymmetricKey
     ) async throws {
         guard var props = await message.props(symmetricKey: symmetricKey) else { throw EventErrors.propsError }
+        guard props.deliveryState != deliveryState else {
+            // Already in target state; skip update and avoid sending duplicate receipt.
+            return
+        }
         props.deliveryState = deliveryState
         let updatedMessage = try await message.updateMessage(with: props, symmetricKey: symmetricKey)
         try await cache.updateMessage(updatedMessage, symmetricKey: symmetricKey)

@@ -252,17 +252,24 @@ public struct RotatedPublicKeys: Codable, Sendable {
     /// The signed device configuration after the key rotation has been completed.
     public let signedDevice: UserConfiguration.SignedDeviceConfiguration
 
+    /// When non-empty, server replaces the entire `signedDevices` array in one write (required for
+    /// multi-device rotation so `signingPublicKey` and every device attestation stay consistent).
+    public let allSignedDevices: [UserConfiguration.SignedDeviceConfiguration]?
+
     /// Initializes a new `RotatedPublicKeys` instance.
     ///
     /// - Parameters:
     ///   - pskData: The pre-shared key data used during the key rotation process.
     ///   - signedDevice: The signed device configuration after key rotation.
+    ///   - allSignedDevices: Full re-signed device list for atomic multi-device updates; omit for single-device.
     public init(
         pskData: Data,
-        signedDevice: UserConfiguration.SignedDeviceConfiguration
+        signedDevice: UserConfiguration.SignedDeviceConfiguration,
+        allSignedDevices: [UserConfiguration.SignedDeviceConfiguration]? = nil
     ) {
         self.pskData = pskData
         self.signedDevice = signedDevice
+        self.allSignedDevices = allSignedDevices
     }
 }
 

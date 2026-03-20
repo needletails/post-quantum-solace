@@ -166,7 +166,7 @@ public extension PQSSession {
                 session: self)
 
         } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-            logger.log(level: .warning, message: "MaxSkippedHeadersExceeded - rotation disabled, using resend recovery flow.")
+            logger.log(level: .warning, message: "MaxSkippedHeadersExceeded - bounded ML-KEM publish, then surfacing resend error.")
 
             let now = Date()
             if let cooldownUntil = maxSkippedRotationCooldownUntil, now < cooldownUntil {
@@ -178,7 +178,10 @@ public extension PQSSession {
             // Set gate BEFORE awaiting rotation to prevent re-entrant calls from racing.
             maxSkippedRotationCooldownUntil = now.addingTimeInterval(60)
             hasRotatedForMaxSkipped = true
-            
+
+            // Contract: one bounded publish so peers can observe fresh ML-KEM; publish failures propagate to the consumer.
+            try await publishBoundedRotationAfterMaxSkipped()
+
             // Rethrow the original error so the consumer can delete offline backlog and request resend.
             throw ratchetError
         } catch {

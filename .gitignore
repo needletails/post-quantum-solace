@@ -12,7 +12,23 @@ DerivedData/
 *.xcodeproj/
 *.xcworkspace/
 *.swp
+*.swo
+*~
 *.lock
 *.DS_Store
 Package.resolved
 .swiftpm
+
+# Environment / credentials
+.env
+.env.*
+
+# IDEs
+.vscode/
+.cursor/
+.idea/
+
+# Logs / temporary
+*.log
+*.orig
+*.rej
