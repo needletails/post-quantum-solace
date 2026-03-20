@@ -395,10 +395,12 @@ private extension PQSSession {
         }
 
         // Publish to server *before* persisting local keys (same as rotateKeysOnPotentialCompromise).
+        // IMPORTANT: `pskData` is the account attestation signing key used to verify signedDevices,
+        // not necessarily the per-device signingPublicKey field inside a signed device payload.
         try await transportDelegate.publishRotatedKeys(
             for: sessionContext.sessionUser.secretName,
             deviceId: sessionContext.sessionUser.deviceId.uuidString,
-            rotated: .init(pskData: device.signingPublicKey, signedDevice: reSigned)
+            rotated: .init(pskData: sessionContext.activeUserConfiguration.signingPublicKey, signedDevice: reSigned)
         )
 
         try await updateRotatedKeySessionContext(sessionContext: sessionContext)
