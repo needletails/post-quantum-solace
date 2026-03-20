@@ -127,6 +127,23 @@ extension PQSSession {
             let oldSigningKeyData = sessionContext.activeUserConfiguration.signingPublicKey
             let oldSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: oldSigningKeyData)
 
+            // Self device lists can be stale when another device was linked after this client registered.
+            // For full compromise rotation we must re-sign every current device attestation, so prefer the
+            // latest server copy of our own signedDevices when it is still verified by the current account key.
+            if let transportDelegate,
+               let latestConfiguration = try? await transportDelegate.findConfiguration(
+                for: sessionContext.sessionUser.secretName
+               ),
+               latestConfiguration.signingPublicKey == oldSigningKeyData {
+                let latestDevices = latestConfiguration.signedDevices
+                let allLatestVerify = latestDevices.allSatisfy { signed in
+                    (try? signed.verified(using: oldSigningKey)) != nil
+                }
+                if allLatestVerify {
+                    sessionContext.activeUserConfiguration.signedDevices = latestDevices
+                }
+            }
+
             guard sessionContext.activeUserConfiguration.signedDevices.contains(where: { signed in
                 guard let verified = try? signed.verified(using: oldSigningKey) else { return false }
                 return verified.deviceId == sessionContext.sessionUser.deviceId
