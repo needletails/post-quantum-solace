@@ -509,6 +509,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         case invalidKeyId = "The Key ID is invalid."
         case drainedKeys = "The Local Keys are drained."
         case longTermKeyRotationFailed = "Failed to rotate the long-term key."
+        case signingKeyOutOfSync = "Local signing key is out of sync with server-trusted account state."
         case invalidOperatorCount = "The number of operators must be greater than 0."
         case invalidMemberCount = "The number of members must be greater than 2."
         
@@ -567,6 +568,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 return "Verify the password is correct and try again"
             case .saltError:
                 return "Ensure the device salt is properly initialized"
+            case .signingKeyOutOfSync:
+                return "Re-link this device from a trusted device or reset account keys"
             default:
                 return nil
             }

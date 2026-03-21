@@ -14,6 +14,8 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
+import BinaryCodable
+import Crypto
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
@@ -126,18 +128,38 @@ extension PQSSession {
 
             let oldSigningKeyData = sessionContext.activeUserConfiguration.signingPublicKey
             let oldSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: oldSigningKeyData)
+            let oldSigningPrivateKey = try Curve25519.Signing.PrivateKey(
+                rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey
+            )
+            var invalidServerDeviceIds: [UUID] = []
+            var validServerDeviceIds: [UUID] = []
+            var serverDeviceIds: [UUID] = []
 
             // Self device lists can be stale when another device was linked after this client registered.
-            // For full compromise rotation we must re-sign every current device attestation, so prefer the
-            // latest server copy of our own signedDevices when it is still verified by the current account key.
-            if let transportDelegate,
-               let latestConfiguration = try? await transportDelegate.findConfiguration(
-                for: sessionContext.sessionUser.secretName
-               ),
-               latestConfiguration.signingPublicKey == oldSigningKeyData {
+            // For full compromise rotation we must re-sign every current device attestation, so load the
+            // latest server bundle before rotating. Do not require `signingPublicKey == oldSigningKeyData`:
+            // the top-level field can differ from locally cached `Data` while every `signedDevices` entry
+            // still verifies under `oldSigningKey` — skipping merge in that case produced a single-device
+            // PUT and `400 Multi-device key rotation requires batch signedDevices payload` on the server.
+            if let transportDelegate {
+                let latestConfiguration = try await transportDelegate.findConfiguration(
+                    for: sessionContext.sessionUser.secretName
+                )
                 let latestDevices = latestConfiguration.signedDevices
-                let allLatestVerify = latestDevices.allSatisfy { signed in
-                    (try? signed.verified(using: oldSigningKey)) != nil
+                serverDeviceIds = latestDevices.map(\.id)
+                let verificationResults = latestDevices.map { signed in
+                    let verifiedDevice = try? signed.verified(using: oldSigningKey)
+                    return (id: signed.id, isValid: verifiedDevice != nil)
+                }
+                validServerDeviceIds = verificationResults.compactMap { $0.isValid ? $0.id : nil }
+                invalidServerDeviceIds = verificationResults.compactMap { $0.isValid ? nil : $0.id }
+                let allLatestVerify = !verificationResults.isEmpty && verificationResults.allSatisfy(\.isValid)
+                let canAttemptMasterRescue = validServerDeviceIds.isEmpty
+                    && serverDeviceIds.count > 1
+                    && serverDeviceIds.contains(sessionContext.sessionUser.deviceId)
+                if !validServerDeviceIds.contains(sessionContext.sessionUser.deviceId), !canAttemptMasterRescue {
+                    logger.log(level: .error, message: "Rotation compromise aborted due to signing key divergence.")
+                    throw PQSSession.SessionErrors.signingKeyOutOfSync
                 }
                 if allLatestVerify {
                     sessionContext.activeUserConfiguration.signedDevices = latestDevices
@@ -186,6 +208,37 @@ extension PQSSession {
             guard let rotatingDeviceSigned = allReSigned.first(where: { $0.id == sessionContext.sessionUser.deviceId }) else {
                 throw PQSSession.SessionErrors.invalidDeviceIdentity
             }
+            let shouldUseCorruptionRecovery = allReSigned.count == 1
+                && validServerDeviceIds == [sessionContext.sessionUser.deviceId]
+                && !invalidServerDeviceIds.isEmpty
+            var recovery: RotatedKeysRecovery?
+            var recoveryPrunedDeviceIds: [UUID] = []
+            if shouldUseCorruptionRecovery {
+                recoveryPrunedDeviceIds = invalidServerDeviceIds
+            } else if allReSigned.count == 1,
+                      serverDeviceIds.count > 1,
+                      serverDeviceIds.contains(sessionContext.sessionUser.deviceId) {
+                // Failed/partial linking can leave local-only view diverged from server bundle.
+                // In this case, try a recovery payload that prunes every non-self server device;
+                // server still enforces exact invalid-id match before accepting.
+                recoveryPrunedDeviceIds = serverDeviceIds.filter { $0 != sessionContext.sessionUser.deviceId }
+            }
+            if !recoveryPrunedDeviceIds.isEmpty {
+                let authorization = RotatedKeysRecoveryAuthorization(
+                    secretName: sessionContext.sessionUser.secretName,
+                    recoveringDeviceId: sessionContext.sessionUser.deviceId,
+                    newSigningPublicKey: pskData,
+                    newSignedDeviceData: rotatingDeviceSigned.data,
+                    prunedDeviceIds: recoveryPrunedDeviceIds
+                )
+                let authorizationData = authorization.canonicalSigningData()
+                let signature = try oldSigningPrivateKey.signature(for: authorizationData)
+                recovery = RotatedKeysRecovery(
+                    recoveringDeviceId: sessionContext.sessionUser.deviceId,
+                    prunedDeviceIds: recoveryPrunedDeviceIds,
+                    oldAccountSignature: signature
+                )
+            }
             // Multiple PUTs each set `signingPublicKey` before every `signedDevices` entry is updated,
             // leaving the stored bundle unverifiable between requests. Batch when we have >1 device.
             if allReSigned.count > 1 {
@@ -195,12 +248,17 @@ extension PQSSession {
                     rotated: .init(
                         pskData: pskData,
                         signedDevice: rotatingDeviceSigned,
-                        allSignedDevices: allReSigned))
+                        allSignedDevices: allReSigned,
+                        recovery: nil))
             } else {
                 try await transportDelegate.publishRotatedKeys(
                     for: sessionContext.sessionUser.secretName,
                     deviceId: sessionContext.sessionUser.deviceId.uuidString,
-                    rotated: .init(pskData: pskData, signedDevice: rotatingDeviceSigned))
+                    rotated: .init(
+                        pskData: pskData,
+                        signedDevice: rotatingDeviceSigned,
+                        recovery: recovery
+                    ))
             }
 
             try await updateRotatedKeySessionContext(sessionContext: sessionContext)

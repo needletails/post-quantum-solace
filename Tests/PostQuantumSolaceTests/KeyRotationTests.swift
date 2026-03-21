@@ -59,6 +59,75 @@ actor KeyRotationTests {
         return (transport, cacheStore)
     }
 
+    private func makeLinkedSignedDevice(from context: SessionContext) throws -> UserConfiguration.SignedDeviceConfiguration {
+        let signingPrivateKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: context.sessionUser.deviceKeys.signingPrivateKey
+        )
+        guard let currentSignedDevice = context.activeUserConfiguration.signedDevices.first,
+              let currentDevice = try? currentSignedDevice.verified(
+                using: Curve25519.Signing.PublicKey(rawRepresentation: context.activeUserConfiguration.signingPublicKey)
+              ) else {
+            throw PQSSession.SessionErrors.invalidDeviceIdentity
+        }
+
+        let linkedDevice = UserDeviceConfiguration(
+            deviceId: UUID(),
+            signingPublicKey: currentDevice.signingPublicKey,
+            longTermPublicKey: currentDevice.longTermPublicKey,
+            finalMLKEMPublicKey: currentDevice.finalMLKEMPublicKey,
+            deviceName: "linked-device",
+            hmacData: currentDevice.hmacData,
+            isMasterDevice: false
+        )
+        return try UserConfiguration.SignedDeviceConfiguration(
+            device: linkedDevice,
+            signingKey: signingPrivateKey
+        )
+    }
+
+    private func makeCorruptedSignedDevice(
+        from signedDevice: UserConfiguration.SignedDeviceConfiguration
+    ) throws -> UserConfiguration.SignedDeviceConfiguration {
+        let signedDeviceJSON = try JSONEncoder().encode(signedDevice)
+        guard var signedDeviceObject = try JSONSerialization.jsonObject(with: signedDeviceJSON) as? [String: Any] else {
+            throw PQSSession.SessionErrors.invalidSignature
+        }
+        signedDeviceObject["c"] = Data(repeating: 0xA5, count: 64).base64EncodedString()
+        return try JSONDecoder().decode(
+            UserConfiguration.SignedDeviceConfiguration.self,
+            from: try JSONSerialization.data(withJSONObject: signedDeviceObject)
+        )
+    }
+
+    private func makeSingleDeviceCompromiseRotation(from context: SessionContext) async throws -> RotatedPublicKeys {
+        let oldSigningKey = try Curve25519.Signing.PublicKey(
+            rawRepresentation: context.activeUserConfiguration.signingPublicKey
+        )
+        let newSigningKey = Curve25519.Signing.PrivateKey()
+        let newCurveKey = Curve25519.KeyAgreement.PrivateKey()
+        let mlKEMPrivateKey = try crypto.generateMLKem1024PrivateKey()
+        let mlKEMPublicKey = try MLKEMPublicKey(
+            id: UUID(),
+            mlKEMPrivateKey.publicKey.rawRepresentation
+        )
+        guard let currentSignedDevice = context.activeUserConfiguration.signedDevices.first,
+              var currentDevice = try? currentSignedDevice.verified(using: oldSigningKey) else {
+            throw PQSSession.SessionErrors.invalidDeviceIdentity
+        }
+
+        await currentDevice.updateSigningPublicKey(newSigningKey.publicKey.rawRepresentation)
+        await currentDevice.updateLongTermPublicKey(newCurveKey.publicKey.rawRepresentation)
+        await currentDevice.updateFinalMLKEMPublicKey(mlKEMPublicKey)
+
+        return try RotatedPublicKeys(
+            pskData: newSigningKey.publicKey.rawRepresentation,
+            signedDevice: UserConfiguration.SignedDeviceConfiguration(
+                device: currentDevice,
+                signingKey: newSigningKey
+            )
+        )
+    }
+
     // MARK: - Tests
 
     @Test("rotateKeysOnPotentialCompromise should update signing, curve and MLKEM keys and publish rotation")
@@ -88,6 +157,135 @@ actor KeyRotationTests {
         // Assert that publishRotatedKeys was called by checking store user configuration was updated
         let userConfigs = await store.userConfigurations
         #expect(userConfigs.count == 1, "Expected a single user configuration in TransportStore after rotation")
+
+        await session.shutdown()
+    }
+
+    @Test("rotateKeysOnPotentialCompromise refreshes stale local device list and publishes batched rotation")
+    func testRotateKeysOnPotentialCompromise_refreshesStaleLocalMultiDeviceState() async throws {
+        _ = try await setupRotatableSession()
+
+        guard let originalContext = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+
+        var serverConfiguration = originalContext.activeUserConfiguration
+        let linkedSignedDevice = try makeLinkedSignedDevice(from: originalContext)
+        serverConfiguration.signedDevices.append(linkedSignedDevice)
+        await store.setUserConfigurations(index: 0, config: serverConfiguration)
+
+        let localDeviceCountBeforeRotation = await session.sessionContext?.activeUserConfiguration.signedDevices.count
+        #expect(localDeviceCountBeforeRotation == 1)
+
+        let serverDeviceCountBeforeRotation = await store.userConfigurations.first?.config.signedDevices.count
+        #expect(serverDeviceCountBeforeRotation == 2)
+
+        try await session.rotateKeysOnPotentialCompromise()
+
+        let publishedKeys = await store.lastPublishedRotatedKeys
+        #expect(publishedKeys?.allSignedDevices?.count == 2)
+
+        let publishedIds = Set(publishedKeys?.allSignedDevices?.map(\.id) ?? [])
+        #expect(publishedIds.count == 2)
+        #expect(publishedIds.contains(originalContext.sessionUser.deviceId))
+        #expect(publishedIds.contains(linkedSignedDevice.id))
+
+        let rotatedServerConfiguration = await store.userConfigurations.first?.config
+        #expect(rotatedServerConfiguration?.signedDevices.count == 2)
+
+        await session.shutdown()
+    }
+
+    @Test("rotateKeysOnPotentialCompromise recovers corrupted multi-device state by pruning invalid devices")
+    func testRotateKeysOnPotentialCompromise_recoversCorruptedMultiDeviceState() async throws {
+        _ = try await setupRotatableSession()
+
+        guard let originalContext = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+
+        let linkedSignedDevice = try makeLinkedSignedDevice(from: originalContext)
+        let corruptedLinkedSignedDevice = try makeCorruptedSignedDevice(from: linkedSignedDevice)
+        var serverConfiguration = originalContext.activeUserConfiguration
+        serverConfiguration.signedDevices.append(corruptedLinkedSignedDevice)
+        await store.setUserConfigurations(index: 0, config: serverConfiguration)
+
+        try await session.rotateKeysOnPotentialCompromise()
+
+        let publishedKeys = await store.lastPublishedRotatedKeys
+        #expect(publishedKeys?.allSignedDevices == nil)
+        #expect(publishedKeys?.recovery?.recoveringDeviceId == originalContext.sessionUser.deviceId)
+        #expect(publishedKeys?.recovery?.prunedDeviceIds == [linkedSignedDevice.id])
+
+        let rotatedServerConfiguration = await store.userConfigurations.first?.config
+        #expect(rotatedServerConfiguration?.signedDevices.count == 1)
+        #expect(rotatedServerConfiguration?.signedDevices.first?.id == originalContext.sessionUser.deviceId)
+
+        await session.shutdown()
+    }
+
+    @Test("rotateKeysOnPotentialCompromise fails fast when local signing key cannot verify own server device")
+    func testRotateKeysOnPotentialCompromise_signingKeyOutOfSyncFailsFast() async throws {
+        _ = try await setupRotatableSession()
+
+        guard let originalContext = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        let localSigningKey = try Curve25519.Signing.PublicKey(
+            rawRepresentation: originalContext.activeUserConfiguration.signingPublicKey
+        )
+        let divergentSigningKey = Curve25519.Signing.PrivateKey()
+        var serverConfiguration = originalContext.activeUserConfiguration
+        serverConfiguration.signingPublicKey = divergentSigningKey.publicKey.rawRepresentation
+        serverConfiguration.signedDevices = try serverConfiguration.signedDevices.compactMap { signed in
+            guard let device = try signed.verified(using: localSigningKey) else {
+                return nil
+            }
+            return try UserConfiguration.SignedDeviceConfiguration(device: device, signingKey: divergentSigningKey)
+        }
+        await store.setUserConfigurations(index: 0, config: serverConfiguration)
+
+        do {
+            try await session.rotateKeysOnPotentialCompromise()
+            Issue.record("Expected key rotation to fail when local signing key is out of sync")
+        } catch let error as PQSSession.SessionErrors {
+            #expect(error == .signingKeyOutOfSync)
+        }
+
+        let published = await store.lastPublishedRotatedKeys
+        #expect(published == nil)
+
+        await session.shutdown()
+    }
+
+    @Test("mock server rejects single-device compromise rotation when server configuration is multi-device")
+    func testMockServerRejectsSingleDeviceCompromiseRotationForMultiDeviceConfig() async throws {
+        _ = try await setupRotatableSession()
+
+        guard let originalContext = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+
+        var serverConfiguration = originalContext.activeUserConfiguration
+        serverConfiguration.signedDevices.append(try makeLinkedSignedDevice(from: originalContext))
+        await store.setUserConfigurations(index: 0, config: serverConfiguration)
+
+        let invalidSingleDeviceRotation = try await makeSingleDeviceCompromiseRotation(from: originalContext)
+
+        do {
+            try await store.publishRotatedKeys(
+                for: originalContext.sessionUser.secretName,
+                deviceId: originalContext.sessionUser.deviceId.uuidString,
+                rotated: invalidSingleDeviceRotation
+            )
+            Issue.record("Expected mock server to reject single-device multi-device compromise rotation")
+        } catch let error as TestError {
+            #expect(error == .multiDeviceRotationRequiresBatch)
+        }
 
         await session.shutdown()
     }

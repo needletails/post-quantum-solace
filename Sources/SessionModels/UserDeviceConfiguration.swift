@@ -245,6 +245,64 @@ public struct LongTermKeys: Codable, Sendable {
 
 /// A struct representing rotated public keys that have been updated during a key rotation event.
 /// Contains the new pre-shared key data and the signed device configuration after rotation.
+public struct RotatedKeysRecovery: Codable, Sendable {
+    /// The sole trusted device that is authorizing prune-and-recover.
+    public let recoveringDeviceId: UUID
+
+    /// Device IDs to remove from the account state because their attestations no longer verify.
+    public let prunedDeviceIds: [UUID]
+
+    /// Signature by the previous account signing key over the recovery authorization payload.
+    public let oldAccountSignature: Data
+
+    public init(
+        recoveringDeviceId: UUID,
+        prunedDeviceIds: [UUID],
+        oldAccountSignature: Data
+    ) {
+        self.recoveringDeviceId = recoveringDeviceId
+        self.prunedDeviceIds = prunedDeviceIds
+        self.oldAccountSignature = oldAccountSignature
+    }
+}
+
+public struct RotatedKeysRecoveryAuthorization: Codable, Sendable {
+    public let secretName: String
+    public let recoveringDeviceId: UUID
+    public let newSigningPublicKey: Data
+    public let newSignedDeviceData: Data
+    public let prunedDeviceIds: [UUID]
+
+    public init(
+        secretName: String,
+        recoveringDeviceId: UUID,
+        newSigningPublicKey: Data,
+        newSignedDeviceData: Data,
+        prunedDeviceIds: [UUID]
+    ) {
+        self.secretName = secretName
+        self.recoveringDeviceId = recoveringDeviceId
+        self.newSigningPublicKey = newSigningPublicKey
+        self.newSignedDeviceData = newSignedDeviceData
+        self.prunedDeviceIds = prunedDeviceIds.sorted { $0.uuidString < $1.uuidString }
+    }
+
+    /// Stable, encoder-independent bytes for recovery proof signatures.
+    /// Keeps signatures consistent even if BinaryCodable versions differ.
+    public func canonicalSigningData() -> Data {
+        let pruned = prunedDeviceIds.map(\.uuidString).joined(separator: ",")
+        let text = """
+        v1
+        secretName=\(secretName)
+        recoveringDeviceId=\(recoveringDeviceId.uuidString)
+        newSigningPublicKeyB64=\(newSigningPublicKey.base64EncodedString())
+        newSignedDeviceDataB64=\(newSignedDeviceData.base64EncodedString())
+        prunedDeviceIds=\(pruned)
+        """
+        return Data(text.utf8)
+    }
+}
+
 public struct RotatedPublicKeys: Codable, Sendable {
     /// The pre-shared key data used for the key rotation.
     public let pskData: Data
@@ -256,6 +314,10 @@ public struct RotatedPublicKeys: Codable, Sendable {
     /// multi-device rotation so `signingPublicKey` and every device attestation stay consistent).
     public let allSignedDevices: [UserConfiguration.SignedDeviceConfiguration]?
 
+    /// Optional proof signed by the old account signing key authorizing prune-and-recover when only
+    /// one trusted device remains from a corrupted multi-device account state.
+    public let recovery: RotatedKeysRecovery?
+
     /// Initializes a new `RotatedPublicKeys` instance.
     ///
     /// - Parameters:
@@ -265,11 +327,13 @@ public struct RotatedPublicKeys: Codable, Sendable {
     public init(
         pskData: Data,
         signedDevice: UserConfiguration.SignedDeviceConfiguration,
-        allSignedDevices: [UserConfiguration.SignedDeviceConfiguration]? = nil
+        allSignedDevices: [UserConfiguration.SignedDeviceConfiguration]? = nil,
+        recovery: RotatedKeysRecovery? = nil
     ) {
         self.pskData = pskData
         self.signedDevice = signedDevice
         self.allSignedDevices = allSignedDevices
+        self.recovery = recovery
     }
 }
 

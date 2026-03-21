@@ -5913,6 +5913,7 @@ actor TransportStore {
     var mlKEMOneTimeKeyPairs = [IdentifiableSignedMLKEMOneTimeKey]()
     var publishableName: String!
     var userConfigurations = [User]()
+    var lastPublishedRotatedKeys: SessionModels.RotatedPublicKeys?
     
     func setPublishableName(_ publishableName: String) async {
         self.publishableName = publishableName
@@ -6010,14 +6011,92 @@ actor TransportStore {
         var userConfig = userConfigurations[index]
         let oldSigningKey = try Curve25519.Signing.PublicKey(
             rawRepresentation: userConfig.config.signingPublicKey)
+        let newSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: keys.pskData)
+        lastPublishedRotatedKeys = keys
+        let trustedExistingDeviceIds = userConfig.config.signedDevices.compactMap { signedDevice in
+            (try? signedDevice.verified(using: oldSigningKey))?.deviceId
+        }
+        let invalidExistingDeviceIds = userConfig.config.signedDevices.compactMap { signedDevice in
+            trustedExistingDeviceIds.contains(signedDevice.id) ? nil : signedDevice.id
+        }
+
+        if let batch = keys.allSignedDevices, !batch.isEmpty {
+            for signedDevice in batch {
+                guard try signedDevice.verified(using: newSigningKey) != nil else {
+                    throw TestError.invalidRotatedDeviceSignature
+                }
+            }
+            userConfig.config.signingPublicKey = keys.pskData
+            userConfig.config.signedDevices = batch
+            userConfigurations[index] = userConfig
+            return
+        }
+
+        var accountSigningKeyUnchanged = keys.pskData == userConfig.config.signingPublicKey
+        if !accountSigningKeyUnchanged {
+            accountSigningKeyUnchanged = (try? keys.signedDevice.verified(using: oldSigningKey)) != nil
+        }
+        if userConfig.config.signedDevices.count > 1, !accountSigningKeyUnchanged {
+            let deviceUUID = UUID(uuidString: deviceId)
+            let trustedExistingDeviceId = trustedExistingDeviceIds.count == 1 ? trustedExistingDeviceIds[0] : nil
+            let pathMatchesTrustedExistingDevice = deviceUUID == trustedExistingDeviceId
+            let payloadMatchesTrustedExistingDevice = keys.signedDevice.id == trustedExistingDeviceId
+            let verifiedWithNewSigningKey = (try? keys.signedDevice.verified(using: newSigningKey)) != nil
+            if let recovery = keys.recovery,
+               let trustedExistingDeviceId,
+               recovery.recoveringDeviceId == trustedExistingDeviceId,
+               pathMatchesTrustedExistingDevice,
+               payloadMatchesTrustedExistingDevice,
+               verifiedWithNewSigningKey,
+               recovery.prunedDeviceIds.sorted(by: { $0.uuidString < $1.uuidString })
+                    == invalidExistingDeviceIds.sorted(by: { $0.uuidString < $1.uuidString }) {
+                let authorization = RotatedKeysRecoveryAuthorization(
+                    secretName: secretName,
+                    recoveringDeviceId: trustedExistingDeviceId,
+                    newSigningPublicKey: keys.pskData,
+                    newSignedDeviceData: keys.signedDevice.data,
+                    prunedDeviceIds: recovery.prunedDeviceIds
+                )
+                let canonicalAuthorizationData = authorization.canonicalSigningData()
+                let legacyBinaryAuthorizationData = try BinaryEncoder().encode(authorization)
+                guard let trustedExistingDevice = try userConfig.config.signedDevices
+                    .first(where: { $0.id == trustedExistingDeviceId })?
+                    .verified(using: oldSigningKey) else {
+                    throw TestError.invalidRecoverySignature
+                }
+                let trustedDeviceSigningKey = try Curve25519.Signing.PublicKey(
+                    rawRepresentation: trustedExistingDevice.signingPublicKey
+                )
+                guard trustedDeviceSigningKey.isValidSignature(recovery.oldAccountSignature, for: canonicalAuthorizationData)
+                    || trustedDeviceSigningKey.isValidSignature(recovery.oldAccountSignature, for: legacyBinaryAuthorizationData)
+                else {
+                    throw TestError.invalidRecoverySignature
+                }
+                userConfig.config.signingPublicKey = keys.pskData
+                userConfig.config.signedDevices = [keys.signedDevice]
+                userConfigurations[index] = userConfig
+                return
+            }
+            throw TestError.multiDeviceRotationRequiresBatch
+        }
+
+        let verifiedWithEffectiveKey = accountSigningKeyUnchanged
+            ? ((try? keys.signedDevice.verified(using: oldSigningKey)) != nil)
+            : ((try? keys.signedDevice.verified(using: newSigningKey)) != nil)
+        guard verifiedWithEffectiveKey else {
+            throw TestError.invalidRotatedDeviceSignature
+        }
+
         guard
             let deviceIndex = userConfig.config.signedDevices.firstIndex(where: {
                 guard let verified = try? $0.verified(using: oldSigningKey) else { return false }
                 return verified.deviceId.uuidString == deviceId
             })
         else { fatalError() }
+        if !accountSigningKeyUnchanged {
+            userConfig.config.signingPublicKey = keys.pskData
+        }
         userConfig.config.signedDevices[deviceIndex] = keys.signedDevice
-        userConfig.config.signingPublicKey = keys.pskData
         userConfigurations[index] = userConfig
     }
 }
@@ -6367,6 +6446,9 @@ extension Data {
 
 // MARK: - Test Errors
 
-enum TestError: Error {
+enum TestError: Error, Equatable {
     case contactPropsDecryptionFailed
+    case multiDeviceRotationRequiresBatch
+    case invalidRotatedDeviceSignature
+    case invalidRecoverySignature
 }
