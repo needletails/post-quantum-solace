@@ -1221,7 +1221,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
         case .broadcast:
-            // Broadcast messages are not persiseted yet
+            // Outbound broadcast is fanned out as per-peer `.nickname` ciphertext; legacy `.broadcast` payloads are not used.
             break
         }
     }

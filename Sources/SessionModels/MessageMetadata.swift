@@ -62,6 +62,7 @@ public struct MessageMetadata: Sendable, Codable {
         case userMarkedPinned
         case userMarkedRead
         case userMarkedArchived
+        case userMarkedHidden
     }
 
     /// A Boolean value indicating whether the user has marked the message as pinned.
@@ -81,6 +82,9 @@ public struct MessageMetadata: Sendable, Codable {
     /// When `true`, the conversation is archived in the sidebar (local list UI only).
     public var userMarkedArchived: Bool
 
+    /// When `true`, the conversation is hidden from the main list until the Hidden filter is shown and selected (local UI only).
+    public var userMarkedHidden: Bool
+
     /// Initializes a new instance of `MessageMetadata`.
     ///
     /// - Parameters:
@@ -89,14 +93,17 @@ public struct MessageMetadata: Sendable, Codable {
     ///   - userMarkedRead: A Boolean value indicating whether the user has marked the message as read.
     ///     Defaults to `false` for new messages.
     ///   - userMarkedArchived: Archived sidebar state. Defaults to `false`.
+    ///   - userMarkedHidden: Hidden sidebar state. Defaults to `false`.
     public init(
         userMarkedPinned: Bool = false,
         userMarkedRead: Bool = false,
-        userMarkedArchived: Bool = false
+        userMarkedArchived: Bool = false,
+        userMarkedHidden: Bool = false
     ) {
         self.userMarkedPinned = userMarkedPinned
         self.userMarkedRead = userMarkedRead
         self.userMarkedArchived = userMarkedArchived
+        self.userMarkedHidden = userMarkedHidden
     }
 
     public init(from decoder: Decoder) throws {
@@ -104,6 +111,7 @@ public struct MessageMetadata: Sendable, Codable {
         userMarkedPinned = try c.decodeIfPresent(Bool.self, forKey: .userMarkedPinned) ?? false
         userMarkedRead = try c.decodeIfPresent(Bool.self, forKey: .userMarkedRead) ?? false
         userMarkedArchived = try c.decodeIfPresent(Bool.self, forKey: .userMarkedArchived) ?? false
+        userMarkedHidden = try c.decodeIfPresent(Bool.self, forKey: .userMarkedHidden) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -111,6 +119,7 @@ public struct MessageMetadata: Sendable, Codable {
         try c.encode(userMarkedPinned, forKey: .userMarkedPinned)
         try c.encode(userMarkedRead, forKey: .userMarkedRead)
         try c.encode(userMarkedArchived, forKey: .userMarkedArchived)
+        try c.encode(userMarkedHidden, forKey: .userMarkedHidden)
     }
 
     /// Creates a copy of the current metadata with updated pinned state.
@@ -121,7 +130,8 @@ public struct MessageMetadata: Sendable, Codable {
         MessageMetadata(
             userMarkedPinned: isPinned,
             userMarkedRead: userMarkedRead,
-            userMarkedArchived: userMarkedArchived
+            userMarkedArchived: userMarkedArchived,
+            userMarkedHidden: userMarkedHidden
         )
     }
 
@@ -133,7 +143,8 @@ public struct MessageMetadata: Sendable, Codable {
         MessageMetadata(
             userMarkedPinned: userMarkedPinned,
             userMarkedRead: isRead,
-            userMarkedArchived: userMarkedArchived
+            userMarkedArchived: userMarkedArchived,
+            userMarkedHidden: userMarkedHidden
         )
     }
 
@@ -141,7 +152,17 @@ public struct MessageMetadata: Sendable, Codable {
         MessageMetadata(
             userMarkedPinned: userMarkedPinned,
             userMarkedRead: userMarkedRead,
-            userMarkedArchived: isArchived
+            userMarkedArchived: isArchived,
+            userMarkedHidden: userMarkedHidden
+        )
+    }
+
+    public func updatingHiddenState(_ isHidden: Bool) -> MessageMetadata {
+        MessageMetadata(
+            userMarkedPinned: userMarkedPinned,
+            userMarkedRead: userMarkedRead,
+            userMarkedArchived: userMarkedArchived,
+            userMarkedHidden: isHidden
         )
     }
 }

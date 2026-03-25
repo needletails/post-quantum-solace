@@ -214,7 +214,7 @@ public actor TaskProcessor {
     /// - **Personal**: Messages sent to the sender's own devices
     /// - **Nickname**: Private messages between two users
     /// - **Channel**: Messages sent to a group of users
-    /// - **Broadcast**: Messages sent to all known users (not fully implemented)
+    /// - **Broadcast**: Fan-out to every contact plus existing ratchet peers (excluding self), after per-peer `refreshIdentities`; one ciphertext per device via `.nickname` transports.
     ///
     /// ## Security Features
     /// - All messages are encrypted using Double Ratchet protocol
@@ -318,7 +318,18 @@ public actor TaskProcessor {
                 throw error
             }
         case .broadcast:
-            break
+            identities = try await gatherBroadcastIdentities(
+                session: session,
+                cache: cache,
+                symmetricKey: symmetricKey,
+                sender: sender,
+                logger: logger)
+            for identity in identities {
+                if let peer = await identity.props(symmetricKey: symmetricKey)?.secretName {
+                    recipients.insert(peer)
+                }
+            }
+            recipients.insert(sender)
         }
 
         /// Utility for selecting matching identities by secret name and device ID.
@@ -341,19 +352,57 @@ public actor TaskProcessor {
         if let sessionDelegate = await session.sessionDelegate {
             if let (secretName, deviceId) = await sessionDelegate.retrieveUserInfo(message.transportInfo) {
                 if !deviceId.isEmpty {
-                    let resolvedIdentity = await getIdentity(secretName: secretName.isEmpty ? type.recipientDescription : secretName, deviceId: deviceId)
-                    if let offerIdentity = resolvedIdentity {
-                        identities = [offerIdentity]
+                    let lookupSecretName: String?
+                    if secretName.isEmpty {
+                        switch type {
+                        case let .nickname(name), let .channel(name):
+                            lookupSecretName = name
+                        case .personalMessage:
+                            lookupSecretName = sender
+                        case .broadcast:
+                            lookupSecretName = nil
+                        }
                     } else {
-                        logger.log(level: .error, message: "Missing Offer Identity: \(secretName)")
-                        return
+                        lookupSecretName = secretName
+                    }
+                    if let lookupSecretName {
+                        let resolvedIdentity = await getIdentity(secretName: lookupSecretName, deviceId: deviceId)
+                        if let offerIdentity = resolvedIdentity {
+                            identities = [offerIdentity]
+                        } else {
+                            logger.log(level: .error, message: "Missing Offer Identity: \(lookupSecretName)")
+                            return
+                        }
                     }
                 }
-            } else {
+            } else if type != .broadcast {
                 await identities.asyncRemoveAll {
                     await ($0.props(symmetricKey: symmetricKey)?.isMasterDevice == false)
                 }
             }
+        }
+
+        if case .broadcast = type {
+            let identitiesByPeer = await BroadcastRecipientDiscovery.groupIdentitiesByPeerSecretName(
+                identities,
+                symmetricKey: symmetricKey)
+            for peer in identitiesByPeer.keys.sorted() {
+                guard let peerIdentities = identitiesByPeer[peer], !peerIdentities.isEmpty else { continue }
+                var peerMessage = message
+                peerMessage.recipient = .nickname(peer)
+                try await createEncryptableTask(
+                    for: peerIdentities,
+                    message: peerMessage,
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey,
+                    sender: sender,
+                    recipients: Set([sender, peer]),
+                    shouldPersist: shouldPersist,
+                    logger: logger
+                )
+            }
+            return
         }
 
         try await createEncryptableTask(
@@ -473,6 +522,47 @@ public actor TaskProcessor {
             sendOneTimeIdentities: sendOneTimeIdentities)
         logger.log(level: .info, message: "Gathered \(identities.count) Private Message Session Identities")
         return identities
+    }
+
+    /// Peer devices for broadcast: union of contacts and existing session identities, then `refreshIdentities` per peer
+    /// so missing or stale ratchet rows are filled before encrypting (same pattern as channel member gathering).
+    private func gatherBroadcastIdentities(
+        session: PQSSession,
+        cache: SessionCache,
+        symmetricKey: SymmetricKey,
+        sender: String,
+        logger: NeedleTailLogger
+    ) async throws -> [SessionIdentity] {
+        let stored = try await cache.fetchSessionIdentities()
+        let contacts = try await cache.fetchContacts()
+        let peerNames = await BroadcastRecipientDiscovery.collectPeerSecretNames(
+            sender: sender,
+            sessionIdentities: stored,
+            contacts: contacts,
+            symmetricKey: symmetricKey
+        )
+
+        logger.log(level: .info, message: "Broadcast: resolving identities for \(peerNames.count) peer(s)")
+
+        for peer in peerNames.sorted() {
+            do {
+                _ = try await session.refreshIdentities(secretName: peer)
+            } catch {
+                // Do not log peer identifiers in production logs.
+                logger.log(level: .error, message: "Broadcast: refreshIdentities failed for a peer: \(error)")
+            }
+        }
+
+        let refreshed = try await cache.fetchSessionIdentities()
+        var result: [SessionIdentity] = []
+        result.reserveCapacity(refreshed.count)
+        for identity in refreshed {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard props.secretName != sender else { continue }
+            result.append(identity)
+        }
+        logger.log(level: .info, message: "Gathered \(result.count) broadcast session identities (peers only)")
+        return result
     }
 
     /// Fetches all identities for channel messages.
