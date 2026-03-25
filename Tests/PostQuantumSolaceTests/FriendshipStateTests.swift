@@ -103,7 +103,7 @@ struct FriendshipMetadataTests {
     ///
     /// Verifies that calling `setBlockState(isBlocking: false)` correctly updates the
     /// states to reflect that the other party is blocking the current user, resulting
-    /// in the current user having a `.blockedByOther` state.
+    /// in the current user having a `.blockedByOther` state and a combined `.blocked` relationship state.
     @Test
     func blockUser() {
         var friendship = FriendshipMetadata()
@@ -111,7 +111,7 @@ struct FriendshipMetadataTests {
 
         #expect(friendship.myState == .blockedByOther)
         #expect(friendship.theirState == .blocked)
-        #expect(friendship.ourState == .pending)
+        #expect(friendship.ourState == .blocked)
     }
 
     /// Tests the user unblocking functionality using the new `unblockUser()` method.
