@@ -659,7 +659,8 @@ public actor TaskProcessor {
                             message: message,
                             recipientIdentity: identity,
                             localId: UUID(),
-                            sharedId: UUID().uuidString
+                            sharedId: UUID().uuidString,
+                            isPersistedOutbound: false
                         ))
                     )
                 }

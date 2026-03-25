@@ -6,7 +6,7 @@
 //
 
 
-public struct ChannelInfo: Codable {
+public struct ChannelInfo: Codable, Sendable, Hashable {
     public let name: String
     public let administrator: String
     public let members: Set<String>

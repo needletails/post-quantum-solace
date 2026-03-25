@@ -278,4 +278,13 @@ public protocol PQSSessionDelegate: Sendable {
         senderSecretName: String,
         senderDeviceId: UUID
     ) async -> Bool
+
+    /// When `true`, the session may notify message senders that their message was stored on this device
+    /// (e.g. automatic `.delivered` delivery-state updates). Return `false` when the user has disabled
+    /// read/delivery receipts so peers do not receive that signal.
+    func shouldSendAutomaticDeliveryReceipts() async -> Bool
+}
+
+public extension PQSSessionDelegate {
+    func shouldSendAutomaticDeliveryReceipts() async -> Bool { true }
 }

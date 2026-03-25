@@ -42,22 +42,55 @@ public struct OutboundTaskMessage: Codable & Sendable {
     /// A shared identifier for the message that can be used across devices.
     public let sharedId: String
 
+    /// When `false`, the outbound task did not create a local DB row (e.g. key-sync / session reestablishment).
+    /// In that case `localId` is not meaningful for `fetchMessage(id:)` and must not be used to update delivery state.
+    public let isPersistedOutbound: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case message
+        case recipientIdentity
+        case localId
+        case sharedId
+        case isPersistedOutbound
+    }
+
     /// Initializes a new instance of `OutboundTaskMessage`.
     /// - Parameters:
     ///   - message: The encrypted message content to be sent.
     ///   - recipientIdentity: The identity of the recipient session.
     ///   - localId: A unique identifier for the local message.
     ///   - sharedId: A shared identifier for the message.
+    ///   - isPersistedOutbound: Whether this send corresponds to a row in local message storage (`localId` is the row id).
     public init(
         message: CryptoMessage,
         recipientIdentity: SessionIdentity,
         localId: UUID,
-        sharedId: String
+        sharedId: String,
+        isPersistedOutbound: Bool = true
     ) {
         self.message = message
         self.recipientIdentity = recipientIdentity
         self.localId = localId
         self.sharedId = sharedId
+        self.isPersistedOutbound = isPersistedOutbound
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        message = try c.decode(CryptoMessage.self, forKey: .message)
+        recipientIdentity = try c.decode(SessionIdentity.self, forKey: .recipientIdentity)
+        localId = try c.decode(UUID.self, forKey: .localId)
+        sharedId = try c.decode(String.self, forKey: .sharedId)
+        isPersistedOutbound = try c.decodeIfPresent(Bool.self, forKey: .isPersistedOutbound) ?? true
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(message, forKey: .message)
+        try c.encode(recipientIdentity, forKey: .recipientIdentity)
+        try c.encode(localId, forKey: .localId)
+        try c.encode(sharedId, forKey: .sharedId)
+        try c.encode(isPersistedOutbound, forKey: .isPersistedOutbound)
     }
 }
 

@@ -240,7 +240,11 @@ public struct FriendshipMetadata: Sendable, Codable {
     /// 5. If the other user has blocked the current user, the combined state is `.blocked`
     /// 6. Default to `.pending` for any unhandled combinations
     public mutating func updateOurState() {
-        if myState == .blocked {
+        if (myState == .blocked && theirState == .blockedByOther)
+            || (myState == .blockedByOther && theirState == .blocked) {
+            // Canonical block encodings from `setBlockState`; treat as one relationship state.
+            ourState = .blocked
+        } else if myState == .blocked {
             // If my state is blocked, I cannot change our state.
         } else if myState == .accepted && theirState == .accepted {
             ourState = .accepted

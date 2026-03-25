@@ -58,6 +58,12 @@ import Foundation
 /// - JSON/Binary encoding
 /// - Message synchronization between devices
 public struct MessageMetadata: Sendable, Codable {
+    enum CodingKeys: String, CodingKey {
+        case userMarkedPinned
+        case userMarkedRead
+        case userMarkedArchived
+    }
+
     /// A Boolean value indicating whether the user has marked the message as pinned.
     ///
     /// When `true`, this indicates that the user has explicitly pinned the message for easy access.
@@ -72,6 +78,9 @@ public struct MessageMetadata: Sendable, Codable {
     /// in the user interface.
     public var userMarkedRead: Bool
 
+    /// When `true`, the conversation is archived in the sidebar (local list UI only).
+    public var userMarkedArchived: Bool
+
     /// Initializes a new instance of `MessageMetadata`.
     ///
     /// - Parameters:
@@ -79,12 +88,29 @@ public struct MessageMetadata: Sendable, Codable {
     ///     Defaults to `false` for new messages.
     ///   - userMarkedRead: A Boolean value indicating whether the user has marked the message as read.
     ///     Defaults to `false` for new messages.
+    ///   - userMarkedArchived: Archived sidebar state. Defaults to `false`.
     public init(
         userMarkedPinned: Bool = false,
-        userMarkedRead: Bool = false
+        userMarkedRead: Bool = false,
+        userMarkedArchived: Bool = false
     ) {
         self.userMarkedPinned = userMarkedPinned
         self.userMarkedRead = userMarkedRead
+        self.userMarkedArchived = userMarkedArchived
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        userMarkedPinned = try c.decodeIfPresent(Bool.self, forKey: .userMarkedPinned) ?? false
+        userMarkedRead = try c.decodeIfPresent(Bool.self, forKey: .userMarkedRead) ?? false
+        userMarkedArchived = try c.decodeIfPresent(Bool.self, forKey: .userMarkedArchived) ?? false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(userMarkedPinned, forKey: .userMarkedPinned)
+        try c.encode(userMarkedRead, forKey: .userMarkedRead)
+        try c.encode(userMarkedArchived, forKey: .userMarkedArchived)
     }
 
     /// Creates a copy of the current metadata with updated pinned state.
@@ -94,7 +120,8 @@ public struct MessageMetadata: Sendable, Codable {
     public func updatingPinnedState(_ isPinned: Bool) -> MessageMetadata {
         MessageMetadata(
             userMarkedPinned: isPinned,
-            userMarkedRead: userMarkedRead
+            userMarkedRead: userMarkedRead,
+            userMarkedArchived: userMarkedArchived
         )
     }
 
@@ -105,7 +132,16 @@ public struct MessageMetadata: Sendable, Codable {
     public func updatingReadState(_ isRead: Bool) -> MessageMetadata {
         MessageMetadata(
             userMarkedPinned: userMarkedPinned,
-            userMarkedRead: isRead
+            userMarkedRead: isRead,
+            userMarkedArchived: userMarkedArchived
+        )
+    }
+
+    public func updatingArchivedState(_ isArchived: Bool) -> MessageMetadata {
+        MessageMetadata(
+            userMarkedPinned: userMarkedPinned,
+            userMarkedRead: userMarkedRead,
+            userMarkedArchived: isArchived
         )
     }
 }

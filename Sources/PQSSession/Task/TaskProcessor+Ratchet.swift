@@ -481,6 +481,10 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             transportMetadata: outboundTask.message.transportInfo,
             sharedMessageId: outboundTask.sharedId,
             transportEvent: transportEvent))
+
+        if outboundTask.isPersistedOutbound {
+            await markPersistedOutboundPastSendingIfNeeded(session: session, localMessageId: outboundTask.localId)
+        }
         
         // Perform remote key deletion only after a successful send
         if results.needsRemoteDeletion {
@@ -948,6 +952,63 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     ///              Provides context and cryptographic keys.
     ///   - sessionIdentity: The `SessionIdentity` associated with the recipient of the message.
     ///                      Contains sender's cryptographic identity.
+    /// After the transport accepts an outbound ratchet payload, move the local persisted copy off `.sending`
+    /// so clients can show a stable "sent" state without waiting for a peer receipt.
+    private func markPersistedOutboundPastSendingIfNeeded(session: PQSSession, localMessageId: UUID) async {
+        guard let cache = await session.cache else { return }
+        let persisted: EncryptedMessage
+        do {
+            persisted = try await cache.fetchMessage(id: localMessageId)
+        } catch {
+            return
+        }
+        do {
+            let symmetricKey = try await session.getDatabaseSymmetricKey()
+            guard var props = await persisted.props(symmetricKey: symmetricKey) else { return }
+            guard case .sending = props.deliveryState else { return }
+            props.deliveryState = .waitingDelivery
+            let updated = try await persisted.updateMessage(with: props, symmetricKey: symmetricKey)
+            try await cache.updateMessage(updated, symmetricKey: symmetricKey)
+            await session.receiverDelegate?.updatedMessage(updated)
+        } catch {
+            logger.log(level: .debug, message: "markPersistedOutboundPastSendingIfNeeded failed: \(error)")
+        }
+    }
+
+    /// Lets the original sender advance their outbound delivery glyph once we've decrypted and stored the message.
+    /// Skips channels (noise) and self-sent / multidevice echoes.
+    private func sendAutomaticDeliveredReceiptIfNeeded(
+        session: PQSSession,
+        inboundTask: InboundTaskMessage,
+        sharedId: String,
+        conversationRecipient: MessageRecipient
+    ) async {
+        switch conversationRecipient {
+        case .nickname, .personalMessage:
+            break
+        default:
+            return
+        }
+        guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return }
+        guard inboundTask.senderSecretName != mySecretName else { return }
+        guard let sessionDelegate = await session.sessionDelegate else { return }
+        guard await sessionDelegate.shouldSendAutomaticDeliveryReceipts() else { return }
+
+        let metadata = DeliveryStateMetadata(state: .delivered, sharedId: sharedId)
+        let encoded: Data
+        do {
+            encoded = try BinaryEncoder().encode(metadata)
+        } catch {
+            return
+        }
+        let receiptRecipient = MessageRecipient.nickname(inboundTask.senderSecretName)
+        do {
+            try await sessionDelegate.deliveryStateChanged(recipient: receiptRecipient, metadata: encoded)
+        } catch {
+            logger.log(level: .debug, message: "Automatic delivered receipt failed for sharedId=\(sharedId): \(error)")
+        }
+    }
+
     /// - Throws: An error if the message processing fails due to issues such as missing metadata,
     ///           session errors, or communication model errors.
     private func handleDecodedMessage(_ decodedMessage: CryptoMessage,
@@ -1025,6 +1086,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
+            await sendAutomaticDeliveredReceiptIfNeeded(
+                session: session,
+                inboundTask: inboundTask,
+                sharedId: messageModel.sharedId,
+                conversationRecipient: decodedMessage.recipient)
         case .personalMessage:
             let sender = inboundTask.senderSecretName
             guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return }
@@ -1088,6 +1154,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
+            await sendAutomaticDeliveredReceiptIfNeeded(
+                session: session,
+                inboundTask: inboundTask,
+                sharedId: messageModel.sharedId,
+                conversationRecipient: decodedMessage.recipient)
         case .channel:
             let sender = inboundTask.senderSecretName
             var communicationModel: BaseCommunication

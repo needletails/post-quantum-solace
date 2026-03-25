@@ -250,7 +250,8 @@ public protocol SessionEvents: Sendable {
     /// - `.pending` → `resetToPendingState()` - Resets the friendship to initial state
     /// - `.requested` → `setRequestedState()` - Initiates a friendship request
     /// - `.accepted` → `setAcceptedState()` - Accepts a friendship request
-    /// - `.blocked`/`.blockedByOther` → `setBlockState(isBlocking: false)` - Blocks the contact
+    /// - `.blocked` → `setBlockState(isBlocking: true)` - Current user blocks the other party
+    /// - `.blockedByOther` → `setBlockState(isBlocking: false)` - Other party blocks the current user (symmetric / protocol use)
     /// - `.unblocked` → `setAcceptedState()` - Unblocks the contact (resets to accepted)
     /// - `.rejected`/`.rejectedByOther`/`.mutuallyRejected` → `rejectRequest()` - Rejects the request
     ///
@@ -784,7 +785,8 @@ public extension SessionEvents {
     /// - `.pending` → `resetToPendingState()` - Resets the friendship to initial state
     /// - `.requested` → `setRequestedState()` - Initiates a friendship request
     /// - `.accepted` → `setAcceptedState()` - Accepts a friendship request
-    /// - `.blocked`/`.blockedByOther` → `setBlockState(isBlocking: false)` - Blocks the contact
+    /// - `.blocked` → `setBlockState(isBlocking: true)` - Current user blocks the other party
+    /// - `.blockedByOther` → `setBlockState(isBlocking: false)` - Other party blocks the current user (symmetric / protocol use)
     /// - `.unblocked` → `setAcceptedState()` - Unblocks the contact (resets to accepted)
     /// - `.rejected`/`.rejectedByOther`/`.mutuallyRejected` → `rejectRequest()` - Rejects the request
     ///
@@ -831,16 +833,15 @@ public extension SessionEvents {
         guard let foundContact = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.secretName == contact.secretName }) else { throw EventErrors.cannotFindContact }
         
         var currentMetadata: FriendshipMetadata?
-        
-        if let friendshipData = contact.metadata["friendshipMetadata"], !friendshipData.isEmpty {
+        // Prefer cache metadata so we branch from DB truth; the UI `contact` can lag behind.
+        if let foundProps = await foundContact.props(symmetricKey: symmetricKey),
+           let friendshipData = foundProps.metadata["friendshipMetadata"], !friendshipData.isEmpty {
+            currentMetadata = try BinaryDecoder().decode(FriendshipMetadata.self, from: friendshipData)
+        } else if let friendshipData = contact.metadata["friendshipMetadata"], !friendshipData.isEmpty {
             currentMetadata = try BinaryDecoder().decode(FriendshipMetadata.self, from: friendshipData)
         }
         if currentMetadata == nil {
             currentMetadata = FriendshipMetadata()
-        }
-        
-        if currentMetadata?.myState == .blocked {
-            throw EventErrors.userIsBlocked
         }
         
         guard var currentMetadata else { return }
@@ -855,7 +856,9 @@ public extension SessionEvents {
             currentMetadata.setRequestedState()
         case .accepted:
             currentMetadata.setAcceptedState()
-        case .blocked, .blockedByOther:
+        case .blocked:
+            currentMetadata.setBlockState(isBlocking: true)
+        case .blockedByOther:
             currentMetadata.setBlockState(isBlocking: false)
         case .unblocked:
             currentMetadata.setAcceptedState()
