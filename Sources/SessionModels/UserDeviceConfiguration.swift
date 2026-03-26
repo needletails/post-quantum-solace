@@ -80,6 +80,10 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     /// A flag indicating if this device is the master device.
     public let isMasterDevice: Bool
 
+    /// Last time this device was observed online by a master device.
+    /// Used for stale linked-device pruning.
+    public let lastSeenAt: Date?
+
     /// Coding keys for encoding and decoding the struct.
     /// Single-letter keys are used for obfuscation and reduced payload size.
     enum CodingKeys: String, CodingKey, Codable, Sendable {
@@ -90,6 +94,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         case deviceName = "e" // Key for the device name
         case hmacData = "f" // Key for the HMAC data
         case isMasterDevice = "g" // Key for the master device flag
+        case lastSeenAt = "h" // Key for last seen timestamp
     }
 
     /// Initializes a new `UserDeviceConfiguration` instance.
@@ -102,6 +107,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     ///   - deviceName: An optional name for the device.
     ///   - hmacData: The HMAC data for JWT authentication.
     ///   - isMasterDevice: A flag indicating if this is the master device.
+    ///   - lastSeenAt: Last observed online timestamp for stale-device pruning.
     public init(
         deviceId: UUID,
         signingPublicKey: Data,
@@ -109,7 +115,8 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         finalMLKEMPublicKey: MLKEMPublicKey,
         deviceName: String?,
         hmacData: Data,
-        isMasterDevice: Bool
+        isMasterDevice: Bool,
+        lastSeenAt: Date? = nil
     ) {
         self.deviceId = deviceId
         self.signingPublicKey = signingPublicKey
@@ -118,6 +125,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         self.deviceName = deviceName
         self.hmacData = hmacData
         self.isMasterDevice = isMasterDevice
+        self.lastSeenAt = lastSeenAt
     }
 
     /// Updates the signing public key with new data.

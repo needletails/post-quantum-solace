@@ -678,7 +678,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             finalMLKEMPublicKey: mlKEMPublicKey,
             deviceName: getDeviceName(),
             hmacData: hmacData,
-            isMasterDevice: isMaster
+            isMasterDevice: isMaster,
+            lastSeenAt: Date()
         )
 
         // Sign the device configuration
@@ -888,7 +889,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             finalMLKEMPublicKey: .init(Data(count: 1568)),
             deviceName: bundle.deviceConfiguration.deviceName,
             hmacData: bundle.deviceConfiguration.hmacData,
-            isMasterDevice: bundle.deviceConfiguration.isMasterDevice
+            isMasterDevice: bundle.deviceConfiguration.isMasterDevice,
+            lastSeenAt: Date()
         )
 
         // Encode the device configuration to prepare for QR code generation
@@ -1646,7 +1648,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         do {
             try await taskProcessor.ratchetManager.shutdown()
         } catch {
-            fatalError("Could not shutdown ratchet manager: \(error)")
+            // Teardown can race with in-flight session cleanup; do not crash the app.
+            logger.log(level: .warning, message: "Ratchet manager shutdown encountered non-fatal error: \(error)")
         }
         isViable = false
         cache = nil
