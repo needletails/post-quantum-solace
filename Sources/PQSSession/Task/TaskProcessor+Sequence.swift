@@ -229,7 +229,21 @@ extension TaskProcessor {
             
         } catch let cryptoError as CryptoKitError where cryptoError == .authenticationFailure {
             try await cache.deleteJob(job)
+            if case .streamMessage = props.task.task {
+                logger.log(level: .warning, message: "Inbound authentication failed after recovery attempts: \(cryptoError)")
+                throw cryptoError
+            }
             return .deleted
+
+        } catch let cryptoError as CryptoKitError {
+            // CoreCrypto errors for inbound backlog frames are not recoverable by retrying the same ciphertext.
+            if case .streamMessage = props.task.task {
+                try await cache.deleteJob(job)
+                logger.log(level: .warning, message: "Inbound stale crypto frame requires resend: \(cryptoError)")
+                throw cryptoError
+            }
+            logger.log(level: .warning, message: "Job crypto error: \(cryptoError)")
+            return .failed
             
         } catch let sessionError as PQSSession.SessionErrors
                     where sessionError == .invalidKeyId || sessionError == .cannotFindOneTimeKey {
@@ -238,43 +252,88 @@ extension TaskProcessor {
             
         } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
             try await cache.deleteJob(job)
-            // Treat as a critical job failure, but do not crash the whole processor / bubble to callers.
-            logger.log(level: .error, message: "Job ratchet error: \(ratchetError)")
-            throw ratchetError
-            
-        } catch let ratchetError as RatchetError where ratchetError == .stateUninitialized {
-            // Common right after key rotation / session reestablishment.
-            // Instead of crashing the whole processor, reschedule the job with a small bounded backoff.
-            //
-            // This enables "no delay" post-rotation delivery in practice by allowing convergence as
-            // identities/one-time keys propagate, while still bounding retries via `attempts`.
+            logger.log(level: .error, message: "Job ratchet error: \(ratchetError) - deleting stale job")
+
+//            do {
+//                _ = try await session.attemptBoundedRotationAfterMaxSkipped()
+//            } catch {
+//                logger.log(level: .warning, message: "Max-skipped rotation publish failed after deleting stale job: \(error)")
+//            }
+            if case .streamMessage = props.task.task {
+                throw ratchetError
+            }
+            return .deleted
+
+        } catch let ratchetError as RatchetError where ratchetError == .missingOneTimeKey {
+            // Inbound backlog can reference consumed one-time keys after reconnect/rotation.
+            // Surface live stream failures so the caller can request resend after reconciliation.
+            if case .streamMessage = props.task.task {
+                try await cache.deleteJob(job)
+                logger.log(level: .warning, message: "Inbound stale ratchet frame requires resend: \(ratchetError)")
+                throw ratchetError
+            }
+            logger.log(level: .warning, message: "Job ratchet error: \(ratchetError)")
+            return .failed
+
+        } catch let ratchetError as RatchetError where ratchetError == .initialMessageNotReceived {
+            // Treat startup bootstrap misses as short-lived and bounded for inbound traffic.
             guard var currentProps = await job.props(symmetricKey: symmetricKey) else {
                 try await cache.deleteJob(job)
                 return .deleted
             }
-            
+
             currentProps.attempts += 1
-            
-            // Cap retries to avoid infinite loops.
-            if currentProps.attempts >= 8 {
+            let maxAttempts = ( {
+                if case .streamMessage = currentProps.task.task { return 3 }
+                return 8
+            } )()
+
+            if currentProps.attempts >= maxAttempts {
                 try await cache.deleteJob(job)
-                logger.log(level: .error, message: "Job ratchet error (exceeded retries): \(ratchetError)")
+                logger.log(level: .warning, message: "Dropping job after repeated initialMessageNotReceived (attempts=\(currentProps.attempts))")
                 return .deleted
             }
-            
-            // Exponential backoff (50ms, 100ms, 200ms, 250ms, ...), capped at 250ms.
+
             let base: TimeInterval = 0.05
             let maxDelay: TimeInterval = 0.25
             let delay = min(maxDelay, base * pow(2.0, Double(currentProps.attempts - 1)))
             currentProps.delayedUntil = Date().addingTimeInterval(delay)
-            
+
             _ = try await job.updateProps(symmetricKey: symmetricKey, props: currentProps)
             try await cache.updateJob(job)
-            
+
             logger.log(level: .warning, message: "Job ratchet error: \(ratchetError) (attempt \(currentProps.attempts)) - retrying after \(delay)s")
             return .failed
-            
-        } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+
+        }
+//        catch let ratchetError as RatchetError where ratchetError == .stateUninitialized {
+//            // Common during reconnect/recovery windows. Retry with bounded backoff.
+//            guard var currentProps = await job.props(symmetricKey: symmetricKey) else {
+//                try await cache.deleteJob(job)
+//                return .deleted
+//            }
+//
+//            currentProps.attempts += 1
+//
+//            if currentProps.attempts >= 8 {
+//                try await cache.deleteJob(job)
+//                logger.log(level: .error, message: "Job ratchet error (exceeded retries): \(ratchetError)")
+//                return .deleted
+//            }
+//
+//            let base: TimeInterval = 0.05
+//            let maxDelay: TimeInterval = 0.25
+//            let delay = min(maxDelay, base * pow(2.0, Double(currentProps.attempts - 1)))
+//            currentProps.delayedUntil = Date().addingTimeInterval(delay)
+//
+//            _ = try await job.updateProps(symmetricKey: symmetricKey, props: currentProps)
+//            try await cache.updateJob(job)
+//
+//            logger.log(level: .warning, message: "Job ratchet error: \(ratchetError) (attempt \(currentProps.attempts)) - retrying after \(delay)s")
+//            return .failed
+//            
+//        }
+        catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
             try await cache.deleteJob(job)
             // Treat as a critical job failure, but do not crash the whole processor / bubble to callers.
             logger.log(level: .error, message: "Job session error: \(sessionError)")

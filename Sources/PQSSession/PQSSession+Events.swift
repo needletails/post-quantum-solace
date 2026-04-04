@@ -160,33 +160,50 @@ public extension PQSSession {
                 senderSecretName: sender,
                 senderDeviceId: deviceId,
                 sharedMessageId: messageId)
-
+            
             try await taskProcessor.inboundTask(
                 message,
                 session: self)
-
-        } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-            logger.log(level: .warning, message: "MaxSkippedHeadersExceeded - bounded ML-KEM publish, then surfacing resend error.")
-
-            let now = Date()
-            if let cooldownUntil = maxSkippedRotationCooldownUntil, now < cooldownUntil {
-                // Rotation already attempted recently; rethrow so SDK consumer can request resend.
-                throw ratchetError
-            }
-
-            // Gate rotations to prevent storms under offline backlog delivery.
-            // Set gate BEFORE awaiting rotation to prevent re-entrant calls from racing.
-            maxSkippedRotationCooldownUntil = now.addingTimeInterval(60)
-            hasRotatedForMaxSkipped = true
-
-            // Contract: one bounded publish so peers can observe fresh ML-KEM; publish failures propagate to the consumer.
-            try await publishBoundedRotationAfterMaxSkipped()
-
-            // Rethrow the original error so the consumer can delete offline backlog and request resend.
+            
+        } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+            logger.log(level: .warning, message: "InvalidSignature")
+            try await rotateKeysOnDecryptionFailure(error: sessionError)
+            throw sessionError
+        } catch let ratchetError as DoubleRatchetKit.RatchetError where ratchetError == .maxSkippedHeadersExceeded {
+            logger.log(level: .warning, message: "MaxSkippedHeadersExceeded")
+            try await rotateKeysOnDecryptionFailure(error: ratchetError)
             throw ratchetError
+        } catch let ratchetError as RatchetError where ratchetError == .missingOneTimeKey {
+            logger.log(level: .warning, message: "MissingOTK")
+            try await rotateKeysOnDecryptionFailure(error: ratchetError)
+            throw ratchetError
+        } catch let cryptoError as CryptoKitError {
+            logger.log(level: .warning, message: "CryptoKitError")
+            try await rotateKeysOnDecryptionFailure(error: cryptoError)
+            throw cryptoError
         } catch {
             logger.log(level: .error, message: "Error during message processing: \(error)")
             throw error
+        }
+        
+        func rotateKeysOnDecryptionFailure(error: Error) async throws {
+            guard let sessionContext = await sessionContext else {
+                throw error
+            }
+            let oldSigningKeyData = sessionContext.activeUserConfiguration.signingPublicKey
+            let oldSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: oldSigningKeyData)
+            
+            guard let currentSignedDevice = await sessionContext.activeUserConfiguration.signedDevices.first(where: { signed in
+                guard let verified = try? signed.verified(using: oldSigningKey) else { return false }
+                return verified.deviceId == sessionContext.sessionUser.deviceId
+            }), let currentDevice = try? currentSignedDevice.verified(using: oldSigningKey) else {
+                throw SessionErrors.invalidDeviceIdentity
+            }
+            if currentDevice.isMasterDevice {
+                try await rotateKeysOnPotentialCompromise()
+            } else {
+                try await rotateCurrentDeviceKeys()
+            }
         }
     }
 
@@ -223,12 +240,14 @@ public extension PQSSession {
         message: CryptoMessage,
         session: PQSSession
     ) async throws {
+        
         guard let sessionContext = await session.sessionContext else {
             throw SessionErrors.sessionNotInitialized
         }
         guard let cache = await session.cache else {
             throw SessionErrors.databaseNotInitialized
         }
+        
         let symmetricKey = try await getDatabaseSymmetricKey()
         let mySecretName = sessionContext.sessionUser.secretName
 
@@ -241,6 +260,8 @@ public extension PQSSession {
                 case .sessionReestablishment:
                     shouldPersist = false
                 case .synchronizeOneTimeKeys(_):
+                    shouldPersist = false
+                case .refreshOneTimeKeys:
                     shouldPersist = false
                 }
             } catch {}

@@ -348,6 +348,30 @@ actor SessionIdentityTests {
             throw error
         }
     }
+
+    @Test("Should rethrow critical invalid-signature refresh failures")
+    func testRefreshIdentitiesRethrowsCriticalInvalidSignature() async throws {
+        do {
+            let (_, transport) = try await setupTestSession()
+
+            let bundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            var invalidConfiguration = bundle.userConfiguration
+            invalidConfiguration.signingPublicKey = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation
+            transport.configurations["alice"] = invalidConfiguration
+
+            do {
+                _ = try await session.refreshIdentities(secretName: "alice", forceRefresh: true)
+                Issue.record("Expected refreshIdentities to throw invalidSignature for tampered configuration")
+            } catch let error as PQSSession.SessionErrors {
+                #expect(error == .invalidSignature)
+            }
+
+            await session.shutdown()
+        } catch {
+            await session.shutdown()
+            throw error
+        }
+    }
     
     // MARK: Identity Management Tests
     
@@ -399,6 +423,48 @@ actor SessionIdentityTests {
             await session.shutdown()
         } catch {
             // Ensure proper cleanup
+            await session.shutdown()
+            throw error
+        }
+    }
+
+    @Test("Should never return current device identity from getSessionIdentities")
+    func testGetSessionIdentitiesExcludesCurrentDeviceIdentity() async throws {
+        do {
+            let (store, _) = try await setupTestSession()
+            guard let context = await session.sessionContext else {
+                Issue.record("Session context should be initialized")
+                await session.shutdown()
+                return
+            }
+
+            // Insert an identity row that points to this same device.
+            let signingPublicKey = try Curve25519.Signing.PublicKey(
+                rawRepresentation: context.activeUserConfiguration.signingPublicKey
+            )
+            guard let signedDevice = context.activeUserConfiguration.signedDevices.first(where: { signed in
+                guard let verified = try? signed.verified(using: signingPublicKey) else { return false }
+                return verified.deviceId == context.sessionUser.deviceId
+            }), let currentDevice = try signedDevice.verified(using: signingPublicKey) else {
+                Issue.record("Expected to resolve current device configuration")
+                await session.shutdown()
+                return
+            }
+            let selfIdentity = try await session.createEncryptableSessionIdentityModel(
+                with: currentDevice,
+                oneTimePublicKey: nil,
+                mlKEMPublicKey: currentDevice.finalMLKEMPublicKey,
+                for: context.sessionUser.secretName,
+                associatedWith: context.sessionUser.deviceId,
+                new: Int.random(in: 1 ..< Int.max)
+            )
+            try await store.createSessionIdentity(selfIdentity)
+
+            let identities = try await session.getSessionIdentities(with: context.sessionUser.secretName)
+            #expect(identities.isEmpty)
+
+            await session.shutdown()
+        } catch {
             await session.shutdown()
             throw error
         }

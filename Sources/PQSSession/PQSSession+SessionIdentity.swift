@@ -240,6 +240,7 @@ public extension PQSSession {
         
         if needsRefresh {
             do {
+                
                 let refreshed = try await refreshSessionIdentities(
                     for: secretName,
                     from: existingIdentities,
@@ -248,11 +249,25 @@ public extension PQSSession {
                     sendOneTimeIdentities: sendOneTimeIdentities,
                     oneTime: syncKeys?.curveId,
                     oneTime: syncKeys?.mlKEMId)
+                
                 // Ensure we never return inactive snapshots.
                 let symmetricKey = try await getDatabaseSymmetricKey()
+                
                 return await refreshed.asyncFilter { identity in
                     guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
                     return !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+                }
+                
+            } catch let sessionError as PQSSession.SessionErrors {
+                // Do not silently mask critical verification/rotation failures; callers
+                // need to react (e.g. force re-sync / re-link) instead of using stale identities.
+                switch sessionError {
+                case .invalidSignature, .signingKeyOutOfSync, .longTermKeyRotationFailed:
+                    logger.log(level: .error, message: "Critical refreshIdentities failure for \(secretName): \(sessionError)")
+                    throw sessionError
+                default:
+                    logger.log(level: .error, message: "Error in refreshIdentities for \(secretName): \(sessionError)")
+                    return existingIdentities
                 }
             } catch {
                 logger.log(level: .error, message: "Error in refreshIdentities for \(secretName): \(error)")
@@ -309,9 +324,10 @@ public extension PQSSession {
                 guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
                 // Never surface inactive snapshot identities to callers.
                 if props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) { return false }
-                // Check if the identity is not the current user's identity
-                let myChildIdentity = props.secretName == sessionContext.sessionUser.secretName && props.deviceId != sessionContext.sessionUser.deviceId
-                // Return true if the secret name matches the recipient name or if it's a different identity
+                // Never surface this device's own identity as a recipient row.
+                if props.deviceId == sessionContext.sessionUser.deviceId { return false }
+                // Include rows for the requested recipient and linked sibling rows for our own account.
+                let myChildIdentity = props.secretName == sessionContext.sessionUser.secretName
                 return (props.secretName == recipientName) || myChildIdentity
             } catch {
                 return false
@@ -408,8 +424,8 @@ public extension PQSSession {
                         mlKEMPublicKey: mlKEM,
                         for: secretName,
                         associatedWith: device.deviceId,
-                        new: sessionContextId
-                    )
+                        new: sessionContextId)
+                    
                     logger.log(level: .info, message: "Created Session Identity: \(identity)")
                     identities.append(identity)
 

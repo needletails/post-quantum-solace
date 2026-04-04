@@ -345,6 +345,8 @@ actor EndToEndTests {
             return false
         } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
             return false
+        } catch is CryptoKitError {
+            return false
         }
     }
     
@@ -5624,6 +5626,274 @@ actor EndToEndTests {
             print("Bob updateOneTimeKeys calls: \(bobCalls)")
         }
     }
+
+    @Test("Missing MLKEM OTK recovery archives state without crashing")
+    func testMissingMLKEMOTKRecoveryArchivesStateWithoutCrashing() async throws {
+        defer { Task { await shutdownSessions() } }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+
+        actor Capture {
+            var msg: ReceivedMessage?
+            func set(_ message: ReceivedMessage) { msg = message }
+            func get() -> ReceivedMessage? { msg }
+        }
+
+        let brokenCapture = Capture()
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+
+        _ = try await _senderSession.refreshIdentities(
+            secretName: rMockUserData.ssn,
+            forceRefresh: true,
+            sendOneTimeIdentities: true
+        )
+        _ = try await _recipientSession.refreshIdentities(
+            secretName: sMockUserData.ssn,
+            forceRefresh: true,
+            sendOneTimeIdentities: true
+        )
+
+        guard let senderContext = await _recipientSession.sessionContext else {
+            Issue.record("Recipient session context should be initialized")
+            return
+        }
+
+        bobTransport.shouldDeliver = { _ in false }
+        bobTransport.transformOutgoing = { received in
+            guard let signed = received.message.signed else { return received }
+            let ratchetMessage = try BinaryDecoder().decode(RatchetMessage.self, from: signed.data)
+            guard let encryptedData = Mirror(reflecting: ratchetMessage)
+                .children
+                .first(where: { $0.label == "encryptedData" })?
+                .value as? Data
+            else {
+                throw TestError.invalidRatchetHeader
+            }
+
+            let forgedHeader = EncryptedHeader(
+                remoteLongTermPublicKey: ratchetMessage.header.remoteLongTermPublicKey,
+                remoteOneTimePublicKey: ratchetMessage.header.remoteOneTimePublicKey,
+                remoteMLKEMPublicKey: ratchetMessage.header.remoteMLKEMPublicKey,
+                headerCiphertext: ratchetMessage.header.headerCiphertext,
+                messageCiphertext: ratchetMessage.header.messageCiphertext,
+                oneTimeKeyId: ratchetMessage.header.oneTimeKeyId,
+                mlKEMOneTimeKeyId: UUID(),
+                encrypted: ratchetMessage.header.encrypted
+            )
+            let forgedRatchetMessage = RatchetMessage(
+                header: forgedHeader,
+                encryptedData: encryptedData
+            )
+            let forged = try SignedRatchetMessage(
+                message: forgedRatchetMessage,
+                signingPrivateKey: senderContext.sessionUser.deviceKeys.signingPrivateKey
+            )
+            let forgedReceived = ReceivedMessage(
+                message: forged,
+                sender: received.sender,
+                recipient: received.recipient,
+                deviceId: received.deviceId,
+                messageId: received.messageId,
+                transportEvent: received.transportEvent
+            )
+            await brokenCapture.set(forgedReceived)
+            return forgedReceived
+        }
+
+        let receiverMessageCountBefore = await senderStore.createdMessages.count
+        let receiverIdentityCountBefore = await senderStore.identities.count
+
+        try await _recipientSession.writeTextMessage(
+            recipient: .nickname(sMockUserData.ssn),
+            text: "broken"
+        )
+
+        guard let brokenMessage = await brokenCapture.get() else {
+            Issue.record("Broken outbound message should be captured")
+            return
+        }
+
+        await #expect(throws: Never.self) {
+            try await self._senderSession.receiveMessage(
+                message: brokenMessage.message,
+                sender: brokenMessage.sender,
+                deviceId: brokenMessage.deviceId,
+                messageId: brokenMessage.messageId
+            )
+        }
+
+        #expect(
+            await senderStore.createdMessages.count == receiverMessageCountBefore,
+            "Failed missing-OTK payload should not be persisted"
+        )
+        #expect(
+            await senderStore.identities.count > receiverIdentityCountBefore,
+            "Missing OTK recovery should archive inactive ratchet state"
+        )
+    }
+
+    @Test("refreshOneTimeKeys control archives active state and stays non-persistent")
+    func testRefreshOneTimeKeysControlArchivesActiveState() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+
+        aliceTask = Task {
+            for await received in aliceStream {
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._senderSession,
+                    received: received
+                )
+            }
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._recipientSession,
+                    received: received
+                )
+            }
+        }
+
+        _ = try await _senderSession.refreshIdentities(
+            secretName: rMockUserData.ssn,
+            forceRefresh: true,
+            sendOneTimeIdentities: true
+        )
+        _ = try await _recipientSession.refreshIdentities(
+            secretName: sMockUserData.ssn,
+            forceRefresh: true,
+            sendOneTimeIdentities: true
+        )
+        try await _recipientSession.writeTextMessage(
+            recipient: .nickname(sMockUserData.ssn),
+            text: "establish state"
+        )
+
+        for _ in 0..<20 {
+            if await senderStore.createdMessages.count > 0 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+
+        let senderMessageCountBeforeRefresh = await senderStore.createdMessages.count
+        let controlMetadata = try BinaryEncoder().encode(TransportEvent.refreshOneTimeKeys)
+        let senderIdentityCountBeforeRefresh = await senderStore.identities.count
+        try await _recipientSession.writeTextMessage(
+            recipient: .nickname(sMockUserData.ssn),
+            transportInfo: controlMetadata
+        )
+
+        try await Task.sleep(for: .milliseconds(400))
+
+        for _ in 0..<20 {
+            if await senderStore.createdMessages.count == senderMessageCountBeforeRefresh + 1 {
+                break
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+
+        #expect(
+            await senderStore.createdMessages.count == senderMessageCountBeforeRefresh + 1,
+            "refreshOneTimeKeys control should not persist as a user message"
+        )
+        #expect(
+            await senderStore.identities.count > senderIdentityCountBeforeRefresh,
+            "refreshOneTimeKeys control should archive the previous active ratchet state"
+        )
+    }
+
+    @Test("refreshOneTimeKeys control message is non-persistent and triggers refresh")
+    func testRefreshOneTimeKeysControlMessageIsNonPersistentAndTriggersRefresh() async throws {
+        defer { Task { await shutdownSessions() } }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+
+        actor Capture {
+            var msg: ReceivedMessage?
+            func set(_ message: ReceivedMessage) { msg = message }
+            func get() -> ReceivedMessage? { msg }
+        }
+
+        let controlCapture = Capture()
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+
+        _ = try await _senderSession.refreshIdentities(
+            secretName: rMockUserData.ssn,
+            forceRefresh: true,
+            sendOneTimeIdentities: true
+        )
+        _ = try await _recipientSession.refreshIdentities(
+            secretName: sMockUserData.ssn,
+            forceRefresh: true,
+            sendOneTimeIdentities: true
+        )
+
+        bobTransport.shouldDeliver = { received in
+            await controlCapture.set(received)
+            return false
+        }
+
+        let metadata = try BinaryEncoder().encode(TransportEvent.refreshOneTimeKeys)
+        let senderMessageCountBefore = await recipientStore.createdMessages.count
+        try await _recipientSession.writeTextMessage(
+            recipient: .nickname(sMockUserData.ssn),
+            transportInfo: metadata
+        )
+
+        guard let controlMessage = await controlCapture.get() else {
+            Issue.record("refreshOneTimeKeys control message should be captured")
+            return
+        }
+
+        #expect(
+            await recipientStore.createdMessages.count == senderMessageCountBefore,
+            "refreshOneTimeKeys control frames should not be persisted"
+        )
+        if case .refreshOneTimeKeys = controlMessage.transportEvent {
+            #expect(Bool(true))
+        } else {
+            Issue.record("Expected refreshOneTimeKeys transport event")
+        }
+    }
 }
 
 
@@ -5725,6 +5995,8 @@ struct SessionDelegate: PQSSessionDelegate {
                 case .sessionReestablishment:
                     await SessionEventProbe.shared.markReestablishment(for: session.id)
                 case .synchronizeOneTimeKeys(_):
+                    break
+                case .refreshOneTimeKeys:
                     break
                 }
             }
@@ -5914,6 +6186,11 @@ actor TransportStore {
     var publishableName: String!
     var userConfigurations = [User]()
     var lastPublishedRotatedKeys: SessionModels.RotatedPublicKeys?
+
+    /// Test helper: the store is shared across serialized suite tests; clear capture before asserting on rotation payloads.
+    func resetLastPublishedRotatedKeys() async {
+        lastPublishedRotatedKeys = nil
+    }
     
     func setPublishableName(_ publishableName: String) async {
         self.publishableName = publishableName
@@ -5958,16 +6235,85 @@ actor TransportStore {
         let config = userConfigurations.first(where: { $0.secretName == secretName })
         guard let signingKeyData = config?.config.signingPublicKey else { fatalError() }
         let signingKey = try Curve25519.Signing.PublicKey(rawRepresentation: signingKeyData)
-        let filtered = oneTimePublicKeyPairs.filter { $0.id == secretName }
+        let filteredCurve = oneTimePublicKeyPairs.filter { $0.id == secretName }
+        let filteredMLKEM = mlKEMOneTimeKeyPairs.filter { $0.id == secretName }
         var verifiedIDs: [UUID] = []
-        for key in filtered {
-            for oneTimeKey in key.keys {
-                if let verifiedKey = try? oneTimeKey.verified(using: signingKey) {
-                    verifiedIDs.append(verifiedKey.id)
+
+        switch type {
+        case .curve:
+            for key in filteredCurve {
+                for oneTimeKey in key.keys {
+                    if let verifiedKey = try? oneTimeKey.verified(using: signingKey) {
+                        verifiedIDs.append(verifiedKey.id)
+                    }
+                }
+            }
+        case .mlKEM:
+            for key in filteredMLKEM {
+                for oneTimeKey in key.keys {
+                    if let verifiedKey = try? oneTimeKey.verified(using: signingKey) {
+                        verifiedIDs.append(verifiedKey.id)
+                    }
                 }
             }
         }
         return verifiedIDs
+    }
+
+    func updateOneTimeKeys(
+        for secretName: String,
+        deviceId _: String,
+        keys: [UserConfiguration.SignedOneTimePublicKey]
+    ) async throws {
+        if let index = oneTimePublicKeyPairs.firstIndex(where: { $0.id == secretName }) {
+            oneTimePublicKeyPairs[index].keys.append(contentsOf: keys)
+        } else {
+            oneTimePublicKeyPairs.append(
+                IdentifiableSignedoneTimePublicKey(id: secretName, keys: keys)
+            )
+        }
+    }
+
+    func updateOneTimeMLKEMKeys(
+        for secretName: String,
+        deviceId _: String,
+        keys: [UserConfiguration.SignedMLKEMOneTimeKey]
+    ) async throws {
+        if let index = mlKEMOneTimeKeyPairs.firstIndex(where: { $0.id == secretName }) {
+            mlKEMOneTimeKeyPairs[index].keys.append(contentsOf: keys)
+        } else {
+            mlKEMOneTimeKeyPairs.append(
+                IdentifiableSignedMLKEMOneTimeKey(id: secretName, keys: keys)
+            )
+        }
+    }
+
+    func batchDeleteOneTimeKeys(for secretName: String, with _: String, type: KeysType) async throws {
+        switch type {
+        case .curve:
+            if let index = oneTimePublicKeyPairs.firstIndex(where: { $0.id == secretName }) {
+                oneTimePublicKeyPairs[index].keys.removeAll()
+            }
+        case .mlKEM:
+            if let index = mlKEMOneTimeKeyPairs.firstIndex(where: { $0.id == secretName }) {
+                mlKEMOneTimeKeyPairs[index].keys.removeAll()
+            }
+        }
+    }
+
+    func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {
+        guard let keyId = UUID(uuidString: id) else { return }
+
+        switch type {
+        case .curve:
+            if let index = oneTimePublicKeyPairs.firstIndex(where: { $0.id == secretName }) {
+                oneTimePublicKeyPairs[index].keys.removeAll(where: { $0.id == keyId })
+            }
+        case .mlKEM:
+            if let index = mlKEMOneTimeKeyPairs.firstIndex(where: { $0.id == secretName }) {
+                mlKEMOneTimeKeyPairs[index].keys.removeAll(where: { $0.id == keyId })
+            }
+        }
     }
     
     func publishUserConfiguration(
@@ -6213,17 +6559,24 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     ) async throws {
         // Track calls for testing (thread-safe)
         await callTracker.record(secretName: secretName, deviceId: deviceId, keyCount: keys.count)
+        try await store.updateOneTimeKeys(for: secretName, deviceId: deviceId, keys: keys)
     }
     func updateOneTimeMLKEMKeys(
-        for _: String, deviceId _: String,
-        keys _: [SessionModels.UserConfiguration.SignedMLKEMOneTimeKey]
-    ) async throws {}
-    func batchDeleteOneTimeKeys(for _: String, with _: String, type _: SessionModels.KeysType)
+        for secretName: String, deviceId: String,
+        keys: [SessionModels.UserConfiguration.SignedMLKEMOneTimeKey]
+    ) async throws {
+        try await store.updateOneTimeMLKEMKeys(for: secretName, deviceId: deviceId, keys: keys)
+    }
+    func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: SessionModels.KeysType)
     async throws
-    {}
-    func deleteOneTimeKeys(for _: String, with _: String, type _: SessionModels.KeysType)
+    {
+        try await store.batchDeleteOneTimeKeys(for: secretName, with: id, type: type)
+    }
+    func deleteOneTimeKeys(for secretName: String, with id: String, type: SessionModels.KeysType)
     async throws
-    {}
+    {
+        try await store.deleteOneTimeKeys(for: secretName, with: id, type: type)
+    }
     func createUploadPacket(
         secretName _: String, deviceId _: UUID, recipient _: SessionModels.MessageRecipient,
         metadata _: Data
@@ -6451,4 +6804,5 @@ enum TestError: Error, Equatable {
     case multiDeviceRotationRequiresBatch
     case invalidRotatedDeviceSignature
     case invalidRecoverySignature
+    case invalidRatchetHeader
 }

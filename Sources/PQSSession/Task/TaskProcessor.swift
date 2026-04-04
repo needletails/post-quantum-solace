@@ -122,6 +122,14 @@ public actor TaskProcessor {
     
     var taskDelegate: TaskSequenceDelegate?
 
+    /// Last time we sent a peer `refreshOneTimeKeys` control message for a given peer secret name.
+    /// Used to debounce control-plane churn during reconnect bursts.
+    var lastPeerRefreshRequestAt: [String: Date] = [:]
+
+    /// Minimum interval between peer refresh control messages for the same peer.
+    /// Keeps recovery behavior while reducing startup storms that can race with live traffic.
+    let peerRefreshRequestCooldown: TimeInterval = 15
+
     /// Represents a stashed inbound task for later processing.
     ///
     /// This struct is used to temporarily store inbound messages that cannot be processed
@@ -253,11 +261,15 @@ public actor TaskProcessor {
 
         switch type {
         case .personalMessage:
+            
             identities = try await gatherPersonalIdentities(session: session, sender: sender, logger: logger)
             recipients.insert(sender)
+            
         case .nickname(let nickname):
+            
             var sendOneTimeIdentities = false
             var createIdentity = true
+            
             if let state = try? BinaryDecoder().decode(FriendshipMetadata.self, from: message.metadata) {
                 if state.myState == .requested {
                     sendOneTimeIdentities = true
@@ -272,9 +284,10 @@ public actor TaskProcessor {
                 target: nickname,
                 logger: logger,
                 createIdentity: createIdentity,
-                sendOneTimeIdentities: sendOneTimeIdentities
-            )
+                sendOneTimeIdentities: sendOneTimeIdentities)
+            
             recipients.formUnion([sender, nickname])
+            
         case .channel:
             do {
                 
@@ -597,12 +610,12 @@ public actor TaskProcessor {
         }
 
         let members = props.members
-        var identities = [SessionIdentity]()
+        var identities = Set<SessionIdentity>()
         for member in members {
-            try await identities.append(contentsOf: session.refreshIdentities(secretName: member, forceRefresh: true))
+            try await identities.formUnion(session.refreshIdentities(secretName: member))
         }
-        logger.log(level: .info, message: "Gathered \(identities.count) Channel Session Identities")
-        return (identities, members)
+        logger.log(level: .info, message: "Gathered \(await identities.count) Channel Session Identities")
+        return (Array(identities), members)
     }
 
     // MARK: - Message Encryption
@@ -797,3 +810,13 @@ public actor TaskProcessor {
     }
 }
 
+extension SessionIdentity: Hashable {
+    
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+    
+    public static func == (lhs: DoubleRatchetKit.SessionIdentity, rhs: DoubleRatchetKit.SessionIdentity) -> Bool {
+        lhs.id == rhs.id
+    }
+}

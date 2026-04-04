@@ -100,9 +100,11 @@ public struct SynchronizationKeyIdentities: Sendable, Codable {
 public enum TransportEvent: Sendable, Codable {
     case sessionReestablishment
     case synchronizeOneTimeKeys(SynchronizationKeyIdentities)
+    case refreshOneTimeKeys
     
     enum CodingKeys: String, CodingKey {
         case sessionReestablishment = "a"
         case synchronizeOneTimeKeys = "b"
+        case refreshOneTimeKeys = "c"
     }
 }

@@ -15,6 +15,7 @@
 //
 
 import DoubleRatchetKit
+import BinaryCodable
 import Foundation
 import NeedleTailCrypto
 @testable import PQSSession
@@ -128,6 +129,53 @@ actor KeyRotationTests {
         )
     }
 
+    private func setCurrentDeviceMasterFlag(_ isMaster: Bool) async throws {
+        guard var context = await session.sessionContext else {
+            throw PQSSession.SessionErrors.sessionNotInitialized
+        }
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+
+        let signingPrivateKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: context.sessionUser.deviceKeys.signingPrivateKey
+        )
+        let signingPublicKey = try Curve25519.Signing.PublicKey(
+            rawRepresentation: context.activeUserConfiguration.signingPublicKey
+        )
+
+        let updatedSignedDevices = try context.activeUserConfiguration.signedDevices.map { signed -> UserConfiguration.SignedDeviceConfiguration in
+            guard let verified = try signed.verified(using: signingPublicKey) else {
+                throw PQSSession.SessionErrors.invalidSignature
+            }
+            let updated = UserDeviceConfiguration(
+                deviceId: verified.deviceId,
+                signingPublicKey: verified.signingPublicKey,
+                longTermPublicKey: verified.longTermPublicKey,
+                finalMLKEMPublicKey: verified.finalMLKEMPublicKey,
+                deviceName: verified.deviceName,
+                hmacData: verified.hmacData,
+                isMasterDevice: verified.deviceId == context.sessionUser.deviceId ? isMaster : verified.isMasterDevice,
+                lastSeenAt: verified.lastSeenAt
+            )
+            return try UserConfiguration.SignedDeviceConfiguration(device: updated, signingKey: signingPrivateKey)
+        }
+
+        context.activeUserConfiguration = UserConfiguration(
+            signingPublicKey: context.activeUserConfiguration.signingPublicKey,
+            signedDevices: updatedSignedDevices,
+            signedOneTimePublicKeys: context.activeUserConfiguration.signedOneTimePublicKeys,
+            signedMLKEMOneTimePublicKeys: context.activeUserConfiguration.signedMLKEMOneTimePublicKeys
+        )
+        await session.setSessionContext(context)
+
+        let encoded = try BinaryEncoder().encode(context)
+        guard let encrypted = try await crypto.encrypt(data: encoded, symmetricKey: session.getAppSymmetricKey()) else {
+            throw PQSSession.SessionErrors.sessionEncryptionError
+        }
+        try await cache.updateLocalSessionContext(encrypted)
+    }
+
     // MARK: - Tests
 
     @Test("rotateKeysOnPotentialCompromise should update signing, curve and MLKEM keys and publish rotation")
@@ -153,6 +201,7 @@ actor KeyRotationTests {
 
         #expect(rotatedContext.sessionUser.deviceKeys.signingPrivateKey != originalSigningKey)
         #expect(rotatedContext.sessionUser.deviceKeys.longTermPrivateKey != originalCurveKey)
+        #expect(await session.keyLoadingState == .complete)
 
         // Assert that publishRotatedKeys was called by checking store user configuration was updated
         let userConfigs = await store.userConfigurations
@@ -261,6 +310,58 @@ actor KeyRotationTests {
         await session.shutdown()
     }
 
+    @Test("rotateKeysOnPotentialCompromise rejects non-master devices")
+    func testRotateKeysOnPotentialCompromise_rejectsNonMasterDevice() async throws {
+        _ = try await setupRotatableSession()
+        try await setCurrentDeviceMasterFlag(false)
+
+        do {
+            try await session.rotateKeysOnPotentialCompromise()
+            Issue.record("Expected key rotation to fail for non-master devices")
+        } catch let error as PQSSession.SessionErrors {
+            #expect(error == .compromiseRotationRequiresMasterDevice)
+        }
+
+        let published = await store.lastPublishedRotatedKeys
+        #expect(published == nil)
+
+        await session.shutdown()
+    }
+
+    @Test("rotateCurrentDeviceKeys rotates child device keys without account signing key rollover")
+    func testRotateCurrentDeviceKeys_forNonMasterDevice() async throws {
+        _ = try await setupRotatableSession()
+        try await setCurrentDeviceMasterFlag(false)
+
+        guard let originalContext = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        let originalSigningPrivateKey = originalContext.sessionUser.deviceKeys.signingPrivateKey
+        let originalLongTermPrivateKey = originalContext.sessionUser.deviceKeys.longTermPrivateKey
+        let originalFinalMLKEMId = originalContext.sessionUser.deviceKeys.finalMLKEMPrivateKey.id
+
+        try await session.rotateCurrentDeviceKeys()
+
+        guard let rotatedContext = await session.sessionContext else {
+            Issue.record("Rotated session context should not be nil")
+            return
+        }
+
+        #expect(rotatedContext.sessionUser.deviceKeys.signingPrivateKey == originalSigningPrivateKey)
+        #expect(rotatedContext.sessionUser.deviceKeys.longTermPrivateKey != originalLongTermPrivateKey)
+        #expect(rotatedContext.sessionUser.deviceKeys.finalMLKEMPrivateKey.id != originalFinalMLKEMId)
+        #expect(rotatedContext.activeUserConfiguration.signingPublicKey == originalContext.activeUserConfiguration.signingPublicKey)
+        #expect(await session.keyLoadingState == .complete)
+
+        let publishedKeys = await store.lastPublishedRotatedKeys
+        #expect(publishedKeys != nil)
+        #expect(publishedKeys?.allSignedDevices == nil)
+        #expect(publishedKeys?.pskData == originalContext.activeUserConfiguration.signingPublicKey)
+
+        await session.shutdown()
+    }
+
     @Test("mock server rejects single-device compromise rotation when server configuration is multi-device")
     func testMockServerRejectsSingleDeviceCompromiseRotationForMultiDeviceConfig() async throws {
         _ = try await setupRotatableSession()
@@ -339,6 +440,55 @@ actor KeyRotationTests {
         await session.shutdown()
     }
 
+    @Test("rotateMLKEMKeysIfNeeded publishes batched allSignedDevices when local account has multiple devices")
+    func testRotateMLKEMKeysIfNeeded_multiDeviceUsesBatchPayload() async throws {
+        await store.resetLastPublishedRotatedKeys()
+        let (transport, _) = try await setupRotatableSession()
+
+        guard let sessionCache = await session.cache else {
+            Issue.record("Session cache should be initialized")
+            return
+        }
+
+        guard var context = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+
+        let linkedSignedDevice = try makeLinkedSignedDevice(from: context)
+        context.activeUserConfiguration.signedDevices.append(linkedSignedDevice)
+
+        let pastDate = Calendar.current.date(byAdding: .day, value: -(PQSSessionConstants.keyRotationIntervalDays + 1), to: Date())!
+        context.sessionUser.deviceKeys.rotateKeysDate = pastDate
+
+        await session.setSessionContext(context)
+        let encodedMulti = try BinaryEncoder().encode(context)
+        guard let encryptedMulti = try await crypto.encrypt(data: encodedMulti, symmetricKey: session.getAppSymmetricKey()) else {
+            throw PQSSession.SessionErrors.sessionEncryptionError
+        }
+        // Persist through SessionCache so PQSSession.getSessionContext() sees the same blob (not stale in-memory cache).
+        try await sessionCache.updateLocalSessionContext(encryptedMulti)
+
+        let roundTripData = try await sessionCache.fetchLocalSessionContext()
+        guard let roundTripPlain = try await crypto.decrypt(data: roundTripData, symmetricKey: session.getAppSymmetricKey()) else {
+            throw PQSSession.SessionErrors.sessionDecryptionError
+        }
+        let persistedContext = try BinaryDecoder().decode(SessionContext.self, from: roundTripPlain)
+        #expect(persistedContext.activeUserConfiguration.signedDevices.count == 2)
+
+        let serverConfiguration = context.activeUserConfiguration
+        await store.setUserConfigurations(index: 0, config: serverConfiguration)
+
+        let rotated = try await session.rotateMLKEMKeysIfNeeded()
+        #expect(rotated == true)
+
+        #expect(await transport.publishRotatedKeysCallCount == 1)
+        let publishedKeys = await store.lastPublishedRotatedKeys
+        #expect(publishedKeys?.allSignedDevices?.count == 2)
+
+        await session.shutdown()
+    }
+
     @Test("refreshOneTimeKeys with MLKEM type should replace MLKEM one-time key batch")
     func testRefreshOneTimeKeysMLKEMReplacesKeyBatch() async throws {
         _ = try await setupRotatableSession()
@@ -353,6 +503,11 @@ actor KeyRotationTests {
         )
         #expect(!originalIds.isEmpty)
 
+        try await store.batchDeleteOneTimeKeys(
+            for: originalContext.sessionUser.secretName,
+            with: originalContext.sessionUser.deviceId.uuidString,
+            type: .mlKEM
+        )
         try await session.refreshOneTimeKeys(refreshType: .mlKEM)
 
         guard let updatedContext = await session.sessionContext else {

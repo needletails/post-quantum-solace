@@ -172,8 +172,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     private(set) var receiverDelegate: (any EventReceiver)?
     private(set) var sessionDelegate: (any PQSSessionDelegate)?
     private(set) var eventDelegate: (any SessionEvents)?
-    private var refreshOTKeysTask: Task<Void, Never>?
-    private var refreshMLKEMOTKeysTask: Task<Void, Never>?
+    private var refreshOTKeysTask: Task<Bool, Never>?
+    private var refreshMLKEMOTKeysTask: Task<Bool, Never>?
     /// Optional delegate for device linking operations
     public nonisolated(unsafe) weak var linkDelegate: DeviceLinkingDelegate?
     
@@ -344,7 +344,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let mySecretName = await sessionContext?.sessionUser.secretName
         guard let cache else { return }
         for identity in try await cache.fetchSessionIdentities() {
-            guard var props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
             if let secretName, props.secretName != secretName { continue }
             // Never invalidate archived/inactive snapshots.
             if isInactiveSessionIdentity(deviceName: props.deviceName) { continue }
@@ -352,7 +352,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             // peer-to-peer ratchet reestablishment.
             if secretName == nil, let mySecretName, props.secretName == mySecretName { continue }
             guard props.state != nil else { continue }
-            guard let props = try await identity.props(symmetricKey: symmetricKey) else {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else {
                 throw RatchetError.missingProps
             }
             switch policy {
@@ -510,6 +510,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         case drainedKeys = "The Local Keys are drained."
         case longTermKeyRotationFailed = "Failed to rotate the long-term key."
         case signingKeyOutOfSync = "Local signing key is out of sync with server-trusted account state."
+        case compromiseRotationRequiresMasterDevice = "Compromise key rotation is restricted to the master device."
         case invalidOperatorCount = "The number of operators must be greater than 0."
         case invalidMemberCount = "The number of members must be greater than 2."
         
@@ -570,6 +571,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 return "Ensure the device salt is properly initialized"
             case .signingKeyOutOfSync:
                 return "Re-link this device from a trusted device or reset account keys"
+            case .compromiseRotationRequiresMasterDevice:
+                return "Initiate compromise rotation from the master device, then re-link secondary devices if needed"
             default:
                 return nil
             }
@@ -1247,60 +1250,83 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
     /// Manually triggers a refresh of Curve25519 one-time keys
     ///
-    /// This method cancels any existing refresh task and starts a new one to generate
-    /// a batch of one-time keys. Keys are automatically refreshed when the count drops
-    /// below `PQSSessionConstants.oneTimeKeyLowWatermark`, but this method allows
-    /// manual triggering if needed.
+    /// By default this matches automatic refresh: after syncing with the server, new keys are
+    /// generated and uploaded only when the remaining count is at or below
+    /// `PQSSessionConstants.oneTimeKeyLowWatermark`. Set `forceReplenish` to bypass that gate
+    /// (used after inbound key reconciliation) so the device tops up toward
+    /// `oneTimeKeyBatchSize` even when still above the low watermark.
     ///
-    /// - Note: The refresh task runs asynchronously and generates
-    ///   `PQSSessionConstants.oneTimeKeyBatchSize` keys.
-    public func refreshOneTimeKeysTask() async {
-        refreshOTKeysTask?.cancel()
-        
-        refreshOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
-            guard let self else { return }
-            do {
-                try await refreshOneTimeKeys(refreshType: .curve)
-            } catch {
-                // Handle any errors that may occur during the refresh
-                await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
-            }
-
-            // Clean up the task reference after completion
-            await removeExpiredOTKeys()
+    /// - Note: The refresh task runs asynchronously. When a replenish runs, it creates up to
+    ///   enough keys to reach `PQSSessionConstants.oneTimeKeyBatchSize`.
+    /// - Parameter forceReplenish: When `true`, runs the same top-up logic as when low on keys,
+    ///   regardless of the low-watermark check. Default `false` preserves existing behavior.
+    @discardableResult
+    public func refreshOneTimeKeysTask(forceReplenish: Bool = false) async -> Bool {
+        // Coalesce concurrent refresh requests to avoid cancel/restart storms that
+        // surface as URLSession cancellation errors (-999) under load.
+        if forceReplenish, let existingTask = refreshOTKeysTask {
+            _ = await existingTask.value
+        } else if let existingTask = refreshOTKeysTask {
+            return await existingTask.value
         }
-        
-        _ = await refreshOTKeysTask?.value
+
+        refreshOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
+            guard let self else { return false }
+            do {
+                try await refreshOneTimeKeys(refreshType: .curve, forceReplenish: forceReplenish)
+                await removeExpiredOTKeys()
+                return true
+            } catch {
+                await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
+                await logger.log(level: .warning, message: "Curve one-time-key refresh failed; local/server state may remain out of sync")
+                await removeExpiredOTKeys()
+                return false
+            }
+        }
+
+        return await refreshOTKeysTask?.value ?? false
     }
 
     /// Manually triggers a refresh of MLKEM one-time keys
     ///
-    /// This method cancels any existing refresh task and starts a new one to generate
-    /// a batch of post-quantum MLKEM one-time keys. Keys are automatically refreshed
-    /// when needed, but this method allows manual triggering if needed.
+    /// Default behavior matches automatic refresh (see `refreshOneTimeKeysTask`). Use
+    /// `forceReplenish` for reconciliation paths that must top up even when above the
+    /// low watermark.
     ///
-    /// - Note: The refresh task runs asynchronously and generates
-    ///   `PQSSessionConstants.oneTimeKeyBatchSize` keys.
-    public func refreshMLKEMOneTimeKeysTask() async {
-        refreshMLKEMOTKeysTask?.cancel()
+    /// - Parameter forceReplenish: When `true`, tops up toward `oneTimeKeyBatchSize` even when
+    ///   the count is above `oneTimeKeyLowWatermark`. Default `false` preserves existing behavior.
+    @discardableResult
+    public func refreshMLKEMOneTimeKeysTask(forceReplenish: Bool = false) async -> Bool {
+        // Coalesce concurrent refresh requests to avoid cancel/restart storms that
+        // surface as URLSession cancellation errors (-999) under load.
+        if forceReplenish, let existingTask = refreshMLKEMOTKeysTask {
+            _ = await existingTask.value
+        } else if let existingTask = refreshMLKEMOTKeysTask {
+            return await existingTask.value
+        }
 
         refreshMLKEMOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
-            guard let self else { return }
+            guard let self else { return false }
 
             do {
-                try await refreshOneTimeKeys(refreshType: .mlKEM)
+                try await refreshOneTimeKeys(refreshType: .mlKEM, forceReplenish: forceReplenish)
+                await removeExpiredMLKEMOTKeys()
+                return true
             } catch {
-                // Handle any errors that may occur during the refresh
                 await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
+                await logger.log(level: .warning, message: "MLKEM one-time-key refresh failed; local/server state may remain out of sync")
+                await removeExpiredMLKEMOTKeys()
+                return false
             }
-
-            // Clean up the task reference after completion
-            await removeExpiredMLKEMOTKeys()
         }
-        _ = await refreshMLKEMOTKeysTask?.value
+        return await refreshMLKEMOTKeysTask?.value ?? false
     }
 
-    func refreshOneTimeKeys(refreshType: KeysType) async throws {
+    /// - Parameter forceReplenish: If `false` (default), creates and uploads keys only when at or below
+    ///   the low watermark. If `true`, uses the same top-up-to-batch-size logic whenever the count
+    ///   is below `oneTimeKeyBatchSize`, regardless of the watermark—without changing the generation
+    ///   formula when the count is already at batch size (still a no-op then).
+    func refreshOneTimeKeys(refreshType: KeysType, forceReplenish: Bool = false) async throws {
         guard let sessionContext = await sessionContext else { return }
         guard let cache else { return }
         var keys = [UUID]()
@@ -1309,88 +1335,91 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             keys = fetched
         }
 
-        if !keys.isEmpty {
-            let publicKeysCount = try await synchronizeLocalKeys(cache: cache, keys: keys, type: refreshType)
-            if publicKeysCount <= PQSSessionConstants.oneTimeKeyLowWatermark {
-                // 1. Delete all local keys that are not on the server
-                let config = try await cache.fetchLocalSessionContext()
+        if keys.isEmpty {
+            logger.log(level: .warning, message: "No remote one-time key identities found for \(refreshType); regenerating local batch")
+        }
 
-                // Decrypt the session context data using the app's symmetric key
-                guard let configurationData = try await crypto.decrypt(data: config, symmetricKey: getAppSymmetricKey()) else {
-                    throw SessionErrors.sessionDecryptionError
-                }
+        let publicKeysCount = try await synchronizeLocalKeys(cache: cache, keys: keys, type: refreshType)
+        let shouldReplenish = forceReplenish || publicKeysCount <= PQSSessionConstants.oneTimeKeyLowWatermark
+        if shouldReplenish {
+            // 1. Delete all local keys that are not on the server
+            let config = try await cache.fetchLocalSessionContext()
 
-                // Decode the session context from the decrypted data
-                var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
-
-                logger.log(level: .info, message: "Creating Key Pairs, count: \(PQSSessionConstants.oneTimeKeyBatchSize - publicKeysCount)")
-                switch refreshType {
-                case .curve:
-                    // Create needed key pairs
-                    let privateOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize - publicKeysCount).map { _ in
-                        let id = UUID()
-                        let privateKey = crypto.generateCurve25519PrivateKey()
-                        let privateKeyRep = try CurvePrivateKey(id: id, privateKey.rawRepresentation)
-                        let publicKey = try CurvePublicKey(id: id, privateKey.publicKey.rawRepresentation)
-                        return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
-                    }
-
-                    sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
-                    let signedOneTimePublicKeys: [UserConfiguration.SignedOneTimePublicKey] = try privateOneTimeKeyPairs.map { keyPair in
-                        try UserConfiguration.SignedOneTimePublicKey(
-                            key: keyPair.publicKey,
-                            deviceId: sessionContext.sessionUser.deviceId,
-                            signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
-                        )
-                    }
-
-                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
-
-                    try await transportDelegate?.updateOneTimeKeys(
-                        for: sessionContext.sessionUser.secretName,
-                        deviceId: sessionContext.sessionUser.deviceId.uuidString,
-                        keys: signedOneTimePublicKeys
-                    )
-
-                case .mlKEM:
-                    // Create needed key pairs
-                    let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
-                        let id = UUID()
-                        let privateKey = try crypto.generateMLKem1024PrivateKey()
-                        let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
-                        let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
-                        return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
-                    }
-
-                    sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
-                    let signedMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
-                        try UserConfiguration.SignedMLKEMOneTimeKey(
-                            key: keyPair.publicKey,
-                            deviceId: sessionContext.sessionUser.deviceId,
-                            signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
-                        )
-                    }
-
-                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
-
-                    try await transportDelegate?.updateOneTimeMLKEMKeys(
-                        for: sessionContext.sessionUser.secretName,
-                        deviceId: sessionContext.sessionUser.deviceId.uuidString,
-                        keys: signedMLKEMOneTimeKeys
-                    )
-                }
-
-                sessionContext.updateSessionUser(sessionContext.sessionUser)
-                await setSessionContext(sessionContext)
-
-                // Encrypt and persist
-                let encodedData = try BinaryEncoder().encode(sessionContext)
-                guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
-                    throw PQSSession.SessionErrors.sessionEncryptionError
-                }
-
-                try await cache.updateLocalSessionContext(encryptedConfig)
+            // Decrypt the session context data using the app's symmetric key
+            guard let configurationData = try await crypto.decrypt(data: config, symmetricKey: getAppSymmetricKey()) else {
+                throw SessionErrors.sessionDecryptionError
             }
+
+            // Decode the session context from the decrypted data
+            var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+            let keyPairsToCreate = max(0, PQSSessionConstants.oneTimeKeyBatchSize - publicKeysCount)
+
+            logger.log(level: .info, message: "Creating Key Pairs, count: \(keyPairsToCreate)")
+            switch refreshType {
+            case .curve:
+                // Create needed key pairs
+                let privateOneTimeKeyPairs: [KeyPair] = try (0 ..< keyPairsToCreate).map { _ in
+                    let id = UUID()
+                    let privateKey = crypto.generateCurve25519PrivateKey()
+                    let privateKeyRep = try CurvePrivateKey(id: id, privateKey.rawRepresentation)
+                    let publicKey = try CurvePublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                    return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+                }
+
+                sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
+                let signedOneTimePublicKeys: [UserConfiguration.SignedOneTimePublicKey] = try privateOneTimeKeyPairs.map { keyPair in
+                    try UserConfiguration.SignedOneTimePublicKey(
+                        key: keyPair.publicKey,
+                        deviceId: sessionContext.sessionUser.deviceId,
+                        signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey))
+                }
+
+                try await transportDelegate?.updateOneTimeKeys(
+                    for: sessionContext.sessionUser.secretName,
+                    deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                    keys: signedOneTimePublicKeys
+                )
+
+                sessionContext.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
+
+            case .mlKEM:
+                // Create needed key pairs
+                let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< keyPairsToCreate).map { _ in
+                    let id = UUID()
+                    let privateKey = try crypto.generateMLKem1024PrivateKey()
+                    let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
+                    let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                    return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+                }
+
+                sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
+                let signedMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
+                    try UserConfiguration.SignedMLKEMOneTimeKey(
+                        key: keyPair.publicKey,
+                        deviceId: sessionContext.sessionUser.deviceId,
+                        signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
+                    )
+                }
+
+                try await transportDelegate?.updateOneTimeMLKEMKeys(
+                    for: sessionContext.sessionUser.secretName,
+                    deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                    keys: signedMLKEMOneTimeKeys
+                )
+
+                sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
+            }
+
+            sessionContext.updateSessionUser(sessionContext.sessionUser)
+            await setSessionContext(sessionContext)
+
+            // Encrypt and persist
+            let encodedData = try BinaryEncoder().encode(sessionContext)
+            guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
+                throw PQSSession.SessionErrors.sessionEncryptionError
+            }
+
+            try await cache.updateLocalSessionContext(encryptedConfig)
         }
     }
 

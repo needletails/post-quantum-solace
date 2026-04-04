@@ -506,6 +506,70 @@ actor TaskProcessorSequenceTests {
         
         await session.shutdown()
     }
+
+    @Test("Error Handling - Invalid Signature Requires Explicit Resume For Remaining Jobs")
+    func testErrorHandlingInvalidSignatureLeavesLaterJobsCachedUntilResume() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        let recipientIdentity = createTestRecipientIdentity()
+
+        let firstTask = EncryptableTask(task: .writeMessage(.init(
+            message: createTestMessage("fatal_invalid_signature"),
+            recipientIdentity: recipientIdentity,
+            localId: localId,
+            sharedId: "fatal_invalid_signature_shared"
+        )))
+        let secondTask = EncryptableTask(task: .writeMessage(.init(
+            message: createTestMessage("processed_after_resume"),
+            recipientIdentity: recipientIdentity,
+            localId: localId,
+            sharedId: "processed_after_resume_shared"
+        )))
+
+        let firstJob = try await session.taskProcessor.createJobModel(
+            sequenceId: await session.taskProcessor.incrementId(),
+            task: firstTask,
+            symmetricKey: symmetricKey
+        )
+        let secondJob = try await session.taskProcessor.createJobModel(
+            sequenceId: await session.taskProcessor.incrementId(),
+            task: secondTask,
+            symmetricKey: symmetricKey
+        )
+
+        try await cache.createJob(firstJob)
+        try await cache.createJob(secondJob)
+
+        let failingDelegate = MockTaskDelegateWithOneShotError(
+            failingMessage: "fatal_invalid_signature",
+            error: PQSSession.SessionErrors.invalidSignature
+        )
+        await session.taskProcessor.setTaskDelegate(failingDelegate)
+
+        await #expect(throws: PQSSession.SessionErrors.invalidSignature) {
+            try await session.resumeJobQueue()
+        }
+
+        #expect(await failingDelegate.getErrorCount() == 1, "Expected one invalid signature failure")
+        #expect(await failingDelegate.getProcessedMessages().isEmpty, "No messages should be processed before recovery")
+
+        let jobsAfterFailure = try await cache.fetchJobs()
+        #expect(jobsAfterFailure.count == 1, "Only the failing job should be removed after invalid signature")
+
+        let recoveryDelegate = MockTaskDelegate()
+        await session.taskProcessor.setTaskDelegate(recoveryDelegate)
+        try await session.resumeJobQueue()
+
+        #expect(await recoveryDelegate.getProcessedMessages() == ["processed_after_resume"], "Remaining cached jobs should drain after an explicit resume")
+        #expect(try await cache.fetchJobs().isEmpty, "All jobs should be removed once recovery resume succeeds")
+
+        await session.shutdown()
+    }
     
     // MARK: - Task Type Tests
     
@@ -1093,6 +1157,41 @@ final class MockTaskDelegateWithMixedErrors: TaskSequenceDelegate, @unchecked Se
         await messageTracker.getMessages()
     }
     
+    func getErrorCount() async -> Int {
+        await errorTracker.getErrorCount()
+    }
+}
+
+final class MockTaskDelegateWithOneShotError: TaskSequenceDelegate, @unchecked Sendable {
+    private let messageTracker = MessageTracker()
+    private let errorTracker = ErrorTracker()
+    private let failingMessage: String
+    private let error: Error
+    private var hasThrown = false
+
+    init(failingMessage: String, error: Error) {
+        self.failingMessage = failingMessage
+        self.error = error
+    }
+
+    func performRatchet(task: SessionModels.TaskType, session: PQSSession) async throws {
+        switch task {
+        case .writeMessage(let task):
+            if !hasThrown && task.message.text == failingMessage {
+                hasThrown = true
+                await errorTracker.incrementErrorCount()
+                throw error
+            }
+            await messageTracker.addMessage(task.message.text)
+        case .streamMessage(let task):
+            await messageTracker.addMessage(task.sharedMessageId)
+        }
+    }
+
+    func getProcessedMessages() async -> [String] {
+        await messageTracker.getMessages()
+    }
+
     func getErrorCount() async -> Int {
         await errorTracker.getErrorCount()
     }
