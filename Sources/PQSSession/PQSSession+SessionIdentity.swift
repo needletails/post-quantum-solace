@@ -15,6 +15,7 @@
 //
 
 import DoubleRatchetKit
+import BinaryCodable
 import Foundation
 import NeedleTailCrypto
 import SessionModels
@@ -278,6 +279,77 @@ public extension PQSSession {
         }
     }
 
+    internal func refreshIdentitiesAssessingImpact(
+        secretName: String,
+        deviceId: UUID,
+        createIdentity: Bool = true,
+        forceRefresh: Bool = false,
+        sendOneTimeIdentities: Bool = false
+    ) async throws -> PeerIdentityRefreshAssessment {
+        let symmetricKey = try await getDatabaseSymmetricKey()
+
+        struct Snapshot: Sendable, Equatable {
+            let signingPublicKey: Data
+            let longTermPublicKey: Data
+            let oneTimeKeyId: UUID?
+            let mlKEMKeyId: UUID
+        }
+
+        func snapshot(
+            from identities: [SessionIdentity]
+        ) async -> Snapshot? {
+            for identity in identities {
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+                guard props.secretName == secretName else { continue }
+                guard props.deviceId == deviceId else { continue }
+                guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+                return Snapshot(
+                    signingPublicKey: props.signingPublicKey,
+                    longTermPublicKey: props.longTermPublicKey,
+                    oneTimeKeyId: props.oneTimePublicKey?.id,
+                    mlKEMKeyId: props.mlKEMPublicKey.id
+                )
+            }
+            return nil
+        }
+
+        let beforeIdentities = try await getSessionIdentities(with: secretName)
+        let before = await snapshot(from: beforeIdentities)
+        let refreshed = try await refreshIdentities(
+            secretName: secretName,
+            createIdentity: createIdentity,
+            forceRefresh: forceRefresh,
+            sendOneTimeIdentities: sendOneTimeIdentities
+        )
+        let after = await snapshot(from: refreshed)
+
+        let impact: PeerIdentityRefreshImpact = {
+            switch (before, after) {
+            case (nil, nil):
+                return .noSessionImpact
+            case (nil, .some):
+                return .freshSessionRecommended
+            case (.some, nil):
+                return .freshSessionRecommended
+            case let (.some(before), .some(after)):
+                if before.signingPublicKey != after.signingPublicKey
+                    || before.longTermPublicKey != after.longTermPublicKey {
+                    return .freshSessionRecommended
+                }
+                if before.oneTimeKeyId != after.oneTimeKeyId
+                    || before.mlKEMKeyId != after.mlKEMKeyId {
+                    return .resendRecommended
+                }
+                return .noSessionImpact
+            }
+        }()
+
+        return PeerIdentityRefreshAssessment(
+            identities: refreshed,
+            impact: impact
+        )
+    }
+
     /// Checks if there are valid identities for a specific recipient
     /// - Parameters:
     ///   - identities: Array of existing identities to check
@@ -326,9 +398,7 @@ public extension PQSSession {
                 if props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) { return false }
                 // Never surface this device's own identity as a recipient row.
                 if props.deviceId == sessionContext.sessionUser.deviceId { return false }
-                // Include rows for the requested recipient and linked sibling rows for our own account.
-                let myChildIdentity = props.secretName == sessionContext.sessionUser.secretName
-                return (props.secretName == recipientName) || myChildIdentity
+                return props.secretName == recipientName
             } catch {
                 return false
             }
@@ -336,6 +406,42 @@ public extension PQSSession {
     }
 
 
+
+    /// Fetches archived (inactive) session identities for a specific peer device, sorted newest-first.
+    ///
+    /// Unlike `getSessionIdentities` and `refreshIdentities`, this method returns **only** rows
+    /// that carry the `inactiveSessionDeviceNamePrefix`. These are ratchet-state snapshots preserved
+    /// during compromise recovery so that delayed in-flight messages encrypted under the old epoch
+    /// can still be decrypted.
+    ///
+    /// - Parameters:
+    ///   - secretName: The secret name of the peer whose archived identities should be fetched.
+    ///   - deviceId: The device ID to filter on.
+    /// - Returns: Archived `SessionIdentity` rows sorted by `sessionContextId` descending (newest first).
+    internal func fetchArchivedSessionIdentities(
+        secretName: String,
+        deviceId: UUID
+    ) async throws -> [SessionIdentity] {
+        guard let cache else { return [] }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let all = try await cache.fetchSessionIdentities()
+
+        struct Ranked: Sendable {
+            let identity: SessionIdentity
+            let contextId: Int
+        }
+
+        var ranked = [Ranked]()
+        for identity in all {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+            guard props.secretName == secretName, props.deviceId == deviceId else { continue }
+            ranked.append(Ranked(identity: identity, contextId: props.sessionContextId))
+        }
+
+        ranked.sort { $0.contextId > $1.contextId }
+        return ranked.map(\.identity)
+    }
 
     /// Refreshes the session identities for a specified recipient name based on the provided filtered identities.
     /// This method verifies the devices and removes any stale identities that are no longer valid.
@@ -369,6 +475,7 @@ public extension PQSSession {
         guard let sessionUser = await sessionContext?.sessionUser else {
             throw PQSSession.SessionErrors.sessionNotInitialized
         }
+        let isSelfSecretName = secretName == sessionUser.secretName
 
         let symmetricKey = try await getDatabaseSymmetricKey()
         
@@ -397,6 +504,12 @@ public extension PQSSession {
                 if try (device.verified(using: signingPublicKey) != nil) == false {
                     throw PQSSession.SessionErrors.invalidSignature
                 }
+            }
+            
+            // For linked-device convergence, force-refreshing self identities should also
+            // synchronize the persisted active account bundle.
+            if isSelfSecretName, forceRefresh {
+                try await synchronizeActiveUserConfiguration(configuration)
             }
 
             var generatedSessionContextIds = Set<Int>()
@@ -535,7 +648,26 @@ public extension PQSSession {
                 }
             }
             
-            sessionIdentities.insert(secretName)
+            // Do not memoize "refreshed" for the local account until sibling rows exist when the
+            // account configuration lists other devices. Otherwise the next `refreshIdentities`
+            // skips this block (`sessionIdentities` already contains `secretName`) while the cache
+            // is still empty — linked devices never get SessionIdentity rows and personal/control
+            // delivery to siblings silently no-ops.
+            let accountDevices = try configuration.getVerifiedDevices()
+            let accountListsPeerDevices = accountDevices.contains { $0.deviceId != sessionUser.deviceId }
+            let hasSiblingIdentity = await identities.asyncContains(where: { identity in
+                guard let p = await identity.props(symmetricKey: symmetricKey) else { return false }
+                return p.secretName == secretName && p.deviceId != sessionUser.deviceId
+            })
+            if isSelfSecretName {
+                if !accountListsPeerDevices {
+                    sessionIdentities.insert(secretName)
+                } else if hasSiblingIdentity {
+                    sessionIdentities.insert(secretName)
+                }
+            } else {
+                sessionIdentities.insert(secretName)
+            }
         }
         return identities
     }
@@ -609,5 +741,17 @@ public extension PQSSession {
             text: "",
             transportInfo: metadata,
             metadata: metadata)
+    }
+    
+    private func synchronizeActiveUserConfiguration(_ configuration: UserConfiguration) async throws {
+        guard let cache else { throw PQSSession.SessionErrors.databaseNotInitialized }
+        guard var context = await sessionContext else { throw PQSSession.SessionErrors.sessionNotInitialized }
+        context.activeUserConfiguration = configuration
+        await setSessionContext(context)
+        let encodedData = try BinaryEncoder().encode(context)
+        guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: await getAppSymmetricKey()) else {
+            throw PQSSession.SessionErrors.sessionEncryptionError
+        }
+        try await cache.updateLocalSessionContext(encryptedConfig)
     }
 }

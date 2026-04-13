@@ -184,14 +184,61 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     var logger = NeedleTailLogger("[PQSSession]")
     var sessionIdentities = Set<String>()
     var addingContactData: Data?
-    var hasRotatedForMaxSkipped = false
-    /// Cooldown gate to prevent rotation storms when an offline backlog triggers repeated
-    /// `.maxSkippedHeadersExceeded` failures in rapid succession.
-    ///
-    /// This is intentionally internal state (actor-isolated) rather than a delegate callback.
-    /// The SDK will attempt rotation once per cooldown window, then rethrow the error so the
-    /// SDK consumer can delete offline backlog and request resend.
-    var maxSkippedRotationCooldownUntil: Date?
+    /// Last successful automatic key-rotation attempt by inbound peer key.
+    /// Key format: "<secretName>|<deviceUUID>".
+    var lastAutomaticRotationAtByPeer: [String: Date] = [:]
+    
+    /// Global timestamp for the last successful automatic key-rotation attempt.
+    /// Helps cap account-wide churn when many peers fail at once.
+    var lastAutomaticRotationAt: Date?
+    
+    /// Cooldown window for automatic rotation attempts per peer.
+    let automaticRotationPeerCooldown: TimeInterval = 60
+    
+    /// Cooldown window for automatic rotation attempts globally.
+    let automaticRotationGlobalCooldown: TimeInterval = 20
+
+    /// Per-peer timestamp for the last key-reconciliation recovery (archive + identity reset).
+    var lastReconciliationAtByPeer: [String: Date] = [:]
+    let reconciliationPeerCooldown: TimeInterval = 15
+
+#if DEBUG
+    /// Test-only hook: when set, replaces decrypted payload bytes before CryptoMessage decode.
+    /// Used to simulate sessionDecryptionError without fighting AEAD.
+    var _testDecryptedPayloadTransform: (@Sendable (Data) -> Data)?
+
+    func setTestDecryptedPayloadTransform(_ transform: (@Sendable (Data) -> Data)?) {
+        _testDecryptedPayloadTransform = transform
+    }
+#endif
+
+    func canAttemptReconciliation(sender: String, deviceId: UUID, now: Date = Date()) -> Bool {
+        let key = automaticRotationPeerKey(sender: sender, deviceId: deviceId)
+        if let last = lastReconciliationAtByPeer[key],
+           now.timeIntervalSince(last) < reconciliationPeerCooldown { return false }
+        return true
+    }
+
+    func markReconciliationAttempt(sender: String, deviceId: UUID, now: Date = Date()) {
+        let key = automaticRotationPeerKey(sender: sender, deviceId: deviceId)
+        lastReconciliationAtByPeer[key] = now
+    }
+
+    /// Unified inbound-failure policy table.
+    /// Keys are either:
+    /// - "<sender>|<deviceUUID>|<messageId>" for explicit whole-tuple quarantine
+    /// - "<sender>|<deviceUUID>|<messageId>|<failureClass>" for failure-class suppression
+    var inboundFailurePolicyUntil: [String: Date] = [:]
+    
+    /// Suppression duration for replayed/failed inbound frames.
+    let inboundFailurePolicyTTL: TimeInterval = 60 * 10
+    
+    /// Last resend/refresh control request timestamp per request key.
+    /// Key format: "<secretName>|<deviceUUID>|<failedSharedMessageId>".
+    var lastResendRequestAtByPeer: [String: Date] = [:]
+    
+    /// Cooldown for peer resend/refresh requests triggered by inbound failures.
+    let peerResendRequestCooldown: TimeInterval = 15
 
     // MARK: - Sesame-style inactive session support (backward compatible)
 
@@ -203,6 +250,17 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         case archive
         case drop
     }
+
+    enum InactiveSessionSnapshotScope: Sendable {
+        case peer(secretName: String)
+        case allPeersExcludingLocalUser
+    }
+
+    public enum OneTimeKeyRefreshPolicy: Sendable {
+        case automatic
+        case replenishBatch
+        case replaceCurrentDeviceBatch
+    }
     
     enum KeyLoadingState: Sendable {
         case initial, rotating, complete
@@ -211,6 +269,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     var keyLoadingState: KeyLoadingState = .initial
     func setKeyLoadingState(_ newState: KeyLoadingState) {
         keyLoadingState = newState
+    }
+
+    var pendingLinkedDeviceRepair = false
+    func setPendingLinkedDeviceRepair(_ isPending: Bool) {
+        pendingLinkedDeviceRepair = isPending
+    }
+    func hasPendingLinkedDeviceRepair() -> Bool {
+        pendingLinkedDeviceRepair
     }
     
     //MARK: Media Encryption
@@ -249,6 +315,167 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     // Sets the application password
     func setAppPassword(_ password: String) async {
         _appPassword = password
+    }
+    
+    /// Builds a stable key for peer-scoped automatic rotation throttling.
+    func automaticRotationPeerKey(sender: String, deviceId: UUID) -> String {
+        "\(sender)|\(deviceId.uuidString)"
+    }
+    
+    enum InboundFailureDisposition: Sendable, Equatable {
+        case dropAndIgnore
+        case reconcileThenRequestResend
+        case rotateAndRequestResend
+        case rotate
+    }
+
+    enum InboundFailureKind: Sendable, Equatable {
+        case securityViolation
+        case sessionRepairNeeded
+        case payloadRepairNeeded
+        case dropOrQuarantine
+    }
+
+    enum PeerIdentityRefreshImpact: Sendable, Equatable {
+        case noSessionImpact
+        case resendRecommended
+        case freshSessionRecommended
+    }
+
+    struct PeerIdentityRefreshAssessment: Sendable {
+        let identities: [SessionIdentity]
+        let impact: PeerIdentityRefreshImpact
+    }
+    
+    struct InboundFailureClassification: Sendable {
+        let failureClass: String
+        let disposition: InboundFailureDisposition
+        let kind: InboundFailureKind
+
+        init(
+            failureClass: String,
+            disposition: InboundFailureDisposition,
+            kind: InboundFailureKind? = nil
+        ) {
+            self.failureClass = failureClass
+            self.disposition = disposition
+            self.kind = kind ?? {
+                switch disposition {
+                case .dropAndIgnore:
+                    return .dropOrQuarantine
+                case .reconcileThenRequestResend:
+                    return .sessionRepairNeeded
+                case .rotateAndRequestResend, .rotate:
+                    return .securityViolation
+                }
+            }()
+        }
+    }
+    
+    /// Builds a stable key for inbound failure policy.
+    func inboundFailureKey(sender: String, deviceId: UUID, messageId: String, failureClass: String? = nil) -> String {
+        guard let failureClass else {
+            return "\(sender)|\(deviceId.uuidString)|\(messageId)"
+        }
+        return "\(sender)|\(deviceId.uuidString)|\(messageId)|\(failureClass)"
+    }
+    
+    /// Builds a stable key for whole-message inbound failure quarantine.
+    func inboundFailureQuarantineKey(sender: String, deviceId: UUID, messageId: String) -> String {
+        "\(sender)|\(deviceId.uuidString)|\(messageId)"
+    }
+
+    /// Builds a stable key for resend requests scoped to a failed message for a peer/device.
+    func peerResendRequestKey(sender: String, deviceId: UUID, failedMessageId: String) -> String {
+        "\(sender)|\(deviceId.uuidString)|\(failedMessageId)"
+    }
+    
+    /// Drops expired entries from inbound-failure policy state.
+    func cleanupInboundFailurePolicy(now: Date = Date()) {
+        inboundFailurePolicyUntil = inboundFailurePolicyUntil.filter { _, expiry in
+            expiry > now
+        }
+    }
+    
+    /// Returns `true` when this inbound tuple has been recently quarantined.
+    func isInboundFailureQuarantined(sender: String, deviceId: UUID, messageId: String, now: Date = Date()) -> Bool {
+        cleanupInboundFailurePolicy(now: now)
+        let key = inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: messageId)
+        guard let expiry = inboundFailurePolicyUntil[key] else {
+            return false
+        }
+        return expiry > now
+    }
+    
+    /// Quarantines a failed inbound tuple to suppress replay-induced loops.
+    func quarantineInboundFailure(sender: String, deviceId: UUID, messageId: String, now: Date = Date()) {
+        cleanupInboundFailurePolicy(now: now)
+        let key = inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: messageId)
+        inboundFailurePolicyUntil[key] = now.addingTimeInterval(inboundFailurePolicyTTL)
+    }
+    
+    /// Returns whether a specific inbound failure class should be suppressed for this tuple.
+    func shouldSuppressInboundFailure(_ inbound: InboundTaskMessage, failureClass: String, now: Date = Date()) -> Bool {
+        cleanupInboundFailurePolicy(now: now)
+        let key = inboundFailureKey(
+            sender: inbound.senderSecretName,
+            deviceId: inbound.senderDeviceId,
+            messageId: inbound.sharedMessageId,
+            failureClass: failureClass
+        )
+        guard let expiry = inboundFailurePolicyUntil[key] else {
+            return false
+        }
+        return expiry > now
+    }
+    
+    /// Records failure-class suppression for a final inbound failure.
+    /// Intentionally does not quarantine the whole message tuple: resend recovery reuses the same
+    /// `sharedMessageId`, so tuple-wide quarantine would drop the replay before decryption.
+    func markInboundFailure(_ inbound: InboundTaskMessage, failureClass: String, now: Date = Date()) {
+        cleanupInboundFailurePolicy(now: now)
+        let key = inboundFailureKey(
+            sender: inbound.senderSecretName,
+            deviceId: inbound.senderDeviceId,
+            messageId: inbound.sharedMessageId,
+            failureClass: failureClass
+        )
+        inboundFailurePolicyUntil[key] = now.addingTimeInterval(inboundFailurePolicyTTL)
+    }
+    
+    /// Returns whether automatic key rotation is currently allowed for this peer.
+    func canAttemptAutomaticRotation(sender: String, deviceId: UUID, now: Date = Date()) -> Bool {
+        let peerKey = automaticRotationPeerKey(sender: sender, deviceId: deviceId)
+        if let lastGlobal = lastAutomaticRotationAt, now.timeIntervalSince(lastGlobal) < automaticRotationGlobalCooldown {
+            return false
+        }
+        if let lastPeer = lastAutomaticRotationAtByPeer[peerKey], now.timeIntervalSince(lastPeer) < automaticRotationPeerCooldown {
+            return false
+        }
+        return true
+    }
+    
+    /// Records a successful automatic rotation attempt for cooldown gating.
+    func markAutomaticRotationAttempt(sender: String, deviceId: UUID, now: Date = Date()) {
+        let peerKey = automaticRotationPeerKey(sender: sender, deviceId: deviceId)
+        lastAutomaticRotationAt = now
+        lastAutomaticRotationAtByPeer[peerKey] = now
+    }
+    
+    /// Returns whether a resend/refresh control request can be sent for this failed message.
+    func canSendPeerResendRequest(sender: String, deviceId: UUID, failedMessageId: String, now: Date = Date()) -> Bool {
+        let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        if let lastSentAt = lastResendRequestAtByPeer[requestKey],
+           now.timeIntervalSince(lastSentAt) < peerResendRequestCooldown {
+            return false
+        }
+        return true
+    }
+    
+    /// Marks a resend/refresh control request as sent for this failed message.
+    func markPeerResendRequestSent(sender: String, deviceId: UUID, failedMessageId: String, now: Date = Date()) {
+        let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        lastResendRequestAtByPeer[requestKey] = now
     }
 
     /// Sets the logger log level for both the session and task processor
@@ -290,7 +517,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// Deletes expired/excess inactive session snapshots for a given peer device.
-    private func cleanupInactiveSessionSnapshots(
+    func cleanupInactiveSessionSnapshots(
         cache: SessionCache,
         symmetricKey: SymmetricKey,
         secretName: String,
@@ -335,9 +562,55 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
     
     
-    /// Keeps a record of inactive session identities for authorized past messages
+    /// Prunes all stale inactive session snapshots across every `(secretName, deviceId)` pair.
+    /// Called at session startup to clean up archives that expired while the app was offline.
+    func cleanupAllInactiveSessionSnapshots() async {
+        guard let cache else { return }
+        do {
+            let symmetricKey = try await getDatabaseSymmetricKey()
+            let all = try await cache.fetchSessionIdentities()
+
+            var seen = Set<String>()
+            for identity in all {
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+                guard isInactiveSessionIdentity(deviceName: props.deviceName) else { continue }
+                let key = "\(props.secretName)|\(props.deviceId)"
+                guard seen.insert(key).inserted else { continue }
+                await cleanupInactiveSessionSnapshots(
+                    cache: cache,
+                    symmetricKey: symmetricKey,
+                    secretName: props.secretName,
+                    deviceId: props.deviceId)
+            }
+        } catch {
+            logger.log(level: .warning, message: "Startup inactive session cleanup failed: \(error)")
+        }
+    }
+
+    /// Keeps a record of inactive session identities for one peer.
     func createInactiveSessionSnapshot(
-        for secretName: String? = nil,
+        for secretName: String,
+        policy: RatchetInvalidationPolicy
+    ) async throws {
+        try await createInactiveSessionSnapshots(
+            scope: .peer(secretName: secretName),
+            policy: policy
+        )
+    }
+
+    /// Keeps a record of inactive session identities for all peers except the local user.
+    func createInactiveSessionSnapshotsForAllPeers(
+        policy: RatchetInvalidationPolicy
+    ) async throws {
+        try await createInactiveSessionSnapshots(
+            scope: .allPeersExcludingLocalUser,
+            policy: policy
+        )
+    }
+
+    /// Keeps a record of inactive session identities for authorized past messages.
+    private func createInactiveSessionSnapshots(
+        scope: InactiveSessionSnapshotScope,
         policy: RatchetInvalidationPolicy
     ) async throws {
         let symmetricKey = try await getDatabaseSymmetricKey()
@@ -345,12 +618,16 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         guard let cache else { return }
         for identity in try await cache.fetchSessionIdentities() {
             guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
-            if let secretName, props.secretName != secretName { continue }
+            switch scope {
+            case .peer(let secretName):
+                guard props.secretName == secretName else { continue }
+            case .allPeersExcludingLocalUser:
+                // Global archival exists for compromise recovery, but our own identities are not
+                // used for peer-to-peer ratchet reestablishment.
+                if let mySecretName, props.secretName == mySecretName { continue }
+            }
             // Never invalidate archived/inactive snapshots.
             if isInactiveSessionIdentity(deviceName: props.deviceName) { continue }
-            // When invalidating globally, avoid touching our own identities; those are not used for
-            // peer-to-peer ratchet reestablishment.
-            if secretName == nil, let mySecretName, props.secretName == mySecretName { continue }
             guard props.state != nil else { continue }
             guard let props = await identity.props(symmetricKey: symmetricKey) else {
                 throw RatchetError.missingProps
@@ -1234,6 +1511,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             // Decode the session context from the decrypted data
             let sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
             await setSessionContext(sessionContext)
+
+            // Prune archived session identities that expired while offline.
+            await cleanupAllInactiveSessionSnapshots()
+
             return self
         } catch {
             throw error
@@ -1252,19 +1533,18 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     ///
     /// By default this matches automatic refresh: after syncing with the server, new keys are
     /// generated and uploaded only when the remaining count is at or below
-    /// `PQSSessionConstants.oneTimeKeyLowWatermark`. Set `forceReplenish` to bypass that gate
-    /// (used after inbound key reconciliation) so the device tops up toward
-    /// `oneTimeKeyBatchSize` even when still above the low watermark.
+    /// `PQSSessionConstants.oneTimeKeyLowWatermark`. Use `policy` to request an explicit top-up
+    /// or to fully replace this device's current batch.
     ///
     /// - Note: The refresh task runs asynchronously. When a replenish runs, it creates up to
     ///   enough keys to reach `PQSSessionConstants.oneTimeKeyBatchSize`.
-    /// - Parameter forceReplenish: When `true`, runs the same top-up logic as when low on keys,
-    ///   regardless of the low-watermark check. Default `false` preserves existing behavior.
+    /// - Parameter policy: Controls whether the task only refreshes when low, forces a top-up,
+    ///   or replaces the current device's one-time-key batch entirely.
     @discardableResult
-    public func refreshOneTimeKeysTask(forceReplenish: Bool = false) async -> Bool {
+    public func refreshOneTimeKeysTask(policy: OneTimeKeyRefreshPolicy = .automatic) async -> Bool {
         // Coalesce concurrent refresh requests to avoid cancel/restart storms that
         // surface as URLSession cancellation errors (-999) under load.
-        if forceReplenish, let existingTask = refreshOTKeysTask {
+        if policy != .automatic, let existingTask = refreshOTKeysTask {
             _ = await existingTask.value
         } else if let existingTask = refreshOTKeysTask {
             return await existingTask.value
@@ -1272,16 +1552,29 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
         refreshOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
             guard let self else { return false }
-            do {
-                try await refreshOneTimeKeys(refreshType: .curve, forceReplenish: forceReplenish)
-                await removeExpiredOTKeys()
-                return true
-            } catch {
-                await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
-                await logger.log(level: .warning, message: "Curve one-time-key refresh failed; local/server state may remain out of sync")
-                await removeExpiredOTKeys()
-                return false
+            let retryDelays: [UInt64] = [1_000_000_000, 3_000_000_000]
+            for attempt in 0...retryDelays.count {
+                do {
+                    try await refreshOneTimeKeys(refreshType: .curve, policy: policy)
+                    await removeExpiredOTKeys()
+                    return true
+                } catch let sessionError as SessionErrors where sessionError == .oneTimeKeyUploadFailed {
+                    if attempt < retryDelays.count {
+                        await logger.log(level: .warning, message: "Curve OTK upload failed (attempt \(attempt + 1)/\(retryDelays.count + 1)), retrying after backoff")
+                        try? await Task.sleep(nanoseconds: retryDelays[attempt])
+                    } else {
+                        await logger.log(level: .error, message: "Curve OTK upload failed after \(attempt + 1) attempts")
+                        await removeExpiredOTKeys()
+                        return false
+                    }
+                } catch {
+                    await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
+                    await logger.log(level: .warning, message: "Curve one-time-key refresh failed; local/server state may remain out of sync")
+                    await removeExpiredOTKeys()
+                    return false
+                }
             }
+            return false
         }
 
         return await refreshOTKeysTask?.value ?? false
@@ -1289,17 +1582,17 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
     /// Manually triggers a refresh of MLKEM one-time keys
     ///
-    /// Default behavior matches automatic refresh (see `refreshOneTimeKeysTask`). Use
-    /// `forceReplenish` for reconciliation paths that must top up even when above the
-    /// low watermark.
+    /// Default behavior matches automatic refresh (see `refreshOneTimeKeysTask`). Use `policy`
+    /// for reconciliation paths that must top up even when above the low watermark or for
+    /// compromise-recovery paths that must replace the current device batch.
     ///
-    /// - Parameter forceReplenish: When `true`, tops up toward `oneTimeKeyBatchSize` even when
-    ///   the count is above `oneTimeKeyLowWatermark`. Default `false` preserves existing behavior.
+    /// - Parameter policy: Controls whether the task only refreshes when low, forces a top-up,
+    ///   or replaces the current device's one-time-key batch entirely.
     @discardableResult
-    public func refreshMLKEMOneTimeKeysTask(forceReplenish: Bool = false) async -> Bool {
+    public func refreshMLKEMOneTimeKeysTask(policy: OneTimeKeyRefreshPolicy = .automatic) async -> Bool {
         // Coalesce concurrent refresh requests to avoid cancel/restart storms that
         // surface as URLSession cancellation errors (-999) under load.
-        if forceReplenish, let existingTask = refreshMLKEMOTKeysTask {
+        if policy != .automatic, let existingTask = refreshMLKEMOTKeysTask {
             _ = await existingTask.value
         } else if let existingTask = refreshMLKEMOTKeysTask {
             return await existingTask.value
@@ -1307,31 +1600,50 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
         refreshMLKEMOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
             guard let self else { return false }
-
-            do {
-                try await refreshOneTimeKeys(refreshType: .mlKEM, forceReplenish: forceReplenish)
-                await removeExpiredMLKEMOTKeys()
-                return true
-            } catch {
-                await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
-                await logger.log(level: .warning, message: "MLKEM one-time-key refresh failed; local/server state may remain out of sync")
-                await removeExpiredMLKEMOTKeys()
-                return false
+            let retryDelays: [UInt64] = [1_000_000_000, 3_000_000_000]
+            for attempt in 0...retryDelays.count {
+                do {
+                    try await refreshOneTimeKeys(refreshType: .mlKEM, policy: policy)
+                    await removeExpiredMLKEMOTKeys()
+                    return true
+                } catch let sessionError as SessionErrors where sessionError == .oneTimeKeyUploadFailed {
+                    if attempt < retryDelays.count {
+                        await logger.log(level: .warning, message: "MLKEM OTK upload failed (attempt \(attempt + 1)/\(retryDelays.count + 1)), retrying after backoff")
+                        try? await Task.sleep(nanoseconds: retryDelays[attempt])
+                    } else {
+                        await logger.log(level: .error, message: "MLKEM OTK upload failed after \(attempt + 1) attempts")
+                        await removeExpiredMLKEMOTKeys()
+                        return false
+                    }
+                } catch {
+                    await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
+                    await logger.log(level: .warning, message: "MLKEM one-time-key refresh failed; local/server state may remain out of sync")
+                    await removeExpiredMLKEMOTKeys()
+                    return false
+                }
             }
+            return false
         }
         return await refreshMLKEMOTKeysTask?.value ?? false
     }
 
-    /// - Parameter forceReplenish: If `false` (default), creates and uploads keys only when at or below
-    ///   the low watermark. If `true`, uses the same top-up-to-batch-size logic whenever the count
-    ///   is below `oneTimeKeyBatchSize`, regardless of the watermark—without changing the generation
-    ///   formula when the count is already at batch size (still a no-op then).
-    func refreshOneTimeKeys(refreshType: KeysType, forceReplenish: Bool = false) async throws {
-        guard let sessionContext = await sessionContext else { return }
+    /// - Parameter policy: Controls whether the device only tops up when low, always tops up to the
+    ///   configured batch size, or replaces the current device's entire one-time-key batch.
+    func refreshOneTimeKeys(refreshType: KeysType, policy: OneTimeKeyRefreshPolicy = .automatic) async throws {
+        guard await sessionContext != nil else { return }
         guard let cache else { return }
+        if policy == .replaceCurrentDeviceBatch {
+            try await replaceCurrentDeviceOneTimeKeys(cache: cache, refreshType: refreshType)
+            return
+        }
         var keys = [UUID]()
 
-        if let fetched = try await transportDelegate?.fetchOneTimeKeyIdentities(for: sessionContext.sessionUser.secretName, deviceId: sessionContext.sessionUser.deviceId.uuidString, type: refreshType) {
+        if let sessionContext = await sessionContext,
+           let fetched = try await transportDelegate?.fetchOneTimeKeyIdentities(
+            for: sessionContext.sessionUser.secretName,
+            deviceId: sessionContext.sessionUser.deviceId.uuidString,
+            type: refreshType
+           ) {
             keys = fetched
         }
 
@@ -1340,7 +1652,15 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
 
         let publicKeysCount = try await synchronizeLocalKeys(cache: cache, keys: keys, type: refreshType)
-        let shouldReplenish = forceReplenish || publicKeysCount <= PQSSessionConstants.oneTimeKeyLowWatermark
+        let shouldReplenish: Bool
+        switch policy {
+        case .automatic:
+            shouldReplenish = publicKeysCount <= PQSSessionConstants.oneTimeKeyLowWatermark
+        case .replenishBatch:
+            shouldReplenish = true
+        case .replaceCurrentDeviceBatch:
+            shouldReplenish = false
+        }
         if shouldReplenish {
             // 1. Delete all local keys that are not on the server
             let config = try await cache.fetchLocalSessionContext()
@@ -1423,6 +1743,103 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
 
+    private func replaceCurrentDeviceOneTimeKeys(
+        cache: SessionCache,
+        refreshType: KeysType
+    ) async throws {
+        guard let transportDelegate else {
+            throw SessionErrors.transportNotInitialized
+        }
+
+        let config = try await cache.fetchLocalSessionContext()
+        guard let configurationData = try await crypto.decrypt(data: config, symmetricKey: getAppSymmetricKey()) else {
+            throw SessionErrors.sessionDecryptionError
+        }
+
+        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+        let signingKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey
+        )
+        let secretName = sessionContext.sessionUser.secretName
+        let deviceId = sessionContext.sessionUser.deviceId
+
+        try await transportDelegate.batchDeleteOneTimeKeys(
+            for: secretName,
+            with: deviceId.uuidString,
+            type: refreshType
+        )
+
+        switch refreshType {
+        case .curve:
+            sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
+            sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
+
+            let privateOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
+                let id = UUID()
+                let privateKey = crypto.generateCurve25519PrivateKey()
+                let privateKeyRep = try CurvePrivateKey(id: id, privateKey.rawRepresentation)
+                let publicKey = try CurvePublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+            }
+
+            sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
+            let signedOneTimePublicKeys: [UserConfiguration.SignedOneTimePublicKey] = try privateOneTimeKeyPairs.map { keyPair in
+                try UserConfiguration.SignedOneTimePublicKey(
+                    key: keyPair.publicKey,
+                    deviceId: deviceId,
+                    signingKey: signingKey
+                )
+            }
+
+            try await transportDelegate.updateOneTimeKeys(
+                for: secretName,
+                deviceId: deviceId.uuidString,
+                keys: signedOneTimePublicKeys
+            )
+
+            sessionContext.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
+
+        case .mlKEM:
+            sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
+            sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
+
+            let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
+                let id = UUID()
+                let privateKey = try crypto.generateMLKem1024PrivateKey()
+                let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
+                let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+            }
+
+            sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
+            let signedMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
+                try UserConfiguration.SignedMLKEMOneTimeKey(
+                    key: keyPair.publicKey,
+                    deviceId: deviceId,
+                    signingKey: signingKey
+                )
+            }
+
+            try await transportDelegate.updateOneTimeMLKEMKeys(
+                for: secretName,
+                deviceId: deviceId.uuidString,
+                keys: signedMLKEMOneTimeKeys
+            )
+
+            sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
+        }
+
+        sessionContext.updateSessionUser(sessionContext.sessionUser)
+        await setSessionContext(sessionContext)
+
+        let encodedData = try BinaryEncoder().encode(sessionContext)
+        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
+            throw PQSSession.SessionErrors.sessionEncryptionError
+        }
+
+        try await cache.updateLocalSessionContext(encryptedConfig)
+    }
+
     func synchronizeLocalKeys(cache: SessionCache, keys: [UUID], type: KeysType) async throws -> Int {
         let data = try await cache.fetchLocalSessionContext()
         guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
@@ -1434,28 +1851,17 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
         switch type {
         case .curve:
-            let privateKeys = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys
             let publicKeys = sessionContext.activeUserConfiguration.signedOneTimePublicKeys
-            let privateKeyIDs = Set(privateKeys.map(\.id))
-            let publicKeyIDs = Set(publicKeys.map(\.id))
             let remoteKeySet = Set(keys)
 
-            let privateIntersection = privateKeyIDs.intersection(remoteKeySet)
-            let publicIntersection = publicKeyIDs.intersection(remoteKeySet)
-
-            if privateIntersection.isEmpty, publicIntersection.isEmpty {
-                // No shared keys — remove all
-                sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
+            // Only prune the public key list to stop advertising keys the server
+            // no longer holds. Private keys are preserved — a consumed-on-server
+            // key means an in-flight message needs the private counterpart for
+            // decryption. Private keys are removed after use via updateOneTimeKey(remove:).
+            if remoteKeySet.isEmpty {
                 sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll()
                 didUpdate = true
             } else {
-                // Remove only keys not in remote list
-                let filteredPrivate = privateKeys.filter { remoteKeySet.contains($0.id) }
-                if filteredPrivate.count != privateKeys.count {
-                    sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys = filteredPrivate
-                    didUpdate = true
-                }
-
                 let filteredPublic = publicKeys.filter { remoteKeySet.contains($0.id) }
                 if filteredPublic.count != publicKeys.count {
                     sessionContext.activeUserConfiguration.signedOneTimePublicKeys = filteredPublic
@@ -1474,35 +1880,19 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
                 try await cache.updateLocalSessionContext(encryptedConfig)
 
-                // if we have no keys delete all public keys on the server so we can regenerated a fresh batch
-                if sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.isEmpty || sessionContext.activeUserConfiguration.signedOneTimePublicKeys.isEmpty {
+                if sessionContext.activeUserConfiguration.signedOneTimePublicKeys.isEmpty {
                     try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
                 }
             }
             return sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count
         case .mlKEM:
-            let privateKeys = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys
             let publicKeys = sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
-            let privateKeyIDs = Set(privateKeys.map(\.id))
-            let publicKeyIDs = Set(publicKeys.map(\.id))
             let remoteKeySet = Set(keys)
 
-            let privateIntersection = privateKeyIDs.intersection(remoteKeySet)
-            let publicIntersection = publicKeyIDs.intersection(remoteKeySet)
-
-            if privateIntersection.isEmpty, publicIntersection.isEmpty {
-                // No shared keys — remove all
-                sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
+            if remoteKeySet.isEmpty {
                 sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll()
                 didUpdate = true
             } else {
-                // Remove only keys not in remote list
-                let filteredPrivate = privateKeys.filter { remoteKeySet.contains($0.id) }
-                if filteredPrivate.count != privateKeys.count {
-                    sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys = filteredPrivate
-                    didUpdate = true
-                }
-
                 let filteredPublic = publicKeys.filter { remoteKeySet.contains($0.id) }
                 if filteredPublic.count != publicKeys.count {
                     sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys = filteredPublic
@@ -1521,8 +1911,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
                 try await cache.updateLocalSessionContext(encryptedConfig)
 
-                // if we have no keys delete all public keys on the server so we can regenerated a fresh batch
-                if sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.isEmpty || sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.isEmpty {
+                if sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.isEmpty {
                     try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
                 }
             }

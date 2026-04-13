@@ -84,8 +84,6 @@ public enum PQSSessionConstants: Sendable {
     /// - See also: `PQSSessionConstants.minimumChannelOperators`
     public static let minimumChannelMembers = 2
 
-    // MARK: - Sesame-style inactive session support
-
     /// Prefix used to mark "inactive session" identities in the local store.
     ///
     /// Inactive identities are **never** used for outbound encryption and are hidden from public

@@ -175,6 +175,50 @@ actor KeyRotationTests {
         }
         try await cache.updateLocalSessionContext(encrypted)
     }
+    
+    private func createPeerIdentity(secretName: String, suffix: Int) async throws {
+        let curve = crypto.generateCurve25519PrivateKey()
+        let signing = crypto.generateCurve25519SigningPrivateKey()
+        let mlkemPrivate = try crypto.generateMLKem1024PrivateKey()
+        let mlkemPublic = try MLKEMPublicKey(id: UUID(), mlkemPrivate.publicKey.rawRepresentation)
+        let deviceId = UUID()
+        let device = UserDeviceConfiguration(
+            deviceId: deviceId,
+            signingPublicKey: signing.publicKey.rawRepresentation,
+            longTermPublicKey: curve.publicKey.rawRepresentation,
+            finalMLKEMPublicKey: mlkemPublic,
+            deviceName: "peer-\(suffix)",
+            hmacData: Data(repeating: UInt8(suffix + 1), count: 32),
+            isMasterDevice: suffix == 0
+        )
+        _ = try await session.createEncryptableSessionIdentityModel(
+            with: device,
+            oneTimePublicKey: nil,
+            mlKEMPublicKey: mlkemPublic,
+            for: secretName,
+            associatedWith: deviceId,
+            new: Int.random(in: 1 ..< Int.max)
+        )
+    }
+    
+    private func makeReSignedConfiguration(
+        from context: SessionContext,
+        newSigningKey: Curve25519.Signing.PrivateKey
+    ) throws -> UserConfiguration {
+        let oldSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: context.activeUserConfiguration.signingPublicKey)
+        let reSignedDevices = try context.activeUserConfiguration.signedDevices.map { signed in
+            guard let verified = try signed.verified(using: oldSigningKey) else {
+                throw PQSSession.SessionErrors.invalidSignature
+            }
+            return try UserConfiguration.SignedDeviceConfiguration(device: verified, signingKey: newSigningKey)
+        }
+        return UserConfiguration(
+            signingPublicKey: newSigningKey.publicKey.rawRepresentation,
+            signedDevices: reSignedDevices,
+            signedOneTimePublicKeys: context.activeUserConfiguration.signedOneTimePublicKeys,
+            signedMLKEMOneTimePublicKeys: context.activeUserConfiguration.signedMLKEMOneTimePublicKeys
+        )
+    }
 
     // MARK: - Tests
 
@@ -206,6 +250,79 @@ actor KeyRotationTests {
         // Assert that publishRotatedKeys was called by checking store user configuration was updated
         let userConfigs = await store.userConfigurations
         #expect(userConfigs.count == 1, "Expected a single user configuration in TransportStore after rotation")
+
+        await session.shutdown()
+    }
+
+    @Test("rotateKeysOnPotentialCompromise replaces current-device one-time key batches")
+    func testRotateKeysOnPotentialCompromise_replacesCurrentDeviceOneTimeKeys() async throws {
+        _ = try await setupRotatableSession()
+
+        guard let originalContext = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+
+        let deviceId = originalContext.sessionUser.deviceId
+        let secretName = originalContext.sessionUser.secretName
+        let originalCurveIds = Set(
+            originalContext.activeUserConfiguration.signedOneTimePublicKeys
+                .filter { $0.deviceId == deviceId }
+                .map(\.id)
+        )
+        let originalMLKEMIds = Set(
+            originalContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
+                .filter { $0.deviceId == deviceId }
+                .map(\.id)
+        )
+
+        #expect(originalCurveIds.count == PQSSessionConstants.oneTimeKeyBatchSize)
+        #expect(originalMLKEMIds.count == PQSSessionConstants.oneTimeKeyBatchSize)
+
+        try await session.rotateKeysOnPotentialCompromise()
+
+        guard let rotatedContext = await session.sessionContext else {
+            Issue.record("Rotated session context should not be nil")
+            return
+        }
+
+        let rotatedCurveIds = Set(
+            rotatedContext.activeUserConfiguration.signedOneTimePublicKeys
+                .filter { $0.deviceId == deviceId }
+                .map(\.id)
+        )
+        let rotatedMLKEMIds = Set(
+            rotatedContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
+                .filter { $0.deviceId == deviceId }
+                .map(\.id)
+        )
+
+        #expect(rotatedCurveIds.count == PQSSessionConstants.oneTimeKeyBatchSize)
+        #expect(rotatedMLKEMIds.count == PQSSessionConstants.oneTimeKeyBatchSize)
+        #expect(rotatedCurveIds.isDisjoint(with: originalCurveIds))
+        #expect(rotatedMLKEMIds.isDisjoint(with: originalMLKEMIds))
+
+        let verifiedCurveKeys = try rotatedContext.activeUserConfiguration.getVerifiedCurveKeys(deviceId: deviceId)
+        let verifiedMLKEMKeys = try rotatedContext.activeUserConfiguration.getVerifiedMLKEMKeys(deviceId: deviceId)
+        #expect(verifiedCurveKeys.count == PQSSessionConstants.oneTimeKeyBatchSize)
+        #expect(verifiedMLKEMKeys.count == PQSSessionConstants.oneTimeKeyBatchSize)
+
+        let remoteCurveIds = Set(
+            try await store.fetchOneTimeKeyIdentities(
+                for: secretName,
+                deviceId: deviceId.uuidString,
+                type: .curve
+            )
+        )
+        let remoteMLKEMIds = Set(
+            try await store.fetchOneTimeKeyIdentities(
+                for: secretName,
+                deviceId: deviceId.uuidString,
+                type: .mlKEM
+            )
+        )
+        #expect(remoteCurveIds == rotatedCurveIds)
+        #expect(remoteMLKEMIds == rotatedMLKEMIds)
 
         await session.shutdown()
     }
@@ -388,6 +505,69 @@ actor KeyRotationTests {
             #expect(error == .multiDeviceRotationRequiresBatch)
         }
 
+        await session.shutdown()
+    }
+    
+    @Test("rotation reestablishment sends one nickname control frame per contact secret and still fans out per device")
+    func testRotationReestablishmentDedupesNicknameSendsPerContact() async throws {
+        let (transport, _) = try await setupRotatableSession()
+        let peerSecret = "dedupe-peer"
+        try await createPeerIdentity(secretName: peerSecret, suffix: 0)
+        try await createPeerIdentity(secretName: peerSecret, suffix: 1)
+        
+        let stream = AsyncStream<ReceivedMessage> { continuation in
+            transport.continuation = continuation
+        }
+        let collector = Task { () -> [ReceivedMessage] in
+            var collected: [ReceivedMessage] = []
+            for await received in stream {
+                collected.append(received)
+                if collected.count >= 6 {
+                    break
+                }
+            }
+            return collected
+        }
+        
+        try await session.rotateCurrentDeviceKeys()
+        try await Task.sleep(nanoseconds: 500_000_000)
+        transport.continuation?.finish()
+        let collected = await collector.value
+        
+        let peerReestablishment = collected.filter { received in
+            guard received.recipient == peerSecret else { return false }
+            guard let event = received.transportEvent else { return false }
+            if case .sessionReestablishment = event {
+                return true
+            }
+            return false
+        }
+        #expect(peerReestablishment.count == 2, "Expected one nickname send deduped by secretName with per-device fan-out (2 devices)")
+        
+        await session.shutdown()
+    }
+    
+    @Test("force refreshing self identities synchronizes active user configuration from transport")
+    func testRefreshIdentitiesSelfForceRefreshSynchronizesActiveConfiguration() async throws {
+        _ = try await setupRotatableSession()
+        guard let originalContext = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        
+        let newSigningKey = Curve25519.Signing.PrivateKey()
+        let reSignedConfiguration = try makeReSignedConfiguration(from: originalContext, newSigningKey: newSigningKey)
+        await store.setUserConfigurations(index: 0, config: reSignedConfiguration)
+        
+        let mySecret = originalContext.sessionUser.secretName
+        _ = try await session.refreshIdentities(secretName: mySecret, forceRefresh: true)
+        
+        guard let refreshedContext = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        #expect(refreshedContext.activeUserConfiguration.signingPublicKey == newSigningKey.publicKey.rawRepresentation)
+        
         await session.shutdown()
     }
 

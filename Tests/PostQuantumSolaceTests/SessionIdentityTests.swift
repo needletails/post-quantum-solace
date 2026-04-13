@@ -469,6 +469,38 @@ actor SessionIdentityTests {
             throw error
         }
     }
+
+    @Test("Should not leak linked self devices into non-self recipient lookups")
+    func testGetSessionIdentitiesDoesNotLeakLinkedSelfDevicesIntoPeerLookup() async throws {
+        do {
+            let (store, transport) = try await setupTestSession()
+
+            let selfSiblingIdentity = try await createTestIdentity(for: "test-user")
+            let bobIdentity = try await createTestIdentity(for: "bob")
+
+            try await store.createSessionIdentity(selfSiblingIdentity)
+            try await store.createSessionIdentity(bobIdentity)
+
+            let bundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            transport.configurations["bob"] = bundle.userConfiguration
+
+            let retrieved = try await session.getSessionIdentities(with: "bob")
+
+            #expect(retrieved.count == 1, "Peer lookup should only return Bob identities")
+            guard let onlyIdentity = retrieved.first,
+                  let props = try? await onlyIdentity.props(symmetricKey: session.getDatabaseSymmetricKey()) else {
+                Issue.record("Expected exactly one decryptable Bob identity")
+                await session.shutdown()
+                return
+            }
+            #expect(props.secretName == "bob")
+
+            await session.shutdown()
+        } catch {
+            await session.shutdown()
+            throw error
+        }
+    }
     
     // MARK: Advanced Tests
     
@@ -557,6 +589,74 @@ actor SessionIdentityTests {
             await session.shutdown()
         } catch {
             // Ensure proper cleanup
+            await session.shutdown()
+            throw error
+        }
+    }
+
+    @Test("Should assess peer refresh impact for unchanged and rotated peer identity keys")
+    func testRefreshIdentitiesAssessingImpact() async throws {
+        do {
+            let (store, transport) = try await setupTestSession()
+
+            let bundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            let signingPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: bundle.userConfiguration.signingPublicKey)
+            guard let signedDevice = bundle.userConfiguration.signedDevices.first,
+                  let deviceConfig = try signedDevice.verified(using: signingPublicKey) else {
+                Issue.record("Expected a verified device configuration")
+                await session.shutdown()
+                return
+            }
+
+            let verifiedOneTimeKey = try bundle.userConfiguration.signedOneTimePublicKeys.first?.verified(using: signingPublicKey)
+            let verifiedMLKEMKey = try bundle.userConfiguration.signedMLKEMOneTimePublicKeys.first?.verified(using: signingPublicKey)
+            guard let verifiedMLKEMKey else {
+                Issue.record("Expected a verified MLKEM key")
+                await session.shutdown()
+                return
+            }
+
+            let identity = try await session.createEncryptableSessionIdentityModel(
+                with: deviceConfig,
+                oneTimePublicKey: verifiedOneTimeKey,
+                mlKEMPublicKey: verifiedMLKEMKey,
+                for: "alice",
+                associatedWith: deviceConfig.deviceId,
+                new: 123
+            )
+            try await store.createSessionIdentity(identity)
+            transport.configurations["alice"] = bundle.userConfiguration
+
+            let unchanged = try await session.refreshIdentitiesAssessingImpact(
+                secretName: "alice",
+                deviceId: deviceConfig.deviceId,
+                forceRefresh: false
+            )
+            #expect(unchanged.impact == .noSessionImpact)
+
+            let rotatedSigningKey = Curve25519.Signing.PrivateKey()
+            var rotatedDevice = deviceConfig
+            await rotatedDevice.updateSigningPublicKey(rotatedSigningKey.publicKey.rawRepresentation)
+            let rotatedSignedDevice = try UserConfiguration.SignedDeviceConfiguration(
+                device: rotatedDevice,
+                signingKey: rotatedSigningKey
+            )
+            transport.configurations["alice"] = UserConfiguration(
+                signingPublicKey: rotatedSigningKey.publicKey.rawRepresentation,
+                signedDevices: [rotatedSignedDevice],
+                signedOneTimePublicKeys: [],
+                signedMLKEMOneTimePublicKeys: []
+            )
+
+            let rotated = try await session.refreshIdentitiesAssessingImpact(
+                secretName: "alice",
+                deviceId: deviceConfig.deviceId,
+                forceRefresh: true
+            )
+            #expect(rotated.impact == .freshSessionRecommended)
+
+            await session.shutdown()
+        } catch {
             await session.shutdown()
             throw error
         }

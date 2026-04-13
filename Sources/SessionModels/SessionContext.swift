@@ -172,6 +172,33 @@ public struct LinkDeviceInfo: Sendable {
     }
 }
 
+/// A same-account reprovisioning bundle that restores account signing authority on a linked child device.
+///
+/// This bundle mirrors the critical account-signing portion of the original linking flow without
+/// transporting unrelated chat or session state. It is intended for already-linked devices after a
+/// master compromise rotation.
+public struct LinkedDeviceReprovisioningBundle: Codable, Sendable {
+    public let signingPrivateKeyData: Data
+    public let activeUserConfiguration: UserConfiguration
+    public let issuedByDeviceId: UUID
+    public let issuedAt: Date
+    public let targetDeviceId: UUID
+
+    public init(
+        signingPrivateKeyData: Data,
+        activeUserConfiguration: UserConfiguration,
+        issuedByDeviceId: UUID,
+        issuedAt: Date,
+        targetDeviceId: UUID
+    ) {
+        self.signingPrivateKeyData = signingPrivateKeyData
+        self.activeUserConfiguration = activeUserConfiguration
+        self.issuedByDeviceId = issuedByDeviceId
+        self.issuedAt = issuedAt
+        self.targetDeviceId = targetDeviceId
+    }
+}
+
 /// A protocol defining a delegate for device linking operations.
 ///
 /// This protocol provides a way to handle device linking operations asynchronously,

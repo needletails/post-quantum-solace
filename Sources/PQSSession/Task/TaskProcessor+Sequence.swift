@@ -179,7 +179,6 @@ extension TaskProcessor {
     }
     
     // MARK: - Job execution
-    
     private func process(
         _ job: JobModel,
         cache: SessionCache,
@@ -223,127 +222,96 @@ extension TaskProcessor {
             try await cache.deleteJob(job)
             return .processed
             
-        } catch let jobError as JobProcessorErrors where jobError == .missingIdentity {
-            try await cache.deleteJob(job)
-            return .deleted
-            
-        } catch let cryptoError as CryptoKitError where cryptoError == .authenticationFailure {
-            try await cache.deleteJob(job)
-            if case .streamMessage = props.task.task {
-                logger.log(level: .warning, message: "Inbound authentication failed after recovery attempts: \(cryptoError)")
-                throw cryptoError
-            }
-            return .deleted
-
-        } catch let cryptoError as CryptoKitError {
-            // CoreCrypto errors for inbound backlog frames are not recoverable by retrying the same ciphertext.
-            if case .streamMessage = props.task.task {
-                try await cache.deleteJob(job)
-                logger.log(level: .warning, message: "Inbound stale crypto frame requires resend: \(cryptoError)")
-                throw cryptoError
-            }
-            logger.log(level: .warning, message: "Job crypto error: \(cryptoError)")
-            return .failed
-            
-        } catch let sessionError as PQSSession.SessionErrors
-                    where sessionError == .invalidKeyId || sessionError == .cannotFindOneTimeKey {
-            try await cache.deleteJob(job)
-            return .deleted
-            
         } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-            try await cache.deleteJob(job)
-            logger.log(level: .error, message: "Job ratchet error: \(ratchetError) - deleting stale job")
-
-//            do {
-//                _ = try await session.attemptBoundedRotationAfterMaxSkipped()
-//            } catch {
-//                logger.log(level: .warning, message: "Max-skipped rotation publish failed after deleting stale job: \(error)")
-//            }
-            if case .streamMessage = props.task.task {
-                throw ratchetError
-            }
-            return .deleted
-
-        } catch let ratchetError as RatchetError where ratchetError == .missingOneTimeKey {
-            // Inbound backlog can reference consumed one-time keys after reconnect/rotation.
-            // Surface live stream failures so the caller can request resend after reconciliation.
-            if case .streamMessage = props.task.task {
-                try await cache.deleteJob(job)
-                logger.log(level: .warning, message: "Inbound stale ratchet frame requires resend: \(ratchetError)")
-                throw ratchetError
-            }
-            logger.log(level: .warning, message: "Job ratchet error: \(ratchetError)")
-            return .failed
-
-        } catch let ratchetError as RatchetError where ratchetError == .initialMessageNotReceived {
-            // Treat startup bootstrap misses as short-lived and bounded for inbound traffic.
-            guard var currentProps = await job.props(symmetricKey: symmetricKey) else {
-                try await cache.deleteJob(job)
-                return .deleted
-            }
-
-            currentProps.attempts += 1
-            let maxAttempts = ( {
-                if case .streamMessage = currentProps.task.task { return 3 }
-                return 8
-            } )()
-
-            if currentProps.attempts >= maxAttempts {
-                try await cache.deleteJob(job)
-                logger.log(level: .warning, message: "Dropping job after repeated initialMessageNotReceived (attempts=\(currentProps.attempts))")
-                return .deleted
-            }
-
-            let base: TimeInterval = 0.05
-            let maxDelay: TimeInterval = 0.25
-            let delay = min(maxDelay, base * pow(2.0, Double(currentProps.attempts - 1)))
-            currentProps.delayedUntil = Date().addingTimeInterval(delay)
-
-            _ = try await job.updateProps(symmetricKey: symmetricKey, props: currentProps)
-            try await cache.updateJob(job)
-
-            logger.log(level: .warning, message: "Job ratchet error: \(ratchetError) (attempt \(currentProps.attempts)) - retrying after \(delay)s")
-            return .failed
-
-        }
-//        catch let ratchetError as RatchetError where ratchetError == .stateUninitialized {
-//            // Common during reconnect/recovery windows. Retry with bounded backoff.
-//            guard var currentProps = await job.props(symmetricKey: symmetricKey) else {
-//                try await cache.deleteJob(job)
-//                return .deleted
-//            }
-//
-//            currentProps.attempts += 1
-//
-//            if currentProps.attempts >= 8 {
-//                try await cache.deleteJob(job)
-//                logger.log(level: .error, message: "Job ratchet error (exceeded retries): \(ratchetError)")
-//                return .deleted
-//            }
-//
-//            let base: TimeInterval = 0.05
-//            let maxDelay: TimeInterval = 0.25
-//            let delay = min(maxDelay, base * pow(2.0, Double(currentProps.attempts - 1)))
-//            currentProps.delayedUntil = Date().addingTimeInterval(delay)
-//
-//            _ = try await job.updateProps(symmetricKey: symmetricKey, props: currentProps)
-//            try await cache.updateJob(job)
-//
-//            logger.log(level: .warning, message: "Job ratchet error: \(ratchetError) (attempt \(currentProps.attempts)) - retrying after \(delay)s")
-//            return .failed
-//            
-//        }
-        catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
-            try await cache.deleteJob(job)
-            // Treat as a critical job failure, but do not crash the whole processor / bubble to callers.
-            logger.log(level: .error, message: "Job session error: \(sessionError)")
-            throw sessionError
+            //This means that no where in our current session identity can we find the key on the ring for our permitted range. We could be at Index 4, we try up to 10, so that would be 4...14 with no key being able to decrypt our message. This could be an abuse and or a potential attack. So We must rotate our keys on compromise. This means that the master device must full rotate their sessionIdentity. We will keep an archived SessionIdentity temporarily for other messages that may not have been received yet that are still encrypted with the valid key ring. After a given period of time we will them delete the archived Session Identity; This will cause a different failure since we rotated the master's SessionIdentity already. At that point we will then need to request resend message with out a rotation so that the sender will get the latest Session Identities during the encryption flow.
             
+            //If we are not a master device and hit this error me must tell the master device to rotate on compromise. Afterwards we also need to receive a message that tells us to rotate and then request resend message.
+            
+            //If we are the master device then we rotate on compromise, notify child devices that they need to rotate also which needs to be done after the master rotates so that we can sign the keys properly.
+            
+            switch props.task.task {
+            case .streamMessage(let message):
+                
+                //1. Archive current SessionIdentity:
+                try await session.createInactiveSessionSnapshot(for: message.senderSecretName, policy: .archive)
+                
+                //2. Rotate due to potential compromise
+                guard let context = await session.sessionContext else { return .failed }
+                
+                guard let currentDevice = try context.activeUserConfiguration
+                    .getVerifiedDevices()
+                    .first(where: { $0.deviceId == context.sessionUser.deviceId }) else {
+                    throw PQSSession.SessionErrors.invalidDeviceIdentity
+                }
+                
+                if currentDevice.isMasterDevice {
+                    try await session.rotateKeysOnPotentialCompromise()
+                } else {
+                    let metadata = try BinaryEncoder().encode(
+                        TransportEvent.sessionReestablishment(.linkedDeviceCompromiseObserved)
+                    )
+                    try await session.writeTextMessage(
+                        recipient: .personalMessage,
+                        transportInfo: metadata)
+                    try await session.rotateCurrentDeviceKeys()
+                }
+                try await session.requestMessageResend(
+                    sharedMessageId: message.sharedMessageId,
+                    senderName: message.senderSecretName,
+                    senderDeviceId: message.senderDeviceId)
+                try await cache.deleteJob(job)
+                return .deleted
+            case .writeMessage(let message):
+                logger.log(level: .error, message: "MaxSkippedHeadersExceeded for writeMessage to recipient: \(message.message.recipient)")
+                try await cache.deleteJob(job)
+            }
+            
+        } catch let ratchetError as RatchetError where ratchetError == .missingOneTimeKey {
+            switch props.task.task {
+            case .streamMessage(let message):
+                logger.log(level: .warning, message: "missingOneTimeKey for sender \(message.senderSecretName) — replacing OTK batch and notifying peer to refresh")
+                let curveReplaced = await session.refreshOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
+                let mlKEMReplaced = await session.refreshMLKEMOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
+                if !curveReplaced || !mlKEMReplaced {
+                    logger.log(level: .error, message: "OTK batch replacement failed; cannot recover from missingOneTimeKey")
+                }
+                let metadata = try BinaryEncoder().encode(
+                    TransportEvent.sessionReestablishment(.peerRefresh)
+                )
+                try await session.writeTextMessage(
+                    recipient: .nickname(message.senderSecretName),
+                    transportInfo: metadata)
+                try await cache.deleteJob(job)
+                return .deleted
+            case .writeMessage(let message):
+                logger.log(level: .error, message: "missingOneTimeKey for writeMessage to recipient: \(message.message.recipient)")
+                try await cache.deleteJob(job)
+            }
+        } catch let cryptoError as CryptoKitError {
+            switch props.task.task {
+            case .streamMessage(let message):
+                logger.log(level: .error, message: "Decryption failure (\(cryptoError)) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId) — notifying peer to refresh")
+                let metadata = try BinaryEncoder().encode(
+                    TransportEvent.sessionReestablishment(.peerRefresh)
+                )
+                let mySecretName = await session.sessionContext?.sessionUser.secretName
+                let recipient: MessageRecipient = (message.senderSecretName == mySecretName)
+                    ? .personalMessage
+                    : .nickname(message.senderSecretName)
+                try await session.writeTextMessage(
+                    recipient: recipient,
+                    transportInfo: metadata)
+                try await cache.deleteJob(job)
+                return .deleted
+            case .writeMessage(let message):
+                logger.log(level: .error, message: "CryptoKitError for writeMessage to recipient: \(message.message.recipient) — \(cryptoError)")
+                try await cache.deleteJob(job)
+            }
         } catch {
-            logger.log(level: .error, message: "Job error: \(error)")
-            // Keep the job in cache for now (retry semantics are handled elsewhere / future improvements).
-            return .failed
+            logger.log(level: .error, message: "Unhandled error during job processing: \(error)")
+            try await cache.deleteJob(job)
         }
+        return .failed
     }
     
     // MARK: - Job Processing Outcomes
@@ -372,6 +340,12 @@ extension TaskProcessor {
             "Ensure the session identity exists before processing the job"
         }
     }
+    
+    private func inboundTask(from task: TaskType) -> InboundTaskMessage? {
+        guard case let .streamMessage(inbound) = task else { return nil }
+        return inbound
+    }
+    
 }
 
 

@@ -81,7 +81,8 @@ public extension PQSSession {
         text: String = "",
         transportInfo: Data? = nil,
         metadata: Data = .init(),
-        destructionTime: TimeInterval? = nil
+        destructionTime: TimeInterval? = nil,
+        sharedIdOverride: String? = nil
     ) async throws {
         do {
             let message = CryptoMessage(
@@ -92,7 +93,11 @@ public extension PQSSession {
                 sentDate: Date(),
                 destructionTime: destructionTime)
 
-            try await processWrite(message: message, session: self)
+            try await processWrite(
+                message: message,
+                session: self,
+                sharedIdOverride: sharedIdOverride
+            )
         } catch {
             logger.log(level: .error, message: "\(error)")
             throw error
@@ -146,6 +151,10 @@ public extension PQSSession {
         deviceId: UUID,
         messageId: String
     ) async throws {
+        if isInboundFailureQuarantined(sender: sender, deviceId: deviceId, messageId: messageId) {
+            logger.log(level: .info, message: "Ignoring quarantined inbound message tuple for sender=\(sender) deviceId=\(deviceId.uuidString)")
+            return
+        }
         do {
             // We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less than the low watermark.
             if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
@@ -165,48 +174,43 @@ public extension PQSSession {
                 message,
                 session: self)
             
-        } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
-            logger.log(level: .warning, message: "InvalidSignature")
-            try await rotateKeysOnDecryptionFailure(error: sessionError)
-            throw sessionError
-        } catch let ratchetError as DoubleRatchetKit.RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-            logger.log(level: .warning, message: "MaxSkippedHeadersExceeded")
-            try await rotateKeysOnDecryptionFailure(error: ratchetError)
-            throw ratchetError
-        } catch let ratchetError as RatchetError where ratchetError == .missingOneTimeKey {
-            logger.log(level: .warning, message: "MissingOTK")
-            try await rotateKeysOnDecryptionFailure(error: ratchetError)
-            throw ratchetError
-        } catch let cryptoError as CryptoKitError {
-            logger.log(level: .warning, message: "CryptoKitError")
-            try await rotateKeysOnDecryptionFailure(error: cryptoError)
-            throw cryptoError
         } catch {
             logger.log(level: .error, message: "Error during message processing: \(error)")
             throw error
         }
-        
-        func rotateKeysOnDecryptionFailure(error: Error) async throws {
-            guard let sessionContext = await sessionContext else {
-                throw error
-            }
-            let oldSigningKeyData = sessionContext.activeUserConfiguration.signingPublicKey
-            let oldSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: oldSigningKeyData)
-            
-            guard let currentSignedDevice = await sessionContext.activeUserConfiguration.signedDevices.first(where: { signed in
-                guard let verified = try? signed.verified(using: oldSigningKey) else { return false }
-                return verified.deviceId == sessionContext.sessionUser.deviceId
-            }), let currentDevice = try? currentSignedDevice.verified(using: oldSigningKey) else {
-                throw SessionErrors.invalidDeviceIdentity
-            }
-            if currentDevice.isMasterDevice {
-                try await rotateKeysOnPotentialCompromise()
-            } else {
-                try await rotateCurrentDeviceKeys()
-            }
-        }
     }
-
+  
+    func requestMessageResend(sharedMessageId: String, senderName: String, senderDeviceId: UUID) async throws {
+        
+        let packet = FailedMessageResendRequest(failedSharedMessageId: sharedMessageId, requestingDeviceId: senderDeviceId)
+        let info = TransportEvent.requestMessageResend(packet)
+        let encoded = try BinaryEncoder().encode(info)
+        let message = CryptoMessage(
+            text: "",
+            metadata: .init(),
+            recipient: .nickname(senderName),
+            transportInfo: encoded,
+            sentDate: Date(),
+            destructionTime: nil)
+        
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        guard let identity = try await cache?.fetchSessionIdentities().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.deviceId == senderDeviceId }) else {
+            throw SessionErrors.invalidDeviceIdentity
+        }
+        
+        let task = EncryptableTask(
+            task: .writeMessage(OutboundTaskMessage(
+                message: message,
+                recipientIdentity: identity,
+                localId: UUID(),
+                sharedId: UUID().uuidString,
+                isPersistedOutbound: false
+            ))
+        )
+    
+        try await taskProcessor.feedTask(task, session: self)
+    }
+    
     // MARK: Outbound
 
     /// Processes an outbound message by encrypting and sending it to all target devices.
@@ -238,7 +242,8 @@ public extension PQSSession {
     ///   to all devices associated with the recipient.
     internal func processWrite(
         message: CryptoMessage,
-        session: PQSSession
+        session: PQSSession,
+        sharedIdOverride: String? = nil
     ) async throws {
         
         guard let sessionContext = await session.sessionContext else {
@@ -259,9 +264,13 @@ public extension PQSSession {
                 switch event {
                 case .sessionReestablishment:
                     shouldPersist = false
+                case .linkedDeviceReprovisioning:
+                    shouldPersist = false
                 case .synchronizeOneTimeKeys(_):
                     shouldPersist = false
                 case .refreshOneTimeKeys:
+                    shouldPersist = false
+                case .requestMessageResend(_):
                     shouldPersist = false
                 }
             } catch {}
@@ -274,6 +283,7 @@ public extension PQSSession {
             session: session,
             sender: mySecretName,
             type: message.recipient,
+            sharedIdOverride: sharedIdOverride,
             shouldPersist: shouldPersist,
             logger: logger)
     }

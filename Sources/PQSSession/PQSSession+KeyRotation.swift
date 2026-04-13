@@ -68,6 +68,7 @@ var shouldEmitKeyPayloadLogs: Bool {
 /// - All rotation operations are atomic and either complete fully or fail completely
 
 extension PQSSession {
+
     /// Rotates only this device's long-term and final MLKEM keys.
     ///
     /// Unlike `rotateKeysOnPotentialCompromise()`, this does not roll the account signing key.
@@ -131,17 +132,14 @@ extension PQSSession {
                     rotated: .init(
                         pskData: pskData,
                         signedDevice: reSignedCurrentDevice,
-                        allSignedDevices: allDevices
-                    ))
+                        allSignedDevices: allDevices))
             } else {
                 try await transportDelegate.publishRotatedKeys(
                     for: sessionContext.sessionUser.secretName,
                     deviceId: sessionContext.sessionUser.deviceId.uuidString,
                     rotated: .init(
                         pskData: pskData,
-                        signedDevice: reSignedCurrentDevice
-                    )
-                )
+                        signedDevice: reSignedCurrentDevice))
             }
 
             try await updateRotatedKeySessionContext(sessionContext: sessionContext)
@@ -150,21 +148,22 @@ extension PQSSession {
                 throw SessionErrors.databaseNotInitialized
             }
             
-            let metadata = try BinaryEncoder().encode(TransportEvent.sessionReestablishment)
-            try await writeTextMessage(
-                recipient: .personalMessage,
-                transportInfo: metadata)
-            
             let databaseSymmetricKey = try await getDatabaseSymmetricKey()
             let allIdentities = try await cache.fetchSessionIdentities()
+            var notifiedSecretNames = Set<String>()
+            let metadata = try BinaryEncoder().encode(
+                TransportEvent.sessionReestablishment(.peerRefresh)
+            )
+            
             for identity in allIdentities {
                 guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else { continue }
                 guard props.secretName != sessionContext.sessionUser.secretName else { continue }
                 guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+                guard notifiedSecretNames.insert(props.secretName).inserted else { continue }
+                
                 try await writeTextMessage(
                     recipient: .nickname(props.secretName),
-                    transportInfo: metadata
-                )
+                    transportInfo: metadata)
             }
 
             if let updatedContext = await self.sessionContext {
@@ -178,7 +177,6 @@ extension PQSSession {
                 logger.log(level: .debug, message: "Unable to refresh one-time keys, SessionContext is nil")
             }
 
-            try await createInactiveSessionSnapshot(policy: .archive)
             setKeyLoadingState(.complete)
             logger.log(level: .debug, message: "Completed rotating current device keys")
         } catch {
@@ -301,8 +299,7 @@ extension PQSSession {
             guard sessionContext.activeUserConfiguration.signedDevices.contains(where: { signed in
                 guard let verified = try? signed.verified(using: oldSigningKey) else { return false }
                 return verified.deviceId == sessionContext.sessionUser.deviceId
-            })
-            else {
+            }) else {
                 throw PQSSession.SessionErrors.invalidDeviceIdentity
             }
 
@@ -398,15 +395,23 @@ extension PQSSession {
                 throw SessionErrors.databaseNotInitialized
             }
      
-            let metadata = try BinaryEncoder().encode(TransportEvent.sessionReestablishment)
+            let linkedDeviceRepairMetadata = try BinaryEncoder().encode(
+                TransportEvent.sessionReestablishment(.linkedDeviceRepair)
+            )
+            let peerRefreshMetadata = try BinaryEncoder().encode(
+                TransportEvent.sessionReestablishment(.peerRefresh)
+            )
             
             //Re-establish sessions for self and contacts. Channel recipients are in essences contacts we have a relationship with so sending to their individual nick is sufficient.
             try await writeTextMessage(
                 recipient: .personalMessage,
-                transportInfo: metadata)
+                transportInfo: linkedDeviceRepairMetadata)
+
+            try await sendLinkedDeviceReprovisioningBundles(sessionContext: sessionContext)
             
             let databaseSymmetricKey = try await getDatabaseSymmetricKey()
             let allIdentities = try await cache.fetchSessionIdentities()
+            var notifiedSecretNames = Set<String>()
 
             for identity in allIdentities {
                 
@@ -414,6 +419,7 @@ extension PQSSession {
                 // Skip our own identity and archived/inactive snapshot identities.
                 guard props.secretName != sessionContext.sessionUser.secretName else { continue }
                 guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+                guard notifiedSecretNames.insert(props.secretName).inserted else { continue }
                 
                 if shouldEmitKeyPayloadLogs {
                     logger.log(level: .debug, message: """
@@ -427,23 +433,18 @@ extension PQSSession {
                 
                 try await writeTextMessage(
                     recipient: .nickname(props.secretName),
-                    transportInfo: metadata)
+                    transportInfo: peerRefreshMetadata)
                 
             }
 
-            // Key rotation and reestablishment can consume/delete one-time keys. Before we clear ratchet
-            // state and resume normal traffic, ensure our one-time key pools are replenished so
-            // immediate post-rotation messages can establish fresh sessions without delay.
-            if let updatedContext = await self.sessionContext {
-                if updatedContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-                    await refreshOneTimeKeysTask()
-                }
-                if updatedContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-                    await refreshMLKEMOneTimeKeysTask()
-                }
+            // Full compromise rotation changes the account signing key, so this device's existing
+            // one-time keys must be replaced and re-signed, not merely topped up if low.
+            let curveKeysReplaced = await refreshOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
+            let mlKEMKeysReplaced = await refreshMLKEMOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
+            guard curveKeysReplaced, mlKEMKeysReplaced else {
+                throw SessionErrors.oneTimeKeyUploadFailed
             }
-
-            try await createInactiveSessionSnapshot(policy: .archive)
+            
             setKeyLoadingState(.complete)
             logger.log(level: .debug, message: "Completed rotating keys")
         } catch {
@@ -527,7 +528,62 @@ extension PQSSession {
     }
 }
 
+extension PQSSession {
+    func installLinkedDeviceReprovisioningBundle(_ bundle: LinkedDeviceReprovisioningBundle) async throws {
+        let signingPrivateKey = try Curve25519.Signing.PrivateKey(rawRepresentation: bundle.signingPrivateKeyData)
+        var sessionContext = try await getSessionContext()
+
+        guard bundle.targetDeviceId == sessionContext.sessionUser.deviceId else {
+            throw SessionErrors.invalidDeviceIdentity
+        }
+        guard signingPrivateKey.publicKey.rawRepresentation == bundle.activeUserConfiguration.signingPublicKey else {
+            throw SessionErrors.signingKeyOutOfSync
+        }
+        guard bundle.activeUserConfiguration.signedDevices.contains(where: { $0.id == sessionContext.sessionUser.deviceId }) else {
+            throw SessionErrors.invalidDeviceIdentity
+        }
+
+        sessionContext.sessionUser.deviceKeys.signingPrivateKey = bundle.signingPrivateKeyData
+        sessionContext.activeUserConfiguration = bundle.activeUserConfiguration
+        try await updateRotatedKeySessionContext(sessionContext: sessionContext)
+    }
+
+    func localSigningKeyMatchesActiveConfiguration() async -> Bool {
+        guard let context = await sessionContext else { return false }
+        guard let signingPrivateKey = try? Curve25519.Signing.PrivateKey(
+            rawRepresentation: context.sessionUser.deviceKeys.signingPrivateKey
+        ) else {
+            return false
+        }
+        return signingPrivateKey.publicKey.rawRepresentation == context.activeUserConfiguration.signingPublicKey
+    }
+}
+
 private extension PQSSession {
+    func sendLinkedDeviceReprovisioningBundles(sessionContext: SessionContext) async throws {
+        let verifiedDevices = try sessionContext.activeUserConfiguration.getVerifiedDevices()
+        let childDeviceIds = verifiedDevices
+            .filter { $0.deviceId != sessionContext.sessionUser.deviceId }
+            .map(\.deviceId)
+
+        for targetDeviceId in childDeviceIds {
+            let bundle = LinkedDeviceReprovisioningBundle(
+                signingPrivateKeyData: sessionContext.sessionUser.deviceKeys.signingPrivateKey,
+                activeUserConfiguration: sessionContext.activeUserConfiguration,
+                issuedByDeviceId: sessionContext.sessionUser.deviceId,
+                issuedAt: Date(),
+                targetDeviceId: targetDeviceId
+            )
+            let metadata = try BinaryEncoder().encode(
+                TransportEvent.linkedDeviceReprovisioning(bundle)
+            )
+            try await writeTextMessage(
+                recipient: .personalMessage,
+                transportInfo: metadata
+            )
+        }
+    }
+
     func getSessionContext() async throws -> SessionContext {
         guard let cache else {
             throw SessionErrors.databaseNotInitialized
@@ -631,25 +687,3 @@ private extension PQSSession {
         try await updateRotatedKeySessionContext(sessionContext: sessionContext)
     }
 }
-
-//extension PQSSession {
-//    /// Publishes one bounded ML-KEM rotation (same path as scheduled ML-KEM refresh) when ratchet decrypt fails with `maxSkippedHeadersExceeded`.
-//    internal func publishBoundedRotationAfterMaxSkipped() async throws {
-//        try await rotateMLKEMFinalKey()
-//    }
-//
-//    /// Attempts one bounded max-skipped recovery rotation under cooldown.
-//    /// Returns `true` when a rotation was published, `false` when still in cooldown.
-//    internal func attemptBoundedRotationAfterMaxSkipped(cooldownSeconds: TimeInterval = 60) async throws -> Bool {
-//        let now = Date()
-//        if let cooldownUntil = maxSkippedRotationCooldownUntil, now < cooldownUntil {
-//            return false
-//        }
-//
-//        // Set gate before awaiting to prevent parallel callers from racing.
-//        maxSkippedRotationCooldownUntil = now.addingTimeInterval(cooldownSeconds)
-//        hasRotatedForMaxSkipped = true
-//        try await publishBoundedRotationAfterMaxSkipped()
-//        return true
-//    }
-//}

@@ -14,6 +14,8 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
+import Foundation
+
 /// A structure representing cryptographic key identities for synchronization operations.
 ///
 /// This struct contains the identifiers for both sender and recipient cryptographic keys
@@ -97,14 +99,64 @@ public struct SynchronizationKeyIdentities: Sendable, Codable {
     }
 }
 
+public enum SessionReestablishmentKind: String, Sendable, Codable {
+    case peerRefresh = "a"
+    case linkedDeviceRepair = "b"
+    case linkedDeviceCompromiseObserved = "c"
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let legacyValue = try? container.decode(Bool.self) {
+            self = legacyValue ? .linkedDeviceRepair : .peerRefresh
+            return
+        }
+
+        let rawValue = try container.decode(String.self)
+        guard let value = SessionReestablishmentKind(rawValue: rawValue) else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Invalid session reestablishment kind"
+            )
+        }
+        self = value
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
 public enum TransportEvent: Sendable, Codable {
-    case sessionReestablishment
+    case sessionReestablishment(SessionReestablishmentKind)
+    case linkedDeviceReprovisioning(LinkedDeviceReprovisioningBundle)
     case synchronizeOneTimeKeys(SynchronizationKeyIdentities)
     case refreshOneTimeKeys
+    case requestMessageResend(FailedMessageResendRequest)
     
     enum CodingKeys: String, CodingKey {
         case sessionReestablishment = "a"
-        case synchronizeOneTimeKeys = "b"
-        case refreshOneTimeKeys = "c"
+        case linkedDeviceReprovisioning = "b"
+        case synchronizeOneTimeKeys = "c"
+        case refreshOneTimeKeys = "d"
+        case requestMessageResend = "e"
+    }
+}
+
+public struct FailedMessageResendRequest: Sendable, Codable {
+    public let failedSharedMessageId: String
+    public let requestingDeviceId: UUID
+    
+    private enum CodingKeys: String, CodingKey {
+        case failedSharedMessageId = "a"
+        case requestingDeviceId = "b"
+    }
+    
+    public init(
+        failedSharedMessageId: String,
+        requestingDeviceId: UUID
+    ) {
+        self.failedSharedMessageId = failedSharedMessageId
+        self.requestingDeviceId = requestingDeviceId
     }
 }

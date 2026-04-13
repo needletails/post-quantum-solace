@@ -283,8 +283,19 @@ public protocol PQSSessionDelegate: Sendable {
     /// (e.g. automatic `.delivered` delivery-state updates). Return `false` when the user has disabled
     /// read/delivery receipts so peers do not receive that signal.
     func shouldSendAutomaticDeliveryReceipts() async -> Bool
+
+    /// Called when a linked device on the same account reports a potential compromise
+    /// (e.g. it hit `maxSkippedHeadersExceeded` during decryption).
+    ///
+    /// The master device can use this callback to decide whether to trigger
+    /// `rotateKeysOnPotentialCompromise()`. Child devices may use it for
+    /// informational logging or UI alerts.
+    ///
+    /// - Parameter deviceId: The device ID of the linked device that detected the anomaly.
+    func linkedDeviceReportedPotentialCompromise(deviceId: UUID) async
 }
 
 public extension PQSSessionDelegate {
     func shouldSendAutomaticDeliveryReceipts() async -> Bool { true }
+    func linkedDeviceReportedPotentialCompromise(deviceId: UUID) async {}
 }

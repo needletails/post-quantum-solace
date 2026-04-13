@@ -422,7 +422,7 @@ actor SessionTests {
         await session.setDatabaseDelegate(conformer: mockCache)
         await session.setAppPassword("secret")
 
-        try await session.refreshOneTimeKeys(refreshType: .curve, forceReplenish: false)
+        try await session.refreshOneTimeKeys(refreshType: .curve, policy: .automatic)
 
         let midData = try await mockCache.fetchLocalSessionContext()
         let midDecrypted = try self.crypto.decrypt(data: midData, symmetricKey: appSymmetricKey)!
@@ -430,7 +430,7 @@ actor SessionTests {
         #expect(midContext.activeUserConfiguration.signedOneTimePublicKeys.count == 15)
         #expect(midContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == 15)
 
-        try await session.refreshOneTimeKeys(refreshType: .curve, forceReplenish: true)
+        try await session.refreshOneTimeKeys(refreshType: .curve, policy: .replenishBatch)
 
         let finalData = try await mockCache.fetchLocalSessionContext()
         let finalDecrypted = try self.crypto.decrypt(data: finalData, symmetricKey: appSymmetricKey)!
@@ -645,4 +645,145 @@ actor MockTransport: SessionTransport {
         }
     }
     func deleteOneTimeKeys(for _: String, with _: String, type _: KeysType) async throws {}
+}
+
+// MARK: - OTK Race Condition Proof
+
+@Suite(.serialized)
+actor OTKSyncRaceTests {
+
+    let session = PQSSession()
+    let crypto = NeedleTailCrypto()
+
+    /// Proves that `synchronizeLocalKeys` deletes a private OTK whose public
+    /// counterpart was consumed on the server, making it unavailable for
+    /// decryption of the in-flight message that used it.
+    ///
+    /// Timeline this simulates:
+    /// 1. Alice publishes OTKs [A, B, C, …] to the server.
+    /// 2. Bob fetches OTK "A" from the server and encrypts a message with it.
+    /// 3. The server removes "A" from Alice's available pool (consumed).
+    /// 4. Before Alice processes Bob's message, OTK replenishment runs and
+    ///    calls `synchronizeLocalKeys` with the server's list (no longer has "A").
+    /// 5. Alice's local private key for "A" is deleted.
+    /// 6. Alice tries to decrypt Bob's message → `missingOneTimeKey`.
+    @Test
+    func synchronizeLocalKeys_deletesConsumedPrivateKey_causingDecryptionFailure() async throws {
+        let store = MockIdentityStore(
+            mockUserData: .init(session: session),
+            session: session,
+            isSender: false
+        )
+
+        let deviceId = UUID()
+        let ltpk = crypto.generateCurve25519PrivateKey()
+        let spk = crypto.generateCurve25519SigningPrivateKey()
+        let dbsk = SymmetricKey(size: .bits256)
+
+        let allKeys: [SessionTests.KeyPair] = try (0 ..< 10).map { _ in
+            let id = UUID()
+            let priv = crypto.generateCurve25519PrivateKey()
+            return try SessionTests.KeyPair(
+                id: id,
+                publicKey: .init(id: id, priv.publicKey.rawRepresentation),
+                privateKey: .init(id: id, priv.rawRepresentation)
+            )
+        }
+
+        let signedOneTimePublicKeys: [UserConfiguration.SignedOneTimePublicKey] = try allKeys.map {
+            try UserConfiguration.SignedOneTimePublicKey(
+                key: $0.publicKey,
+                deviceId: deviceId,
+                signingKey: spk
+            )
+        }
+
+        let mlKEMKey = try crypto.generateMLKem1024PrivateKey()
+        let mlKEMOneTimeKeyPairs: [PQSSession.KeyPair] = try (0 ..< 10).map { _ in
+            let id = UUID()
+            let pk = try crypto.generateMLKem1024PrivateKey()
+            return try PQSSession.KeyPair(
+                id: id,
+                publicKey: MLKEMPublicKey(id: id, pk.publicKey.rawRepresentation),
+                privateKey: MLKEMPrivateKey(id: id, pk.encode())
+            )
+        }
+        let signedMLKEM: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map {
+            try UserConfiguration.SignedMLKEMOneTimeKey(key: $0.publicKey, deviceId: deviceId, signingKey: spk)
+        }
+
+        let sessionUser = try SessionUser(
+            secretName: "alice",
+            deviceId: deviceId,
+            deviceKeys: .init(
+                deviceId: deviceId,
+                signingPrivateKey: spk.rawRepresentation,
+                longTermPrivateKey: ltpk.rawRepresentation,
+                oneTimePrivateKeys: allKeys.map(\.privateKey),
+                mlKEMOneTimePrivateKeys: mlKEMOneTimeKeyPairs.map(\.privateKey),
+                finalMLKEMPrivateKey: .init(mlKEMKey.encode())
+            ))
+
+        let context = SessionContext(
+            sessionUser: sessionUser,
+            databaseEncryptionKey: dbsk.withUnsafeBytes { Data($0) },
+            sessionContextId: 123,
+            activeUserConfiguration: .init(
+                signingPublicKey: spk.publicKey.rawRepresentation,
+                signedDevices: [],
+                signedOneTimePublicKeys: signedOneTimePublicKeys,
+                signedMLKEMOneTimePublicKeys: signedMLKEM
+            ),
+            registrationState: .registered
+        )
+
+        await session.setAppPassword("test")
+        let passwordData = await session.appPassword.data(using: .utf8)!
+        let saltData = try await store.fetchLocalDeviceSalt(keyData: passwordData)
+        let symmetricKey = await crypto.deriveStrictSymmetricKey(data: passwordData, salt: saltData)
+
+        let data = try BinaryEncoder().encode(context)
+        let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey)
+        try await store.createLocalSessionContext(encryptedData!)
+        await session.setDatabaseDelegate(conformer: store)
+
+        // ── Step 1: Verify the consumed key exists locally before sync ──
+        let consumedKey = allKeys[0]
+        let beforeData = try await store.fetchLocalSessionContext()
+        let beforeConfig = try crypto.decrypt(data: beforeData, symmetricKey: symmetricKey)!
+        let beforeContext = try BinaryDecoder().decode(SessionContext.self, from: beforeConfig)
+
+        let foundBefore = beforeContext.sessionUser.deviceKeys.oneTimePrivateKeys
+            .first(where: { $0.id == consumedKey.id })
+        #expect(foundBefore != nil, "Private key for consumed OTK must exist before sync")
+
+        // ── Step 2: Simulate server consumption — server list no longer has the consumed key ──
+        let serverList = allKeys.dropFirst().map(\.id) // OTK "0" consumed by Bob
+
+        // ── Step 3: Run synchronizeLocalKeys (this is called during OTK replenishment) ──
+        _ = try await session.synchronizeLocalKeys(
+            cache: session.cache!,
+            keys: Array(serverList),
+            type: .curve
+        )
+
+        // ── Step 4: Prove the consumed key's private counterpart was deleted ──
+        let afterData = try await store.fetchLocalSessionContext()
+        let afterConfig = try crypto.decrypt(data: afterData, symmetricKey: symmetricKey)!
+        let afterContext = try BinaryDecoder().decode(SessionContext.self, from: afterConfig)
+
+        let foundAfter = afterContext.sessionUser.deviceKeys.oneTimePrivateKeys
+            .first(where: { $0.id == consumedKey.id })
+
+        // After the fix: private keys are preserved so in-flight messages can
+        // still be decrypted. Only the public key list is pruned.
+        #expect(foundAfter != nil,
+                "Private key for consumed OTK must be preserved for in-flight message decryption")
+        #expect(afterContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == 10,
+                "All 10 private keys remain — consumed keys are only removed after local decryption")
+        #expect(afterContext.activeUserConfiguration.signedOneTimePublicKeys.count == 9,
+                "Public key list is pruned to match the server (consumed key no longer advertised)")
+
+        await session.shutdown()
+    }
 }

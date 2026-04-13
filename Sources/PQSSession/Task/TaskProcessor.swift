@@ -20,6 +20,7 @@ import NeedleTailAsyncSequence
 import SessionEvents
 import SessionModels
 import Crypto
+import BinaryCodable
 
 /// `TaskProcessor` manages the asynchronous execution of encryption and decryption tasks
 /// using Double Ratchet and other cryptographic mechanisms. It handles inbound and outbound
@@ -129,7 +130,7 @@ public actor TaskProcessor {
     /// Minimum interval between peer refresh control messages for the same peer.
     /// Keeps recovery behavior while reducing startup storms that can race with live traffic.
     let peerRefreshRequestCooldown: TimeInterval = 15
-
+    
     /// Represents a stashed inbound task for later processing.
     ///
     /// This struct is used to temporarily store inbound messages that cannot be processed
@@ -248,6 +249,7 @@ public actor TaskProcessor {
         session: PQSSession,
         sender: String,
         type: MessageRecipient,
+        sharedIdOverride: String? = nil,
         shouldPersist: Bool,
         logger: NeedleTailLogger
     ) async throws {
@@ -285,6 +287,12 @@ public actor TaskProcessor {
                 logger: logger,
                 createIdentity: createIdentity,
                 sendOneTimeIdentities: sendOneTimeIdentities)
+            
+            let isPersistable = await session.sessionDelegate?.shouldPersist(transportInfo: message.transportInfo) != false
+            if isPersistable && !sendOneTimeIdentities {
+                let personalIdentities = try await gatherPersonalIdentities(session: session, sender: sender, logger: logger)
+                identities.append(contentsOf: personalIdentities)
+            }
             
             recipients.formUnion([sender, nickname])
             
@@ -360,6 +368,36 @@ public actor TaskProcessor {
                 return props.secretName == secretName && props.deviceId == UUID(uuidString: deviceId)
             }
         }
+        
+        let shouldPreserveAllDevicesForControlEvent: Bool = {
+            guard let transportInfo = message.transportInfo else { return false }
+            guard let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo) else { return false }
+            switch event {
+            case .sessionReestablishment, .linkedDeviceReprovisioning, .refreshOneTimeKeys, .synchronizeOneTimeKeys:
+                return true
+            case .requestMessageResend:
+                return true
+            }
+        }()
+
+        let targetedPersonalDeviceId: UUID? = {
+            guard type == .personalMessage else { return nil }
+            guard let transportInfo = message.transportInfo else { return nil }
+            guard let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo) else { return nil }
+            switch event {
+            case .linkedDeviceReprovisioning(let bundle):
+                return bundle.targetDeviceId
+            default:
+                return nil
+            }
+        }()
+
+        if let targetedPersonalDeviceId {
+            await identities.asyncRemoveAll { identity in
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { return true }
+                return props.secretName != sender || props.deviceId != targetedPersonalDeviceId
+            }
+        }
 
         // Filter identities based on delegate-supplied info
         if let sessionDelegate = await session.sessionDelegate {
@@ -388,7 +426,7 @@ public actor TaskProcessor {
                         }
                     }
                 }
-            } else if type != .broadcast {
+            } else if type != .broadcast && !shouldPreserveAllDevicesForControlEvent {
                 await identities.asyncRemoveAll {
                     await ($0.props(symmetricKey: symmetricKey)?.isMasterDevice == false)
                 }
@@ -411,6 +449,7 @@ public actor TaskProcessor {
                     symmetricKey: symmetricKey,
                     sender: sender,
                     recipients: Set([sender, peer]),
+                    sharedIdOverride: sharedIdOverride,
                     shouldPersist: shouldPersist,
                     logger: logger
                 )
@@ -426,6 +465,7 @@ public actor TaskProcessor {
             symmetricKey: symmetricKey,
             sender: sender,
             recipients: recipients,
+            sharedIdOverride: sharedIdOverride,
             shouldPersist: shouldPersist,
             logger: logger)
     }
@@ -505,7 +545,10 @@ public actor TaskProcessor {
     /// - Returns: An array of `SessionIdentity` objects for the sender's devices.
     /// - Throws: Errors from identity refresh, typically network or cryptographic errors.
     private func gatherPersonalIdentities(session: PQSSession, sender: String, logger: NeedleTailLogger) async throws -> [SessionIdentity] {
-        let identities = try await session.refreshIdentities(secretName: sender)
+        var identities = try await session.refreshIdentities(secretName: sender)
+        if identities.isEmpty {
+            identities = try await session.refreshIdentities(secretName: sender, forceRefresh: true)
+        }
         logger.log(level: .info, message: "Gathered \(identities.count) Personal Session Identities")
         return identities
     }
@@ -614,7 +657,7 @@ public actor TaskProcessor {
         for member in members {
             try await identities.formUnion(session.refreshIdentities(secretName: member))
         }
-        logger.log(level: .info, message: "Gathered \(await identities.count) Channel Session Identities")
+        logger.log(level: .info, message: "Gathered \(identities.count) Channel Session Identities")
         return (Array(identities), members)
     }
 
@@ -660,6 +703,7 @@ public actor TaskProcessor {
         symmetricKey: SymmetricKey,
         sender _: String,
         recipients: Set<String>,
+        sharedIdOverride: String? = nil,
         shouldPersist: Bool,
         logger: NeedleTailLogger
     ) async throws {
@@ -698,7 +742,7 @@ public actor TaskProcessor {
                 session: session,
                 symmetricKey: symmetricKey,
                 members: recipients,
-                sharedId: UUID().uuidString,
+                sharedId: sharedIdOverride ?? UUID().uuidString,
                 shouldUpdateCommunication: shouldUpdateCommunication)
             await session.receiverDelegate?.createdMessage(savedMessage)
             encryptableMessage = savedMessage
@@ -762,7 +806,7 @@ public actor TaskProcessor {
                             message: message,
                             recipientIdentity: identity,
                             localId: UUID(),
-                            sharedId: UUID().uuidString,
+                            sharedId: sharedIdOverride ?? UUID().uuidString,
                             isPersistedOutbound: false
                         ))
                     )
@@ -773,6 +817,7 @@ public actor TaskProcessor {
             }
         }
     }
+
 
     // MARK: - Inbound Messaging
 
@@ -810,7 +855,8 @@ public actor TaskProcessor {
     }
 }
 
-extension SessionIdentity: Hashable {
+extension SessionIdentity: @retroactive Equatable {}
+extension SessionIdentity: @retroactive Hashable {
     
     public func hash(into hasher: inout Hasher) {
         hasher.combine(id)

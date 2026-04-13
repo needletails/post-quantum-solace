@@ -875,15 +875,17 @@ public extension SessionEvents {
         
         try await cache.updateContact(foundContact)
         
-        guard let updatedMetadata = updatedProps?.metadata else {
+        guard let updatedProps = updatedProps else {
             throw EventErrors.propsError
         }
         
+        // Use cache-truth identity/config so downstream bundle matching and metadata
+        // refresh listeners compare against the canonical contact record.
         let updatedContact = Contact(
-            id: contact.id,
-            secretName: contact.secretName,
-            configuration: contact.configuration,
-            metadata: updatedMetadata
+            id: foundContact.id,
+            secretName: updatedProps.secretName,
+            configuration: updatedProps.configuration,
+            metadata: updatedProps.metadata
         )
         
         try await receiver.updateContact(updatedContact)
