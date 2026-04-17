@@ -66,10 +66,15 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
 
     /// Data representing the private signing key of the device.
     ///
-    /// This key is used for digital signatures to authenticate messages and verify
-    /// the identity of the device. It should be kept secure and rotated periodically
-    /// according to the `rotateKeysDate` schedule.
-    public var signingPrivateKey: Data
+    /// **Per-device identity invariant.** Set exactly once at device registration via
+    /// `init(...)`. After registration this key is immutable for the lifetime of the `DeviceID`
+    /// and may NEVER be rewritten in response to any wire-format input (e.g. a master-issued
+    /// reprovisioning bundle). The single exception is the **master device's** account-key
+    /// compromise rotation, which must use `rotateAccountSigningKey(_:)` and is the only
+    /// supported mutation path post-registration. Linked (non-master) devices have no
+    /// legitimate path to mutate this field; if local state diverges from the per-device
+    /// `signingPublicKey` the server holds, the device must be re-linked.
+    public private(set) var signingPrivateKey: Data
 
     /// Data representing the private long-term key of the device.
     ///
@@ -147,5 +152,17 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     /// - Parameter date: The new date when keys should be rotated.
     public mutating func updateRotateKeysDate(_ date: Date) async {
         rotateKeysDate = date
+    }
+
+    /// Master-device-only entry point for replacing the account signing key during compromise rotation.
+    ///
+    /// On master devices, `signingPrivateKey` plays a dual role: it is both the device's per-device
+    /// signing key AND the account-level key used to sign each `SignedDeviceConfiguration` in the
+    /// shared device list. A successful `rotateKeysOnPotentialCompromise()` must therefore replace
+    /// it. This is the ONLY supported mutation post-registration, and it must never be invoked from
+    /// a linked (non-master) device or in response to any wire-format input. Callers MUST first
+    /// guard on `currentDevice.isMasterDevice` (the rotation function does so today).
+    public mutating func rotateAccountSigningKey(_ data: Data) {
+        signingPrivateKey = data
     }
 }

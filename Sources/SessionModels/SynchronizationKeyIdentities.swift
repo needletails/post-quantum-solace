@@ -127,8 +127,95 @@ public enum SessionReestablishmentKind: String, Sendable, Codable {
     }
 }
 
+/// Wire envelope for `SessionReestablishmentKind` carrying coalescing/idempotency metadata.
+///
+/// The receiver uses `(senderDeviceId, kind, intentId, epoch)` to dedupe redundant control
+/// events that pile up in offline mailboxes and to coalesce same-episode re-emissions into
+/// a single application-level reaction (e.g. one compromise prompt instead of N).
+///
+/// ## Compatibility
+/// The custom `init(from:)` accepts both the new keyed encoding and a legacy bare
+/// `SessionReestablishmentKind` payload, allowing in-flight messages from older SDK
+/// versions to deserialize without metadata.
+public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
+    /// The semantic action requested by the sender.
+    public let kind: SessionReestablishmentKind
+
+    /// Stable identifier shared across every emission within a single sender-side episode.
+    /// `nil` when decoded from a legacy bare-kind payload.
+    public let intentId: UUID?
+
+    /// Sender-side monotonically increasing counter (per-kind) for ordering and dedup.
+    /// Receivers drop strictly-older epochs and treat equal epochs as duplicates.
+    /// `0` when decoded from a legacy bare-kind payload.
+    public let epoch: UInt64
+
+    /// Sender's wall-clock at the moment this envelope was constructed.
+    /// Used for diagnostics; receiver dedup decisions never depend on this value.
+    public let emittedAt: Date
+
+    public init(
+        kind: SessionReestablishmentKind,
+        intentId: UUID? = nil,
+        epoch: UInt64 = 0,
+        emittedAt: Date = Date()
+    ) {
+        self.kind = kind
+        self.intentId = intentId
+        self.epoch = epoch
+        self.emittedAt = emittedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        // We persist `kind` as a raw `String` (its `rawValue`) rather than relying on
+        // `SessionReestablishmentKind`'s custom Codable, because some binary serializers
+        // track the wire type identity of nested Codable values and that interferes with
+        // both round-tripping and tolerant cross-version decoding.
+        case rawKind = "k"
+        case intentId = "i"
+        case epoch = "e"
+        case emittedAt = "t"
+    }
+
+    public init(from decoder: Decoder) throws {
+        if let container = try? decoder.container(keyedBy: CodingKeys.self),
+           let rawKind = try? container.decode(String.self, forKey: .rawKind),
+           let kind = SessionReestablishmentKind(rawValue: rawKind) {
+            self.kind = kind
+            self.intentId = try? container.decodeIfPresent(UUID.self, forKey: .intentId)
+            self.epoch = (try? container.decode(UInt64.self, forKey: .epoch)) ?? 0
+            self.emittedAt = (try? container.decode(Date.self, forKey: .emittedAt)) ?? Date()
+            return
+        }
+        // Legacy fallback for serializers that handed us a bare `SessionReestablishmentKind`.
+        // In-flight pre-envelope payloads from older SDK builds land here.
+        if let single = try? decoder.singleValueContainer(),
+           let kind = try? single.decode(SessionReestablishmentKind.self) {
+            self.kind = kind
+            self.intentId = nil
+            self.epoch = 0
+            self.emittedAt = Date()
+            return
+        }
+        throw DecodingError.dataCorrupted(
+            DecodingError.Context(
+                codingPath: decoder.codingPath,
+                debugDescription: "Unrecognised SessionReestablishmentEnvelope payload"
+            )
+        )
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(kind.rawValue, forKey: .rawKind)
+        try container.encodeIfPresent(intentId, forKey: .intentId)
+        try container.encode(epoch, forKey: .epoch)
+        try container.encode(emittedAt, forKey: .emittedAt)
+    }
+}
+
 public enum TransportEvent: Sendable, Codable {
-    case sessionReestablishment(SessionReestablishmentKind)
+    case sessionReestablishment(SessionReestablishmentEnvelope)
     case linkedDeviceReprovisioning(LinkedDeviceReprovisioningBundle)
     case synchronizeOneTimeKeys(SynchronizationKeyIdentities)
     case refreshOneTimeKeys

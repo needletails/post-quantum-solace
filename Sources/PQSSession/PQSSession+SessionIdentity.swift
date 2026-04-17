@@ -460,11 +460,13 @@ public extension PQSSession {
         oneTime mlKEMId: String?
     ) async throws -> [SessionIdentity] {
         
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-            await refreshOneTimeKeysTask()
-        }
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-            await refreshMLKEMOneTimeKeysTask()
+        if !otkUploadCircuitOpen {
+            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                await refreshOneTimeKeysTask()
+            }
+            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                await refreshMLKEMOneTimeKeysTask()
+            }
         }
         
         var identities = existingIdentities
@@ -744,14 +746,8 @@ public extension PQSSession {
     }
     
     private func synchronizeActiveUserConfiguration(_ configuration: UserConfiguration) async throws {
-        guard let cache else { throw PQSSession.SessionErrors.databaseNotInitialized }
-        guard var context = await sessionContext else { throw PQSSession.SessionErrors.sessionNotInitialized }
-        context.activeUserConfiguration = configuration
-        await setSessionContext(context)
-        let encodedData = try BinaryEncoder().encode(context)
-        guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: await getAppSymmetricKey()) else {
-            throw PQSSession.SessionErrors.sessionEncryptionError
-        }
-        try await cache.updateLocalSessionContext(encryptedConfig)
+        // Route through the public TOFU-pinned adoption helper so the account
+        // signing key cannot silently change via a self-refresh path.
+        try await adoptVerifiedUserConfiguration(configuration)
     }
 }

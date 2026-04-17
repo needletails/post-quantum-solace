@@ -9,7 +9,20 @@
 
 import Foundation
 
-/// Per-device channel list preferences (pin, manual read).
+/// Per-device, never-synchronized UI overlay for a channel
+/// communication.
+///
+/// `ChannelLocalOverlay` describes preferences that should *not* be
+/// shared across devices or with peers: pin position, the user's
+/// manual read marker, archived/hidden state, and a custom display
+/// title. It is encoded into ``BaseCommunication``'s metadata blob
+/// alongside ``ChannelInfo`` (see ``ChannelStoredMetadata``) so that
+/// each device's UI state survives a relaunch without leaking through
+/// channel synchronization payloads.
+///
+/// Defaults are conservative — `userMarkedRead` defaults to `true` so
+/// freshly created or imported channels do not flag themselves as
+/// unread; everything else defaults to `false` / `nil`.
 public struct ChannelLocalOverlay: Codable, Sendable, Hashable {
     enum CodingKeys: String, CodingKey {
         case userMarkedPinned
@@ -65,9 +78,20 @@ public struct ChannelLocalOverlay: Codable, Sendable, Hashable {
     }
 }
 
-/// Wraps `ChannelInfo` with optional local overlay. Legacy rows store only `ChannelInfo` bytes.
+/// On-disk container that pairs a synchronized ``ChannelInfo`` with an
+/// optional per-device ``ChannelLocalOverlay``.
+///
+/// `ChannelStoredMetadata` is what the SDK actually serializes into
+/// ``BaseCommunication/UnwrappedProps/metadata`` for channel
+/// communications. The `core` field is wire-compatible with
+/// `ChannelInfo` so legacy rows that stored only the bare info struct
+/// continue to decode; the optional `overlay` is local-only and must
+/// not be relied upon by remote peers.
 public struct ChannelStoredMetadata: Codable, Sendable, Hashable {
+    /// Synchronized channel descriptor (name, members, roles).
     public var core: ChannelInfo
+    /// Per-device UI preferences. Always `nil` for legacy / un-overlaid
+    /// channels.
     public var overlay: ChannelLocalOverlay?
 
     public init(core: ChannelInfo, overlay: ChannelLocalOverlay? = nil) {

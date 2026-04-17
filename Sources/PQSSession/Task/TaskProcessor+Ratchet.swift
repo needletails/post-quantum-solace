@@ -499,8 +499,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 let event = try BinaryDecoder().decode(TransportEvent.self, from: data)
                 transportEvent = event
                 switch event {
-                case .sessionReestablishment(let kind):
-                    logger.log(level: .info, message: "Prepared to send session reestablishment: \(kind.rawValue)")
+                case .sessionReestablishment(let envelope):
+                    logger.log(
+                        level: .info,
+                        message: "Prepared to send session reestablishment: \(envelope.kind.rawValue) intent=\(envelope.intentId?.uuidString ?? "nil") epoch=\(envelope.epoch)"
+                    )
                 case .linkedDeviceReprovisioning(let bundle):
                     logger.log(level: .info, message: "Prepared to send linked-device reprovisioning for target=\(bundle.targetDeviceId.uuidString)")
                 case .synchronizeOneTimeKeys(var info):
@@ -620,7 +623,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         
         do {
             // Attempt decryption with the active identity first, falling back to archived
-            // identities if needed (Sesame-style previous-state decryption).
+            // identities if needed (previous-state decryption).
             var decryptedData: Data
             do {
                 try await initializeRecipient(
@@ -690,10 +693,35 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo) {
                 do {
                     switch event {
-                    case .sessionReestablishment(let kind):
+                    case .sessionReestablishment(let envelope):
                         canSaveMessage = false
-                        
+
                         guard let context = await session.sessionContext else { return }
+
+                        // Receiver-side coalescing: drop duplicates and stale-epoch replays from
+                        // an offline mailbox before any expensive work or delegate dispatch.
+                        let dedupDecision = await session.recordReceivedSessionReestablishment(
+                            envelope: envelope,
+                            senderDeviceId: inboundTask.senderDeviceId
+                        )
+                        switch dedupDecision {
+                        case .skipDuplicate:
+                            logger.log(
+                                level: .info,
+                                message: "[control-event] coalesced duplicate kind=\(envelope.kind.rawValue) sender=\(inboundTask.senderDeviceId) intent=\(envelope.intentId?.uuidString ?? "nil") epoch=\(envelope.epoch)"
+                            )
+                            return
+                        case .skipStale:
+                            logger.log(
+                                level: .info,
+                                message: "[control-event] dropping stale kind=\(envelope.kind.rawValue) sender=\(inboundTask.senderDeviceId) epoch=\(envelope.epoch)"
+                            )
+                            return
+                        case .process:
+                            break
+                        }
+
+                        let kind = envelope.kind
                         switch try sessionReestablishmentDisposition(
                             for: kind,
                             inboundTask: inboundTask,
@@ -705,7 +733,12 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         case .refreshOnly:
                             break
                         case .rotateCurrentDevice:
-                            _ = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
+                            // Sync local activeUserConfiguration before checking signing-key
+                            // agreement; the post-disposition refresh below cannot cover this
+                            // because the check needs to run on fresh state.
+                            if await session.shouldForceIdentityRefresh(secretName: inboundTask.senderSecretName) {
+                                _ = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
+                            }
                             if await session.localSigningKeyMatchesActiveConfiguration() {
                                 try await performPendingLinkedDeviceRepair(session: session)
                             } else {
@@ -713,13 +746,23 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                 logger.log(level: .info, message: "Linked-device repair requested; waiting for reprovisioning bundle before rotating")
                             }
                         case .compromiseObserved:
-                            logger.log(level: .error, message: "Linked device reported possible compromise; notifying delegate")
-                            await session.sessionDelegate?.linkedDeviceReportedPotentialCompromise(deviceId: inboundTask.senderDeviceId)
+                            logger.log(
+                                level: .error,
+                                message: "Linked device reported possible compromise; notifying delegate (intent=\(envelope.intentId?.uuidString ?? "nil") epoch=\(envelope.epoch))"
+                            )
+                            await session.sessionDelegate?.linkedDeviceReportedPotentialCompromise(
+                                deviceId: inboundTask.senderDeviceId,
+                                intentId: envelope.intentId)
                         }
-                        
-                        //Always update on private and personal message sends
-                        _ = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
-                        logger.log(level: .info, message: "Received Session Reestablishment, refreshed session identities")
+
+                        // Throttled refresh after the disposition. Without this, a 30-message
+                        // backlog from the same sender would each force-refresh identities.
+                        if await session.shouldForceIdentityRefresh(secretName: inboundTask.senderSecretName) {
+                            _ = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
+                            logger.log(level: .info, message: "Received Session Reestablishment, refreshed session identities")
+                        } else {
+                            logger.log(level: .debug, message: "[control-event] coalesced redundant identity refresh for sender=\(inboundTask.senderSecretName)")
+                        }
                     case .linkedDeviceReprovisioning(let bundle):
                         canSaveMessage = false
                         guard let context = await session.sessionContext else { return }

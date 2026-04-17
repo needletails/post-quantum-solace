@@ -950,6 +950,112 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
     
+    // MARK: - Job Stranding Race Condition Tests
+
+    /// Feeds multiple tasks from separate concurrent tasks and verifies
+    /// all jobs are drained from the cache afterwards.
+    ///
+    /// Without the defensive post-loop drain check in `startProcessingIfNeeded`,
+    /// a task fed while the processing loop is between its final deque-empty check
+    /// and `stop()` can be stranded in cache indefinitely (until another feedTask
+    /// or resumeJobQueue happens to pick it up).
+    @Test("Job Stranding - concurrent feedTask calls should not strand jobs in cache")
+    func concurrentFeedTaskDoesNotStrandJobs() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let mockDelegate = MockTaskDelegate()
+        await session.taskProcessor.setTaskDelegate(mockDelegate)
+
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+
+        let recipientIdentity = createTestRecipientIdentity()
+        let iterations = 20
+
+        for iteration in 0..<iterations {
+            let task1 = EncryptableTask(task: .writeMessage(.init(
+                message: createTestMessage("strand_A_\(iteration)"),
+                recipientIdentity: recipientIdentity,
+                localId: localId,
+                sharedId: "strand_A_\(iteration)")))
+            let task2 = EncryptableTask(task: .writeMessage(.init(
+                message: createTestMessage("strand_B_\(iteration)"),
+                recipientIdentity: recipientIdentity,
+                localId: localId,
+                sharedId: "strand_B_\(iteration)")))
+
+            let t1 = Task {
+                try? await session.taskProcessor.feedTask(task1, session: session)
+            }
+            await Task.yield()
+            let t2 = Task {
+                try? await session.taskProcessor.feedTask(task2, session: session)
+            }
+
+            await t1.value
+            await t2.value
+        }
+
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            let remaining = try await cache.fetchJobs()
+            if remaining.isEmpty { break }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+
+        let remaining = try await cache.fetchJobs()
+        #expect(remaining.isEmpty, "Expected all jobs to be drained from cache, but \(remaining.count) remain stranded")
+
+        let processedMessages = await mockDelegate.getProcessedMessages()
+        let expectedCount = iterations * 2
+        #expect(processedMessages.count == expectedCount, "Expected \(expectedCount) messages processed, got \(processedMessages.count)")
+
+        await session.shutdown()
+    }
+
+    /// Feeds a rapid burst of tasks and ensures none remain stranded in cache.
+    @Test("Job Stranding - rapid sequential feedTask should drain all jobs from cache")
+    func rapidSequentialFeedTaskDrainsAllFromCache() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let mockDelegate = MockTaskDelegate()
+        await session.taskProcessor.setTaskDelegate(mockDelegate)
+
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+
+        let recipientIdentity = createTestRecipientIdentity()
+        let count = 10
+
+        for i in 0..<count {
+            let task = EncryptableTask(task: .writeMessage(.init(
+                message: createTestMessage("rapid_\(i)"),
+                recipientIdentity: recipientIdentity,
+                localId: localId,
+                sharedId: "rapid_\(i)")))
+            try await session.taskProcessor.feedTask(task, session: session)
+        }
+
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            let remaining = try await cache.fetchJobs()
+            if remaining.isEmpty { break }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+
+        let remaining = try await cache.fetchJobs()
+        #expect(remaining.isEmpty, "Expected all jobs to be drained from cache, but \(remaining.count) remain")
+
+        let processedMessages = await mockDelegate.getProcessedMessages()
+        #expect(processedMessages.count == count, "Expected \(count) messages processed, got \(processedMessages.count)")
+
+        await session.shutdown()
+    }
+
     // MARK: - Helper Methods
     
     private func createTestRecipientIdentity() -> SessionIdentity {

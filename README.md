@@ -4,7 +4,7 @@
 
 [![Swift](https://img.shields.io/badge/Swift-6.1+-orange.svg)](https://swift.org)
 [![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20macOS%2015%2B%20%7C%20Linux%20%7C%20Android-blue.svg)](https://developer.apple.com)
-[![Version](https://img.shields.io/badge/Version-2.0.0-blue.svg)](https://github.com/needletails/post-quantum-solace)
+[![Version](https://img.shields.io/badge/Version-3.0.0-blue.svg)](https://github.com/needletails/post-quantum-solace)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-green.svg)](LICENSE)
 
 A secure, post-quantum cryptographic messaging SDK with end-to-end encryption, built for the quantum-resistant future.
@@ -37,7 +37,14 @@ Add the Post-Quantum Solace SDK to your project:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "2.0.0")
+    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "3.0.0")
+]
+```
+
+For version 2.x:
+```swift
+dependencies: [
+    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "2.0.0", upToNextMajor: "3.0.0")
 ]
 ```
 
@@ -54,33 +61,157 @@ dependencies: [
 import PostQuantumSolace
 ```
 
-## 🆕 What's New in 2.0.0
+## 🆕 What's New in 3.0.0
 
-Version 2.0.0 introduces significant improvements to the API surface, error handling, and developer experience:
+Version 3.0.0 hardens the trust model, formalizes the per-device identity
+invariant, and exposes the building blocks needed to ship a Signal-grade
+verification experience.
 
 ### ✨ New Features
 
-- **`SessionConfiguration`**: Simplified session setup with a single configuration struct
-  - Configure all delegates in one call
-  - Type-safe initialization
-  - Reduced boilerplate code
+- **Trust On First Use (TOFU) pinning**: The account-level signing key is pinned
+  on first observation and any drift on a subsequent server refresh is rejected
+  with `PQSSession.SessionErrors.signingKeyOutOfSync` instead of being silently
+  adopted.
+- **User-mediated identity recovery**: New
+  `PQSSession.acknowledgeAccountIdentityChange(_:)` lets a master device commit
+  to a server-advertised identity after explicit user confirmation. See
+  [`AccountIdentityRecovery`](Sources/PQSSession/Documentation.docc/AccountIdentityRecovery.md).
+- **Per-device signing key invariant**: Master rotations only update the
+  account-level key; child devices keep their own per-device signing key. New
+  errors `compromiseRotationRequiresMasterDevice` and `deviceIdentityCorrupted`
+  surface this contract to callers.
+- **`SecurityIdentity`** (in `SessionModels`): First-class type for safety
+  numbers and out-of-band fingerprint comparison.
+  See [`SecurityIdentity`](Sources/SessionModels/Documentation.docc/SecurityIdentity.md).
+- **Control event coalescing**: Sender-side episodes and receiver-side
+  deduplication prevent storms of compromise / refresh / repair notifications.
+  Tunables live on `PQSSessionConstants`. See
+  [`ControlEventCoalescing`](Sources/PQSSession/Documentation.docc/ControlEventCoalescing.md).
+- **Broadcast recipient (`MessageRecipient.broadcast`)**: First-class broadcast
+  fan-out for one-to-many announcements.
+- **`OneTimeKeyRefreshPolicy`**: Explicit policies (`.automatic`,
+  `.replenishBatch`, `.replaceCurrentDeviceBatch`) for the OTK refresh tasks.
+- **Linked-device compromise hook**: Optional
+  `PQSSessionDelegate.linkedDeviceReportedPotentialCompromise(deviceId:intentId:)`
+  ships with a no-op default so existing delegates keep compiling.
+- **Binary-codable wire / persistence**: `metadata`, transport blobs and
+  stored channel/contact metadata are now plain `Data` produced by
+  `BinaryCodable` instead of BSON `Document` values.
 
-- **Enhanced Error Handling**: All error types now conform to `LocalizedError`
-  - Detailed error descriptions
-  - Failure reasons with context
-  - Actionable recovery suggestions
-  - Better integration with Swift error handling
+### 🔄 Migration from 2.x to 3.0.0
 
-- **`PQSSessionConstants`**: Centralized configuration constants
-  - No more magic numbers
-  - `Sendable` for concurrency safety
-  - Easy to reference and customize
+#### 1. Handle the new TOFU error path
 
-- **`CryptoError`**: New error type for cryptographic operations
-  - Specific errors for encryption/decryption failures
-  - Consistent error handling across all crypto operations
+`startSession`, `refreshUserConfiguration`, and any code path that adopts a
+fresh `UserConfiguration` from the network can now throw
+`PQSSession.SessionErrors.signingKeyOutOfSync`. Treat it as a security event
+and route the user through your "verify identity" UX instead of retrying
+silently.
+
+```swift
+do {
+    try await session.startSession(appPassword: password)
+} catch PQSSession.SessionErrors.signingKeyOutOfSync {
+    // Show recovery UI. Only call acknowledgeAccountIdentityChange after the
+    // user explicitly confirms (e.g. passcode + visual fingerprint compare).
+    try await session.acknowledgeAccountIdentityChange(serverConfiguration)
+    try await session.startSession(appPassword: password)
+}
+```
+
+#### 2. Don't trigger compromise rotation from a child device
+
+`rotateKeysOnPotentialCompromise()` is now master-only and throws
+`compromiseRotationRequiresMasterDevice` if a linked device calls it. Forward
+the signal to the master via the new
+`PQSSessionDelegate.linkedDeviceReportedPotentialCompromise` callback (or your
+existing transport) and let the master rotate.
+
+```swift
+func linkedDeviceReportedPotentialCompromise(deviceId: UUID, intentId: UUID?) async {
+    guard await session.isMasterDevice else { return }
+    try? await session.rotateKeysOnPotentialCompromise()
+}
+```
+
+#### 3. Treat `deviceIdentityCorrupted` as "auto-unlink"
+
+If a child device's stored per-device signing key no longer matches the
+master-published bundle (for example after a partial restore), the SDK fails
+fast with `PQSSession.SessionErrors.deviceIdentityCorrupted`. The recovery
+path is to unlink and re-link from the master — there is no in-place repair.
+
+```swift
+do {
+    try await session.startSession(appPassword: password)
+} catch PQSSession.SessionErrors.deviceIdentityCorrupted {
+    try await session.deleteSession() // wipe local state
+    presentReLinkFlow()
+}
+```
+
+#### 4. Switch metadata blobs from `Document` to `Data`
+
+All `metadata` parameters (`writeTextMessage`, `BaseCommunication`,
+`MessageMetadata`, `requestFriendshipStateChange`, etc.) are now plain `Data`
+produced via `BinaryEncoder` / `BinaryDecoder`. BSON `Document` values are no
+longer accepted on the wire or in storage.
+
+**Before (2.x):**
+```swift
+try await session.writeTextMessage(
+    recipient: .nickname("bob"),
+    text: "Hello",
+    metadata: ["priority": "high"] as Document
+)
+```
+
+**After (3.0.0):**
+```swift
+struct AppMetadata: Codable, Sendable { let priority: String }
+
+try await session.writeTextMessage(
+    recipient: .nickname("bob"),
+    text: "Hello",
+    metadata: try BinaryEncoder().encode(AppMetadata(priority: "high"))
+)
+```
+
+#### 5. Adopt the new `OneTimeKeyRefreshPolicy`
+
+`refreshOneTimeKeysTask` and `refreshMLKEMOneTimeKeysTask` no longer take a
+boolean. Pick the policy that matches the call site:
+
+```swift
+// Background refresh — let the SDK decide based on remaining OTK count.
+try await session.refreshOneTimeKeysTask(policy: .automatic)
+
+// Top-up after explicit batch consumption.
+try await session.refreshOneTimeKeysTask(policy: .replenishBatch)
+
+// During device-key rotation — replace the current device's batch on server.
+try await session.refreshOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
+```
+
+#### 6. Render safety numbers from `SecurityIdentity`
+
+The new `SecurityIdentity` value type exposes the canonical safety-number and
+short-fingerprint helpers. Use it for any "Verify Safety Number" UX so the
+fingerprint logic stays consistent across platforms.
+
+```swift
+let local  = await session.localSecurityIdentity()!
+let remote = SecurityIdentity(secretName: contact.secretName,
+                              configuration: contact.configuration)
+
+let safetyNumber  = SecurityIdentity.safetyNumber(local: local, remote: remote)
+let shortFprintHex = remote.shortFingerprintHex(byteCount: 8)
+```
 
 ### 🔄 Migration from 1.x to 2.0.0
+
+> Already on 2.x? You can skip this section.
 
 #### Recommended: Use SessionConfiguration
 
@@ -143,22 +274,38 @@ if keyCount < PQSSessionConstants.oneTimeKeyLowWatermark {
 }
 ```
 
-### ⚠️ Breaking Changes
+### ⚠️ Breaking Changes Summary (2.x → 3.0.0)
 
-- **Error Types**: All error enums now conform to `LocalizedError`. While this is backward compatible, accessing `rawValue` directly is no longer recommended. Use `errorDescription` instead.
-
-- **CacheErrors**: The custom `description`, `reason`, and `suggestion` properties have been replaced with `LocalizedError` properties (`errorDescription`, `failureReason`, `recoverySuggestion`).
+- `PQSSession.SessionErrors` adds new cases (`signingKeyOutOfSync`,
+  `compromiseRotationRequiresMasterDevice`, `deviceIdentityCorrupted`,
+  `longTermKeyRotationFailed`). Exhaustive `switch` statements over
+  `SessionErrors` must add cases or a `default`.
+- `rotateKeysOnPotentialCompromise()` is now master-only and will throw on
+  linked devices.
+- `metadata` is `Data` everywhere it was previously `Document`. Re-encode any
+  on-disk blobs you persisted yourself.
+- `refreshOneTimeKeysTask(forceRefresh:)` is replaced by
+  `refreshOneTimeKeysTask(policy:)`. Same for the ML-KEM variant.
+- `MessageRecipient.broadcast` is added — `switch` statements over
+  `MessageRecipient` need to handle it (or use `default`).
+- Inbound `UserConfiguration` from the network now flows through
+  `adoptVerifiedUserConfiguration(_:)` which enforces the TOFU pin. Custom
+  transport implementations that bypass this path will have their refresh
+  rejected.
 
 ### 📝 Backward Compatibility
 
-- All existing APIs remain functional
-- Individual delegate setters still work (not deprecated)
-- Error types maintain their original cases
-- No changes to protocol definitions
+- `PQSSessionDelegate.linkedDeviceReportedPotentialCompromise(deviceId:intentId:)`
+  ships with a no-op default extension; existing delegates compile unchanged.
+- `SessionConfiguration`-style setup, `LocalizedError` conformance, and
+  `PQSSessionConstants` from 2.0 remain unchanged.
 
 ### 🔗 See Also
 
-- [Migration Guide](Sources/PQSSession/Documentation.docc/GettingStarted.md#migration-from-1x)
+- [Account Identity Recovery Guide](Sources/PQSSession/Documentation.docc/AccountIdentityRecovery.md)
+- [Control Event Coalescing](Sources/PQSSession/Documentation.docc/ControlEventCoalescing.md)
+- [SecurityIdentity Reference](Sources/SessionModels/Documentation.docc/SecurityIdentity.md)
+- [Migration Guide (1.x → 2.x)](Sources/PQSSession/Documentation.docc/GettingStarted.md#migration-from-1x)
 - [API Reference](Sources/PQSSession/Documentation.docc/)
 
 ## 🌐 Cross-Platform Support
@@ -264,28 +411,32 @@ try await session.startSession(appPassword: "securePassword")
 ### 4. Send Messages
 
 ```swift
+struct AppMetadata: Codable, Sendable { let timestamp: Date }
+
 // Send a text message
 try await session.writeTextMessage(
     recipient: .nickname("bob"),
     text: "Hello, world!",
-    metadata: ["timestamp": Date()],
+    metadata: try BinaryEncoder().encode(AppMetadata(timestamp: Date())),
     destructionTime: 3600 // Self-destruct after 1 hour
 )
 
 // Send a personal note
 try await session.writeTextMessage(
     recipient: .personalMessage,
-    text: "Note to self",
-    metadata: [:]
+    text: "Note to self"
 )
 
 // Send to a channel
 try await session.writeTextMessage(
     recipient: .channel("general"),
-    text: "Channel message",
-    metadata: [:]
+    text: "Channel message"
 )
 ```
+
+> `metadata` is an opaque `Data` blob the SDK encrypts and forwards
+> verbatim. Encode it with whatever serializer your app uses (`BinaryCodable`,
+> `JSONEncoder`, …); the SDK does not interpret it.
 
 ### Message Types Explained
 
@@ -299,11 +450,13 @@ Personal messages are notes you send to yourself, synchronized across all your d
 - **Device-to-device communication**: Send reminders or data between your own devices
 
 ```swift
+struct ReminderMetadata: Codable, Sendable { let category: String }
+
 // Send a personal note that syncs across all your devices
 try await session.writeTextMessage(
     recipient: .personalMessage,
     text: "Meeting at 3pm tomorrow",
-    metadata: ["category": "reminder"],
+    metadata: try BinaryEncoder().encode(ReminderMetadata(category: "reminder")),
     destructionTime: 86400 // Auto-delete after 24 hours
 )
 ```
@@ -319,11 +472,13 @@ Private messages are end-to-end encrypted direct messages between two users. The
 - **Identity verification**: Messages are cryptographically signed to verify authenticity
 
 ```swift
+struct PriorityMetadata: Codable, Sendable { let priority: String }
+
 // Send a private message to another user
 try await session.writeTextMessage(
     recipient: .nickname("alice"),
     text: "Can we schedule a meeting?",
-    metadata: ["priority": "high"],
+    metadata: try BinaryEncoder().encode(PriorityMetadata(priority: "high")),
     destructionTime: 3600 // Self-destruct after 1 hour
 )
 ```
@@ -345,12 +500,13 @@ Channels are group communication spaces where multiple users can participate. Th
 - **Channel metadata**: Store channel-specific information and settings
 
 ```swift
+struct DeploymentMetadata: Codable, Sendable { let deployment: String }
+
 // Send a message to a channel
 try await session.writeTextMessage(
     recipient: .channel("engineering"),
     text: "New feature deployed!",
-    metadata: ["deployment": "v2.0.0"],
-    destructionTime: nil // Permanent message
+    metadata: try BinaryEncoder().encode(DeploymentMetadata(deployment: "v3.0.0"))
 )
 ```
 
@@ -608,8 +764,9 @@ For detailed documentation, see:
 
 ### Version History
 
-- **2.0.0** (Current): Enhanced error handling with `LocalizedError`, `SessionConfiguration` for simplified setup, `PQSSessionConstants` for centralized configuration, `CryptoError` for cryptographic operations, and comprehensive documentation updates
-- **1.x**: Initial release with core post-quantum cryptographic messaging functionality
+- **3.0.0** (Current): TOFU account-identity pinning with user-mediated recovery (`acknowledgeAccountIdentityChange`), per-device signing key invariant with master-only compromise rotation, `SecurityIdentity` and safety-number support, control-event coalescing, broadcast recipient fan-out, `OneTimeKeyRefreshPolicy`, and `Data`/BinaryCodable metadata blobs.
+- **2.0.0**: Enhanced error handling with `LocalizedError`, `SessionConfiguration` for simplified setup, `PQSSessionConstants` for centralized configuration, `CryptoError` for cryptographic operations, and comprehensive documentation updates.
+- **1.x**: Initial release with core post-quantum cryptographic messaging functionality.
 
 ## 🤝 Contributing
 

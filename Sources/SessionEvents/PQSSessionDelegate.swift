@@ -291,11 +291,17 @@ public protocol PQSSessionDelegate: Sendable {
     /// `rotateKeysOnPotentialCompromise()`. Child devices may use it for
     /// informational logging or UI alerts.
     ///
-    /// - Parameter deviceId: The device ID of the linked device that detected the anomaly.
-    func linkedDeviceReportedPotentialCompromise(deviceId: UUID) async
+    /// - Parameters:
+    ///   - deviceId: The device ID of the linked device that detected the anomaly.
+    ///   - intentId: A stable identifier shared across all delivery attempts of the same
+    ///     compromise episode. The SDK coalesces redundant inbound notifications, but this
+    ///     value lets app code further dedupe user-facing prompts across crashes/restarts
+    ///     by remembering the last `intentId` it surfaced. `nil` for legacy senders that
+    ///     pre-date the envelope wire format.
+    func linkedDeviceReportedPotentialCompromise(deviceId: UUID, intentId: UUID?) async
 }
 
 public extension PQSSessionDelegate {
     func shouldSendAutomaticDeliveryReceipts() async -> Bool { true }
-    func linkedDeviceReportedPotentialCompromise(deviceId: UUID) async {}
+    func linkedDeviceReportedPotentialCompromise(deviceId: UUID, intentId: UUID?) async {}
 }

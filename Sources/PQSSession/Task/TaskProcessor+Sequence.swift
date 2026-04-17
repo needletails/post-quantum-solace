@@ -104,6 +104,12 @@ extension TaskProcessor {
                 throw error
             }
         }.value
+
+        if let cache = await session.cache,
+           let hasJobs = try? await !cache.fetchJobs().isEmpty,
+           hasJobs {
+            try await startProcessingIfNeeded(session)
+        }
     }
     // MARK: - Core loop
     
@@ -247,13 +253,23 @@ extension TaskProcessor {
                 if currentDevice.isMasterDevice {
                     try await session.rotateKeysOnPotentialCompromise()
                 } else {
-                    let metadata = try BinaryEncoder().encode(
-                        TransportEvent.sessionReestablishment(.linkedDeviceCompromiseObserved)
-                    )
-                    try await session.writeTextMessage(
+                    _ = try await session.emitSessionReestablishment(
+                        kind: .linkedDeviceCompromiseObserved,
                         recipient: .personalMessage,
-                        transportInfo: metadata)
-                    try await session.rotateCurrentDeviceKeys()
+                        scope: .personal
+                    )
+                    do {
+                        try await session.rotateCurrentDeviceKeys()
+                    } catch let sessionError as PQSSession.SessionErrors where sessionError == .signingKeyOutOfSync {
+                        logger.log(level: .warning, message: "signingKeyOutOfSync on child device during key rotation recovery; requesting reprovisioning from master")
+                        _ = try await session.emitSessionReestablishment(
+                            kind: .linkedDeviceCompromiseObserved,
+                            recipient: .personalMessage,
+                            scope: .personal
+                        )
+                        try await cache.deleteJob(job)
+                        return .deleted
+                    }
                 }
                 try await session.requestMessageResend(
                     sharedMessageId: message.sharedMessageId,
@@ -275,12 +291,11 @@ extension TaskProcessor {
                 if !curveReplaced || !mlKEMReplaced {
                     logger.log(level: .error, message: "OTK batch replacement failed; cannot recover from missingOneTimeKey")
                 }
-                let metadata = try BinaryEncoder().encode(
-                    TransportEvent.sessionReestablishment(.peerRefresh)
-                )
-                try await session.writeTextMessage(
+                _ = try await session.emitSessionReestablishment(
+                    kind: .peerRefresh,
                     recipient: .nickname(message.senderSecretName),
-                    transportInfo: metadata)
+                    scope: .peer(secretName: message.senderSecretName)
+                )
                 try await cache.deleteJob(job)
                 return .deleted
             case .writeMessage(let message):
@@ -291,20 +306,55 @@ extension TaskProcessor {
             switch props.task.task {
             case .streamMessage(let message):
                 logger.log(level: .error, message: "Decryption failure (\(cryptoError)) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId) — notifying peer to refresh")
-                let metadata = try BinaryEncoder().encode(
-                    TransportEvent.sessionReestablishment(.peerRefresh)
-                )
                 let mySecretName = await session.sessionContext?.sessionUser.secretName
-                let recipient: MessageRecipient = (message.senderSecretName == mySecretName)
-                    ? .personalMessage
-                    : .nickname(message.senderSecretName)
-                try await session.writeTextMessage(
+                let isSelf = message.senderSecretName == mySecretName
+                let recipient: MessageRecipient = isSelf ? .personalMessage : .nickname(message.senderSecretName)
+                let scope: ControlEventScope = isSelf ? .personal : .peer(secretName: message.senderSecretName)
+                _ = try await session.emitSessionReestablishment(
+                    kind: .peerRefresh,
                     recipient: recipient,
-                    transportInfo: metadata)
+                    scope: scope
+                )
                 try await cache.deleteJob(job)
                 return .deleted
             case .writeMessage(let message):
                 logger.log(level: .error, message: "CryptoKitError for writeMessage to recipient: \(message.message.recipient) — \(cryptoError)")
+                try await cache.deleteJob(job)
+            }
+        } catch let sessionError as PQSSession.SessionErrors where sessionError == .signingKeyOutOfSync {
+            logger.log(level: .error, message: "signingKeyOutOfSync during job processing; child device likely needs reprovisioning from master")
+            switch props.task.task {
+            case .streamMessage:
+                do {
+                    _ = try await session.emitSessionReestablishment(
+                        kind: .linkedDeviceCompromiseObserved,
+                        recipient: .personalMessage,
+                        scope: .personal
+                    )
+                } catch {
+                    logger.log(level: .warning, message: "Failed to send reprovisioning request to master: \(error)")
+                }
+            case .writeMessage:
+                break
+            }
+            try await cache.deleteJob(job)
+        } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+            switch props.task.task {
+            case .streamMessage(let message):
+                logger.log(level: .error, message: "invalidSignature for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId) — notifying peer to refresh keys")
+                let mySecretName = await session.sessionContext?.sessionUser.secretName
+                let isSelf = message.senderSecretName == mySecretName
+                let recipient: MessageRecipient = isSelf ? .personalMessage : .nickname(message.senderSecretName)
+                let scope: ControlEventScope = isSelf ? .personal : .peer(secretName: message.senderSecretName)
+                _ = try await session.emitSessionReestablishment(
+                    kind: .peerRefresh,
+                    recipient: recipient,
+                    scope: scope
+                )
+                try await cache.deleteJob(job)
+                return .deleted
+            case .writeMessage(let message):
+                logger.log(level: .error, message: "invalidSignature for writeMessage to recipient: \(message.message.recipient)")
                 try await cache.deleteJob(job)
             }
         } catch {

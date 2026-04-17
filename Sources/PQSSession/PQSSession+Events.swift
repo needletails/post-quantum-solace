@@ -52,10 +52,13 @@ public extension PQSSession {
     /// try await session.writeTextMessage(
     ///     recipient: .nickname("alice"),
     ///     text: "Hello, how are you?",
-    ///     metadata: ["timestamp": Date(), "priority": "high"],
+    ///     metadata: try BinaryEncoder().encode(MyAppMetadata(priority: .high)),
     ///     destructionTime: 3600 // Message self-destructs in 1 hour
     /// )
     /// ```
+    ///
+    /// `metadata` is an opaque `Data` blob owned by the application; the SDK
+    /// encrypts and forwards it untouched alongside the message envelope.
     ///
     /// - Parameters:
     ///   - recipient: The intended recipient of the message. Can be a nickname, group, or other recipient type.
@@ -156,12 +159,13 @@ public extension PQSSession {
             return
         }
         do {
-            // We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less than the low watermark.
-            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-                async let _ = await refreshOneTimeKeysTask()
-            }
-            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-                async let _ = await refreshMLKEMOneTimeKeysTask()
+            if !otkUploadCircuitOpen {
+                if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                    async let _ = await refreshOneTimeKeysTask()
+                }
+                if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                    async let _ = await refreshMLKEMOneTimeKeysTask()
+                }
             }
             
             let message = InboundTaskMessage(

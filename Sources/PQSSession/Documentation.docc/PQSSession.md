@@ -1,123 +1,189 @@
 # ``PQSSession``
 
-The main session manager for the Post-Quantum Solace SDK, orchestrating all cryptographic operations and managing the session lifecycle.
+The singleton actor at the heart of the Post-Quantum Solace SDK. It owns
+session state, drives every encrypt/decrypt path, schedules key rotation,
+enforces TOFU on the account-level signing key, and coordinates the four
+delegate surfaces.
 
 ## Overview
 
-`PQSSession` is a singleton actor that serves as the central entry point for the SDK. It manages cryptographic sessions, key management, secure communication channels, and coordinates all SDK components.
+`PQSSession` is an `actor`; every public method is async and serializes on
+the actor's executor. Always use ``shared``. Configuration happens once via
+``configure(with:)``; afterward you create a brand-new local session with
+``createSession(secretName:appPassword:createInitialTransport:)`` or restore
+an existing one with ``startSession(appPassword:)``.
 
 ## Topics
 
-### Essentials
+### Singleton
 
-- ``PQSSession/shared``
-- ``PQSSession/configure(with:)``
-- ``PQSSession/isViable``
-
-### Session Lifecycle
-
-- ``PQSSession/createSession(secretName:appPassword:createInitialTransport:)``
-- ``PQSSession/startSession(appPassword:)``
-- ``PQSSession/shutdown()``
+- ``shared``
+- ``init(_:)``
+- ``isViable``
 
 ### Configuration
 
-- ``SessionConfiguration``
-- ``PQSSession/configure(with:)``
-- ``PQSSession/setTransportDelegate(conformer:)``
-- ``PQSSession/setDatabaseDelegate(conformer:)``
-- ``PQSSession/setReceiverDelegate(conformer:)``
+- ``configure(with:)``
+- ``setTransportDelegate(conformer:)``
+- ``setDatabaseDelegate(conformer:)``
+- ``setReceiverDelegate(conformer:)``
+- ``setPQSSessionDelegate(conformer:)``
+- ``setSessionEventDelegate(conformer:)``
+- ``linkDelegate``
 
-### Constants
+### Session lifecycle
+
+- ``createSession(secretName:appPassword:createInitialTransport:)``
+- ``startSession(appPassword:)``
+- ``linkDevice(bundle:password:)``
+- ``shutdown()``
+- ``resumeJobQueue()``
+
+### Session context & cache
+
+- ``sessionContext``
+- ``setSessionContext(_:)``
+- ``cache``
+- ``appPassword``
+
+### Account identity & TOFU trust
+
+- <doc:AccountIdentityRecovery>
+- ``localSecurityIdentity()``
+- ``adoptVerifiedUserConfiguration(_:)``
+- ``acknowledgeAccountIdentityChange(_:)``
+- ``updateUserConfiguration(_:)``
+- ``createNewUser(configuration:signingPrivateKeyData:devices:keys:mlKEMKeys:)``
+- ``createDeviceCryptographicBundle(isMaster:)``
+- ``CryptographicBundle``
+- ``KeyPair``
+
+### Messaging
+
+- ``writeTextMessage(recipient:text:transportInfo:metadata:destructionTime:sharedIdOverride:)``
+- ``receiveMessage(message:sender:deviceId:messageId:)``
+- ``editCurrentMessage(_:newText:)``
+- ``updateMessageDeliveryState(_:deliveryState:messageRecipient:allowExternalUpdate:)``
+
+### Channels & contacts
+
+- ``findCommunication(for:)``
+- ``addContacts(_:)``
+- ``createContact(secretName:metadata:friendshipMetadata:requestFriendship:)``
+- ``sendCommunicationSynchronization(contact:)``
+- ``sendContactCreatedAcknowledgment(recipient:)``
+- ``requestFriendshipStateChange(state:contact:)``
+- ``requestMetadata(from:)``
+- ``requestMyMetadata()``
+- ``setAddingContact(_:)``
+
+### Key rotation
+
+- ``rotateCurrentDeviceKeys()``
+- ``rotateKeysOnPotentialCompromise()``
+- ``refreshOneTimeKeysTask(policy:)``
+- ``refreshMLKEMOneTimeKeysTask(policy:)``
+- ``OneTimeKeyRefreshPolicy``
+- ``updateUseroneTimePublicKeys(_:)``
+
+### Identities (per-device)
+
+- ``removeIdentity(with:)``
+
+### Device naming
+
+- ``getDeviceName()``
+
+### Application password & app-data crypto
+
+- ``getAppSymmetricKey()``
+- ``getDatabaseSymmetricKey()``
+- ``verifyAppPassword(_:)``
+- ``changeAppPassword(_:)``
+
+### Logging
+
+- ``setLogLevel(_:)``
+
+### Errors
+
+- ``SessionErrors``
+
+### Configuration constants
 
 - ``PQSSessionConstants``
 
-### Error Handling
+## Trust model (TOFU)
 
-- ``PQSSession/SessionErrors``
+The local account's `signingPublicKey` is **pinned** the first time a
+`SessionContext` is set. Routine refresh paths
+(``adoptVerifiedUserConfiguration(_:)``) reject any server-supplied
+configuration whose account signing key disagrees with the pin, throwing
+``SessionErrors/signingKeyOutOfSync``.
 
-## Key Features
+Two paths legitimately update the pin:
 
-- **Post-Quantum Security**: MLKEM1024 for long-term security
-- **Forward Secrecy**: Double Ratchet protocol implementation
-- **Device Management**: Master/child device support
-- **Automatic Key Rotation**: Compromise recovery and key freshness
-- **Thread Safety**: Actor-based concurrency model
-- **Singleton Pattern**: Single shared instance for consistent state
+1. **Authenticated rotation initiated locally**, e.g. master invoking
+   ``rotateKeysOnPotentialCompromise()``. The pin is updated *before* the
+   new configuration is published, so subsequent refreshes see a matching
+   key.
+2. **User-acknowledged identity change** via
+   ``acknowledgeAccountIdentityChange(_:)``. This is the only externally
+   callable bypass for TOFU and must be gated behind explicit user consent.
 
-## Usage
+Use ``localSecurityIdentity()`` together with
+``SecurityIdentity/safetyNumber(local:remote:version:iterations:)`` to render
+a Signal-style 60-digit safety number for out-of-band verification.
 
-### Basic Setup
+## Master vs. linked devices
+
+- The master device holds the account-level signing **private** key. It is
+  the only device that can call ``rotateKeysOnPotentialCompromise()`` and
+  ``updateUserConfiguration(_:)``.
+- Linked (child) devices each own a **per-device** signing key for the
+  lifetime of their `DeviceID`. They consume server-published bundles via
+  ``adoptVerifiedUserConfiguration(_:)``.
+- A startup invariant verifies the per-device signing key matches what the
+  server records; on mismatch the SDK throws
+  ``SessionErrors/deviceIdentityCorrupted`` and the device should be
+  re-linked.
+
+## Quick start
 
 ```swift
 let session = PQSSession.shared
 
-// Configure with SessionConfiguration (recommended)
-let config = SessionConfiguration(
+try await session.configure(with: SessionConfiguration(
     transport: myTransport,
     store: myStore,
     receiver: myReceiver
-)
-try await session.configure(with: config)
+))
 
-// Create and start session
 try await session.createSession(
     secretName: "alice",
-    appPassword: "securePassword",
-    createInitialTransport: setupTransport
+    appPassword: "correct horse battery staple",
+    createInitialTransport: bootstrapTransport
 )
-try await session.startSession(appPassword: "securePassword")
-```
+try await session.startSession(appPassword: "correct horse battery staple")
 
-### Sending Messages
-
-```swift
 try await session.writeTextMessage(
     recipient: .nickname("bob"),
     text: "Hello, world!",
-    metadata: ["timestamp": Date()],
+    metadata: Data(),
     destructionTime: 3600
 )
 ```
 
-### Error Handling
+## Thread safety
 
-All errors conform to `LocalizedError`:
+`PQSSession` is an `actor`, so all public methods are serialized on the
+actor's executor. Long-running cryptographic work is offloaded to dedicated
+executors managed by ``TaskProcessor`` so that encrypt/decrypt does not
+contend with regular API calls.
 
-```swift
-do {
-    try await session.writeTextMessage(...)
-} catch let error as PQSSession.SessionErrors {
-    if let localizedError = error as? LocalizedError {
-        print("Error: \(localizedError.errorDescription ?? "")")
-        if let suggestion = localizedError.recoverySuggestion {
-            print("Suggestion: \(suggestion)")
-        }
-    }
-}
-```
-
-## Configuration Constants
-
-Use `PQSSessionConstants` for configuration values:
-
-```swift
-// Key refresh threshold
-PQSSessionConstants.oneTimeKeyLowWatermark  // Default: 10
-
-// Batch size for key generation
-PQSSessionConstants.oneTimeKeyBatchSize     // Default: 100
-
-// Key rotation interval
-PQSSessionConstants.keyRotationIntervalDays // Default: 7
-```
-
-## Thread Safety
-
-`PQSSession` is an actor, ensuring thread-safe concurrent access to all session operations.
-
-## See Also
+## See also
 
 - ``SessionConfiguration``
 - ``PQSSessionConstants``
-- ``PQSSession/SessionErrors``
+- ``SecurityIdentity``
+- ``SessionErrors``

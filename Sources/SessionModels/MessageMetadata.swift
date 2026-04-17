@@ -106,6 +106,13 @@ public struct MessageMetadata: Sendable, Codable {
         self.userMarkedHidden = userMarkedHidden
     }
 
+    /// Decodes a `MessageMetadata`, supplying defaults for fields that
+    /// are missing from older on-disk records.
+    ///
+    /// `userMarkedRead`, `userMarkedArchived`, and `userMarkedHidden`
+    /// were added in later schema revisions; legacy rows that predate
+    /// those fields decode them as `false`. `userMarkedPinned` likewise
+    /// defaults to `false` when absent.
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         userMarkedPinned = try c.decodeIfPresent(Bool.self, forKey: .userMarkedPinned) ?? false
@@ -114,6 +121,9 @@ public struct MessageMetadata: Sendable, Codable {
         userMarkedHidden = try c.decodeIfPresent(Bool.self, forKey: .userMarkedHidden) ?? false
     }
 
+    /// Encodes every flag explicitly so on-disk rows always carry the
+    /// full schema and downstream readers can rely on each key being
+    /// present.
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(userMarkedPinned, forKey: .userMarkedPinned)
@@ -148,6 +158,10 @@ public struct MessageMetadata: Sendable, Codable {
         )
     }
 
+    /// Creates a copy of the current metadata with updated archived state.
+    ///
+    /// - Parameter isArchived: The new archived state for the message.
+    /// - Returns: A new `MessageMetadata` instance with the updated archived state.
     public func updatingArchivedState(_ isArchived: Bool) -> MessageMetadata {
         MessageMetadata(
             userMarkedPinned: userMarkedPinned,
@@ -157,6 +171,10 @@ public struct MessageMetadata: Sendable, Codable {
         )
     }
 
+    /// Creates a copy of the current metadata with updated hidden state.
+    ///
+    /// - Parameter isHidden: The new hidden state for the message.
+    /// - Returns: A new `MessageMetadata` instance with the updated hidden state.
     public func updatingHiddenState(_ isHidden: Bool) -> MessageMetadata {
         MessageMetadata(
             userMarkedPinned: userMarkedPinned,

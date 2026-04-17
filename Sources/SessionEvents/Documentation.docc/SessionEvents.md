@@ -1,40 +1,88 @@
 # ``SessionEvents``
 
-A protocol that defines methods for handling session events, with default implementations via extensions.
+The protocol that drives the session's contact, friendship, and
+message-state side effects.
 
 ## Overview
 
-`SessionEvents` provides a comprehensive interface for managing session-related operations including contact management, friendship state changes, message delivery tracking, and communication synchronization.
+`SessionEvents` is an *override surface*: the SDK ships a complete
+default implementation in a protocol extension. Conform to it only when
+you need to alter how contacts are added, how friendship state changes,
+how message delivery state propagates, or how communication
+synchronization is sent.
+
+By default, `PQSSession` itself conforms to `SessionEvents` and uses the
+extension methods. You can install your own conformer at runtime via
+``PQSSession/setSessionEventDelegate(conformer:)`` to intercept any of
+these flows.
+
+The protocol is `Sendable`. Every method is `async`.
 
 ## Topics
 
-### Contact Management
+### Contact lifecycle
 
 - ``SessionEvents/addContacts(_:sessionContext:cache:transport:receiver:sessionDelegate:symmetricKey:logger:)``
+- ``SessionEvents/createContact(secretName:metadata:friendshipMetadata:requestFriendship:sessionContext:cache:transport:receiver:symmetricKey:logger:)``
+- ``SessionEvents/sendCommunicationSynchronization(recipient:metadata:sessionContext:sessionDelegate:cache:receiver:symmetricKey:logger:)``
+- ``SessionEvents/sendContactCreatedAcknowledgment(recipient:sessionDelegate:logger:)``
 
-### Message Handling
+### Friendship state
 
-- ``SessionEvents/processWrite(message:session:)``
-- ``SessionEvents/receiveMessage(message:sender:deviceId:messageId:session:)``
+- ``SessionEvents/requestFriendshipStateChange(state:contact:cache:receiver:sessionDelegate:symmetricKey:logger:)``
 
-## Key Features
+### Message lifecycle
 
-- **Default Implementations**: Protocol extensions provide default behavior
-- **Customizable**: Override methods to customize behavior
-- **Comprehensive**: Covers all major session operations
+- ``SessionEvents/updateMessageDeliveryState(_:deliveryState:messageRecipient:allowExternalUpdate:sessionDelegate:cache:receiver:symmetricKey:)``
+- ``SessionEvents/editCurrentMessage(_:newText:sessionDelegate:cache:receiver:symmetricKey:logger:)``
 
-## Usage
+### Metadata
+
+- ``SessionEvents/requestMetadata(from:sessionDelegate:logger:)``
+- ``SessionEvents/requestMyMetadata(sessionDelegate:logger:)``
+
+### Lookup
+
+- ``SessionEvents/findCommunication(for:cache:symmetricKey:)``
+
+## Customising the default implementation
 
 ```swift
-class CustomSessionEvents: SessionEvents {
-    // Override default implementations as needed
-    func addContacts(...) async throws {
-        // Custom contact handling
+struct LoggingSessionEvents: SessionEvents {
+    func addContacts(_ contactInfos: [SharedContactInfo],
+                     sessionContext: SessionContext,
+                     cache: PQSSessionStore,
+                     transport: SessionTransport,
+                     receiver: EventReceiver,
+                     sessionDelegate: PQSSessionDelegate,
+                     symmetricKey: SymmetricKey,
+                     logger: NeedleTailLogger) async throws {
+        analytics.recordContactImport(count: contactInfos.count)
+
+        // Forward to the protocol-extension default implementation.
+        try await (self as SessionEvents).addContacts(
+            contactInfos,
+            sessionContext: sessionContext,
+            cache: cache,
+            transport: transport,
+            receiver: receiver,
+            sessionDelegate: sessionDelegate,
+            symmetricKey: symmetricKey,
+            logger: logger
+        )
     }
 }
+
+try await PQSSession.shared.setSessionEventDelegate(conformer: LoggingSessionEvents())
 ```
 
-## See Also
+You normally do **not** need to implement `SessionEvents` yourself —
+`PQSSession` already does. Use ``PQSSessionDelegate`` for transport-side
+hooks and ``EventReceiver`` for UI-side notifications.
+
+## See also
 
 - ``PQSSession``
+- ``PQSSessionDelegate``
 - ``EventReceiver``
+- ``SessionTransport``
