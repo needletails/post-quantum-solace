@@ -269,7 +269,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Cooldown for peer resend/refresh requests triggered by inbound failures.
     let peerResendRequestCooldown: TimeInterval = 15
 
-    // MARK: - Sesame-style inactive session support (backward compatible)
+    // MARK: - Inactive session support (backward compatible)
 
     /// Determines how ratchet invalidation is handled.
     ///
@@ -1114,7 +1114,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         createInitialTransport: @Sendable @escaping () async throws -> Void
     ) async throws -> PQSSession {
         await setAppPassword(appPassword)
-        let secretName = secretName.lowercased()
+        // Match the canonical normalization used by the transport layer and
+        // by `createContact` so the local user's identity stays consistent
+        // with how it'll be referenced by every other code path.
+        let secretName = secretName.pqsCanonicalSecretName
         // Ensure identity store is initialized
         guard let cache else {
             throw SessionErrors.databaseNotInitialized

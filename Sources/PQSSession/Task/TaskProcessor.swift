@@ -451,8 +451,7 @@ public actor TaskProcessor {
                     recipients: Set([sender, peer]),
                     sharedIdOverride: sharedIdOverride,
                     shouldPersist: shouldPersist,
-                    logger: logger
-                )
+                    logger: logger)
             }
             return
         }
@@ -811,6 +810,8 @@ public actor TaskProcessor {
                         ))
                     )
                 }
+                let props = try await identity.props(symmetricKey: session.getDatabaseSymmetricKey())
+                logger.log(level: .info, message: "FEEDING MESSAGE FOR IDENTITY: \(props?.secretName) DID \(props?.deviceId)")
                 try await feedTask(task, session: session)
             } catch {
                 logger.log(level: .error, message: "Error handling recipient identity: \(error)")

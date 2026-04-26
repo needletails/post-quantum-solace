@@ -245,7 +245,15 @@ public struct FriendshipMetadata: Sendable, Codable {
             // Canonical block encodings from `setBlockState`; treat as one relationship state.
             ourState = .blocked
         } else if myState == .blocked {
-            // If my state is blocked, I cannot change our state.
+            // I have blocked the other party. Even if `theirState` is in some other
+            // state because their last update predates the block, the relationship
+            // is still effectively blocked from my perspective.
+            ourState = .blocked
+        } else if theirState == .blocked {
+            // The canonical pair `(blocked, blockedByOther)` is handled above; this
+            // covers the symmetric case where the inbound message arrived before we
+            // recorded our own `blockedByOther` state.
+            ourState = .blocked
         } else if myState == .accepted && theirState == .accepted {
             ourState = .accepted
         } else if myState == .requested && theirState == .pending {

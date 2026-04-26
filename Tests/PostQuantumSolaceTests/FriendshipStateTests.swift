@@ -172,4 +172,127 @@ struct FriendshipMetadataTests {
         friendship.updateOurState()
         #expect(friendship.ourState == .requested)
     }
+
+    // MARK: - Block-state regression tests
+
+    /// Regression test for an `updateOurState()` branch that previously left
+    /// `ourState` untouched whenever `myState == .blocked`. This caused the
+    /// combined state to lag behind the actual relationship and produced
+    /// inconsistent UI any time the inbound pair wasn't the canonical
+    /// `(blocked, blockedByOther)` shape.
+    @Test
+    func updateOurStateMyBlockedNonCanonical() {
+        var friendship = FriendshipMetadata(myState: .blocked, theirState: .pending)
+        friendship.updateOurState()
+        #expect(friendship.ourState == .blocked)
+
+        friendship = FriendshipMetadata(myState: .blocked, theirState: .accepted)
+        friendship.updateOurState()
+        #expect(friendship.ourState == .blocked)
+    }
+
+    /// Symmetric regression test: when an inbound block lands before the local
+    /// device records `blockedByOther`, `theirState == .blocked` alone should
+    /// still resolve to a combined `.blocked` state.
+    @Test
+    func updateOurStateTheirBlockedNonCanonical() {
+        var friendship = FriendshipMetadata(myState: .pending, theirState: .blocked)
+        friendship.updateOurState()
+        #expect(friendship.ourState == .blocked)
+    }
+
+    // MARK: - Inbound swap-and-recompute regression tests
+
+    /// Mirrors the inbound friendship-state pipeline used by
+    /// `NeedleTailPQSSessionDelegate.processMessage` after the fix:
+    /// `swapUserPerspectives()` followed by `updateOurState()`. Previously the
+    /// receiver instead called `setRequestedState()` after the swap, which
+    /// clobbered the swapped `myState` to `.requested` and made the receiver's
+    /// UI render "Resend Request" instead of "Be Friends / Reject", so the
+    /// friendship could never be agreed upon.
+    @Test
+    func inboundRequestProducesCorrectReceiverState() {
+        var inbound = FriendshipMetadata(myState: .requested, theirState: .pending)
+        inbound.swapUserPerspectives()
+        inbound.updateOurState()
+
+        #expect(inbound.myState == .pending)
+        #expect(inbound.theirState == .requested)
+        #expect(inbound.ourState == .pending)
+    }
+
+    /// After accepting, the canonical `{accepted, accepted, accepted}` packet
+    /// must round-trip cleanly through swap+updateOurState on the requester's
+    /// device too.
+    @Test
+    func inboundAcceptanceProducesAcceptedState() {
+        var inbound = FriendshipMetadata(myState: .accepted, theirState: .accepted, ourState: .accepted)
+        inbound.swapUserPerspectives()
+        inbound.updateOurState()
+
+        #expect(inbound.myState == .accepted)
+        #expect(inbound.theirState == .accepted)
+        #expect(inbound.ourState == .accepted)
+    }
+
+    /// When the rejecter sends `{rejectedByOther, rejected, mutuallyRejected}`,
+    /// the receiver should land at `myState=.rejected` (they were the one
+    /// rejected) and a combined `.mutuallyRejected` state. Validates that the
+    /// post-fix swap+recompute path matches the pre-fix per-state branch for
+    /// rejection.
+    @Test
+    func inboundRejectionProducesMutuallyRejectedState() {
+        var inbound = FriendshipMetadata(myState: .rejectedByOther, theirState: .rejected, ourState: .mutuallyRejected)
+        inbound.swapUserPerspectives()
+        inbound.updateOurState()
+
+        #expect(inbound.myState == .rejected)
+        #expect(inbound.theirState == .rejectedByOther)
+        #expect(inbound.ourState == .mutuallyRejected)
+    }
+
+    /// A blocker sends `{blocked, blockedByOther, blocked}`; the recipient must
+    /// see `myState=.blockedByOther` (they were blocked) and a combined
+    /// `.blocked` state.
+    @Test
+    func inboundBlockProducesBlockedByOtherState() {
+        var inbound = FriendshipMetadata(myState: .blocked, theirState: .blockedByOther, ourState: .blocked)
+        inbound.swapUserPerspectives()
+        inbound.updateOurState()
+
+        #expect(inbound.myState == .blockedByOther)
+        #expect(inbound.theirState == .blocked)
+        #expect(inbound.ourState == .blocked)
+    }
+
+    /// After unblocking, the canonical reset-to-pending packet must produce a
+    /// pristine `{pending, pending, pending}` state on the receiver, allowing
+    /// a fresh friendship request to be initiated by either party.
+    @Test
+    func inboundUnblockResetsToPending() {
+        var inbound = FriendshipMetadata(myState: .pending, theirState: .pending, ourState: .pending)
+        inbound.swapUserPerspectives()
+        inbound.updateOurState()
+
+        #expect(inbound.myState == .pending)
+        #expect(inbound.theirState == .pending)
+        #expect(inbound.ourState == .pending)
+    }
+
+    // MARK: - FriendshipRequestError surface
+
+    /// Localized descriptions exist for every typed error so the UI can present
+    /// them directly without falling back to the bare error type name.
+    @Test
+    func friendshipRequestErrorsHaveLocalizedDescriptions() {
+        let errors: [FriendshipRequestError] = [
+            .alreadyAccepted,
+            .previouslyRejectedByContact,
+        ]
+
+        for error in errors {
+            #expect(error.errorDescription?.isEmpty == false)
+            #expect(error.recoverySuggestion?.isEmpty == false)
+        }
+    }
 }
