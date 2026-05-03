@@ -58,6 +58,38 @@ actor TaskProcessorSequenceTests {
     }
     
     // MARK: - Basic FIFO Tests
+
+    @Test("Reconciliation cooldowns are directional")
+    func testReconciliationCooldownIsDirectional() async {
+        let peerDeviceId = UUID()
+        let now = Date()
+
+        #expect(await session.canAttemptReconciliation(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            flow: .inbound,
+            now: now))
+
+        await session.markReconciliationAttempt(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            flow: .inbound,
+            now: now)
+
+        #expect(!(await session.canAttemptReconciliation(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            flow: .inbound,
+            now: now.addingTimeInterval(1))))
+
+        #expect(await session.canAttemptReconciliation(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            flow: .outbound,
+            now: now.addingTimeInterval(1)))
+
+        await session.shutdown()
+    }
     
     @Test("Basic FIFO - Single Message")
     func testBasicFIFOSingleMessage() async throws {
@@ -1357,4 +1389,3 @@ actor ErrorTracker {
         errorCount
     }
 }
-

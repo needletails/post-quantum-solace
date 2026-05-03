@@ -154,16 +154,22 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
     /// Used for diagnostics; receiver dedup decisions never depend on this value.
     public let emittedAt: Date
 
+    /// True when this envelope acknowledges that the sender has processed an inbound
+    /// reestablishment request and refreshed its local view.
+    public let isResponse: Bool
+
     public init(
         kind: SessionReestablishmentKind,
         intentId: UUID? = nil,
         epoch: UInt64 = 0,
-        emittedAt: Date = Date()
+        emittedAt: Date = Date(),
+        isResponse: Bool = false
     ) {
         self.kind = kind
         self.intentId = intentId
         self.epoch = epoch
         self.emittedAt = emittedAt
+        self.isResponse = isResponse
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -175,6 +181,7 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
         case intentId = "i"
         case epoch = "e"
         case emittedAt = "t"
+        case isResponse = "r"
     }
 
     public init(from decoder: Decoder) throws {
@@ -185,6 +192,7 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
             self.intentId = try? container.decodeIfPresent(UUID.self, forKey: .intentId)
             self.epoch = (try? container.decode(UInt64.self, forKey: .epoch)) ?? 0
             self.emittedAt = (try? container.decode(Date.self, forKey: .emittedAt)) ?? Date()
+            self.isResponse = (try? container.decode(Bool.self, forKey: .isResponse)) ?? false
             return
         }
         // Legacy fallback for serializers that handed us a bare `SessionReestablishmentKind`.
@@ -195,6 +203,7 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
             self.intentId = nil
             self.epoch = 0
             self.emittedAt = Date()
+            self.isResponse = false
             return
         }
         throw DecodingError.dataCorrupted(
@@ -211,6 +220,7 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
         try container.encodeIfPresent(intentId, forKey: .intentId)
         try container.encode(epoch, forKey: .epoch)
         try container.encode(emittedAt, forKey: .emittedAt)
+        try container.encode(isResponse, forKey: .isResponse)
     }
 }
 

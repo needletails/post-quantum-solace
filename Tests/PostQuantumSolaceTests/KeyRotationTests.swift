@@ -216,7 +216,8 @@ actor KeyRotationTests {
             signingPublicKey: newSigningKey.publicKey.rawRepresentation,
             signedDevices: reSignedDevices,
             signedOneTimePublicKeys: context.activeUserConfiguration.signedOneTimePublicKeys,
-            signedMLKEMOneTimePublicKeys: context.activeUserConfiguration.signedMLKEMOneTimePublicKeys
+            signedMLKEMOneTimePublicKeys: context.activeUserConfiguration.signedMLKEMOneTimePublicKeys,
+            signedDeviceKeyBundles: context.activeUserConfiguration.signedDeviceKeyBundles
         )
     }
 
@@ -474,6 +475,7 @@ actor KeyRotationTests {
         let publishedKeys = await store.lastPublishedRotatedKeys
         #expect(publishedKeys != nil)
         #expect(publishedKeys?.allSignedDevices == nil)
+        #expect(publishedKeys?.deviceKeyBundle?.id == originalContext.sessionUser.deviceId)
         #expect(publishedKeys?.pskData == originalContext.activeUserConfiguration.signingPublicKey)
 
         await session.shutdown()
@@ -547,8 +549,8 @@ actor KeyRotationTests {
         await session.shutdown()
     }
     
-    @Test("force refreshing self identities synchronizes active user configuration from transport")
-    func testRefreshIdentitiesSelfForceRefreshSynchronizesActiveConfiguration() async throws {
+    @Test("force refreshing self identities rejects unauthenticated account signing-key replacement")
+    func testRefreshIdentitiesSelfForceRefreshRejectsForeignAccountSigningKey() async throws {
         _ = try await setupRotatableSession()
         guard let originalContext = await session.sessionContext else {
             Issue.record("Session context should be initialized")
@@ -560,13 +562,15 @@ actor KeyRotationTests {
         await store.setUserConfigurations(index: 0, config: reSignedConfiguration)
         
         let mySecret = originalContext.sessionUser.secretName
-        _ = try await session.refreshIdentities(secretName: mySecret, forceRefresh: true)
+        await #expect(throws: PQSSession.SessionErrors.signingKeyOutOfSync) {
+            _ = try await session.refreshIdentities(secretName: mySecret, forceRefresh: true)
+        }
         
         guard let refreshedContext = await session.sessionContext else {
             Issue.record("Session context should be initialized")
             return
         }
-        #expect(refreshedContext.activeUserConfiguration.signingPublicKey == newSigningKey.publicKey.rawRepresentation)
+        #expect(refreshedContext.activeUserConfiguration.signingPublicKey == originalContext.activeUserConfiguration.signingPublicKey)
         
         await session.shutdown()
     }
@@ -620,8 +624,8 @@ actor KeyRotationTests {
         await session.shutdown()
     }
 
-    @Test("rotateMLKEMKeysIfNeeded publishes batched allSignedDevices when local account has multiple devices")
-    func testRotateMLKEMKeysIfNeeded_multiDeviceUsesBatchPayload() async throws {
+    @Test("rotateMLKEMKeysIfNeeded publishes device-signed bundle when local account has multiple devices")
+    func testRotateMLKEMKeysIfNeeded_multiDeviceUsesDeviceBundlePayload() async throws {
         await store.resetLastPublishedRotatedKeys()
         let (transport, _) = try await setupRotatableSession()
 
@@ -664,7 +668,8 @@ actor KeyRotationTests {
 
         #expect(await transport.publishRotatedKeysCallCount == 1)
         let publishedKeys = await store.lastPublishedRotatedKeys
-        #expect(publishedKeys?.allSignedDevices?.count == 2)
+        #expect(publishedKeys?.allSignedDevices == nil)
+        #expect(publishedKeys?.deviceKeyBundle?.id == context.sessionUser.deviceId)
 
         await session.shutdown()
     }
@@ -705,4 +710,3 @@ actor KeyRotationTests {
         await session.shutdown()
     }
 }
-

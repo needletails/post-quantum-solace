@@ -283,6 +283,112 @@ actor PerDeviceIdentityTests {
         await session.shutdown()
     }
 
+    @Test("Linked child rotates device-owned key bundle without account signing key")
+    func linkedChildRotatesDeviceOwnedBundle() async throws {
+        _ = try await setupRotatableSession()
+
+        guard var context = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+
+        let masterAccountKey = Curve25519.Signing.PrivateKey()
+        let childDeviceSigningKey = Curve25519.Signing.PrivateKey()
+        let template = try currentDevice(from: context)
+
+        let masterDevice = UserDeviceConfiguration(
+            deviceId: UUID(),
+            signingPublicKey: masterAccountKey.publicKey.rawRepresentation,
+            longTermPublicKey: template.longTermPublicKey,
+            finalMLKEMPublicKey: template.finalMLKEMPublicKey,
+            deviceName: "master-device",
+            hmacData: template.hmacData,
+            isMasterDevice: true
+        )
+        let childDevice = UserDeviceConfiguration(
+            deviceId: context.sessionUser.deviceId,
+            signingPublicKey: childDeviceSigningKey.publicKey.rawRepresentation,
+            longTermPublicKey: template.longTermPublicKey,
+            finalMLKEMPublicKey: template.finalMLKEMPublicKey,
+            deviceName: "child-device",
+            hmacData: template.hmacData,
+            isMasterDevice: false
+        )
+        let signedMaster = try UserConfiguration.SignedDeviceConfiguration(
+            device: masterDevice,
+            signingKey: masterAccountKey
+        )
+        let signedChild = try UserConfiguration.SignedDeviceConfiguration(
+            device: childDevice,
+            signingKey: masterAccountKey
+        )
+        let initialChildBundle = try UserConfiguration.SignedDeviceKeyBundle(
+            bundle: .init(
+                deviceId: childDevice.deviceId,
+                longTermPublicKey: childDevice.longTermPublicKey,
+                finalMLKEMPublicKey: childDevice.finalMLKEMPublicKey
+            ),
+            signingKey: childDeviceSigningKey
+        )
+
+        let originalDeviceKeys = context.sessionUser.deviceKeys
+        context.sessionUser.deviceKeys = DeviceKeys(
+            deviceId: originalDeviceKeys.deviceId,
+            signingPrivateKey: childDeviceSigningKey.rawRepresentation,
+            longTermPrivateKey: originalDeviceKeys.longTermPrivateKey,
+            oneTimePrivateKeys: originalDeviceKeys.oneTimePrivateKeys,
+            mlKEMOneTimePrivateKeys: originalDeviceKeys.mlKEMOneTimePrivateKeys,
+            finalMLKEMPrivateKey: originalDeviceKeys.finalMLKEMPrivateKey,
+            rotateKeysDate: originalDeviceKeys.rotateKeysDate
+        )
+        context.activeUserConfiguration = UserConfiguration(
+            signingPublicKey: masterAccountKey.publicKey.rawRepresentation,
+            signedDevices: [signedMaster, signedChild],
+            signedOneTimePublicKeys: [],
+            signedMLKEMOneTimePublicKeys: [],
+            signedDeviceKeyBundles: [initialChildBundle]
+        )
+        try await persist(context: context)
+        await store.setUserConfigurations(index: 0, config: context.activeUserConfiguration)
+
+        let oldLongTermPrivateKey = context.sessionUser.deviceKeys.longTermPrivateKey
+        try await session.rotateCurrentDeviceKeys()
+
+        guard let rotatedContext = await session.sessionContext else {
+            Issue.record("Rotated context should be available")
+            return
+        }
+
+        #expect(rotatedContext.sessionUser.deviceKeys.signingPrivateKey == childDeviceSigningKey.rawRepresentation)
+        #expect(rotatedContext.sessionUser.deviceKeys.longTermPrivateKey != oldLongTermPrivateKey)
+        #expect(rotatedContext.activeUserConfiguration.signingPublicKey == masterAccountKey.publicKey.rawRepresentation)
+        #expect(rotatedContext.activeUserConfiguration.signedDevices.map(\.id) == [signedMaster.id, signedChild.id])
+
+        let published = await store.lastPublishedRotatedKeys
+        #expect(published?.allSignedDevices == nil)
+        #expect(published?.deviceKeyBundle?.id == childDevice.deviceId)
+        #expect(published?.pskData == masterAccountKey.publicKey.rawRepresentation)
+
+        let serverConfig = try await store.findUserConfiguration(secretName: context.sessionUser.secretName)
+        let accountSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: serverConfig.signingPublicKey)
+        guard let serverChild = try serverConfig.signedDevices.first(where: { $0.id == childDevice.deviceId })?
+            .verified(using: accountSigningPublicKey) else {
+            Issue.record("Server child membership should still verify under account key")
+            return
+        }
+        #expect(serverChild.signingPublicKey == childDeviceSigningKey.publicKey.rawRepresentation)
+
+        let childSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: childDeviceSigningKey.publicKey.rawRepresentation)
+        guard let rotatedBundle = try serverConfig.signedDeviceKeyBundles.first(where: { $0.id == childDevice.deviceId })?
+            .verified(using: childSigningPublicKey) else {
+            Issue.record("Server should store child-signed current key bundle")
+            return
+        }
+        #expect(rotatedBundle.longTermPublicKey != childDevice.longTermPublicKey)
+
+        await session.shutdown()
+    }
+
     @Test("installLinkedDeviceReprovisioningBundle rejects bundles that re-attest us with a foreign per-device key")
     func reprovisioningRejectsForeignPerDeviceKey() async throws {
         _ = try await setupRotatableSession()

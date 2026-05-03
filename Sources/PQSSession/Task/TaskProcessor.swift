@@ -130,6 +130,11 @@ public actor TaskProcessor {
     /// Minimum interval between peer refresh control messages for the same peer.
     /// Keeps recovery behavior while reducing startup storms that can race with live traffic.
     let peerRefreshRequestCooldown: TimeInterval = 15
+
+    /// Recovery-critical control messages may need one retry even when a recent outbound
+    /// reconciliation already set the peer cooldown. Keyed by outbound shared id.
+    var outboundControlRepairBypassAtBySharedId: [String: Date] = [:]
+    let outboundControlRepairBypassTTL: TimeInterval = 60 * 10
     
     /// Represents a stashed inbound task for later processing.
     ///
@@ -810,8 +815,13 @@ public actor TaskProcessor {
                         ))
                     )
                 }
-                let props = try await identity.props(symmetricKey: session.getDatabaseSymmetricKey())
-                logger.log(level: .info, message: "FEEDING MESSAGE FOR IDENTITY: \(props?.secretName) DID \(props?.deviceId)")
+                guard let identityProps = await identity.props(symmetricKey: symmetricKey) else {
+                    logger.log(level: .warning, message: "Skipping outbound task for unreadable recipient identity \(identity.id)")
+                    continue
+                }
+                logger.log(
+                    level: .info,
+                    message: "FEEDING MESSAGE FOR IDENTITY: \(identityProps.secretName) DID \(identityProps.deviceId)")
                 try await feedTask(task, session: session)
             } catch {
                 logger.log(level: .error, message: "Error handling recipient identity: \(error)")

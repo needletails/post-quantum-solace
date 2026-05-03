@@ -186,19 +186,38 @@ public extension PQSSession {
   
     func requestMessageResend(sharedMessageId: String, senderName: String, senderDeviceId: UUID) async throws {
         
-        let packet = FailedMessageResendRequest(failedSharedMessageId: sharedMessageId, requestingDeviceId: senderDeviceId)
+        guard let context = await sessionContext else {
+            throw SessionErrors.sessionNotInitialized
+        }
+
+        let packet = FailedMessageResendRequest(
+            failedSharedMessageId: sharedMessageId,
+            requestingDeviceId: context.sessionUser.deviceId)
         let info = TransportEvent.requestMessageResend(packet)
         let encoded = try BinaryEncoder().encode(info)
+        let isSelf = senderName == context.sessionUser.secretName
         let message = CryptoMessage(
             text: "",
             metadata: .init(),
-            recipient: .nickname(senderName),
+            recipient: isSelf ? .personalMessage : .nickname(senderName),
             transportInfo: encoded,
             sentDate: Date(),
             destructionTime: nil)
         
         let symmetricKey = try await getDatabaseSymmetricKey()
-        guard let identity = try await cache?.fetchSessionIdentities().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.deviceId == senderDeviceId }) else {
+        var selected: (identity: SessionIdentity, sessionContextId: Int)?
+        for identity in try await cache?.fetchSessionIdentities() ?? [] {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard props.secretName == senderName,
+                  props.deviceId == senderDeviceId,
+                  !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            else { continue }
+            if selected == nil || props.sessionContextId > selected!.sessionContextId {
+                selected = (identity, props.sessionContextId)
+            }
+        }
+
+        guard let identity = selected?.identity else {
             throw SessionErrors.invalidDeviceIdentity
         }
         

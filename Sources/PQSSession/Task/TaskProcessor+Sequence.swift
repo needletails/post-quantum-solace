@@ -19,6 +19,7 @@ import NeedleTailAsyncSequence
 import SessionModels
 import Crypto
 import DoubleRatchetKit
+import BinaryCodable
 
 extension TaskProcessor {
     
@@ -237,12 +238,26 @@ extension TaskProcessor {
             
             switch props.task.task {
             case .streamMessage(let message):
-                
+
+                guard let context = await session.sessionContext else { return .failed }
+
+                if message.senderSecretName == context.sessionUser.secretName,
+                   message.senderDeviceId != context.sessionUser.deviceId {
+                    logger.log(
+                        level: .warning,
+                        message: "ratchet.maxSkippedHeadersExceeded for linked self device \(message.senderDeviceId); repairing personal SessionIdentity without compromise escalation")
+                    return try await handleFreshSessionRepair(
+                        message: message,
+                        failureClass: "ratchet.maxSkippedHeadersExceeded",
+                        job: job,
+                        cache: cache,
+                        session: session)
+                }
+
                 //1. Archive current SessionIdentity:
                 try await session.createInactiveSessionSnapshot(for: message.senderSecretName, policy: .archive)
-                
+
                 //2. Rotate due to potential compromise
-                guard let context = await session.sessionContext else { return .failed }
                 
                 guard let currentDevice = try context.activeUserConfiguration
                     .getVerifiedDevices()
@@ -265,8 +280,7 @@ extension TaskProcessor {
                         _ = try await session.emitSessionReestablishment(
                             kind: .linkedDeviceCompromiseObserved,
                             recipient: .personalMessage,
-                            scope: .personal
-                        )
+                            scope: .personal)
                         try await cache.deleteJob(job)
                         return .deleted
                     }
@@ -282,20 +296,64 @@ extension TaskProcessor {
                 try await cache.deleteJob(job)
             }
             
+        } catch let ratchetError as RatchetError where isFreshSessionRepairError(ratchetError) {
+            switch props.task.task {
+            case .streamMessage(let message):
+                return try await handleFreshSessionRepair(
+                    message: message,
+                    failureClass: freshSessionFailureClass(ratchetError),
+                    job: job,
+                    cache: cache,
+                    session: session)
+            case .writeMessage(let message):
+                return try await handleFreshOutboundRepair(
+                    message: message,
+                    error: ratchetError,
+                    job: job,
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey)
+            }
+
         } catch let ratchetError as RatchetError where ratchetError == .missingOneTimeKey {
             switch props.task.task {
             case .streamMessage(let message):
+                let failureClass = "ratchet.missingOneTimeKey"
+                if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
+                    logger.log(level: .info, message: "Suppressing repeated \(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+                    try await cache.deleteJob(job)
+                    return .deleted
+                }
+
                 logger.log(level: .warning, message: "missingOneTimeKey for sender \(message.senderSecretName) — replacing OTK batch and notifying peer to refresh")
                 let curveReplaced = await session.refreshOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
                 let mlKEMReplaced = await session.refreshMLKEMOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
                 if !curveReplaced || !mlKEMReplaced {
                     logger.log(level: .error, message: "OTK batch replacement failed; cannot recover from missingOneTimeKey")
                 }
-                _ = try await session.emitSessionReestablishment(
-                    kind: .peerRefresh,
-                    recipient: .nickname(message.senderSecretName),
-                    scope: .peer(secretName: message.senderSecretName)
-                )
+
+                let mySecretName = await session.sessionContext?.sessionUser.secretName
+                let isSelf = message.senderSecretName == mySecretName
+
+                await session.markInboundFailure(message, failureClass: failureClass)
+                await session.deferPeerResendUntilReestablished(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId,
+                    failedMessageId: message.sharedMessageId,
+                    failureClass: failureClass)
+                logger.log(
+                    level: .info,
+                    message: "Deferred resend request for sharedMessageId=\(message.sharedMessageId) until peerRefresh completes for \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+
+                do {
+                    _ = try await session.emitSessionReestablishment(
+                        kind: .peerRefresh,
+                        recipient: isSelf ? .personalMessage : .nickname(message.senderSecretName),
+                        scope: isSelf ? .personal : .peer(secretName: message.senderSecretName))
+                } catch {
+                    logger.log(level: .warning, message: "Failed to emit peerRefresh after \(failureClass): \(error)")
+                }
+
                 try await cache.deleteJob(job)
                 return .deleted
             case .writeMessage(let message):
@@ -305,20 +363,40 @@ extension TaskProcessor {
         } catch let cryptoError as CryptoKitError {
             switch props.task.task {
             case .streamMessage(let message):
-                logger.log(level: .error, message: "Decryption failure (\(cryptoError)) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId) — notifying peer to refresh")
-                let mySecretName = await session.sessionContext?.sessionUser.secretName
-                let isSelf = message.senderSecretName == mySecretName
-                let recipient: MessageRecipient = isSelf ? .personalMessage : .nickname(message.senderSecretName)
-                let scope: ControlEventScope = isSelf ? .personal : .peer(secretName: message.senderSecretName)
-                _ = try await session.emitSessionReestablishment(
-                    kind: .peerRefresh,
-                    recipient: recipient,
-                    scope: scope
-                )
+                logger.log(level: .error, message: "Decryption failure (\(cryptoError)) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId) — preparing fresh peer session and deferring resend until reestablishment")
+                return try await handleFreshSessionRepair(
+                    message: message,
+                    failureClass: "crypto.bodyDecryptionFailed",
+                    job: job,
+                    cache: cache,
+                    session: session)
+            case .writeMessage(let message):
+                logger.log(level: .error, message: "CryptoKitError for writeMessage to recipient: \(message.message.recipient) — \(cryptoError)")
+                try await cache.deleteJob(job)
+            }
+        } catch let sessionError as PQSSession.SessionErrors where sessionError == .sessionDecryptionError {
+            switch props.task.task {
+            case .streamMessage(let message):
+                let failureClass = "payload.sessionDecryptionError"
+                if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
+                    logger.log(level: .info, message: "Suppressing repeated \(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+                    try await cache.deleteJob(job)
+                    return .deleted
+                }
+
+                do {
+                    try await session.requestMessageResend(
+                        sharedMessageId: message.sharedMessageId,
+                        senderName: message.senderSecretName,
+                        senderDeviceId: message.senderDeviceId)
+                    await session.markInboundFailure(message, failureClass: failureClass)
+                } catch {
+                    logger.log(level: .warning, message: "Failed to request resend after \(failureClass) for sharedMessageId=\(message.sharedMessageId): \(error)")
+                }
                 try await cache.deleteJob(job)
                 return .deleted
             case .writeMessage(let message):
-                logger.log(level: .error, message: "CryptoKitError for writeMessage to recipient: \(message.message.recipient) — \(cryptoError)")
+                logger.log(level: .error, message: "sessionDecryptionError for writeMessage to recipient: \(message.message.recipient)")
                 try await cache.deleteJob(job)
             }
         } catch let sessionError as PQSSession.SessionErrors where sessionError == .signingKeyOutOfSync {
@@ -363,7 +441,7 @@ extension TaskProcessor {
         }
         return .failed
     }
-    
+
     // MARK: - Job Processing Outcomes
     
     enum JobProcessingOutcome: Sendable, Equatable {
@@ -394,6 +472,218 @@ extension TaskProcessor {
     private func inboundTask(from task: TaskType) -> InboundTaskMessage? {
         guard case let .streamMessage(inbound) = task else { return nil }
         return inbound
+    }
+
+    private func isFreshSessionRepairError(_ error: RatchetError) -> Bool {
+        [
+            .initialMessageNotReceived,
+            .rootKeyIsNil,
+            .missingCipherText,
+            .sendingKeyIsNil,
+            .stateUninitialized
+        ].contains(error)
+    }
+
+    private func freshSessionFailureClass(_ error: RatchetError) -> String {
+        switch error {
+        case .initialMessageNotReceived:
+            return "ratchet.initialMessageNotReceived"
+        case .rootKeyIsNil:
+            return "ratchet.rootKeyIsNil"
+        case .missingCipherText:
+            return "ratchet.missingCipherText"
+        case .sendingKeyIsNil:
+            return "ratchet.sendingKeyIsNil"
+        case .stateUninitialized:
+            return "ratchet.stateUninitialized"
+        default:
+            return "ratchet.freshSessionRepair"
+        }
+    }
+
+    private func handleFreshSessionRepair(
+        message: InboundTaskMessage,
+        failureClass: String,
+        job: JobModel,
+        cache: SessionCache,
+        session: PQSSession,
+        retryOriginalAfterReset: Bool = true
+    ) async throws -> JobProcessingOutcome {
+        if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
+            logger.log(level: .info, message: "Suppressing repeated \(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+
+        logger.log(
+            level: .warning,
+            message: "\(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId); repairing peer SessionIdentity")
+
+        let canReset = await session.canAttemptReconciliation(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            flow: .inbound)
+        var resetSucceeded = false
+        if canReset {
+            await session.markReconciliationAttempt(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                flow: .inbound)
+            do {
+                _ = try await session.resetSessionIdentityForFreshSession(
+                    secretName: message.senderSecretName,
+                    deviceId: message.senderDeviceId,
+                    sendOneTimeIdentities: true)
+                resetSucceeded = true
+            } catch {
+                logger.log(level: .warning, message: "Fresh session reset failed for \(message.senderSecretName) (\(message.senderDeviceId)): \(error)")
+            }
+        } else {
+            logger.log(level: .info, message: "Skipping inbound SessionIdentity reset for \(message.senderSecretName) (\(message.senderDeviceId)); reconciliation cooldown is active")
+        }
+
+        if resetSucceeded && retryOriginalAfterReset {
+            logger.log(level: .info, message: "Retrying inbound message after fresh SessionIdentity reset for \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+            try await cache.deleteJob(job)
+            try await feedTask(
+                EncryptableTask(
+                    task: .streamMessage(message),
+                    priority: .urgent),
+                session: session)
+            return .deleted
+        }
+
+        if resetSucceeded {
+            logger.log(level: .info, message: "Prepared fresh SessionIdentity for repair controls to \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+        }
+
+        await session.markInboundFailure(message, failureClass: failureClass)
+
+        let mySecretName = await session.sessionContext?.sessionUser.secretName
+        let isSelf = message.senderSecretName == mySecretName
+        let recipient: MessageRecipient = isSelf ? .personalMessage : .nickname(message.senderSecretName)
+        let scope: ControlEventScope = isSelf ? .personal : .peer(secretName: message.senderSecretName)
+
+        do {
+            _ = try await session.emitSessionReestablishment(
+                kind: .peerRefresh,
+                recipient: recipient,
+                scope: scope,
+                freshOutboundRepair: resetSucceeded ? nil : (
+                    secretName: message.senderSecretName,
+                    deviceId: message.senderDeviceId,
+                    failureClass: failureClass))
+        } catch {
+            logger.log(level: .warning, message: "Failed to emit peerRefresh after \(failureClass): \(error)")
+        }
+
+        await session.deferPeerResendUntilReestablished(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            failedMessageId: message.sharedMessageId,
+            failureClass: failureClass)
+        logger.log(
+            level: .info,
+            message: "Deferred resend request for sharedMessageId=\(message.sharedMessageId) until peerRefresh completes for \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+
+        try await cache.deleteJob(job)
+        return .deleted
+    }
+
+    private func handleFreshOutboundRepair(
+        message: OutboundTaskMessage,
+        error: RatchetError,
+        job: JobModel,
+        cache: SessionCache,
+        session: PQSSession,
+        symmetricKey: SymmetricKey
+    ) async throws -> JobProcessingOutcome {
+        guard let props = await message.recipientIdentity.props(symmetricKey: symmetricKey) else {
+            logger.log(level: .error, message: "Fresh outbound repair failed: missing recipient props for \(error)")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+
+        logger.log(
+            level: .warning,
+            message: "\(freshSessionFailureClass(error)) while sending to \(props.secretName) deviceId=\(props.deviceId); resetting SessionIdentity and retrying once")
+
+        let canAttempt = await session.canAttemptReconciliation(
+            sender: props.secretName,
+            deviceId: props.deviceId,
+            flow: .outbound)
+        let isRecoveryCriticalControl = isRecoveryCriticalControlMessage(message.message)
+        let canBypassCooldown = isRecoveryCriticalControl && consumeOutboundControlRepairBypass(sharedId: message.sharedId)
+
+        guard canAttempt || canBypassCooldown else {
+            logger.log(level: .warning, message: "Suppressing repeated fresh outbound repair for \(props.secretName) (\(props.deviceId))")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+
+        if !canAttempt, canBypassCooldown {
+            logger.log(
+                level: .info,
+                message: "Allowing one cooldown-bypassed outbound repair for recovery control sharedId=\(message.sharedId) to \(props.secretName) (\(props.deviceId))")
+        }
+
+        do {
+            let replacement = try await session.resetSessionIdentityForFreshSession(
+                secretName: props.secretName,
+                deviceId: props.deviceId,
+                sendOneTimeIdentities: true)
+            await session.markReconciliationAttempt(
+                sender: props.secretName,
+                deviceId: props.deviceId,
+                flow: .outbound)
+
+            let retry = EncryptableTask(
+                task: .writeMessage(OutboundTaskMessage(
+                    message: message.message,
+                    recipientIdentity: replacement,
+                    localId: message.localId,
+                    sharedId: message.sharedId,
+                    isPersistedOutbound: message.isPersistedOutbound
+                )),
+                priority: .urgent)
+
+            try await cache.deleteJob(job)
+            try await feedTask(retry, session: session)
+            return .deleted
+        } catch {
+            logger.log(level: .error, message: "Fresh outbound repair failed for \(props.secretName) (\(props.deviceId)): \(error)")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+    }
+
+    private func isRecoveryCriticalControlMessage(_ message: CryptoMessage) -> Bool {
+        guard let transportInfo = message.transportInfo,
+              let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo)
+        else {
+            return false
+        }
+
+        switch event {
+        case .sessionReestablishment, .requestMessageResend:
+            return true
+        case .linkedDeviceReprovisioning, .synchronizeOneTimeKeys, .refreshOneTimeKeys:
+            return false
+        }
+    }
+
+    private func consumeOutboundControlRepairBypass(sharedId: String, now: Date = Date()) -> Bool {
+        let cutoff = now.addingTimeInterval(-outboundControlRepairBypassTTL)
+        outboundControlRepairBypassAtBySharedId = outboundControlRepairBypassAtBySharedId.filter { _, createdAt in
+            createdAt > cutoff
+        }
+
+        guard outboundControlRepairBypassAtBySharedId[sharedId] == nil else {
+            return false
+        }
+
+        outboundControlRepairBypassAtBySharedId[sharedId] = now
+        return true
     }
     
 }
@@ -487,4 +777,3 @@ protocol TaskSequenceDelegate: Sendable {
         session: PQSSession
     ) async throws
 }
-

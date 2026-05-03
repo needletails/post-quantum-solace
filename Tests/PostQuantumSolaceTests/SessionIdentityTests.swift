@@ -36,8 +36,15 @@ actor SessionIdentityTests {
     // MARK: - Mock Store
     
     final class MockSessionIdentityStore: PQSSessionStore, @unchecked Sendable {
+        enum MockError: Error {
+            case forcedDelete
+            case forcedUpdate
+        }
+
         var sessionContext: Data?
         var identities = [SessionIdentity]()
+        var failNextSessionIdentityDelete = false
+        var failNextSessionIdentityUpdate = false
         
         // Core session context methods
         func createLocalSessionContext(_ data: Data) async throws { sessionContext = data }
@@ -62,11 +69,19 @@ actor SessionIdentityTests {
         // Session identity methods
         func fetchSessionIdentities() async throws -> [SessionIdentity] { identities }
         func updateSessionIdentity(_ session: SessionIdentity) async throws {
+            if failNextSessionIdentityUpdate {
+                failNextSessionIdentityUpdate = false
+                throw MockError.forcedUpdate
+            }
             identities.removeAll(where: { $0.id == session.id })
             identities.append(session)
         }
         func createSessionIdentity(_ session: SessionIdentity) async throws { identities.append(session) }
         func deleteSessionIdentity(_ id: UUID) async throws {
+            if failNextSessionIdentityDelete {
+                failNextSessionIdentityDelete = false
+                throw MockError.forcedDelete
+            }
             identities.removeAll(where: { $0.id == id })
         }
         
@@ -153,6 +168,45 @@ actor SessionIdentityTests {
         func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
         func publishRotatedKeys(for secretName: String, deviceId: String, rotated keys: RotatedPublicKeys) async throws {}
         func createUploadPacket(secretName: String, deviceId: UUID, recipient: MessageRecipient, metadata: Data) async throws {}
+    }
+
+    @Test("SessionCache keeps memory and disk aligned when delete persistence fails")
+    func testSessionCachePreservesIdentityWhenDeleteFails() async throws {
+        let store = MockSessionIdentityStore()
+        let cache = SessionCache(store: store)
+        let identity = SessionIdentity(id: UUID(), data: Data([0x01, 0x02, 0x03]))
+
+        try await cache.createSessionIdentity(identity)
+        store.failNextSessionIdentityDelete = true
+
+        await #expect(throws: MockSessionIdentityStore.MockError.self) {
+            try await cache.deleteSessionIdentity(identity.id)
+        }
+
+        let cached = try await cache.fetchSessionIdentities()
+        #expect(cached.contains(where: { $0.id == identity.id }))
+        #expect(store.identities.contains(where: { $0.id == identity.id }))
+        await session.shutdown()
+    }
+
+    @Test("SessionCache keeps previous identity when update persistence fails")
+    func testSessionCachePreservesIdentityWhenUpdateFails() async throws {
+        let store = MockSessionIdentityStore()
+        let cache = SessionCache(store: store)
+        let original = SessionIdentity(id: UUID(), data: Data([0x01]))
+        let updated = SessionIdentity(id: original.id, data: Data([0x02]))
+
+        try await cache.createSessionIdentity(original)
+        store.failNextSessionIdentityUpdate = true
+
+        await #expect(throws: MockSessionIdentityStore.MockError.self) {
+            try await cache.updateSessionIdentity(updated)
+        }
+
+        let cached = try await cache.fetchSessionIdentities()
+        #expect(cached.first(where: { $0.id == original.id })?.data == original.data)
+        #expect(store.identities.first(where: { $0.id == original.id })?.data == original.data)
+        await session.shutdown()
     }
     
     // MARK: - Helper Methods
@@ -594,6 +648,97 @@ actor SessionIdentityTests {
         }
     }
 
+    @Test("Force refresh replaces rotated active identity instead of mutating it")
+    func testForceRefreshReplacesRotatedActiveIdentity() async throws {
+        do {
+            let (store, transport) = try await setupTestSession()
+
+            let originalBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            let originalSigningPublicKey = try Curve25519.Signing.PublicKey(
+                rawRepresentation: originalBundle.userConfiguration.signingPublicKey
+            )
+            guard let originalSignedDevice = originalBundle.userConfiguration.signedDevices.first,
+                  let originalDevice = try originalSignedDevice.verified(using: originalSigningPublicKey)
+            else {
+                Issue.record("Expected original device to verify")
+                await session.shutdown()
+                return
+            }
+
+            let originalIdentity = try await session.createEncryptableSessionIdentityModel(
+                with: originalDevice,
+                oneTimePublicKey: nil,
+                mlKEMPublicKey: originalDevice.finalMLKEMPublicKey,
+                for: "alice",
+                associatedWith: originalDevice.deviceId,
+                new: 321
+            )
+
+            let rotatedBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            let rotatedSigningKey = try Curve25519.Signing.PrivateKey(
+                rawRepresentation: rotatedBundle.deviceKeys.signingPrivateKey
+            )
+            let rotatedDevice = UserDeviceConfiguration(
+                deviceId: originalDevice.deviceId,
+                signingPublicKey: rotatedSigningKey.publicKey.rawRepresentation,
+                longTermPublicKey: rotatedBundle.deviceConfiguration.longTermPublicKey,
+                finalMLKEMPublicKey: rotatedBundle.deviceConfiguration.finalMLKEMPublicKey,
+                deviceName: originalDevice.deviceName,
+                hmacData: rotatedBundle.deviceConfiguration.hmacData,
+                isMasterDevice: originalDevice.isMasterDevice,
+                lastSeenAt: Date()
+            )
+            let rotatedSignedDevice = try UserConfiguration.SignedDeviceConfiguration(
+                device: rotatedDevice,
+                signingKey: rotatedSigningKey
+            )
+            let rotatedSignedBundle = try UserConfiguration.SignedDeviceKeyBundle(
+                bundle: .init(
+                    deviceId: originalDevice.deviceId,
+                    longTermPublicKey: rotatedDevice.longTermPublicKey,
+                    finalMLKEMPublicKey: rotatedDevice.finalMLKEMPublicKey
+                ),
+                signingKey: rotatedSigningKey
+            )
+            transport.configurations["alice"] = UserConfiguration(
+                signingPublicKey: rotatedSigningKey.publicKey.rawRepresentation,
+                signedDevices: [rotatedSignedDevice],
+                signedOneTimePublicKeys: [],
+                signedMLKEMOneTimePublicKeys: [],
+                signedDeviceKeyBundles: [rotatedSignedBundle]
+            )
+
+            let refreshed = try await session.refreshIdentities(secretName: "alice", forceRefresh: true)
+            let symmetricKey = try await session.getDatabaseSymmetricKey()
+            let activeAliceIdentities = await refreshed.asyncFilter { identity in
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
+                return props.secretName == "alice"
+                    && props.deviceId == originalDevice.deviceId
+                    && !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            }
+
+            #expect(activeAliceIdentities.count == 1)
+            guard let replacement = activeAliceIdentities.first,
+                  let replacementProps = await replacement.props(symmetricKey: symmetricKey)
+            else {
+                Issue.record("Expected one replacement identity")
+                await session.shutdown()
+                return
+            }
+
+            #expect(replacement.id != originalIdentity.id)
+            #expect(replacementProps.longTermPublicKey == rotatedDevice.longTermPublicKey)
+            #expect(replacementProps.signingPublicKey == rotatedDevice.signingPublicKey)
+            #expect(replacementProps.state == nil)
+            #expect(!store.identities.contains(where: { $0.id == originalIdentity.id }))
+
+            await session.shutdown()
+        } catch {
+            await session.shutdown()
+            throw error
+        }
+    }
+
     @Test("Should assess peer refresh impact for unchanged and rotated peer identity keys")
     func testRefreshIdentitiesAssessingImpact() async throws {
         do {
@@ -661,7 +806,7 @@ actor SessionIdentityTests {
             throw error
         }
     }
-    
+
     @Test("Should retrieve existing session identity from storage without refresh")
     func testRetrieveExistingIdentityFromStorage() async throws {
         do {

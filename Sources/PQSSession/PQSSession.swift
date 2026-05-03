@@ -227,6 +227,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Cooldown window for automatic rotation attempts globally.
     let automaticRotationGlobalCooldown: TimeInterval = 20
 
+    enum ReconciliationFlow: String, Sendable {
+        case inbound
+        case outbound
+    }
+
     /// Per-peer timestamp for the last key-reconciliation recovery (archive + identity reset).
     var lastReconciliationAtByPeer: [String: Date] = [:]
     let reconciliationPeerCooldown: TimeInterval = 15
@@ -241,16 +246,30 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 #endif
 
-    func canAttemptReconciliation(sender: String, deviceId: UUID, now: Date = Date()) -> Bool {
-        let key = automaticRotationPeerKey(sender: sender, deviceId: deviceId)
+    func canAttemptReconciliation(
+        sender: String,
+        deviceId: UUID,
+        flow: ReconciliationFlow = .inbound,
+        now: Date = Date()
+    ) -> Bool {
+        let key = reconciliationPeerKey(sender: sender, deviceId: deviceId, flow: flow)
         if let last = lastReconciliationAtByPeer[key],
            now.timeIntervalSince(last) < reconciliationPeerCooldown { return false }
         return true
     }
 
-    func markReconciliationAttempt(sender: String, deviceId: UUID, now: Date = Date()) {
-        let key = automaticRotationPeerKey(sender: sender, deviceId: deviceId)
+    func markReconciliationAttempt(
+        sender: String,
+        deviceId: UUID,
+        flow: ReconciliationFlow = .inbound,
+        now: Date = Date()
+    ) {
+        let key = reconciliationPeerKey(sender: sender, deviceId: deviceId, flow: flow)
         lastReconciliationAtByPeer[key] = now
+    }
+
+    private func reconciliationPeerKey(sender: String, deviceId: UUID, flow: ReconciliationFlow) -> String {
+        "\(automaticRotationPeerKey(sender: sender, deviceId: deviceId))|\(flow.rawValue)"
     }
 
     /// Unified inbound-failure policy table.
@@ -265,6 +284,18 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Last resend/refresh control request timestamp per request key.
     /// Key format: "<secretName>|<deviceUUID>|<failedSharedMessageId>".
     var lastResendRequestAtByPeer: [String: Date] = [:]
+
+    struct PendingResendAfterReestablishment: Sendable, Equatable {
+        let senderName: String
+        let senderDeviceId: UUID
+        let failedSharedMessageId: String
+        let failureClass: String
+        let createdAt: Date
+    }
+
+    /// Failed inbound messages whose replay should be requested only after the
+    /// peer/device has completed the reestablishment round.
+    var pendingResendAfterReestablishment: [String: PendingResendAfterReestablishment] = [:]
     
     /// Cooldown for peer resend/refresh requests triggered by inbound failures.
     let peerResendRequestCooldown: TimeInterval = 15
@@ -515,6 +546,48 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     func markPeerResendRequestSent(sender: String, deviceId: UUID, failedMessageId: String, now: Date = Date()) {
         let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
         lastResendRequestAtByPeer[requestKey] = now
+    }
+
+    func deferPeerResendUntilReestablished(
+        sender: String,
+        deviceId: UUID,
+        failedMessageId: String,
+        failureClass: String,
+        now: Date = Date()
+    ) {
+        cleanupPendingResendAfterReestablishment(now: now)
+        let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        pendingResendAfterReestablishment[requestKey] = PendingResendAfterReestablishment(
+            senderName: sender,
+            senderDeviceId: deviceId,
+            failedSharedMessageId: failedMessageId,
+            failureClass: failureClass,
+            createdAt: now)
+    }
+
+    func takePendingResendsAfterReestablishment(
+        sender: String,
+        deviceId: UUID,
+        satisfiedSharedMessageId: String? = nil,
+        now: Date = Date()
+    ) -> [PendingResendAfterReestablishment] {
+        cleanupPendingResendAfterReestablishment(now: now)
+        let matches = pendingResendAfterReestablishment.filter { _, pending in
+            pending.senderName == sender && pending.senderDeviceId == deviceId
+        }
+        for (key, _) in matches {
+            pendingResendAfterReestablishment.removeValue(forKey: key)
+        }
+        return matches.values.filter { pending in
+            pending.failedSharedMessageId != satisfiedSharedMessageId
+        }
+    }
+
+    private func cleanupPendingResendAfterReestablishment(now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-inboundFailurePolicyTTL)
+        pendingResendAfterReestablishment = pendingResendAfterReestablishment.filter { _, pending in
+            pending.createdAt > cutoff
+        }
     }
 
     /// Sets the logger log level for both the session and task processor
@@ -1070,12 +1143,22 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             )
         }
 
+        let signedDeviceKeyBundle = try UserConfiguration.SignedDeviceKeyBundle(
+            bundle: .init(
+                deviceId: deviceId,
+                longTermPublicKey: longTerm.curve.publicKey.rawRepresentation,
+                finalMLKEMPublicKey: mlKEMPublicKey
+            ),
+            signingKey: longTerm.signing
+        )
+
         // Create the user configuration with the signed device and keys
         let userConfiguration = UserConfiguration(
             signingPublicKey: longTerm.signing.publicKey.rawRepresentation,
             signedDevices: [signedDeviceConfiguration],
             signedOneTimePublicKeys: signedOneTimePublicKeys,
-            signedMLKEMOneTimePublicKeys: signedPublicMLKEMOneTimeKeys
+            signedMLKEMOneTimePublicKeys: signedPublicMLKEMOneTimeKeys,
+            signedDeviceKeyBundles: [signedDeviceKeyBundle]
         )
 
         // Return the complete cryptographic bundle
@@ -1282,13 +1365,62 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             // Generate a symmetric key for encrypting local database models
             let databaseEncryptionKey = generateDatabaseEncryptionKey()
 
-            // Create a new user configuration with the provided device keys and configurations
-            let userConfiguration = try await createNewUser(
-                configuration: bundle.userConfiguration,
-                signingPrivateKeyData: bundle.deviceKeys.signingPrivateKey,
-                devices: credentials.devices,
-                keys: bundle.userConfiguration.getVerifiedCurveKeys(deviceId: bundle.deviceKeys.deviceId),
-                mlKEMKeys: bundle.userConfiguration.getVerifiedMLKEMKeys(deviceId: bundle.deviceKeys.deviceId))
+            let userConfiguration: UserConfiguration
+            if var linkedConfiguration = credentials.userConfiguration {
+                let verifiedDevices = try linkedConfiguration.getVerifiedDevices()
+                guard let localDevice = verifiedDevices.first(where: { $0.deviceId == bundle.deviceKeys.deviceId }) else {
+                    throw SessionErrors.invalidDeviceIdentity
+                }
+                let localSigningKey = try Curve25519.Signing.PrivateKey(
+                    rawRepresentation: bundle.deviceKeys.signingPrivateKey)
+                guard localDevice.signingPublicKey == localSigningKey.publicKey.rawRepresentation else {
+                    throw SessionErrors.deviceIdentityCorrupted
+                }
+
+                let localCurveKeys = bundle.userConfiguration.signedOneTimePublicKeys.filter {
+                    $0.deviceId == bundle.deviceKeys.deviceId
+                }
+                var curveKeysById = Dictionary(uniqueKeysWithValues: linkedConfiguration.signedOneTimePublicKeys.map {
+                    ($0.id, $0)
+                })
+                for key in localCurveKeys {
+                    curveKeysById[key.id] = key
+                }
+                linkedConfiguration.signedOneTimePublicKeys = Array(curveKeysById.values)
+
+                let localMLKEMKeys = bundle.userConfiguration.signedMLKEMOneTimePublicKeys.filter {
+                    $0.deviceId == bundle.deviceKeys.deviceId
+                }
+                var mlkemKeysById = Dictionary(uniqueKeysWithValues: linkedConfiguration.signedMLKEMOneTimePublicKeys.map {
+                    ($0.id, $0)
+                })
+                for key in localMLKEMKeys {
+                    mlkemKeysById[key.id] = key
+                }
+                linkedConfiguration.signedMLKEMOneTimePublicKeys = Array(mlkemKeysById.values)
+
+                if let localBundle = bundle.userConfiguration.signedDeviceKeyBundles.last(where: {
+                    $0.id == bundle.deviceKeys.deviceId
+                }), !linkedConfiguration.signedDeviceKeyBundles.contains(where: {
+                    $0.id == bundle.deviceKeys.deviceId
+                }) {
+                    linkedConfiguration.signedDeviceKeyBundles.append(localBundle)
+                }
+                try validateLinkedDeviceConfiguration(
+                    linkedConfiguration,
+                    localDeviceId: bundle.deviceKeys.deviceId
+                )
+                userConfiguration = linkedConfiguration
+            } else {
+                // Legacy link delegates only return bare devices. Keep this as a compatibility
+                // fallback, but modern Signal-like linking should supply `userConfiguration`.
+                userConfiguration = try await createNewUser(
+                    configuration: bundle.userConfiguration,
+                    signingPrivateKeyData: bundle.deviceKeys.signingPrivateKey,
+                    devices: credentials.devices,
+                    keys: bundle.userConfiguration.getVerifiedCurveKeys(deviceId: bundle.deviceKeys.deviceId),
+                    mlKEMKeys: bundle.userConfiguration.getVerifiedMLKEMKeys(deviceId: bundle.deviceKeys.deviceId))
+            }
 
             // Create a new session context with the session user and user configuration
             var sessionContext = SessionContext(
@@ -1371,6 +1503,30 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         )
     }
 
+    private func validateLinkedDeviceConfiguration(
+        _ configuration: UserConfiguration,
+        localDeviceId: UUID
+    ) throws {
+        let verified = try configuration.getVerifiedDevices()
+        guard verified.count == configuration.signedDevices.count,
+              verified.contains(where: { $0.deviceId == localDeviceId })
+        else {
+            throw SessionErrors.invalidSignature
+        }
+
+        for signedBundle in configuration.signedDeviceKeyBundles {
+            guard let device = verified.first(where: { $0.deviceId == signedBundle.id }) else {
+                throw SessionErrors.invalidDeviceIdentity
+            }
+            let deviceSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
+            guard let bundle = try signedBundle.verified(using: deviceSigningKey),
+                  bundle.deviceId == device.deviceId
+            else {
+                throw SessionErrors.invalidSignature
+            }
+        }
+    }
+
     /// Adopts a `UserConfiguration` that has already been verified against its own
     /// `signingPublicKey` (e.g. one returned from the server's `findConfiguration`
     /// endpoint, where every signed entry was produced by the master's account-level
@@ -1402,6 +1558,17 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let verified = try configuration.getVerifiedDevices()
         guard verified.count == configuration.signedDevices.count else {
             throw SessionErrors.invalidSignature
+        }
+        for signedBundle in configuration.signedDeviceKeyBundles {
+            guard let device = verified.first(where: { $0.deviceId == signedBundle.id }) else {
+                throw SessionErrors.invalidDeviceIdentity
+            }
+            let deviceSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
+            guard let bundle = try signedBundle.verified(using: deviceSigningKey),
+                  bundle.deviceId == device.deviceId
+            else {
+                throw SessionErrors.invalidSignature
+            }
         }
 
         guard let cache else { return }
@@ -1623,7 +1790,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             signingPublicKey: sessionContext.activeUserConfiguration.signingPublicKey,
             signedDevices: sessionContext.activeUserConfiguration.signedDevices,
             signedOneTimePublicKeys: keys,
-            signedMLKEMOneTimePublicKeys: sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
+            signedMLKEMOneTimePublicKeys: sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys,
+            signedDeviceKeyBundles: sessionContext.activeUserConfiguration.signedDeviceKeyBundles
         )
 
         // Update the last user configuration in the session context
@@ -1702,34 +1870,62 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             )
         }
 
-        // Create signed public one-time keys for each device
-        let signedKeys: [UserConfiguration.SignedOneTimePublicKey] = try devices.flatMap { device in
-            try keys.map { key in
+        let activeDeviceIds = Set(devices.map(\.deviceId))
+        let localDevice = devices.first {
+            $0.signingPublicKey == signingPrivateKey.publicKey.rawRepresentation
+        }
+        let retainedSignedKeys = configuration.signedOneTimePublicKeys.filter { signedKey in
+            activeDeviceIds.contains(signedKey.deviceId) && signedKey.deviceId != localDevice?.deviceId
+        }
+        let retainedSignedMLKEMKeys = configuration.signedMLKEMOneTimePublicKeys.filter { signedKey in
+            activeDeviceIds.contains(signedKey.deviceId) && signedKey.deviceId != localDevice?.deviceId
+        }
+
+        let signedKeys: [UserConfiguration.SignedOneTimePublicKey]
+        let signedMLKEMKeys: [UserConfiguration.SignedMLKEMOneTimeKey]
+        if let localDevice {
+            signedKeys = try retainedSignedKeys + keys.map { key in
                 try UserConfiguration.SignedOneTimePublicKey(
                     key: key,
-                    deviceId: device.deviceId,
+                    deviceId: localDevice.deviceId,
                     signingKey: signingPrivateKey
                 )
             }
-        }
-
-        // Create signed public one-time keys for each device
-        let signedMLKEMKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try devices.flatMap { device in
-            try mlKEMKeys.map { key in
+            signedMLKEMKeys = try retainedSignedMLKEMKeys + mlKEMKeys.map { key in
                 try UserConfiguration.SignedMLKEMOneTimeKey(
                     key: key,
-                    deviceId: device.deviceId,
+                    deviceId: localDevice.deviceId,
                     signingKey: signingPrivateKey
                 )
             }
+        } else {
+            signedKeys = retainedSignedKeys
+            signedMLKEMKeys = retainedSignedMLKEMKeys
         }
 
-        // 4) Return the new per-device-signed UserConfiguration
+        var signedDeviceKeyBundles = configuration.signedDeviceKeyBundles.filter { signedBundle in
+            devices.contains(where: { $0.deviceId == signedBundle.id })
+        }
+        if let localDevice {
+            let localBundle = try UserConfiguration.SignedDeviceKeyBundle(
+                bundle: .init(
+                    deviceId: localDevice.deviceId,
+                    longTermPublicKey: localDevice.longTermPublicKey,
+                    finalMLKEMPublicKey: localDevice.finalMLKEMPublicKey
+                ),
+                signingKey: signingPrivateKey
+            )
+            signedDeviceKeyBundles.removeAll { $0.id == localDevice.deviceId }
+            signedDeviceKeyBundles.append(localBundle)
+        }
+
+        // 4) Return the new account-signed membership plus device-owned key bundles.
         return UserConfiguration(
             signingPublicKey: signingPublicKey.rawRepresentation,
             signedDevices: signedDevices,
             signedOneTimePublicKeys: signedKeys,
-            signedMLKEMOneTimePublicKeys: signedMLKEMKeys
+            signedMLKEMOneTimePublicKeys: signedMLKEMKeys,
+            signedDeviceKeyBundles: signedDeviceKeyBundles
         )
     }
 

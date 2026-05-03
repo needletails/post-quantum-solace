@@ -152,6 +152,14 @@ public struct LinkDeviceInfo: Sendable {
     /// It should be strong and kept confidential.
     public let password: String
 
+    /// The account-signed configuration the linked device should install.
+    ///
+    /// Older link payloads only carried `devices`, forcing the child to rebuild a
+    /// temporary self-signed configuration. When present, this is the source of
+    /// truth because it preserves the account signing key, device attestations,
+    /// one-time keys, and device-owned key bundles.
+    public let userConfiguration: UserConfiguration?
+
     /// Initializes a new instance of `LinkDeviceInfo`.
     ///
     /// - Parameters:
@@ -164,11 +172,13 @@ public struct LinkDeviceInfo: Sendable {
     public init(
         secretName: String,
         devices: [UserDeviceConfiguration],
-        password: String
+        password: String,
+        userConfiguration: UserConfiguration? = nil
     ) {
         self.secretName = secretName
         self.devices = devices
         self.password = password
+        self.userConfiguration = userConfiguration
     }
 }
 

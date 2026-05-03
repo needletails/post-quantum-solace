@@ -326,6 +326,11 @@ public struct RotatedPublicKeys: Codable, Sendable {
     /// one trusted device remains from a corrupted multi-device account state.
     public let recovery: RotatedKeysRecovery?
 
+    /// Device-signed current key bundle for routine per-device rotation. When present,
+    /// the server verifies it with the device's account-authorized signing public key and
+    /// updates only `signedDeviceKeyBundles`, not account membership.
+    public let deviceKeyBundle: UserConfiguration.SignedDeviceKeyBundle?
+
     /// Initializes a new `RotatedPublicKeys` instance.
     ///
     /// - Parameters:
@@ -336,12 +341,13 @@ public struct RotatedPublicKeys: Codable, Sendable {
         pskData: Data,
         signedDevice: UserConfiguration.SignedDeviceConfiguration,
         allSignedDevices: [UserConfiguration.SignedDeviceConfiguration]? = nil,
-        recovery: RotatedKeysRecovery? = nil
+        recovery: RotatedKeysRecovery? = nil,
+        deviceKeyBundle: UserConfiguration.SignedDeviceKeyBundle? = nil
     ) {
         self.pskData = pskData
         self.signedDevice = signedDevice
         self.allSignedDevices = allSignedDevices
         self.recovery = recovery
+        self.deviceKeyBundle = deviceKeyBundle
     }
 }
-

@@ -134,14 +134,12 @@ extension PQSSession {
                 senderControlEpisodes[key] = existing
                 logger.log(
                     level: .info,
-                    message: "[control-event] sender re-emit kind=\(kind.rawValue) scope=\(scope) intent=\(existing.intentId.uuidString) epoch=\(nextEpoch) attempt=\(existing.emissionsThisEpisode)"
-                )
+                    message: "[control-event] sender re-emit kind=\(kind.rawValue) scope=\(scope) intent=\(existing.intentId.uuidString) epoch=\(nextEpoch) attempt=\(existing.emissionsThisEpisode)")
                 return SessionReestablishmentEnvelope(
                     kind: kind,
                     intentId: existing.intentId,
                     epoch: nextEpoch,
-                    emittedAt: now
-                )
+                    emittedAt: now)
             }
             // Past episode lifetime: fall through to fresh-episode mint below.
             logger.log(
@@ -164,31 +162,90 @@ extension PQSSession {
         enforceSenderEpisodeBound()
         logger.log(
             level: .info,
-            message: "[control-event] sender new episode kind=\(kind.rawValue) scope=\(scope) intent=\(intentId.uuidString) epoch=\(nextEpoch)"
-        )
+            message: "[control-event] sender new episode kind=\(kind.rawValue) scope=\(scope) intent=\(intentId.uuidString) epoch=\(nextEpoch)")
         return SessionReestablishmentEnvelope(
             kind: kind,
             intentId: intentId,
             epoch: nextEpoch,
-            emittedAt: now
-        )
+            emittedAt: now)
     }
 
     /// Throttled, single-flight emission of a session-reestablishment control event.
     ///
     /// Encodes the envelope into `TransportEvent.sessionReestablishment(_:)` and writes a
     /// personal/peer message via `writeTextMessage(...)`. Returns `true` if a message was
-    /// actually placed on the wire, or `false` if the emission was suppressed by the cooldown.
+    /// queued for transport, or `false` if the emission was suppressed by the cooldown.
     @discardableResult
     func emitSessionReestablishment(
         kind: SessionReestablishmentKind,
         recipient: MessageRecipient,
-        scope: ControlEventScope
+        scope: ControlEventScope,
+        freshOutboundRepair: (secretName: String, deviceId: UUID, failureClass: String)? = nil
     ) async throws -> Bool {
         guard let envelope = makeSessionReestablishmentEnvelope(kind: kind, scope: scope) else {
             return false
         }
+        if let freshOutboundRepair {
+            await prepareFreshOutboundSessionForRepairControls(
+                secretName: freshOutboundRepair.secretName,
+                deviceId: freshOutboundRepair.deviceId,
+                failureClass: freshOutboundRepair.failureClass)
+        }
         let metadata = try BinaryEncoder().encode(TransportEvent.sessionReestablishment(envelope))
+        try await writeTextMessage(recipient: recipient, transportInfo: metadata)
+        return true
+    }
+
+    private func prepareFreshOutboundSessionForRepairControls(
+        secretName: String,
+        deviceId: UUID,
+        failureClass: String
+    ) async {
+        guard canAttemptReconciliation(
+            sender: secretName,
+            deviceId: deviceId,
+            flow: .outbound)
+        else {
+            logger.log(
+                level: .info,
+                message: "Skipping outbound SessionIdentity reset for repair controls to \(secretName) (\(deviceId)); reconciliation cooldown is active")
+            return
+        }
+
+        do {
+            _ = try await resetSessionIdentityForFreshSession(
+                secretName: secretName,
+                deviceId: deviceId,
+                sendOneTimeIdentities: true)
+            logger.log(
+                level: .info,
+                message: "Prepared fresh outbound SessionIdentity for repair controls to \(secretName) deviceId=\(deviceId) after \(failureClass)")
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "Fresh outbound SessionIdentity reset before repair controls failed for \(secretName) (\(deviceId)): \(error)")
+        }
+    }
+
+    /// Emits a response for a reestablishment request after the local refresh work has
+    /// completed. Responses bypass sender-side cooldown so a legitimate acknowledgement
+    /// is not suppressed by the request episode that may already be in flight.
+    @discardableResult
+    func emitSessionReestablishmentResponse(
+        kind: SessionReestablishmentKind,
+        recipient: MessageRecipient,
+        respondingTo envelope: SessionReestablishmentEnvelope
+    ) async throws -> Bool {
+        let nextEpoch = max(
+            (senderControlEpochCounters[kind] ?? 0) + 1,
+            envelope.epoch + 1)
+        senderControlEpochCounters[kind] = nextEpoch
+        let response = SessionReestablishmentEnvelope(
+            kind: kind,
+            intentId: envelope.intentId ?? UUID(),
+            epoch: nextEpoch,
+            isResponse: true)
+        let metadata = try BinaryEncoder().encode(TransportEvent.sessionReestablishment(response))
         try await writeTextMessage(recipient: recipient, transportInfo: metadata)
         return true
     }
