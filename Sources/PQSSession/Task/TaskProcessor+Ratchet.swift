@@ -733,6 +733,8 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             sharedMessageId: outboundTask.sharedId,
             transportEvent: transportEvent))
 
+        rememberRecentOutboundReplayIfNeeded(outboundTask)
+
         if outboundTask.isPersistedOutbound {
             await markPersistedOutboundPastSendingIfNeeded(session: session, localMessageId: outboundTask.localId)
         }
@@ -794,6 +796,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             let activeSessionIdentity = verificationResult.sessionIdentity
             let activeSessionIdentityDataBeforeAttempt = activeSessionIdentity.data
             var decryptedFromArchivedIdentity = false
+            var decryptionSessionIdentity = activeSessionIdentity
             var decryptedData: Data
             do {
                 try await initializeRecipient(
@@ -829,6 +832,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                             sessionId: archived.id)
                         logger.log(level: .info, message: "Archived identity fallback succeeded for \(inboundTask.senderSecretName)")
                         decryptedFromArchivedIdentity = true
+                        decryptionSessionIdentity = archived
                         fallbackData = data
                         break
                     } catch {
@@ -884,6 +888,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         canSaveMessage = false
 
                         guard let context = await session.sessionContext else { return }
+
+                        if decryptedFromArchivedIdentity,
+                           envelope.kind == .peerRefresh {
+                            logger.log(
+                                level: .info,
+                                message: "Ignoring archived peerRefresh control from \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId)); waiting for active reestablishment before continuing recovery"
+                            )
+                            return
+                        }
 
                         // Receiver-side coalescing: drop duplicates and stale-epoch replays from
                         // an offline mailbox before any expensive work or delegate dispatch.
@@ -1008,21 +1021,30 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         
                         
                         let symmetricKey = try await session.getDatabaseSymmetricKey()
-                        let foundMessage: EncryptedMessage?
-                        do {
-                            foundMessage = try await session.cache?.fetchMessage(sharedId: request.failedSharedMessageId)
-                        } catch {
+                        let cryptoMessage: CryptoMessage
+                        if let replay = recentOutboundReplayMessage(sharedId: request.failedSharedMessageId) {
+                            cryptoMessage = replay.message
                             logger.log(
                                 level: .info,
-                                message: "Ignoring requestMessageResend for missing local message sharedMessageId=\(request.failedSharedMessageId): \(error)")
-                            break
-                        }
+                                message: "Replaying recent non-persistent outbound control sharedMessageId=\(request.failedSharedMessageId) replayCount=\(replay.replayCount)")
+                        } else {
+                            let foundMessage: EncryptedMessage?
+                            do {
+                                foundMessage = try await session.cache?.fetchMessage(sharedId: request.failedSharedMessageId)
+                            } catch {
+                                logger.log(
+                                    level: .info,
+                                    message: "Ignoring requestMessageResend for missing local message sharedMessageId=\(request.failedSharedMessageId): \(error)")
+                                break
+                            }
 
-                        guard let cryptoMessage = await foundMessage?.props(symmetricKey: symmetricKey)?.message else {
-                            logger.log(
-                                level: .info,
-                                message: "Ignoring requestMessageResend for unreadable local message sharedMessageId=\(request.failedSharedMessageId)")
-                            break
+                            guard let fetchedCryptoMessage = await foundMessage?.props(symmetricKey: symmetricKey)?.message else {
+                                logger.log(
+                                    level: .info,
+                                    message: "Ignoring requestMessageResend for unreadable local message sharedMessageId=\(request.failedSharedMessageId)")
+                                break
+                            }
+                            cryptoMessage = fetchedCryptoMessage
                         }
                         
                         let identities = try await session.cache?.fetchSessionIdentities() ?? []
@@ -1076,7 +1098,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     decodedMessage,
                     inboundTask: inboundTask,
                     session: session,
-                    sessionIdentity: verificationResult.sessionIdentity)
+                    sessionIdentity: decryptionSessionIdentity)
 
                 let pending = await session.takePendingResendsAfterReestablishment(
                     sender: inboundTask.senderSecretName,
@@ -1124,6 +1146,69 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             logger.log(
                 level: .info,
                 message: "Skipped restoring SessionIdentity after \(reason); identity no longer exists in cache")
+        }
+    }
+
+    private func rememberRecentOutboundReplayIfNeeded(_ outboundTask: OutboundTaskMessage, now: Date = Date()) {
+        cleanupRecentOutboundReplay(now: now)
+        guard !outboundTask.isPersistedOutbound else { return }
+        guard isReplayableNonPersistentControl(outboundTask.message) else { return }
+        guard recentOutboundReplayBySharedId[outboundTask.sharedId] == nil else { return }
+
+        recentOutboundReplayBySharedId[outboundTask.sharedId] = RecentOutboundReplay(
+            message: outboundTask.message,
+            createdAt: now,
+            replayCount: 0)
+
+        guard recentOutboundReplayBySharedId.count > recentOutboundReplayLimit else { return }
+        let overflow = recentOutboundReplayBySharedId.count - recentOutboundReplayLimit
+        let oldestKeys = recentOutboundReplayBySharedId
+            .sorted { $0.value.createdAt < $1.value.createdAt }
+            .prefix(overflow)
+            .map(\.key)
+        for key in oldestKeys {
+            recentOutboundReplayBySharedId.removeValue(forKey: key)
+        }
+    }
+
+    private func recentOutboundReplayMessage(
+        sharedId: String,
+        now: Date = Date()
+    ) -> (message: CryptoMessage, replayCount: Int)? {
+        cleanupRecentOutboundReplay(now: now)
+        guard var replay = recentOutboundReplayBySharedId[sharedId] else {
+            return nil
+        }
+        guard replay.replayCount < recentOutboundReplayMaxReplays else {
+            recentOutboundReplayBySharedId.removeValue(forKey: sharedId)
+            return nil
+        }
+        replay.replayCount += 1
+        recentOutboundReplayBySharedId[sharedId] = replay
+        return (replay.message, replay.replayCount)
+    }
+
+    private func cleanupRecentOutboundReplay(now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-recentOutboundReplayTTL)
+        recentOutboundReplayBySharedId = recentOutboundReplayBySharedId.filter { _, replay in
+            replay.createdAt > cutoff
+        }
+    }
+
+    private func isReplayableNonPersistentControl(_ message: CryptoMessage) -> Bool {
+        guard let transportInfo = message.transportInfo,
+              let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo)
+        else {
+            return false
+        }
+
+        switch event {
+        case .sessionReestablishment(let envelope):
+            return envelope.isResponse
+        case .linkedDeviceReprovisioning:
+            return true
+        case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .requestMessageResend:
+            return false
         }
     }
 

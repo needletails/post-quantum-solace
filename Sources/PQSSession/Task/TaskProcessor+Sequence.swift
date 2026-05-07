@@ -230,67 +230,19 @@ extension TaskProcessor {
             return .processed
             
         } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-            //This means that no where in our current session identity can we find the key on the ring for our permitted range. We could be at Index 4, we try up to 10, so that would be 4...14 with no key being able to decrypt our message. This could be an abuse and or a potential attack. So We must rotate our keys on compromise. This means that the master device must full rotate their sessionIdentity. We will keep an archived SessionIdentity temporarily for other messages that may not have been received yet that are still encrypted with the valid key ring. After a given period of time we will them delete the archived Session Identity; This will cause a different failure since we rotated the master's SessionIdentity already. At that point we will then need to request resend message with out a rotation so that the sender will get the latest Session Identities during the encryption flow.
-            
-            //If we are not a master device and hit this error me must tell the master device to rotate on compromise. Afterwards we also need to receive a message that tells us to rotate and then request resend message.
-            
-            //If we are the master device then we rotate on compromise, notify child devices that they need to rotate also which needs to be done after the master rotates so that we can sign the keys properly.
-            
             switch props.task.task {
             case .streamMessage(let message):
+                let failureClass = "ratchet.maxSkippedHeadersExceeded"
 
-                guard let context = await session.sessionContext else { return .failed }
-
-                if message.senderSecretName == context.sessionUser.secretName,
-                   message.senderDeviceId != context.sessionUser.deviceId {
-                    logger.log(
-                        level: .warning,
-                        message: "ratchet.maxSkippedHeadersExceeded for linked self device \(message.senderDeviceId); repairing personal SessionIdentity without compromise escalation")
-                    return try await handleFreshSessionRepair(
-                        message: message,
-                        failureClass: "ratchet.maxSkippedHeadersExceeded",
-                        job: job,
-                        cache: cache,
-                        session: session)
-                }
-
-                //1. Archive current SessionIdentity:
-                try await session.createInactiveSessionSnapshot(for: message.senderSecretName, policy: .archive)
-
-                //2. Rotate due to potential compromise
-                
-                guard let currentDevice = try context.activeUserConfiguration
-                    .getVerifiedDevices()
-                    .first(where: { $0.deviceId == context.sessionUser.deviceId }) else {
-                    throw PQSSession.SessionErrors.invalidDeviceIdentity
-                }
-                
-                if currentDevice.isMasterDevice {
-                    try await session.rotateKeysOnPotentialCompromise()
-                } else {
-                    _ = try await session.emitSessionReestablishment(
-                        kind: .linkedDeviceCompromiseObserved,
-                        recipient: .personalMessage,
-                        scope: .personal
-                    )
-                    do {
-                        try await session.rotateCurrentDeviceKeys()
-                    } catch let sessionError as PQSSession.SessionErrors where sessionError == .signingKeyOutOfSync {
-                        logger.log(level: .warning, message: "signingKeyOutOfSync on child device during key rotation recovery; requesting reprovisioning from master")
-                        _ = try await session.emitSessionReestablishment(
-                            kind: .linkedDeviceCompromiseObserved,
-                            recipient: .personalMessage,
-                            scope: .personal)
-                        try await cache.deleteJob(job)
-                        return .deleted
-                    }
-                }
-                try await session.requestMessageResend(
-                    sharedMessageId: message.sharedMessageId,
-                    senderName: message.senderSecretName,
-                    senderDeviceId: message.senderDeviceId)
-                try await cache.deleteJob(job)
-                return .deleted
+                logger.log(
+                    level: .warning,
+                    message: "\(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId); using fresh SessionIdentity repair without compromise rotation")
+                return try await handleFreshSessionRepair(
+                    message: message,
+                    failureClass: failureClass,
+                    job: job,
+                    cache: cache,
+                    session: session)
             case .writeMessage(let message):
                 logger.log(level: .error, message: "MaxSkippedHeadersExceeded for writeMessage to recipient: \(message.message.recipient)")
                 try await cache.deleteJob(job)
@@ -349,7 +301,8 @@ extension TaskProcessor {
                     _ = try await session.emitSessionReestablishment(
                         kind: .peerRefresh,
                         recipient: isSelf ? .personalMessage : .nickname(message.senderSecretName),
-                        scope: isSelf ? .personal : .peer(secretName: message.senderSecretName))
+                        scope: isSelf ? .personal : .peer(secretName: message.senderSecretName),
+                        forceReemit: true)
                 } catch {
                     logger.log(level: .warning, message: "Failed to emit peerRefresh after \(failureClass): \(error)")
                 }
@@ -384,14 +337,12 @@ extension TaskProcessor {
                     return .deleted
                 }
 
-                do {
-                    try await session.requestMessageResend(
-                        sharedMessageId: message.sharedMessageId,
-                        senderName: message.senderSecretName,
-                        senderDeviceId: message.senderDeviceId)
+                let didRequestResend = await requestPeerResendIfAllowed(
+                    message: message,
+                    failureClass: failureClass,
+                    session: session)
+                if didRequestResend {
                     await session.markInboundFailure(message, failureClass: failureClass)
-                } catch {
-                    logger.log(level: .warning, message: "Failed to request resend after \(failureClass) for sharedMessageId=\(message.sharedMessageId): \(error)")
                 }
                 try await cache.deleteJob(job)
                 return .deleted
@@ -419,18 +370,11 @@ extension TaskProcessor {
         } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
             switch props.task.task {
             case .streamMessage(let message):
-                logger.log(level: .error, message: "invalidSignature for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId) — notifying peer to refresh keys")
-                let mySecretName = await session.sessionContext?.sessionUser.secretName
-                let isSelf = message.senderSecretName == mySecretName
-                let recipient: MessageRecipient = isSelf ? .personalMessage : .nickname(message.senderSecretName)
-                let scope: ControlEventScope = isSelf ? .personal : .peer(secretName: message.senderSecretName)
-                _ = try await session.emitSessionReestablishment(
-                    kind: .peerRefresh,
-                    recipient: recipient,
-                    scope: scope
-                )
-                try await cache.deleteJob(job)
-                return .deleted
+                return try await handleInvalidSignature(
+                    message: message,
+                    job: job,
+                    cache: cache,
+                    session: session)
             case .writeMessage(let message):
                 logger.log(level: .error, message: "invalidSignature for writeMessage to recipient: \(message.message.recipient)")
                 try await cache.deleteJob(job)
@@ -501,6 +445,119 @@ extension TaskProcessor {
         }
     }
 
+    private func requestPeerResendIfAllowed(
+        message: InboundTaskMessage,
+        failureClass: String,
+        session: PQSSession
+    ) async -> Bool {
+        guard await session.canSendPeerResendRequest(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            failedMessageId: message.sharedMessageId)
+        else {
+            logger.log(
+                level: .info,
+                message: "Skipping resend request after \(failureClass); cooldown active sharedMessageId=\(message.sharedMessageId)")
+            return false
+        }
+
+        do {
+            try await session.requestMessageResend(
+                sharedMessageId: message.sharedMessageId,
+                senderName: message.senderSecretName,
+                senderDeviceId: message.senderDeviceId)
+            await session.markPeerResendRequestSent(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                failedMessageId: message.sharedMessageId)
+            return true
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "Failed to request resend after \(failureClass) for sharedMessageId=\(message.sharedMessageId): \(error)")
+            return false
+        }
+    }
+
+    private func handleInvalidSignature(
+        message: InboundTaskMessage,
+        job: JobModel,
+        cache: SessionCache,
+        session: PQSSession
+    ) async throws -> JobProcessingOutcome {
+        let failureClass = "signature.invalidSignature"
+        if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
+            logger.log(level: .info, message: "Suppressing repeated \(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+
+        await session.markInboundFailure(message, failureClass: failureClass)
+
+        guard let context = await session.sessionContext else {
+            logger.log(level: .error, message: "invalidSignature for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId); dropping without recovery because session context is unavailable")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+
+        let isSelf = message.senderSecretName == context.sessionUser.secretName
+        if isSelf {
+            logger.log(
+                level: .error,
+                message: "invalidSignature from same-account deviceId=\(message.senderDeviceId); treating as linked-device compromise observation")
+
+            let currentDevice = try? context.activeUserConfiguration
+                .getVerifiedDevices()
+                .first(where: { $0.deviceId == context.sessionUser.deviceId })
+
+            if currentDevice?.isMasterDevice == true {
+                await session.sessionDelegate?.linkedDeviceReportedPotentialCompromise(
+                    deviceId: message.senderDeviceId,
+                    intentId: nil)
+            } else {
+                do {
+                    _ = try await session.emitSessionReestablishment(
+                        kind: .linkedDeviceCompromiseObserved,
+                        recipient: .personalMessage,
+                        scope: .personal)
+                } catch {
+                    logger.log(level: .warning, message: "Failed to send linked-device compromise observation after \(failureClass): \(error)")
+                }
+            }
+
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+
+        logger.log(
+            level: .error,
+            message: "invalidSignature for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId); discarding message and requesting bounded resend")
+
+        let didRequestResend = await requestPeerResendIfAllowed(
+            message: message,
+            failureClass: failureClass,
+            session: session)
+
+        if !didRequestResend {
+            await session.deferPeerResendUntilReestablished(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                failedMessageId: message.sharedMessageId,
+                failureClass: failureClass)
+            do {
+                _ = try await session.emitSessionReestablishment(
+                    kind: .peerRefresh,
+                    recipient: .nickname(message.senderSecretName),
+                    scope: .peer(secretName: message.senderSecretName))
+            } catch {
+                logger.log(level: .warning, message: "Failed to emit peerRefresh after \(failureClass): \(error)")
+            }
+        }
+
+        try await cache.deleteJob(job)
+        return .deleted
+    }
+
     private func handleFreshSessionRepair(
         message: InboundTaskMessage,
         failureClass: String,
@@ -564,6 +621,15 @@ extension TaskProcessor {
         let recipient: MessageRecipient = isSelf ? .personalMessage : .nickname(message.senderSecretName)
         let scope: ControlEventScope = isSelf ? .personal : .peer(secretName: message.senderSecretName)
 
+        await session.deferPeerResendUntilReestablished(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            failedMessageId: message.sharedMessageId,
+            failureClass: failureClass)
+        logger.log(
+            level: .info,
+            message: "Deferred resend request for sharedMessageId=\(message.sharedMessageId) until peerRefresh completes for \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+
         do {
             _ = try await session.emitSessionReestablishment(
                 kind: .peerRefresh,
@@ -576,15 +642,6 @@ extension TaskProcessor {
         } catch {
             logger.log(level: .warning, message: "Failed to emit peerRefresh after \(failureClass): \(error)")
         }
-
-        await session.deferPeerResendUntilReestablished(
-            sender: message.senderSecretName,
-            deviceId: message.senderDeviceId,
-            failedMessageId: message.sharedMessageId,
-            failureClass: failureClass)
-        logger.log(
-            level: .info,
-            message: "Deferred resend request for sharedMessageId=\(message.sharedMessageId) until peerRefresh completes for \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
 
         try await cache.deleteJob(job)
         return .deleted

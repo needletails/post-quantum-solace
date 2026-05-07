@@ -87,7 +87,7 @@ public struct ProcessedControlEventState: Sendable {
 public enum ProcessedControlEventDecision: Sendable, Equatable {
     /// First time we have seen this `(intentId, epoch)` for `(senderDeviceId, kind)` -> act on it.
     case process
-    /// Same `intentId` (or same epoch) as one we already acted on -> drop silently.
+    /// Same epoch, or same `intentId` without newer epoch ordering, as one we already acted on -> drop silently.
     case skipDuplicate
     /// Strictly older epoch than the latest we processed -> drop as out-of-order replay.
     case skipStale
@@ -109,7 +109,8 @@ extension PQSSession {
     ///   - If past the episode lifetime, treat as a new problem and mint a fresh `intentId`.
     func makeSessionReestablishmentEnvelope(
         kind: SessionReestablishmentKind,
-        scope: ControlEventScope
+        scope: ControlEventScope,
+        forceReemit: Bool = false
     ) -> SessionReestablishmentEnvelope? {
         pruneStaleSenderEpisodes()
         let now = Date()
@@ -118,7 +119,7 @@ extension PQSSession {
         let episodeMaxLifetime = PQSSessionConstants.controlEventEpisodeMaxLifetimeSeconds
 
         if var existing = senderControlEpisodes[key] {
-            if now.timeIntervalSince(existing.lastEmittedAt) < cooldown {
+            if now.timeIntervalSince(existing.lastEmittedAt) < cooldown && !forceReemit {
                 logger.log(
                     level: .debug,
                     message: "[control-event] sender suppressed kind=\(kind.rawValue) scope=\(scope) (within cooldown=\(Int(cooldown))s, episode=\(existing.intentId.uuidString))"
@@ -134,7 +135,7 @@ extension PQSSession {
                 senderControlEpisodes[key] = existing
                 logger.log(
                     level: .info,
-                    message: "[control-event] sender re-emit kind=\(kind.rawValue) scope=\(scope) intent=\(existing.intentId.uuidString) epoch=\(nextEpoch) attempt=\(existing.emissionsThisEpisode)")
+                    message: "[control-event] sender \(forceReemit ? "forced " : "")re-emit kind=\(kind.rawValue) scope=\(scope) intent=\(existing.intentId.uuidString) epoch=\(nextEpoch) attempt=\(existing.emissionsThisEpisode)")
                 return SessionReestablishmentEnvelope(
                     kind: kind,
                     intentId: existing.intentId,
@@ -180,9 +181,13 @@ extension PQSSession {
         kind: SessionReestablishmentKind,
         recipient: MessageRecipient,
         scope: ControlEventScope,
+        forceReemit: Bool = false,
         freshOutboundRepair: (secretName: String, deviceId: UUID, failureClass: String)? = nil
     ) async throws -> Bool {
-        guard let envelope = makeSessionReestablishmentEnvelope(kind: kind, scope: scope) else {
+        guard let envelope = makeSessionReestablishmentEnvelope(
+            kind: kind,
+            scope: scope,
+            forceReemit: forceReemit) else {
             return false
         }
         if let freshOutboundRepair {
@@ -217,6 +222,10 @@ extension PQSSession {
                 secretName: secretName,
                 deviceId: deviceId,
                 sendOneTimeIdentities: true)
+            markReconciliationAttempt(
+                sender: secretName,
+                deviceId: deviceId,
+                flow: .outbound)
             logger.log(
                 level: .info,
                 message: "Prepared fresh outbound SessionIdentity for repair controls to \(secretName) deviceId=\(deviceId) after \(failureClass)")
@@ -253,8 +262,8 @@ extension PQSSession {
     // MARK: - Receiver-Side Coalescing
 
     /// Decide whether an inbound `SessionReestablishmentEnvelope` should be acted upon, and
-    /// atomically record that decision so subsequent replays of the same `(intentId, epoch)`
-    /// from `senderDeviceId` are dropped.
+    /// atomically record that decision so exact replays from `senderDeviceId` are dropped while
+    /// higher-epoch re-emits of the same intent can still drive a fresh idempotent response.
     func recordReceivedSessionReestablishment(
         envelope: SessionReestablishmentEnvelope,
         senderDeviceId: UUID
@@ -264,11 +273,6 @@ extension PQSSession {
         let now = Date()
 
         if let existing = processedControlEvents[key] {
-            if let existingIntent = existing.lastProcessedIntentId,
-               let incomingIntent = envelope.intentId,
-               existingIntent == incomingIntent {
-                return .skipDuplicate
-            }
             if envelope.epoch > 0 && existing.lastProcessedEpoch > 0 {
                 if envelope.epoch < existing.lastProcessedEpoch {
                     return .skipStale
@@ -276,6 +280,10 @@ extension PQSSession {
                 if envelope.epoch == existing.lastProcessedEpoch {
                     return .skipDuplicate
                 }
+            } else if let existingIntent = existing.lastProcessedIntentId,
+                      let incomingIntent = envelope.intentId,
+                      existingIntent == incomingIntent {
+                return .skipDuplicate
             }
         }
 

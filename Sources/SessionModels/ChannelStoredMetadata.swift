@@ -31,6 +31,7 @@ public struct ChannelLocalOverlay: Codable, Sendable, Hashable {
         case displayTitle
         case userMarkedArchived
         case userMarkedHidden
+        case isClosedByAdminDestruction
     }
 
     public var userMarkedPinned: Bool
@@ -40,6 +41,8 @@ public struct ChannelLocalOverlay: Codable, Sendable, Hashable {
     public var displayTitle: String?
     public var userMarkedArchived: Bool
     public var userMarkedHidden: Bool
+    /// Local-only: channel was removed on the server by an admin; member devices keep a read-only shell.
+    public var isClosedByAdminDestruction: Bool
 
     public init(
         userMarkedPinned: Bool = false,
@@ -47,7 +50,8 @@ public struct ChannelLocalOverlay: Codable, Sendable, Hashable {
         useManualReadState: Bool = false,
         displayTitle: String? = nil,
         userMarkedArchived: Bool = false,
-        userMarkedHidden: Bool = false
+        userMarkedHidden: Bool = false,
+        isClosedByAdminDestruction: Bool = false
     ) {
         self.userMarkedPinned = userMarkedPinned
         self.userMarkedRead = userMarkedRead
@@ -55,6 +59,7 @@ public struct ChannelLocalOverlay: Codable, Sendable, Hashable {
         self.displayTitle = displayTitle
         self.userMarkedArchived = userMarkedArchived
         self.userMarkedHidden = userMarkedHidden
+        self.isClosedByAdminDestruction = isClosedByAdminDestruction
     }
 
     public init(from decoder: Decoder) throws {
@@ -65,6 +70,7 @@ public struct ChannelLocalOverlay: Codable, Sendable, Hashable {
         displayTitle = try c.decodeIfPresent(String.self, forKey: .displayTitle)
         userMarkedArchived = try c.decodeIfPresent(Bool.self, forKey: .userMarkedArchived) ?? false
         userMarkedHidden = try c.decodeIfPresent(Bool.self, forKey: .userMarkedHidden) ?? false
+        isClosedByAdminDestruction = try c.decodeIfPresent(Bool.self, forKey: .isClosedByAdminDestruction) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -75,6 +81,7 @@ public struct ChannelLocalOverlay: Codable, Sendable, Hashable {
         try c.encodeIfPresent(displayTitle, forKey: .displayTitle)
         try c.encode(userMarkedArchived, forKey: .userMarkedArchived)
         try c.encode(userMarkedHidden, forKey: .userMarkedHidden)
+        try c.encode(isClosedByAdminDestruction, forKey: .isClosedByAdminDestruction)
     }
 }
 

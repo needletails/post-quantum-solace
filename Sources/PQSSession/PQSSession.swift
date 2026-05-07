@@ -1527,6 +1527,45 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
 
+    func userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+        _ incomingConfiguration: UserConfiguration,
+        currentContext: SessionContext
+    ) -> UserConfiguration {
+        let deviceId = currentContext.sessionUser.deviceId
+        guard let verifiedDevice = try? incomingConfiguration.getVerifiedDevices().first(where: {
+            $0.deviceId == deviceId
+        }),
+              let deviceSigningKey = try? Curve25519.Signing.PublicKey(
+                rawRepresentation: verifiedDevice.signingPublicKey
+              )
+        else {
+            return incomingConfiguration
+        }
+
+        let localCurveKeys = currentContext.activeUserConfiguration.signedOneTimePublicKeys
+            .filter { $0.deviceId == deviceId }
+            .filter { (try? $0.verified(using: deviceSigningKey)) != nil }
+        let localMLKEMKeys = currentContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
+            .filter { $0.deviceId == deviceId }
+            .filter { (try? $0.verified(using: deviceSigningKey)) != nil }
+
+        guard !localCurveKeys.isEmpty || !localMLKEMKeys.isEmpty else {
+            return incomingConfiguration
+        }
+
+        var mergedConfiguration = incomingConfiguration
+        if !localCurveKeys.isEmpty {
+            mergedConfiguration.signedOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
+            mergedConfiguration.signedOneTimePublicKeys.append(contentsOf: localCurveKeys)
+        }
+        if !localMLKEMKeys.isEmpty {
+            mergedConfiguration.signedMLKEMOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
+            mergedConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: localMLKEMKeys)
+        }
+
+        return mergedConfiguration
+    }
+
     /// Adopts a `UserConfiguration` that has already been verified against its own
     /// `signingPublicKey` (e.g. one returned from the server's `findConfiguration`
     /// endpoint, where every signed entry was produced by the master's account-level
@@ -1593,7 +1632,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             throw SessionErrors.signingKeyOutOfSync
         }
 
-        sessionContext.activeUserConfiguration = configuration
+        sessionContext.activeUserConfiguration = userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+            configuration,
+            currentContext: sessionContext
+        )
         await setSessionContext(sessionContext)
 
         let encodedData = try BinaryEncoder().encode(sessionContext)
@@ -1654,7 +1696,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
         // Idempotent no-op: nothing to acknowledge.
         guard oldKey != newKey else {
-            sessionContext.activeUserConfiguration = proposedConfiguration
+            sessionContext.activeUserConfiguration = userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+                proposedConfiguration,
+                currentContext: sessionContext
+            )
             await setSessionContext(sessionContext)
             let encodedData = try BinaryEncoder().encode(sessionContext)
             guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
@@ -1669,7 +1714,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             message: "[acknowledgeAccountIdentityChange] user-acknowledged account signing key change. oldPrefix=\(oldKey.prefix(8).map { String(format: "%02x", $0) }.joined()) newPrefix=\(newKey.prefix(8).map { String(format: "%02x", $0) }.joined()) deviceCount=\(verified.count)"
         )
 
-        sessionContext.activeUserConfiguration = proposedConfiguration
+        sessionContext.activeUserConfiguration = userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+            proposedConfiguration,
+            currentContext: sessionContext
+        )
         await setSessionContext(sessionContext)
 
         let encodedData = try BinaryEncoder().encode(sessionContext)
@@ -2355,6 +2403,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             )
 
             sessionContext.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
+            logger.log(level: .debug, message: "Replaced local curve OTK batch; count=\(signedOneTimePublicKeys.count)")
 
         case .mlKEM:
             sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
@@ -2384,6 +2433,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             )
 
             sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
+            logger.log(level: .debug, message: "Replaced local MLKEM OTK batch; count=\(signedMLKEMOneTimeKeys.count)")
         }
 
         sessionContext.updateSessionUser(sessionContext.sessionUser)

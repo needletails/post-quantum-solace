@@ -135,6 +135,20 @@ public actor TaskProcessor {
     /// reconciliation already set the peer cooldown. Keyed by outbound shared id.
     var outboundControlRepairBypassAtBySharedId: [String: Date] = [:]
     let outboundControlRepairBypassTTL: TimeInterval = 60 * 10
+
+    struct RecentOutboundReplay: Sendable {
+        let message: CryptoMessage
+        let createdAt: Date
+        var replayCount: Int
+    }
+
+    /// Recent non-persistent SDK control payloads, keyed by shared id.
+    /// Persisted user messages are replayed from the app store; this covers the
+    /// Signal/Sesame recovery controls that intentionally do not create UI rows.
+    var recentOutboundReplayBySharedId: [String: RecentOutboundReplay] = [:]
+    let recentOutboundReplayTTL: TimeInterval = 60 * 10
+    let recentOutboundReplayLimit = 256
+    let recentOutboundReplayMaxReplays = 5
     
     /// Represents a stashed inbound task for later processing.
     ///

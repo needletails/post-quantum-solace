@@ -43,6 +43,22 @@ actor SessionEventProbe {
     }
 }
 
+actor LinkedDeviceCompromiseProbe {
+    private var reportedDeviceIds: [UUID] = []
+
+    func mark(deviceId: UUID) {
+        reportedDeviceIds.append(deviceId)
+    }
+
+    func count() -> Int {
+        reportedDeviceIds.count
+    }
+
+    func contains(_ deviceId: UUID) -> Bool {
+        reportedDeviceIds.contains(deviceId)
+    }
+}
+
 @Suite(.serialized)
 actor EndToEndTests {
     let crypto = NeedleTailCrypto()
@@ -358,9 +374,9 @@ actor EndToEndTests {
     
     /// Receives a message but tolerates transient/expected errors during key rotation.
     ///
-    /// In production, `.maxSkippedHeadersExceeded` is rethrown after an SDK-driven rotation so the
-    /// SDK consumer can clear backlog and request resend. In tests, we typically want receive loops
-    /// to keep running while rotation/reestablishment converges.
+    /// In production, `.maxSkippedHeadersExceeded` is handled as session repair so the
+    /// SDK can reestablish with the sender and request resend without rotating local identity keys.
+    /// In tests, we typically want receive loops to keep running while reestablishment converges.
     @discardableResult
     private func receiveIgnoringRecoverableErrors(
         _ session: PQSSession,
@@ -4081,7 +4097,7 @@ actor EndToEndTests {
         
         try await Task.sleep(until: .now + .milliseconds(500))
         
-        // Verify behavior: if maxSkipped happened, we should have attempted an SDK-side rotation.
+        // Verify behavior: if maxSkipped happened, it should stay bounded and recover through repair.
         let errors = await counter.getErrors()
         let bobCount = await counter.getBobCount()
         let aliceCount = await counter.getAliceCount()
@@ -5467,12 +5483,12 @@ actor EndToEndTests {
         bobTransport.continuation?.finish()
     }
 
-    @Test("MaxSkipped backlog triggers only one key rotation")
-    func testMaxSkippedBacklogTriggersOnlyOneKeyRotation() async throws {
+    @Test("MaxSkipped backlog repairs without key rotation")
+    func testMaxSkippedBacklogRepairsWithoutKeyRotation() async throws {
         // Reproduces the production issue:
         // Bob misses > maxSkippedMessageKeys messages, then receives later messages.
         // Each late message fails with `.maxSkippedHeadersExceeded`, which used to trigger
-        // repeated key rotations. We assert only ONE rotation occurs.
+        // repeated key rotations. We assert the repair path does not rotate local identity keys.
 
         var bobTask: Task<Void, Never>?
         defer {
@@ -5538,22 +5554,22 @@ actor EndToEndTests {
             try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "msg \(i)")
         }
 
-        // Give Bob time to process the delivered late messages and trigger rotation.
+        // Give Bob time to process the delivered late messages and trigger repair.
         try await Task.sleep(until: .now + .seconds(2))
         aliceTransport.continuation?.finish()
         _ = await bobTask?.value
 
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
-        #expect(rotationCount == 1, "Expected exactly one key rotation after maxSkipped backlog, got \(rotationCount)")
+        #expect(rotationCount == 0, "Expected maxSkipped backlog to use repair/resend without key rotation, got \(rotationCount)")
     }
     
-    @Test("maxSkipped triggers SDK rotation and rethrows for resend")
-    func testMaxSkippedTriggersRotationAndRethrowsForResend() async throws {
+    @Test("maxSkipped emits repair without SDK rotation")
+    func testMaxSkippedEmitsRepairWithoutSDKRotation() async throws {
         // Contract test for production behavior:
         // - A late message causes `maxSkippedHeadersExceeded`
-        // - SDK performs a single bounded rotation
-        // - SDK rethrows `maxSkippedHeadersExceeded` so the consumer can request resend
-        // - Subsequent late messages may still error, but must not trigger additional rotations
+        // - SDK prepares a fresh SessionIdentity and emits existing repair controls
+        // - SDK does not rotate local account/device identity material
+        // - Subsequent late messages may still error, but must stay on repair/resend
         
         var bobTask: Task<Void, Never>?
         defer {
@@ -5606,11 +5622,28 @@ actor EndToEndTests {
         }
         
         actor Counters {
-            var maxSkippedThrows = 0
-            func incMaxSkipped() { maxSkippedThrows += 1 }
-            func getMaxSkipped() -> Int { maxSkippedThrows }
+            var peerRefreshes = 0
+            func saw(_ event: TransportEvent?) {
+                if case .sessionReestablishment(let envelope) = event,
+                   envelope.kind == .peerRefresh {
+                    peerRefreshes += 1
+                }
+            }
+            func getPeerRefreshes() -> Int { peerRefreshes }
         }
         let counters = Counters()
+        let aliceRepairStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let aliceRepairTask = Task {
+            for await received in aliceRepairStream {
+                await counters.saw(received.transportEvent)
+            }
+        }
+        defer {
+            aliceRepairTask.cancel()
+            bobTransport.continuation?.finish()
+        }
         
         bobTask = Task {
             for await received in bobStream {
@@ -5621,9 +5654,6 @@ actor EndToEndTests {
                         deviceId: received.deviceId,
                         messageId: received.messageId
                     )
-                } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-                    await counters.incMaxSkipped()
-                    // continue: we want to observe bounded rotation behavior over the stream
                 } catch {
                     // Ignore other errors for this contract test
                 }
@@ -5635,21 +5665,19 @@ actor EndToEndTests {
         aliceTransport.continuation?.finish()
         _ = await bobTask?.value
         
-        let maxSkippedCount = await counters.getMaxSkipped()
+        let peerRefreshCount = await counters.getPeerRefreshes()
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
         
-        #expect(maxSkippedCount >= 1, "Expected at least one maxSkippedHeadersExceeded to be surfaced for resend. Got \(maxSkippedCount)")
-        #expect(rotationCount == 1, "Expected exactly one SDK-driven rotation under maxSkipped, got \(rotationCount)")
-        #expect(rotationCount >= 1, "Expected SDK to attempt bounded rotation on maxSkipped.")
+        #expect(peerRefreshCount == 1, "Expected maxSkipped repair to emit one coalesced peerRefresh. Got \(peerRefreshCount)")
+        #expect(rotationCount == 0, "Expected maxSkipped repair to avoid key rotation, got \(rotationCount)")
     }
 
-    @Test("maxSkipped rotation failure propagates to consumer")
-    func testMaxSkippedRotationFailurePropagates() async throws {
+    @Test("maxSkipped does not invoke rotation publish")
+    func testMaxSkippedDoesNotInvokeRotationPublish() async throws {
         // Contract test:
         // - A late message causes `.maxSkippedHeadersExceeded`
-        // - SDK attempts a bounded rotation
-        // - If rotation publish fails, `receiveMessage` must throw the rotation failure (consumer handles it)
-        // - SDK should still set `hasRotatedForMaxSkipped` and the cooldown gate before attempting rotation
+        // - SDK uses repair controls instead of key rotation
+        // - A failing `publishRotatedKeys` hook must not surface because this path should not call it
         
         var bobTask: Task<Void, Never>?
         defer {
@@ -5699,9 +5727,9 @@ actor EndToEndTests {
         }
         
         actor Flags {
-            var sawRotationFailure = false
-            func mark() { sawRotationFailure = true }
-            func get() -> Bool { sawRotationFailure }
+            var sawUnexpectedFailure = false
+            func mark() { sawUnexpectedFailure = true }
+            func get() -> Bool { sawUnexpectedFailure }
         }
         let flags = Flags()
         
@@ -5715,7 +5743,6 @@ actor EndToEndTests {
                         messageId: received.messageId
                     )
                 } catch {
-                    // We expect the rotation publish failure to surface from receiveMessage.
                     await flags.mark()
                     break
                 }
@@ -5727,19 +5754,16 @@ actor EndToEndTests {
         _ = await bobTask?.value
         
         let sawFailure = await flags.get()
-        #expect(sawFailure, "Expected receiveMessage to surface rotation publish failure after maxSkipped.")
+        let rotations = await bobTransport.publishRotatedKeysCallCount
+        #expect(!sawFailure, "Did not expect maxSkipped repair to surface rotation publish failure.")
+        #expect(rotations == 0, "Expected maxSkipped repair not to publish rotated keys, got \(rotations).")
     }
 
-    @Test("maxSkipped cooldown expiry allows second bounded rotation")
-    func testMaxSkippedCooldownExpiryAllowsSecondRotation() async throws {
+    @Test("maxSkipped repeat backlog stays on repair path")
+    func testMaxSkippedRepeatBacklogStaysOnRepairPath() async throws {
         // Contract test (stable + production-realistic):
-        // - First maxSkipped triggers exactly one bounded rotation
-        // - SDK sets a cooldown gate into the future
-        // - If we expire that gate, the stored cooldown reflects expiry
-        //
-        // We do NOT assert a second maxSkipped->rotation here because the rotation path intentionally
-        // invalidates ratchet state; in real usage the consumer requests resend rather than continuing
-        // to process the same broken backlog until a second maxSkipped occurs.
+        // - A maxSkipped backlog can repeat while resend/reestablishment is in flight
+        // - The SDK must stay on repair controls and never escalate to key rotation
         
         var bobTask: Task<Void, Never>?
         defer {
@@ -5772,7 +5796,7 @@ actor EndToEndTests {
         }
         let maxSkippedCounter = MaxSkippedCounter()
         
-        // Receive loop: keep consuming even if maxSkipped rethrows (we care about rotation counts).
+        // Receive loop: keep consuming even if transient errors occur.
         bobTask = Task {
             for await received in bobStream {
                 do {
@@ -5785,7 +5809,7 @@ actor EndToEndTests {
                 } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
                     await maxSkippedCounter.inc()
                 } catch {
-                    // Ignore other errors; this test is about bounded rotation + cooldown.
+                    // Ignore other errors; this test is about staying off rotation.
                 }
             }
         }
@@ -5818,22 +5842,21 @@ actor EndToEndTests {
         
         try await runDropBatch(label: "batch1")
         let rotationsAfterFirst = await bobTransport.publishRotatedKeysCallCount
-        #expect(rotationsAfterFirst == 1, "Expected exactly one rotation after first maxSkipped batch, got \(rotationsAfterFirst)")
-        #expect(rotationsAfterFirst >= 1, "Expected at least one rotation after first maxSkipped batch.")
+        #expect(rotationsAfterFirst == 0, "Expected no rotation after first maxSkipped batch, got \(rotationsAfterFirst)")
         
         aliceTransport.continuation?.finish()
         _ = await bobTask?.value
         
-        let maxSkippedSeen = await maxSkippedCounter.get()
-        #expect(maxSkippedSeen >= 1, "Expected to observe at least one maxSkipped rethrow. Got \(maxSkippedSeen)")
+        let rotationsAfterProcessing = await bobTransport.publishRotatedKeysCallCount
+        #expect(rotationsAfterProcessing == 0, "Expected repeated maxSkipped backlog to stay off key rotation, got \(rotationsAfterProcessing)")
     }
 
-    @Test("invalidSignature is surfaced for resend")
-    func testInvalidSignatureSurfacedForResendDoesNotRotate() async throws {
+    @Test("delayed pre-rotation message is handled internally without rotation")
+    func testDelayedPreRotationMessageHandledInternallyDoesNotRotate() async throws {
         // Contract test for production behavior:
-        // - A message signed with Alice's *old* signing key surfaces `invalidSignature` (consumer can request resend)
-        // - Key rotation may still occur if independent `maxSkippedHeadersExceeded` happens concurrently
-        //   (e.g. due to delivery/reestablishment timing), so this test does NOT assert rotation counts.
+        // - A delayed message signed with Alice's old key is tried against archived identity state.
+        // - If the body cannot decrypt, SDK repair/resend handling contains it internally.
+        // - The recipient must not rotate local account/device identity material.
         //
         // Determinism notes:
         // - We only hold back ONE pre-rotation message (and only non-control messages).
@@ -5950,34 +5973,33 @@ actor EndToEndTests {
         #expect(snap.ok >= 1, "Bob should have successfully processed at least one delivered message after rotation. ok=\(snap.ok)")
 
         // Now deliver the delayed pre-rotation message after Bob has refreshed identity to Alice's new signing key.
-        // This should fail signature verification and surface invalidSignature for consumer resend.
+        // The SDK should either decrypt from archive or contain the failure through repair/resend without
+        // surfacing a rotation-worthy error to the caller.
         let delayed = await holdback.drain()
         #expect(delayed.count == 1, "Expected exactly 1 held pre-rotation message, got \(delayed.count)")
 
         let held = delayed[0]
-        do {
-            try await _recipientSession.receiveMessage(
-                message: held.message,
-                sender: held.sender,
-                deviceId: held.deviceId,
-                messageId: held.messageId
-            )
-            Issue.record("Expected invalidSignature to be surfaced for resend, but receiveMessage succeeded.")
-        } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
-            // Expected: consumer should handle resend on invalidSignature.
-        } catch {
-            Issue.record("Expected invalidSignature, got \(error)")
-        }
+        let rotationsBeforeHeld = await bobTransport.publishRotatedKeysCallCount
+        try await _recipientSession.receiveMessage(
+            message: held.message,
+            sender: held.sender,
+            deviceId: held.deviceId,
+            messageId: held.messageId
+        )
+        try await Task.sleep(for: .milliseconds(500))
+        let rotationsAfterHeld = await bobTransport.publishRotatedKeysCallCount
 
-        _ = await bobTransport.publishRotatedKeysCallCount
+        #expect(
+            rotationsAfterHeld == rotationsBeforeHeld,
+            "Delayed pre-rotation repair must not rotate recipient keys. before=\(rotationsBeforeHeld) after=\(rotationsAfterHeld)")
     }
 
-    @Test("Forged signature triggers compromise rotation and quarantines tuple")
-    func testForgedSignatureTriggersCompromiseRotation() async throws {
+    @Test("Forged remote signature is discarded and requests resend without rotation")
+    func testForgedRemoteSignatureRequestsResendWithoutRotation() async throws {
         // Deterministic contract test:
         // - Deliver exactly one forged message (same ratchet payload, wrong signing key)
-        // - Treat it as a security violation
-        // - Expect compromise rotation, not resend-style repair
+        // - Treat it as a remote authentication failure
+        // - Discard the forged envelope and request bounded resend without rotating our account keys
         
         defer {
             Task { await shutdownSessions() }
@@ -5991,7 +6013,17 @@ actor EndToEndTests {
             func set(_ m: ReceivedMessage) { msg = m }
             func get() -> ReceivedMessage? { msg }
         }
+        actor ResendProbe {
+            var resendRequests = 0
+            func saw(_ event: TransportEvent?) {
+                if case .requestMessageResend = event {
+                    resendRequests += 1
+                }
+            }
+            func count() -> Int { resendRequests }
+        }
         let capture = Capture()
+        let resendProbe = ResendProbe()
         
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
@@ -6025,6 +6057,10 @@ actor EndToEndTests {
         }
         // Don't deliver into any async stream; we only want the captured message.
         aliceTransport.shouldDeliver = { _ in false }
+        bobTransport.shouldDeliver = { received in
+            await resendProbe.saw(received.transportEvent)
+            return false
+        }
         
         // Send one message from Alice; Bob should receive a forged version.
         try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "forged")
@@ -6041,26 +6077,33 @@ actor EndToEndTests {
         )
 
         for _ in 0..<30 {
-            if await bobTransport.publishRotatedKeysCallCount > 0,
-               await _recipientSession.isInboundFailureQuarantined(
-                    sender: received.sender,
-                    deviceId: received.deviceId,
-                    messageId: received.messageId
-               ) {
+            if await resendProbe.count() > 0 {
                 break
             }
             try await Task.sleep(for: .milliseconds(100))
         }
         
         let rotations = await bobTransport.publishRotatedKeysCallCount
-        #expect(rotations > 0, "Forged invalidSignature should trigger compromise rotation. Got \(rotations).")
+        #expect(rotations == 0, "Remote invalidSignature must not rotate local account keys. Got \(rotations).")
+        #expect(await resendProbe.count() == 1, "Forged invalidSignature should request one bounded resend")
+
+        let failedInbound = InboundTaskMessage(
+            message: received.message,
+            senderSecretName: received.sender,
+            senderDeviceId: received.deviceId,
+            sharedMessageId: received.messageId)
         #expect(
-            await _recipientSession.isInboundFailureQuarantined(
+            await _recipientSession.shouldSuppressInboundFailure(
+                failedInbound,
+                failureClass: "signature.invalidSignature"),
+            "Forged invalidSignature should suppress repeated processing of the same failed class"
+        )
+        #expect(
+            !(await _recipientSession.isInboundFailureQuarantined(
                 sender: received.sender,
                 deviceId: received.deviceId,
-                messageId: received.messageId
-            ),
-            "Forged invalidSignature should quarantine the failed tuple"
+                messageId: received.messageId)),
+            "Remote invalidSignature must not quarantine the tuple because the valid resend reuses the shared id"
         )
     }
     
@@ -6070,11 +6113,11 @@ actor EndToEndTests {
     /// - Alice rotates keys during the backlog period
     /// - Bob comes back online and server delivers all offline messages at once
     /// - Many messages fail with `invalidSignature` (signed with old keys before rotation)
-    /// - This triggers repeated key rotations (rotation storm) - the bug
+    /// - This used to trigger repeated key rotations
     ///
     /// This test verifies that `receiveMessage` throws `invalidSignature` errors
-    /// and demonstrates the rotation storm behavior from the production logs.
-    @Test("Offline backlog with key rotation triggers invalidSignature errors and rotation storm")
+    /// and documents the backlog shape from the production logs.
+    @Test("Offline backlog with key rotation stays recoverable")
     func testOfflineBacklogWithKeyRotationTriggersInvalidSignature() async throws {
         var bobTask: Task<Void, Never>?
         defer {
@@ -6169,7 +6212,7 @@ actor EndToEndTests {
         // and process them together, so Bob's identity may refresh before processing old messages.
         // 
         // The production scenario from logs shows both invalidSignature and maxSkipped errors,
-        // suggesting a mix of scenarios. This test verifies the setup and rotation behavior.
+        // suggesting a mix of scenarios. This test verifies the setup and recovery behavior.
         try await _senderMaxSkipSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .milliseconds(100))
 
@@ -6206,7 +6249,7 @@ actor EndToEndTests {
         }
 
         // Verify the scenario was set up correctly
-        // In production logs, this scenario shows:
+        // Older production logs for this scenario showed:
         // - Many "❌ JOB ERROR INVALIDSIGNATURE" messages
         // - Many "Rotated Keys and Updated Identity" messages (rotation storm)
         //
@@ -6215,7 +6258,7 @@ actor EndToEndTests {
         // 1. Messages signed with old keys (before rotation) are processed with stale identity cache -> invalidSignature
         // 2. Messages exceed maxSkippedMessageKeys -> maxSkippedHeadersExceeded
         //
-        // These errors trigger rotations. The exact number depends on timing and identity cache state.
+        // These errors should now recover through resend/reestablishment rather than rotation.
         // This test documents the scenario and error handling pattern:
         // do {
         //     try await receiveMessage(...)
@@ -6224,25 +6267,23 @@ actor EndToEndTests {
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
         
         // Verify the scenario was set up and messages were processed
-        // In production logs, this scenario shows many errors and rotations.
-        // The test verifies the setup is correct. Rotations may not occur in test if
-        // Bob's identity cache refreshes before processing old messages, but the scenario
-        // is documented and matches production behavior.
+        // The test verifies the setup is correct. Rotation is not required for this
+        // recovery path; resend/reestablishment handles the broken backlog.
         // 
         // This test documents the offline backlog scenario from production logs and
         // demonstrates the error handling pattern consumers should use.
         let messageCount = await offlineQueue.count()
-        #expect(messageCount == 0, 
-                "Test verifies offline backlog scenario: messages queued while offline (\(messageCount) messages), then processed when online. In production, this causes '❌ JOB ERROR INVALIDSIGNATURE' and rotation storms. Got \(rotationCount) rotations.")
+        #expect(messageCount == 0,
+                "Test verifies offline backlog scenario: messages queued while offline (\(messageCount) messages), then processed when online. Recovery should stay on resend/reestablishment; observed \(rotationCount) rotations.")
     }
     
-    @Test("Multiple Offline Messages Trigger Only One Key Rotation - Prevents Rotation Storm")
-    func testMultipleOfflineMessagesTriggerOnlyOneRotation() async throws {
+    @Test("Multiple offline maxSkipped messages do not rotate keys")
+    func testMultipleOfflineMessagesDoNotRotateKeys() async throws {
         // This test replicates the exact scenario from Android logs:
         // 1. Server sends multiple offline messages in a batch
         // 2. All messages fail decryption with maxSkippedHeadersExceeded
-        // 3. Each failure attempts to rotate keys
-        // 4. Expected: Only ONE rotation should occur, not multiple (rotation storm)
+        // 3. Each failure should use the existing repair/resend path
+        // 4. Expected: no key rotation occurs
         
         var bobTask: Task<Void, Never>?
         defer {
@@ -6292,12 +6333,12 @@ actor EndToEndTests {
             
             // Phase 2: Bob comes back online - server delivers ALL queued messages at once
             // This is the critical scenario: multiple messages processed concurrently,
-            // all failing with maxSkippedHeadersExceeded, each trying to rotate keys
+            // all failing with maxSkippedHeadersExceeded, each needing repair.
             let backlog = await offlineQueue.dequeueAll()
             
             // Process all offline messages concurrently (simulating server batch delivery)
             // Each receiveMessage() enqueues a job that will be processed by the job processor
-            // When multiple jobs fail with maxSkippedHeadersExceeded, they all try to rotate
+            // When multiple jobs fail with maxSkippedHeadersExceeded, they should all stay on repair.
             await withTaskGroup(of: Void.self) { group in
                 for received in backlog {
                     group.addTask {
@@ -6364,11 +6405,11 @@ actor EndToEndTests {
             try await Task.sleep(until: .now + .milliseconds(200))
         }
 
-        // THE KEY ASSERTION: Only ONE rotation should occur, not multiple
-        // This verifies that the fix prevents the "rotation storm" seen in production logs
+        // THE KEY ASSERTION: no key rotation should occur.
+        // This verifies that maxSkipped recovery stays on fresh-session repair.
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
-        #expect(rotationCount == 1, 
-                "Expected exactly 1 key rotation when multiple offline messages fail decryption. Got \(rotationCount) rotations, indicating multiple concurrent rotation attempts were not properly guarded. This matches the 'rotation storm' behavior from production logs.")
+        #expect(rotationCount == 0,
+                "Expected 0 key rotations when multiple offline messages fail decryption. Got \(rotationCount), indicating maxSkipped recovery escalated outside repair/resend.")
         
         // Verify messages were processed (queued and handled by job processor)
         let messageCount = await offlineQueue.count()
@@ -7201,6 +7242,439 @@ actor EndToEndTests {
             "next successful inbound message should request resend of the earlier failed shared id")
     }
 
+    @Test("archived peerRefresh response does not drain deferred resend")
+    func testArchivedPeerRefreshResponseDoesNotDrainDeferredResend() async throws {
+        actor ResponseProbe {
+            private var response: ReceivedMessage?
+
+            func capture(_ received: ReceivedMessage) {
+                response = received
+            }
+
+            func get() -> ReceivedMessage? {
+                response
+            }
+        }
+
+        actor ResendProbe {
+            private(set) var sawResendRequest = false
+
+            func markResendRequest() {
+                sawResendRequest = true
+            }
+
+            func reset() {
+                sawResendRequest = false
+            }
+        }
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 8,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return false
+        }
+
+        let responseProbe = ResponseProbe()
+        let resendProbe = ResendProbe()
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        aliceTask = Task {
+            for await received in aliceStream {
+                if let transportEvent = received.transportEvent,
+                   case .requestMessageResend = transportEvent {
+                    await resendProbe.markResendRequest()
+                }
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._senderSession,
+                    received: received)
+            }
+        }
+
+        bobTask = Task {
+            for await received in bobStream {
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._recipientSession,
+                    received: received)
+            }
+        }
+
+        try await _senderSession.writeTextMessage(
+            recipient: .nickname("bob"),
+            text: "baseline before archived response")
+
+        #expect(
+            await waitUntil { await recipientStore.createdMessages.count > 0 },
+            "Baseline message should establish the active ratchet before archiving")
+
+        guard let aliceDeviceId = await _senderSession.sessionContext?.sessionUser.deviceId else {
+            Issue.record("Alice device id should be available")
+            return
+        }
+        bobTask?.cancel()
+        bobTask = nil
+        try await Task.sleep(for: .milliseconds(200))
+        _ = await _recipientSession.takePendingResendsAfterReestablishment(
+            sender: "alice",
+            deviceId: aliceDeviceId)
+        await resendProbe.reset()
+
+        let pendingSharedId = UUID().uuidString
+        await _recipientSession.deferPeerResendUntilReestablished(
+            sender: "alice",
+            deviceId: aliceDeviceId,
+            failedMessageId: pendingSharedId,
+            failureClass: "test.archivedPeerRefresh")
+
+        let responseIntentId = UUID()
+        aliceTransport.shouldDeliver = { received in
+            guard case .sessionReestablishment(let envelope)? = received.transportEvent,
+                  envelope.kind == .peerRefresh,
+                  envelope.isResponse,
+                  envelope.intentId == responseIntentId
+            else {
+                return true
+            }
+            await responseProbe.capture(received)
+            return false
+        }
+
+        let originalPeerRefresh = SessionReestablishmentEnvelope(
+            kind: .peerRefresh,
+            intentId: responseIntentId,
+            epoch: 1)
+        _ = try await _senderSession.emitSessionReestablishmentResponse(
+            kind: .peerRefresh,
+            recipient: .nickname("bob"),
+            respondingTo: originalPeerRefresh)
+
+        #expect(
+            await waitUntil { await responseProbe.get() != nil },
+            "PeerRefresh response should be captured before delivery")
+
+        try await _recipientSession.createInactiveSessionSnapshot(
+            for: "alice",
+            policy: .archive)
+
+        let bobCache = await _recipientSession.cache!
+        let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
+        for identity in try await bobCache.fetchSessionIdentities() {
+            guard var props = await identity.props(symmetricKey: bobSymKey) else { continue }
+            guard props.secretName == "alice" else { continue }
+            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+            props.state = nil
+            try await identity.updateIdentityProps(symmetricKey: bobSymKey, props: props)
+            try await bobCache.updateSessionIdentity(identity)
+        }
+        await _recipientSession.removeIdentity(with: "alice")
+
+        guard let archivedOnlyResponse = await responseProbe.get() else {
+            Issue.record("Captured peerRefresh response should exist")
+            return
+        }
+
+        try await _recipientSession.receiveMessage(
+            message: archivedOnlyResponse.message,
+            sender: archivedOnlyResponse.sender,
+            deviceId: archivedOnlyResponse.deviceId,
+            messageId: archivedOnlyResponse.messageId)
+
+        try await Task.sleep(for: .milliseconds(500))
+
+        #expect(
+            (await resendProbe.sawResendRequest) == false,
+            "Archived peerRefresh response must not request resend/replay and restart recovery")
+
+        let pending = await _recipientSession.takePendingResendsAfterReestablishment(
+            sender: "alice",
+            deviceId: aliceDeviceId)
+        #expect(
+            pending.contains(where: { $0.failedSharedMessageId == pendingSharedId }),
+            "Deferred resend should remain pending until active reestablishment succeeds")
+    }
+
+    @Test("requestMessageResend replays recent non-persistent recovery control")
+    func testRequestMessageResendReplaysRecentNonPersistentControl() async throws {
+        actor ReplayProbe {
+            private var expectedIntentId: UUID?
+            private var droppedSharedId: String?
+            private var replayCountsBySharedId: [String: Int] = [:]
+
+            func expect(intentId: UUID) {
+                expectedIntentId = intentId
+            }
+
+            func shouldDropFirstMatchingControl(_ received: ReceivedMessage) -> Bool {
+                guard droppedSharedId == nil else { return false }
+                guard received.sender == "alice", received.recipient == "bob" else { return false }
+                guard case .sessionReestablishment(let envelope)? = received.transportEvent else { return false }
+                guard envelope.kind == .peerRefresh, envelope.isResponse else { return false }
+                guard envelope.intentId == expectedIntentId else { return false }
+                droppedSharedId = received.messageId
+                return true
+            }
+
+            func markReplayIfNeeded(_ received: ReceivedMessage) {
+                guard let droppedSharedId else { return }
+                guard received.messageId == droppedSharedId else { return }
+                guard case .sessionReestablishment = received.transportEvent else { return }
+                replayCountsBySharedId[received.messageId, default: 0] += 1
+            }
+
+            func droppedId() -> String? {
+                droppedSharedId
+            }
+
+            func sawReplay(for sharedId: String) -> Bool {
+                replayCount(for: sharedId) > 0
+            }
+
+            func replayCount(for sharedId: String) -> Int {
+                replayCountsBySharedId[sharedId, default: 0]
+            }
+        }
+
+        actor LinkedReplayProbe {
+            private var expectedTargetDeviceId: UUID?
+            private var droppedSharedId: String?
+            private var replayCountsBySharedId: [String: Int] = [:]
+
+            func expect(targetDeviceId: UUID) {
+                expectedTargetDeviceId = targetDeviceId
+            }
+
+            func shouldDropFirstMatchingControl(_ received: ReceivedMessage) -> Bool {
+                guard droppedSharedId == nil else { return false }
+                guard received.sender == "alice", received.recipient == "bob" else { return false }
+                guard case .linkedDeviceReprovisioning(let bundle)? = received.transportEvent else { return false }
+                guard bundle.targetDeviceId == expectedTargetDeviceId else { return false }
+                droppedSharedId = received.messageId
+                return true
+            }
+
+            func markReplayIfNeeded(_ received: ReceivedMessage) {
+                guard let droppedSharedId else { return }
+                guard received.messageId == droppedSharedId else { return }
+                guard case .linkedDeviceReprovisioning = received.transportEvent else { return }
+                replayCountsBySharedId[received.messageId, default: 0] += 1
+            }
+
+            func droppedId() -> String? {
+                droppedSharedId
+            }
+
+            func sawReplay(for sharedId: String) -> Bool {
+                replayCount(for: sharedId) > 0
+            }
+
+            func replayCount(for sharedId: String) -> Int {
+                replayCountsBySharedId[sharedId, default: 0]
+            }
+        }
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 8,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return false
+        }
+
+        let probe = ReplayProbe()
+        let linkedProbe = LinkedReplayProbe()
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        aliceTask = Task {
+            for await received in aliceStream {
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._senderSession,
+                    received: received)
+            }
+        }
+
+        bobTask = Task {
+            for await received in bobStream {
+                await probe.markReplayIfNeeded(received)
+                await linkedProbe.markReplayIfNeeded(received)
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._recipientSession,
+                    received: received)
+            }
+        }
+
+        try await _senderSession.writeTextMessage(
+            recipient: .nickname("bob"),
+            text: "baseline before control replay")
+
+        #expect(
+            await waitUntil { await recipientStore.createdMessages.count > 0 },
+            "Baseline message should establish the ratchet before replaying a control frame")
+
+        let intentId = UUID()
+        let originalPeerRefresh = SessionReestablishmentEnvelope(
+            kind: .peerRefresh,
+            intentId: intentId,
+            epoch: 1)
+        await probe.expect(intentId: intentId)
+        aliceTransport.shouldDeliver = { received in
+            !(await probe.shouldDropFirstMatchingControl(received))
+        }
+
+        _ = try await _senderSession.emitSessionReestablishmentResponse(
+            kind: .peerRefresh,
+            recipient: .nickname("bob"),
+            respondingTo: originalPeerRefresh)
+
+        let droppedOriginal = await waitUntil {
+            await probe.droppedId() != nil
+        }
+        guard droppedOriginal, let droppedSharedId = await probe.droppedId() else {
+            Issue.record("Expected the original non-persistent peerRefresh response to be dropped")
+            return
+        }
+
+        guard let aliceDeviceId = await _senderSession.sessionContext?.sessionUser.deviceId else {
+            Issue.record("Alice device id should be available")
+            return
+        }
+
+        try await _recipientSession.requestMessageResend(
+            sharedMessageId: droppedSharedId,
+            senderName: "alice",
+            senderDeviceId: aliceDeviceId)
+
+        #expect(
+            await waitUntil { await probe.sawReplay(for: droppedSharedId) },
+            "requestMessageResend should replay a recent non-persistent recovery control by shared id")
+
+        let peerRefreshReplayCount = await probe.replayCount(for: droppedSharedId)
+        try await _recipientSession.requestMessageResend(
+            sharedMessageId: droppedSharedId,
+            senderName: "alice",
+            senderDeviceId: aliceDeviceId)
+
+        #expect(
+            await waitUntil { await probe.replayCount(for: droppedSharedId) > peerRefreshReplayCount },
+            "non-persistent recovery controls should allow bounded repeated replay while the peer is still repairing")
+
+        guard let aliceContext = await _senderSession.sessionContext,
+              let bobDeviceId = await _recipientSession.sessionContext?.sessionUser.deviceId else {
+            Issue.record("Session contexts should be available")
+            return
+        }
+        let reprovisioningBundle = LinkedDeviceReprovisioningBundle(
+            activeUserConfiguration: aliceContext.activeUserConfiguration,
+            issuedByDeviceId: aliceContext.sessionUser.deviceId,
+            issuedAt: Date(),
+            targetDeviceId: bobDeviceId)
+        let reprovisioningMetadata = try BinaryEncoder().encode(
+            TransportEvent.linkedDeviceReprovisioning(reprovisioningBundle))
+        await linkedProbe.expect(targetDeviceId: bobDeviceId)
+        aliceTransport.shouldDeliver = { received in
+            !(await linkedProbe.shouldDropFirstMatchingControl(received))
+        }
+
+        try await _senderSession.writeTextMessage(
+            recipient: .nickname("bob"),
+            transportInfo: reprovisioningMetadata)
+
+        let droppedLinkedControl = await waitUntil {
+            await linkedProbe.droppedId() != nil
+        }
+        guard droppedLinkedControl, let droppedLinkedSharedId = await linkedProbe.droppedId() else {
+            Issue.record("Expected the original non-persistent linked-device reprovisioning control to be dropped")
+            return
+        }
+
+        try await _recipientSession.requestMessageResend(
+            sharedMessageId: droppedLinkedSharedId,
+            senderName: "alice",
+            senderDeviceId: aliceDeviceId)
+
+        #expect(
+            await waitUntil { await linkedProbe.sawReplay(for: droppedLinkedSharedId) },
+            "requestMessageResend should replay a recent non-persistent linked-device control by shared id")
+
+        let linkedReplayCount = await linkedProbe.replayCount(for: droppedLinkedSharedId)
+        try await _recipientSession.requestMessageResend(
+            sharedMessageId: droppedLinkedSharedId,
+            senderName: "alice",
+            senderDeviceId: aliceDeviceId)
+
+        #expect(
+            await waitUntil { await linkedProbe.replayCount(for: droppedLinkedSharedId) > linkedReplayCount },
+            "linked-device reprovisioning replay should also allow bounded repeated replay while the peer is still repairing")
+    }
+
     @Test("Old message decrypted from archive after reconciliation")
     func testOldMessageDecryptedFromArchiveAfterReconciliation() async throws {
         var aliceTask: Task<Void, Never>?
@@ -7726,18 +8200,26 @@ actor EndToEndTests {
             bobRotationCountAfter == bobRotationCountBefore,
             "Archive recovery should NOT trigger full reconciliation (rotation count should not change)")
 
-        var activeStateWasMutated = false
+        let aliceConfiguration = try await bobTransport.findConfiguration(for: sMockUserData.ssn)
+        let currentAliceDevices = try aliceConfiguration.getVerifiedDevices().map {
+            try aliceConfiguration.deviceWithCurrentKeyBundle($0)
+        }
+        guard let currentAliceDevice = currentAliceDevices.first(where: { $0.deviceId == oldMessage.deviceId }) else {
+            Issue.record("Expected Alice's current server device bundle to exist")
+            return
+        }
+
+        var activeAliceProps = [SessionIdentity.UnwrappedProps]()
         for identity in try await bobCache.fetchSessionIdentities() {
             guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
             guard props.secretName == sMockUserData.ssn else { continue }
             guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
-            if props.state != nil {
-                activeStateWasMutated = true
-            }
+            activeAliceProps.append(props)
         }
-        #expect(
-            !activeStateWasMutated,
-            "Missing-OTK archive fallback must not leave partial ratchet state on the active SessionIdentity")
+        #expect(activeAliceProps.count == 1)
+        guard let activeAlice = activeAliceProps.first else { return }
+        #expect(activeAlice.longTermPublicKey == currentAliceDevice.longTermPublicKey)
+        #expect(activeAlice.signingPublicKey == currentAliceDevice.signingPublicKey)
     }
 
     @Test("Job survives identity deletion during reconciliation")
@@ -8038,9 +8520,11 @@ actor ContinuationSignal {
 struct SessionDelegate: PQSSessionDelegate {
     
     let session: PQSSession
+    let compromiseProbe: LinkedDeviceCompromiseProbe?
     
-    init(session: PQSSession) {
+    init(session: PQSSession, compromiseProbe: LinkedDeviceCompromiseProbe? = nil) {
         self.session = session
+        self.compromiseProbe = compromiseProbe
     }
     
     func synchronizeCommunication(
@@ -8143,6 +8627,10 @@ struct SessionDelegate: PQSSessionDelegate {
                 requestFriendship: false)
         }
         return true
+    }
+
+    func linkedDeviceReportedPotentialCompromise(deviceId: UUID, intentId: UUID?) async {
+        await compromiseProbe?.mark(deviceId: deviceId)
     }
 }
 

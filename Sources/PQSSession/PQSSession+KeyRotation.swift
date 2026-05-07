@@ -412,6 +412,12 @@ extension PQSSession {
             guard curveKeysReplaced, mlKEMKeysReplaced else {
                 throw SessionErrors.oneTimeKeyUploadFailed
             }
+
+            // The forced OTK replacement persists a fresh local context. Continue the
+            // repair flow from that context so reprovisioning/control messages do not
+            // carry or re-expose the pre-rotation one-time-key batches.
+            sessionContext = try await getSessionContext()
+            await setSessionContext(sessionContext)
             
             guard let cache else {
                 throw SessionErrors.databaseNotInitialized
@@ -578,7 +584,10 @@ extension PQSSession {
             throw SessionErrors.deviceIdentityCorrupted
         }
 
-        sessionContext.activeUserConfiguration = bundle.activeUserConfiguration
+        sessionContext.activeUserConfiguration = userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+            bundle.activeUserConfiguration,
+            currentContext: sessionContext
+        )
         try await updateRotatedKeySessionContext(sessionContext: sessionContext)
 
         // Master pushed us a new account-level signing public key; defensively clear the

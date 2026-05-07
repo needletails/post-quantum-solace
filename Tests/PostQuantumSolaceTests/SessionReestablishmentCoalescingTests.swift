@@ -96,6 +96,27 @@ struct SessionReestablishmentCoalescingTests {
         await session.shutdown()
     }
 
+    @Test("Sender can force peerRefresh re-emit inside cooldown for recovery")
+    func senderForcedPeerRefreshReemitBypassesCooldown() async {
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let scope = ControlEventScope.peer(secretName: "alice")
+
+        let first = await session.makeSessionReestablishmentEnvelope(kind: .peerRefresh, scope: scope)
+        let suppressed = await session.makeSessionReestablishmentEnvelope(kind: .peerRefresh, scope: scope)
+        let forced = await session.makeSessionReestablishmentEnvelope(
+            kind: .peerRefresh,
+            scope: scope,
+            forceReemit: true)
+
+        #expect(first != nil)
+        #expect(suppressed == nil)
+        #expect(forced != nil, "Recovery failures must be able to send a fresh peerRefresh even inside cooldown")
+        #expect(forced?.intentId == first?.intentId)
+        #expect((forced?.epoch ?? 0) > (first?.epoch ?? 0))
+        await session.shutdown()
+    }
+
     @Test("Sender treats different scopes independently")
     func senderDifferentScopesDoNotDedupe() async {
         let session = PQSSession()
@@ -312,6 +333,37 @@ struct SessionReestablishmentCoalescingTests {
 
         #expect(firstResult == .process)
         #expect(nextResult == .process)
+        await session.shutdown()
+    }
+
+    @Test("Receiver allows higher epoch through for same intent re-emits")
+    func receiverAcceptsSameIntentNewerEpochReemit() async {
+        let session = PQSSession()
+        let senderDeviceId = UUID()
+        let intentId = UUID()
+
+        let first = SessionReestablishmentEnvelope(
+            kind: .peerRefresh,
+            intentId: intentId,
+            epoch: 1
+        )
+        let reemit = SessionReestablishmentEnvelope(
+            kind: .peerRefresh,
+            intentId: intentId,
+            epoch: 4
+        )
+
+        let firstResult = await session.recordReceivedSessionReestablishment(
+            envelope: first,
+            senderDeviceId: senderDeviceId
+        )
+        let reemitResult = await session.recordReceivedSessionReestablishment(
+            envelope: reemit,
+            senderDeviceId: senderDeviceId
+        )
+
+        #expect(firstResult == .process)
+        #expect(reemitResult == .process)
         await session.shutdown()
     }
 

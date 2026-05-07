@@ -154,23 +154,25 @@ actor SessionTests {
             try await store.createLocalSessionContext(encryptedData!)
             await self.session.setDatabaseDelegate(conformer: store)
 
-            // ✅ First Test Case: Remote list has *some* valid keys
+            // First Test Case: Remote list has some valid keys.
+            // Public keys are pruned to the server list, while private keys are
+            // retained for in-flight messages that may still need to decrypt.
             let partialKeys = Array(validKeys.prefix(10)).map(\.id)
             _ = try await self.session.synchronizeLocalKeys(cache: self.session.cache!, keys: partialKeys, type: .curve)
 
             let updatedData = try await store.fetchLocalSessionContext()
             let decrypted = try self.crypto.decrypt(data: updatedData, symmetricKey: symmetricKey)
             let decoded = try BinaryDecoder().decode(SessionContext.self, from: decrypted!)
-            #expect(decoded.sessionUser.deviceKeys.oneTimePrivateKeys.count == 10, "Should keep only the matching private keys.")
+            #expect(decoded.sessionUser.deviceKeys.oneTimePrivateKeys.count == 100, "Private keys should be preserved for in-flight decryption.")
             #expect(decoded.activeUserConfiguration.signedOneTimePublicKeys.count == 10, "Should keep only the matching public keys.")
 
-            // ✅ Second Test Case: Remote list has *no* matching keys
+            // Second Test Case: Remote list has no matching keys.
             _ = try await self.session.synchronizeLocalKeys(cache: self.session.cache!, keys: badKeys.map(\.id), type: .curve)
 
             let updatedDataFinal = try await store.fetchLocalSessionContext()
             let decryptedFinal = try self.crypto.decrypt(data: updatedDataFinal, symmetricKey: symmetricKey)
             let decodedFinal = try BinaryDecoder().decode(SessionContext.self, from: decryptedFinal!)
-            #expect(decodedFinal.sessionUser.deviceKeys.oneTimePrivateKeys.count == 0, "All private keys should be removed.")
+            #expect(decodedFinal.sessionUser.deviceKeys.oneTimePrivateKeys.count == 100, "Private keys should remain until consumed locally.")
             #expect(decodedFinal.activeUserConfiguration.signedOneTimePublicKeys.count == 0, "All public keys should be removed.")
             
             // Ensure proper cleanup
@@ -319,7 +321,9 @@ actor SessionTests {
 
         #expect(refreshedIds.count == PQSSessionConstants.oneTimeKeyBatchSize)
         #expect(refreshedIds != originalIds)
-        #expect(refreshedContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count == PQSSessionConstants.oneTimeKeyBatchSize)
+        #expect(
+            refreshedContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count == bundle.deviceKeys.mlKEMOneTimePrivateKeys.count + PQSSessionConstants.oneTimeKeyBatchSize,
+            "Unadvertised MLKEM private keys stay available for in-flight prekey messages while the new public batch is advertised.")
 
         await session.shutdown()
     }
@@ -375,7 +379,9 @@ actor SessionTests {
         let refreshedContext = try BinaryDecoder().decode(SessionContext.self, from: refreshedConfig)
 
         #expect(refreshedContext.activeUserConfiguration.signedOneTimePublicKeys.count == retainedIds.count)
-        #expect(refreshedContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == retainedIds.count)
+        #expect(
+            refreshedContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == bundle.deviceKeys.oneTimePrivateKeys.count,
+            "Failed uploads must not persist generated private keys, but already-local private keys remain for in-flight messages.")
         #expect(Set(refreshedContext.activeUserConfiguration.signedOneTimePublicKeys.map(\.id)) == Set(retainedIds))
 
         await session.shutdown()
@@ -428,7 +434,7 @@ actor SessionTests {
         let midDecrypted = try self.crypto.decrypt(data: midData, symmetricKey: appSymmetricKey)!
         let midContext = try BinaryDecoder().decode(SessionContext.self, from: midDecrypted)
         #expect(midContext.activeUserConfiguration.signedOneTimePublicKeys.count == 15)
-        #expect(midContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == 15)
+        #expect(midContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == bundle.deviceKeys.oneTimePrivateKeys.count)
 
         try await session.refreshOneTimeKeys(refreshType: .curve, policy: .replenishBatch)
 
@@ -436,7 +442,7 @@ actor SessionTests {
         let finalDecrypted = try self.crypto.decrypt(data: finalData, symmetricKey: appSymmetricKey)!
         let finalContext = try BinaryDecoder().decode(SessionContext.self, from: finalDecrypted)
         #expect(finalContext.activeUserConfiguration.signedOneTimePublicKeys.count == PQSSessionConstants.oneTimeKeyBatchSize)
-        #expect(finalContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == PQSSessionConstants.oneTimeKeyBatchSize)
+        #expect(finalContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == bundle.deviceKeys.oneTimePrivateKeys.count + 85)
 
         await session.shutdown()
     }

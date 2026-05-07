@@ -602,6 +602,58 @@ actor TaskProcessorSequenceTests {
 
         await session.shutdown()
     }
+
+    @Test("Error Handling - Same Account Invalid Signature Reports Linked Device Compromise")
+    func testSameAccountInvalidSignatureReportsLinkedDeviceCompromise() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let probe = LinkedDeviceCompromiseProbe()
+        await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session, compromiseProbe: probe))
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: PQSSession.SessionErrors.invalidSignature)
+        )
+
+        guard let context = await session.sessionContext else {
+            Issue.record("Session context should be available")
+            await session.shutdown()
+            return
+        }
+
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let header = EncryptedHeader(
+            remoteLongTermPublicKey: Data(repeating: 1, count: 32),
+            remoteOneTimePublicKey: nil,
+            remoteMLKEMPublicKey: try MLKEMPublicKey(Data(repeating: 2, count: 1568)),
+            headerCiphertext: Data([0x01]),
+            messageCiphertext: Data([0x02]),
+            oneTimeKeyId: nil,
+            mlKEMOneTimeKeyId: UUID(),
+            encrypted: Data([0x04])
+        )
+        let ratchetMessage = RatchetMessage(header: header, encryptedData: Data([0x03]))
+        let signed = try SignedRatchetMessage(
+            message: ratchetMessage,
+            signingPrivateKey: signingKey.rawRepresentation
+        )
+        let claimedDeviceId = UUID()
+        let inbound = InboundTaskMessage(
+            message: signed,
+            senderSecretName: context.sessionUser.secretName,
+            senderDeviceId: claimedDeviceId,
+            sharedMessageId: "same_account_invalid_signature"
+        )
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+
+        #expect(await probe.contains(claimedDeviceId), "Master should report same-account invalidSignature as linked-device compromise")
+        #expect(await probe.count() == 1, "Same invalidSignature should produce one compromise report")
+
+        await session.shutdown()
+    }
     
     // MARK: - Task Type Tests
     
@@ -1332,6 +1384,23 @@ final class MockTaskDelegateWithOneShotError: TaskSequenceDelegate, @unchecked S
 
     func getErrorCount() async -> Int {
         await errorTracker.getErrorCount()
+    }
+}
+
+final class MockTaskDelegateWithStreamError: TaskSequenceDelegate, @unchecked Sendable {
+    private let error: Error
+
+    init(error: Error) {
+        self.error = error
+    }
+
+    func performRatchet(task: SessionModels.TaskType, session: PQSSession) async throws {
+        switch task {
+        case .streamMessage:
+            throw error
+        case .writeMessage:
+            break
+        }
     }
 }
 
