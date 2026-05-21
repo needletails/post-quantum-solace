@@ -66,7 +66,7 @@ public struct FriendshipMetadata: Sendable, Codable {
         /// The other party has blocked the current user.
         case blockedByOther = "h"
 
-        /// The current user has unblocked the other party (resets to pending state).
+        /// The current user has unblocked the other party.
         case unblocked = "i"
     }
 
@@ -86,6 +86,16 @@ public struct FriendshipMetadata: Sendable, Codable {
     /// the effective status of the friendship relationship.
     public var ourState: State
 
+    /// The current user's state before the active block was applied.
+    ///
+    /// Blocks are a temporary communication guard, not proof that the friendship
+    /// contract should be discarded. These fields let unblock restore the prior
+    /// relationship when both clients understand the newer metadata shape.
+    public var blockedPreviousMyState: State?
+
+    /// The other user's state before the active block was applied.
+    public var blockedPreviousTheirState: State?
+
     /// Initializes a new instance of `FriendshipMetadata`.
     ///
     /// Creates a new friendship metadata instance with the specified states. All states
@@ -98,11 +108,15 @@ public struct FriendshipMetadata: Sendable, Codable {
     public init(
         myState: State = .pending,
         theirState: State = .pending,
-        ourState: State = .pending
+        ourState: State = .pending,
+        blockedPreviousMyState: State? = nil,
+        blockedPreviousTheirState: State? = nil
     ) {
         self.myState = myState
         self.theirState = theirState
         self.ourState = ourState
+        self.blockedPreviousMyState = blockedPreviousMyState
+        self.blockedPreviousTheirState = blockedPreviousTheirState
     }
 
     /// Sets the state to indicate that a friend request has been sent.
@@ -119,6 +133,8 @@ public struct FriendshipMetadata: Sendable, Codable {
     /// ```
     public mutating func setRequestedState() {
         myState = .requested
+        blockedPreviousMyState = nil
+        blockedPreviousTheirState = nil
         updateOurState()
     }
 
@@ -138,6 +154,8 @@ public struct FriendshipMetadata: Sendable, Codable {
     public mutating func setAcceptedState() {
         myState = .accepted
         theirState = .accepted
+        blockedPreviousMyState = nil
+        blockedPreviousTheirState = nil
         updateOurState()
     }
 
@@ -157,6 +175,8 @@ public struct FriendshipMetadata: Sendable, Codable {
     public mutating func resetToPendingState() {
         myState = .pending
         theirState = .pending
+        blockedPreviousMyState = nil
+        blockedPreviousTheirState = nil
         updateOurState()
     }
 
@@ -176,6 +196,8 @@ public struct FriendshipMetadata: Sendable, Codable {
     public mutating func rejectRequest() {
         myState = .rejectedByOther
         theirState = .rejected
+        blockedPreviousMyState = nil
+        blockedPreviousTheirState = nil
         updateOurState()
     }
 
@@ -199,6 +221,13 @@ public struct FriendshipMetadata: Sendable, Codable {
     /// // friendship.theirState == .blocked
     /// ```
     public mutating func setBlockState(isBlocking: Bool) {
+        if blockedPreviousMyState == nil,
+           blockedPreviousTheirState == nil,
+           !myState.isBlockingState,
+           !theirState.isBlockingState {
+            blockedPreviousMyState = myState
+            blockedPreviousTheirState = theirState
+        }
         myState = isBlocking ? .blocked : .blockedByOther
         theirState = isBlocking ? .blockedByOther : .blocked
         updateOurState()
@@ -206,23 +235,30 @@ public struct FriendshipMetadata: Sendable, Codable {
 
     /// Sets the state to indicate that the user has unblocked the other party.
     ///
-    /// This method resets both users' states to `.pending`, effectively removing the block
-    /// and allowing the friendship process to begin again.
+    /// This method removes the block and restores the relationship state that existed
+    /// before the block was applied. When older metadata does not include that history,
+    /// it falls back to `.pending`.
     ///
     /// ## Important
-    /// After unblocking, a new friendship request must be sent to re-establish the relationship.
+    /// After unblocking, a previously accepted friendship remains accepted. Pending
+    /// or requested relationships return to their prior request shape.
     ///
     /// ## Example
     /// ```swift
-    /// var friendship = FriendshipMetadata(myState: .blocked, theirState: .blockedByOther)
+    /// var friendship = FriendshipMetadata(myState: .accepted, theirState: .accepted)
+    /// friendship.setBlockState(isBlocking: true)
     /// friendship.unblockUser()
-    /// // friendship.myState == .pending
-    /// // friendship.theirState == .pending
-    /// // friendship.ourState == .pending
+    /// // friendship.myState == .accepted
+    /// // friendship.theirState == .accepted
+    /// // friendship.ourState == .accepted
     /// ```
     public mutating func unblockUser() {
-        myState = .pending
-        theirState = .pending
+        let restoredMyState = blockedPreviousMyState?.restorableAfterUnblock ?? .pending
+        let restoredTheirState = blockedPreviousTheirState?.restorableAfterUnblock ?? .pending
+        myState = restoredMyState
+        theirState = restoredTheirState
+        blockedPreviousMyState = nil
+        blockedPreviousTheirState = nil
         updateOurState()
     }
 
@@ -298,5 +334,21 @@ public struct FriendshipMetadata: Sendable, Codable {
     /// friendship changes to ensure proper state synchronization.
     public mutating func swapUserPerspectives() {
         (myState, theirState) = (theirState, myState)
+        (blockedPreviousMyState, blockedPreviousTheirState) = (blockedPreviousTheirState, blockedPreviousMyState)
+    }
+}
+
+private extension FriendshipMetadata.State {
+    var isBlockingState: Bool {
+        switch self {
+        case .blocked, .blockedByOther:
+            return true
+        case .pending, .requested, .accepted, .rejected, .rejectedByOther, .mutuallyRejected, .unblocked:
+            return false
+        }
+    }
+
+    var restorableAfterUnblock: FriendshipMetadata.State? {
+        isBlockingState ? nil : self
     }
 }

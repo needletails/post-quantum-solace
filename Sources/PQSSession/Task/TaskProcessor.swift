@@ -21,6 +21,7 @@ import SessionEvents
 import SessionModels
 import Crypto
 import BinaryCodable
+import AsyncAlgorithms
 
 /// `TaskProcessor` manages the asynchronous execution of encryption and decryption tasks
 /// using Double Ratchet and other cryptographic mechanisms. It handles inbound and outbound
@@ -519,19 +520,25 @@ public actor TaskProcessor {
             throw PQSSession.SessionErrors.invalidMemberCount
         }
 
-        let communicationModel = try await createCommunicationModel(
-            administrator: administrator,
-            operators: operators,
-            recipients: members,
-            communicationType: .channel(channelName),
-            metadata: metadata,
-            symmetricKey: symmetricKey)
-        
-        try await cache.createCommunication(communicationModel)
-        await session.receiverDelegate?.updatedCommunication(
-            communicationModel,
-            members: members)
-        await session.receiverDelegate?.createdChannel(communicationModel)
+        if try await cache.fetchCommunications().async.first(where: {
+            try await $0.props(symmetricKey: symmetricKey)?.communicationType == .channel(channelName)
+        }) == nil {
+            let communicationModel = try await createCommunicationModel(
+                administrator: administrator,
+                operators: operators,
+                recipients: members,
+                communicationType: .channel(channelName),
+                metadata: metadata,
+                symmetricKey: symmetricKey)
+
+            try await cache.createCommunication(communicationModel)
+
+            await session.receiverDelegate?.updatedCommunication(
+                communicationModel,
+                members: members)
+
+            await session.receiverDelegate?.createdChannel(communicationModel)
+        }
         
         if shouldSynchronize {
             let params = try await session.requireSessionParametersWithoutTransportDelegate()
@@ -833,9 +840,6 @@ public actor TaskProcessor {
                     logger.log(level: .warning, message: "Skipping outbound task for unreadable recipient identity \(identity.id)")
                     continue
                 }
-                logger.log(
-                    level: .info,
-                    message: "FEEDING MESSAGE FOR IDENTITY: \(identityProps.secretName) DID \(identityProps.deviceId)")
                 try await feedTask(task, session: session)
             } catch {
                 logger.log(level: .error, message: "Error handling recipient identity: \(error)")

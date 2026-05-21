@@ -19,6 +19,7 @@
 @testable import SessionEvents
 @testable import SessionModels
 import Testing
+import BinaryCodable
 
 @Suite(.serialized)
 struct FriendshipMetadataTests {
@@ -114,18 +115,52 @@ struct FriendshipMetadataTests {
         #expect(friendship.ourState == .blocked)
     }
 
-    /// Tests the user unblocking functionality using the new `unblockUser()` method.
-    ///
-    /// Verifies that calling `unblockUser()` correctly resets all states to `.pending`,
-    /// effectively removing the block and allowing the friendship process to begin again.
     @Test
-    func testUnblockUser() {
+    func unblockUserRestoresAcceptedFriendship() {
+        var friendship = FriendshipMetadata(myState: .accepted, theirState: .accepted)
+        friendship.setBlockState(isBlocking: true)
+        friendship.unblockUser()
+
+        #expect(friendship.myState == .accepted)
+        #expect(friendship.theirState == .accepted)
+        #expect(friendship.ourState == .accepted)
+        #expect(friendship.blockedPreviousMyState == nil)
+        #expect(friendship.blockedPreviousTheirState == nil)
+    }
+
+    @Test
+    func unblockUserRestoresPriorRequestShape() {
+        var friendship = FriendshipMetadata(myState: .requested, theirState: .pending)
+        friendship.setBlockState(isBlocking: true)
+        friendship.unblockUser()
+
+        #expect(friendship.myState == .requested)
+        #expect(friendship.theirState == .pending)
+        #expect(friendship.ourState == .pending)
+    }
+
+    @Test
+    func unblockUserFallsBackToPendingWithoutPreviousState() {
         var friendship = FriendshipMetadata(myState: .blockedByOther, theirState: .blocked)
         friendship.unblockUser()
 
         #expect(friendship.myState == .pending)
         #expect(friendship.theirState == .pending)
         #expect(friendship.ourState == .pending)
+    }
+
+    @Test
+    func blockHistorySurvivesBinaryRoundTrip() throws {
+        var friendship = FriendshipMetadata(myState: .accepted, theirState: .accepted)
+        friendship.setBlockState(isBlocking: true)
+
+        let decoded = try BinaryDecoder().decode(
+            FriendshipMetadata.self,
+            from: try BinaryEncoder().encode(friendship)
+        )
+
+        #expect(decoded.blockedPreviousMyState == .accepted)
+        #expect(decoded.blockedPreviousTheirState == .accepted)
     }
 
     // MARK: - State Management Tests
@@ -265,18 +300,17 @@ struct FriendshipMetadataTests {
         #expect(inbound.ourState == .blocked)
     }
 
-    /// After unblocking, the canonical reset-to-pending packet must produce a
-    /// pristine `{pending, pending, pending}` state on the receiver, allowing
-    /// a fresh friendship request to be initiated by either party.
+    /// After unblocking, a previously accepted relationship should be restored
+    /// on the receiver instead of dropping both users into pending.
     @Test
-    func inboundUnblockResetsToPending() {
-        var inbound = FriendshipMetadata(myState: .pending, theirState: .pending, ourState: .pending)
+    func inboundUnblockRestoresAcceptedFriendship() {
+        var inbound = FriendshipMetadata(myState: .accepted, theirState: .accepted, ourState: .accepted)
         inbound.swapUserPerspectives()
         inbound.updateOurState()
 
-        #expect(inbound.myState == .pending)
-        #expect(inbound.theirState == .pending)
-        #expect(inbound.ourState == .pending)
+        #expect(inbound.myState == .accepted)
+        #expect(inbound.theirState == .accepted)
+        #expect(inbound.ourState == .accepted)
     }
 
     // MARK: - FriendshipRequestError surface

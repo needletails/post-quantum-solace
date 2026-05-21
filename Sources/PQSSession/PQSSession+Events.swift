@@ -488,7 +488,8 @@ extension PQSSession: SessionEvents {
         secretName: String,
         metadata: Data = .init(),
         friendshipMetadata: FriendshipMetadata? = nil,
-        requestFriendship: Bool
+        requestFriendship: Bool,
+        friendshipMetadataConflictPolicy: FriendshipMetadataConflictPolicy = .preferSettled
     ) async throws -> ContactModel {
         let params = try await requireAllSessionParameters()
         if let eventDelegate {
@@ -502,7 +503,8 @@ extension PQSSession: SessionEvents {
                 transport: params.transportDelegate,
                 receiver: params.receiverDelegate,
                 symmetricKey: params.symmetricKey,
-                logger: logger
+                logger: logger,
+                friendshipMetadataConflictPolicy: friendshipMetadataConflictPolicy
             )
         } else {
             return try await createContact(
@@ -515,7 +517,8 @@ extension PQSSession: SessionEvents {
                 transport: params.transportDelegate,
                 receiver: params.receiverDelegate,
                 symmetricKey: params.symmetricKey,
-                logger: logger
+                logger: logger,
+                friendshipMetadataConflictPolicy: friendshipMetadataConflictPolicy
             )
         }
     }

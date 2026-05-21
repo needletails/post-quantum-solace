@@ -1743,6 +1743,10 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 try await cache.updateCommunication(communicationModel)
             }
             try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            if shouldUpdateCommunication,
+               let members = await communicationModel.props(symmetricKey: databaseSymmetricKey)?.members {
+                await session.receiverDelegate?.updatedCommunication(communicationModel, members: members)
+            }
             logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)

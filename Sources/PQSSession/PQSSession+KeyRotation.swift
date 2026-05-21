@@ -615,6 +615,82 @@ extension PQSSession {
         return signingPrivateKey.publicKey.rawRepresentation == verifiedSelf.signingPublicKey
     }
 
+    /// Re-issues the current master device's server-auth HMAC after restoring from a local backup.
+    ///
+    /// This is intentionally master-only. The restored backup still contains the old HMAC so it can
+    /// authenticate exactly once. After this method publishes the updated signed device record, copied
+    /// backups with the old HMAC can no longer authenticate against the server.
+    public func reissueMasterDeviceAuthenticationCredentialAfterRestore() async throws {
+        guard let transportDelegate else {
+            throw SessionErrors.transportNotInitialized
+        }
+        var sessionContext = try await getSessionContext()
+        let deviceId = sessionContext.sessionUser.deviceId
+        let secretName = sessionContext.sessionUser.secretName
+        let accountSigningKeyData = sessionContext.activeUserConfiguration.signingPublicKey
+        let accountSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: accountSigningKeyData)
+        let accountSigningPrivateKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey
+        )
+
+        guard accountSigningPrivateKey.publicKey.rawRepresentation == accountSigningKeyData else {
+            throw SessionErrors.compromiseRotationRequiresMasterDevice
+        }
+
+        var baseConfiguration = sessionContext.activeUserConfiguration
+        if let latestConfiguration = try? await transportDelegate.findConfiguration(for: secretName),
+           let latestDevices = try? latestConfiguration.getVerifiedDevices(),
+           !latestDevices.isEmpty {
+            baseConfiguration = userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+                latestConfiguration,
+                currentContext: sessionContext)
+        }
+
+        guard let currentSignedDevice = baseConfiguration.signedDevices.first(where: { $0.id == deviceId }),
+              let currentDevice = try currentSignedDevice.verified(using: accountSigningKey),
+              currentDevice.isMasterDevice else {
+            throw SessionErrors.compromiseRotationRequiresMasterDevice
+        }
+
+        let newHMACData = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
+        let updatedDevice = UserDeviceConfiguration(
+            deviceId: currentDevice.deviceId,
+            signingPublicKey: currentDevice.signingPublicKey,
+            longTermPublicKey: currentDevice.longTermPublicKey,
+            finalMLKEMPublicKey: currentDevice.finalMLKEMPublicKey,
+            deviceName: currentDevice.deviceName,
+            hmacData: newHMACData,
+            isMasterDevice: true,
+            lastSeenAt: Date()
+        )
+        let updatedSignedDevice = try UserConfiguration.SignedDeviceConfiguration(
+            device: updatedDevice,
+            signingKey: accountSigningPrivateKey
+        )
+
+        var signedDevices = baseConfiguration.signedDevices
+        guard let index = signedDevices.firstIndex(where: { $0.id == deviceId }) else {
+            throw SessionErrors.invalidDeviceIdentity
+        }
+        signedDevices[index] = updatedSignedDevice
+
+        try await transportDelegate.publishRotatedKeys(
+            for: secretName,
+            deviceId: deviceId.uuidString,
+            rotated: .init(
+                pskData: accountSigningKeyData,
+                signedDevice: updatedSignedDevice,
+                allSignedDevices: signedDevices.count > 1 ? signedDevices : nil,
+                recovery: nil,
+                deviceKeyBundle: nil
+            )
+        )
+
+        baseConfiguration.signedDevices = signedDevices
+        sessionContext.activeUserConfiguration = baseConfiguration
+        try await updateRotatedKeySessionContext(sessionContext: sessionContext)
+    }
+
     /// Recovers from a state where the local signing key diverges from what the server
     /// has stored in the device attestation blob.
     ///

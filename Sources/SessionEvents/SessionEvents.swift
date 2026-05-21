@@ -119,6 +119,20 @@ fileprivate func preferSettledFriendshipMetadata(
     return passed
 }
 
+public enum FriendshipMetadataConflictPolicy: Sendable {
+    case preferSettled
+    case incoming
+
+    fileprivate func resolve(passed: FriendshipMetadata, stored: FriendshipMetadata) -> FriendshipMetadata {
+        switch self {
+        case .preferSettled:
+            return preferSettledFriendshipMetadata(passed: passed, stored: stored)
+        case .incoming:
+            return passed
+        }
+    }
+}
+
 /// A protocol that defines methods for handling session events in a post-quantum secure messaging system.
 ///
 /// The `SessionEvents` protocol provides a comprehensive interface for managing session-related operations
@@ -282,7 +296,7 @@ public protocol SessionEvents: Sendable {
     /// - `.accepted` → `setAcceptedState()` - Accepts a friendship request
     /// - `.blocked` → `setBlockState(isBlocking: true)` - Current user blocks the other party
     /// - `.blockedByOther` → `setBlockState(isBlocking: false)` - Other party blocks the current user (symmetric / protocol use)
-    /// - `.unblocked` → `unblockUser()` - Unblocks the contact (resets to pending so a fresh request can be made)
+    /// - `.unblocked` → `unblockUser()` - Unblocks the contact and restores its pre-block relationship state when known
     /// - `.rejected`/`.rejectedByOther`/`.mutuallyRejected` → `rejectRequest()` - Rejects the request
     ///
     /// - Parameters:
@@ -555,6 +569,34 @@ public extension SessionEvents {
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws -> ContactModel {
+        try await createContact(
+            secretName: secretName,
+            metadata: metadata,
+            friendshipMetadata: friendshipMetadata,
+            requestFriendship: requestFriendship,
+            sessionContext: sessionContext,
+            cache: cache,
+            transport: transport,
+            receiver: receiver,
+            symmetricKey: symmetricKey,
+            logger: logger,
+            friendshipMetadataConflictPolicy: .preferSettled
+        )
+    }
+
+    func createContact(
+        secretName: String,
+        metadata: Data = .init(),
+        friendshipMetadata: FriendshipMetadata?,
+        requestFriendship: Bool,
+        sessionContext: SessionContext,
+        cache: PQSSessionStore,
+        transport: SessionTransport,
+        receiver: EventReceiver,
+        symmetricKey: SymmetricKey,
+        logger: NeedleTailLogger,
+        friendshipMetadataConflictPolicy: FriendshipMetadataConflictPolicy = .preferSettled
+    ) async throws -> ContactModel {
         // Use the same canonical form the transport layer applies before
         // handing names to PQS so that lookups against `cache.fetchContacts()`
         // can't miss records whose `secretName` contains IRC-equivalent
@@ -594,7 +636,7 @@ public extension SessionEvents {
             let resolvedFriendshipMetadata: FriendshipMetadata = {
                 switch (friendshipMetadata, storedFriendshipMetadata) {
                 case let (.some(passed), .some(stored)):
-                    return preferSettledFriendshipMetadata(passed: passed, stored: stored)
+                    return friendshipMetadataConflictPolicy.resolve(passed: passed, stored: stored)
                 case let (.some(passed), .none):
                     return passed
                 case let (.none, .some(stored)):
@@ -618,9 +660,7 @@ public extension SessionEvents {
                 configuration: configuration,
                 metadata: updatedMetadata
             )
-            
-            try await receiver.updateContact(updatedContact)
-            
+
             let contactModel = try ContactModel(
                 id: updatedContact.id, // Use the same UUID
                 props: .init(
@@ -632,6 +672,7 @@ public extension SessionEvents {
             )
             
             try await cache.updateContact(contactModel)
+            try await receiver.updateContact(updatedContact)
 
             // Mirror the new-contact branch: when a UI add (re-)requests friendship,
             // ensure a request actually goes out. Without this, re-adding a contact
@@ -851,7 +892,7 @@ public extension SessionEvents {
     /// - `.accepted` → `setAcceptedState()` - Accepts a friendship request
     /// - `.blocked` → `setBlockState(isBlocking: true)` - Current user blocks the other party
     /// - `.blockedByOther` → `setBlockState(isBlocking: false)` - Other party blocks the current user (symmetric / protocol use)
-    /// - `.unblocked` → `unblockUser()` - Unblocks the contact (resets to pending so a fresh request can be made)
+    /// - `.unblocked` → `unblockUser()` - Unblocks the contact and restores its pre-block relationship state when known
     /// - `.rejected`/`.rejectedByOther`/`.mutuallyRejected` → `rejectRequest()` - Rejects the request
     ///
     /// - Parameters:
@@ -912,10 +953,12 @@ public extension SessionEvents {
         
         // Capture the pre-transition state so we can compute the server-side
         // block/unblock flag from intent rather than the post-transition state.
-        // (`unblockUser()` resets `myState` to `.pending`, so deriving the flag
-        // from the new state would never produce `unblock=false`.)
+        // (newer metadata may restore `.accepted`, while older metadata may fall
+        // back to `.pending`, so the post-transition state is not a reliable
+        // signal for the server-side unblock packet.)
         let priorMyState = currentMetadata.myState
-        let wasBlocked = (priorMyState == .blocked)
+        let priorTheirState = currentMetadata.theirState
+        let wasBlocked = (priorMyState == .blocked || priorTheirState == .blocked)
 
         // Throw a typed error rather than silently `return`ing so the UI can
         // surface a banner explaining why the action did nothing — the previous
@@ -947,8 +990,9 @@ public extension SessionEvents {
             // Was `setAcceptedState()`, which silently re-friended a previously
             // blocked contact and (because the post-transition `theirState`
             // became `.accepted`) suppressed the server-side unblock packet.
-            // `unblockUser()` resets to pending so a fresh friendship cycle is
-            // possible, and the explicit `wasBlocked` flag below tells the
+            // `unblockUser()` restores the pre-block relationship when newer
+            // metadata contains that history, and falls back to pending for
+            // older metadata. The explicit `wasBlocked` flag below tells the
             // server to drop its block entry.
             currentMetadata.unblockUser()
         case .rejectedByOther, .mutuallyRejected, .rejected:
@@ -986,8 +1030,8 @@ public extension SessionEvents {
         }
         
         // Derive the server block/unblock flag from the requested transition rather
-        // than from the resulting metadata so unblock (which resets to pending)
-        // still produces an explicit `false` packet for the server to act on.
+        // than from the resulting metadata so unblock still produces an
+        // explicit `false` packet for the server to act on.
         var blockUnblockData: Data?
         switch state {
         case .blocked:
