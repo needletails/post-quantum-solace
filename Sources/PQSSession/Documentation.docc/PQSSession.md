@@ -133,7 +133,14 @@ Two paths legitimately update the pin:
 
 Use ``localSecurityIdentity()`` together with
 ``SecurityIdentity/safetyNumber(local:remote:version:iterations:)`` to render
-a Signal-style 60-digit safety number for out-of-band verification.
+a 60-digit safety number for out-of-band verification.
+
+Contacts also pin the peer's account-level `signingPublicKey`. A forced
+identity refresh that sees a different peer account key throws
+``SessionErrors/peerSigningKeyOutOfSync`` and notifies
+``PQSSessionDelegate/peerAccountIdentityChanged(secretName:deviceId:failedSharedMessageId:)``
+instead of attempting automatic ratchet repair. Resume communication only
+after the user verifies and accepts the new safety number.
 
 ## Master vs. linked devices
 

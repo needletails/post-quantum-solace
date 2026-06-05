@@ -143,13 +143,29 @@ public actor TaskProcessor {
         var replayCount: Int
     }
 
+    struct PendingOutboundTransport: Sendable {
+        let message: SignedRatchetMessage
+        let metadata: SignedRatchetMessageMetadata
+        let needsRemoteDeletion: Bool
+        let curveOneTimeKeyId: String?
+        let mlKEMOneTimeKeyId: String
+        let createdAt: Date
+    }
+
     /// Recent non-persistent SDK control payloads, keyed by shared id.
     /// Persisted user messages are replayed from the app store; this covers the
-    /// Signal/Sesame recovery controls that intentionally do not create UI rows.
+    /// Session recovery controls that intentionally do not create UI rows.
     var recentOutboundReplayBySharedId: [String: RecentOutboundReplay] = [:]
     let recentOutboundReplayTTL: TimeInterval = 60 * 10
     let recentOutboundReplayLimit = 256
     let recentOutboundReplayMaxReplays = 5
+
+    /// Signed ratchet frames whose encryption succeeded but whose transport send has not.
+    /// Retrying these frames avoids advancing the outbound ratchet a second time for the same
+    /// logical message, which is especially important for first messages in a session.
+    var pendingOutboundTransportBySharedId: [String: PendingOutboundTransport] = [:]
+    let pendingOutboundTransportTTL: TimeInterval = 60 * 10
+    let pendingOutboundTransportLimit = 256
     
     /// Represents a stashed inbound task for later processing.
     ///
@@ -294,7 +310,11 @@ public actor TaskProcessor {
             
             if let state = try? BinaryDecoder().decode(FriendshipMetadata.self, from: message.metadata) {
                 if state.myState == .requested {
-                    sendOneTimeIdentities = true
+                    // Only bootstrap fresh OTK identities when none exist yet. Callers that
+                    // pre-bootstrap (e.g. MessageReceiverManager.synchronize) already sent
+                    // notifyIdentityCreation and must not burn another OTK on friendship.
+                    let existingPeerIdentities = try await session.getSessionIdentities(with: nickname)
+                    sendOneTimeIdentities = existingPeerIdentities.isEmpty
                 }
                 if state.myState == .pending && state.theirState == .pending {
                     createIdentity = false
@@ -521,7 +541,7 @@ public actor TaskProcessor {
         }
 
         if try await cache.fetchCommunications().async.first(where: {
-            try await $0.props(symmetricKey: symmetricKey)?.communicationType == .channel(channelName)
+            await $0.props(symmetricKey: symmetricKey)?.communicationType == .channel(channelName)
         }) == nil {
             let communicationModel = try await createCommunicationModel(
                 administrator: administrator,
@@ -545,6 +565,62 @@ public actor TaskProcessor {
             
             try await session.sendCommunicationSynchronization(
                 recipient: recipient,
+                metadata: metadata,
+                sessionContext: params.sessionContext,
+                sessionDelegate: params.sessionDelegate,
+                cache: params.cache,
+                receiver: params.receiverDelegate,
+                symmetricKey: params.symmetricKey,
+                logger: logger)
+        }
+    }
+
+    /// Expands an existing channel communication roster and optionally re-synchronizes encryption state.
+    public func updateChannelMembership(
+        channelName: String,
+        administrator: String,
+        members: Set<String>,
+        operators: Set<String>,
+        symmetricKey: SymmetricKey,
+        session: PQSSession,
+        cache: SessionCache,
+        shouldSynchronize: Bool
+    ) async throws {
+        var members = members
+        var operators = operators
+        members.insert(administrator)
+        operators.insert(administrator)
+
+        let communicationModel = try await findCommunicationType(
+            cache: cache,
+            communicationType: .channel(channelName),
+            session: session)
+
+        guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
+            throw PQSSession.SessionErrors.missingMetadata
+        }
+
+        let wireInfo = ChannelInfo(
+            name: channelName,
+            administrator: administrator,
+            members: members,
+            operators: operators)
+        let metadata = try BinaryEncoder().encode(wireInfo)
+
+        props.administrator = administrator
+        props.members = members
+        props.operators = operators
+        props.metadata = metadata
+
+        _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
+        try await cache.updateCommunication(communicationModel)
+
+        await session.receiverDelegate?.updatedCommunication(communicationModel, members: members)
+
+        if shouldSynchronize {
+            let params = try await session.requireSessionParametersWithoutTransportDelegate()
+            try await session.sendCommunicationSynchronization(
+                recipient: .channel(channelName),
                 metadata: metadata,
                 sessionContext: params.sessionContext,
                 sessionDelegate: params.sessionDelegate,
@@ -836,7 +912,7 @@ public actor TaskProcessor {
                         ))
                     )
                 }
-                guard let identityProps = await identity.props(symmetricKey: symmetricKey) else {
+                guard await identity.props(symmetricKey: symmetricKey) != nil else {
                     logger.log(level: .warning, message: "Skipping outbound task for unreadable recipient identity \(identity.id)")
                     continue
                 }

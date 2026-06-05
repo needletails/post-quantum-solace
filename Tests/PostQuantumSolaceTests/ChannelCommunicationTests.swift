@@ -114,5 +114,53 @@ actor ChannelCommunicationTests {
 
         await session.shutdown()
     }
+
+    @Test("updateChannelMembership expands persisted channel roster")
+    func testUpdateChannelMembership_expandsRoster() async throws {
+        let (cache, symmetricKey) = try await setupSession()
+
+        let metadata = try BinaryEncoder().encode(
+            ChannelInfo(
+                name: "general",
+                administrator: "alice",
+                members: ["alice", "bob"],
+                operators: ["alice"]))
+
+        try await session.taskProcessor.createChannelCommunication(
+            sender: "alice",
+            recipient: .channel("general"),
+            channelName: "general",
+            administrator: "alice",
+            members: ["alice", "bob"],
+            operators: ["alice"],
+            symmetricKey: symmetricKey,
+            session: session,
+            cache: cache,
+            metadata: metadata,
+            shouldSynchronize: false)
+
+        try await session.taskProcessor.updateChannelMembership(
+            channelName: "general",
+            administrator: "alice",
+            members: ["alice", "bob", "carol"],
+            operators: ["alice"],
+            symmetricKey: symmetricKey,
+            session: session,
+            cache: cache,
+            shouldSynchronize: false)
+
+        let communication = try await session.taskProcessor.findCommunicationType(
+            cache: cache,
+            communicationType: .channel("general"),
+            session: session)
+        let props = await communication.props(symmetricKey: symmetricKey)
+        #expect(props?.members.contains("carol") == true)
+        #expect(props?.members.count == 3)
+
+        let decoded = try BinaryDecoder().decode(ChannelInfo.self, from: props!.metadata)
+        #expect(decoded.members.contains("carol"))
+
+        await session.shutdown()
+    }
 }
 

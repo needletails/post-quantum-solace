@@ -503,14 +503,45 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Intentionally does not quarantine the whole message tuple: resend recovery reuses the same
     /// `sharedMessageId`, so tuple-wide quarantine would drop the replay before decryption.
     func markInboundFailure(_ inbound: InboundTaskMessage, failureClass: String, now: Date = Date()) {
-        cleanupInboundFailurePolicy(now: now)
-        let key = inboundFailureKey(
+        markInboundFailure(
             sender: inbound.senderSecretName,
             deviceId: inbound.senderDeviceId,
             messageId: inbound.sharedMessageId,
+            failureClass: failureClass,
+            now: now)
+    }
+
+    /// Records failure-class suppression once the associated recovery side effect is accepted.
+    func markInboundFailure(
+        sender: String,
+        deviceId: UUID,
+        messageId: String,
+        failureClass: String,
+        now: Date = Date()
+    ) {
+        cleanupInboundFailurePolicy(now: now)
+        let key = inboundFailureKey(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: messageId,
             failureClass: failureClass
         )
         inboundFailurePolicyUntil[key] = now.addingTimeInterval(inboundFailurePolicyTTL)
+    }
+
+    func takeInboundFailureClasses(
+        sender: String,
+        deviceId: UUID,
+        messageId: String,
+        now: Date = Date()
+    ) -> [String] {
+        cleanupInboundFailurePolicy(now: now)
+        let prefix = "\(sender)|\(deviceId.uuidString)|\(messageId)|"
+        let matches = inboundFailurePolicyUntil.keys.filter { $0.hasPrefix(prefix) }
+        for key in matches {
+            inboundFailurePolicyUntil.removeValue(forKey: key)
+        }
+        return matches.map { String($0.dropFirst(prefix.count)) }
     }
     
     /// Returns whether automatic key rotation is currently allowed for this peer.
@@ -563,6 +594,25 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             failedSharedMessageId: failedMessageId,
             failureClass: failureClass,
             createdAt: now)
+        let delegate = sessionDelegate
+        Task {
+            await delegate?.inboundRecoveryDeferred(
+                senderSecretName: sender,
+                senderDeviceId: deviceId,
+                failedSharedMessageId: failedMessageId,
+                failureClass: failureClass)
+        }
+    }
+
+    func hasPendingResendAfterReestablishment(
+        sender: String,
+        deviceId: UUID,
+        now: Date = Date()
+    ) -> Bool {
+        cleanupPendingResendAfterReestablishment(now: now)
+        return pendingResendAfterReestablishment.values.contains { pending in
+            pending.senderName == sender && pending.senderDeviceId == deviceId
+        }
     }
 
     func takePendingResendsAfterReestablishment(
@@ -922,6 +972,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         case drainedKeys = "The Local Keys are drained."
         case longTermKeyRotationFailed = "Failed to rotate the long-term key."
         case signingKeyOutOfSync = "Local signing key is out of sync with server-trusted account state."
+        case peerSigningKeyOutOfSync = "Peer account signing key is out of sync with the locally pinned contact identity."
         case compromiseRotationRequiresMasterDevice = "Compromise key rotation is restricted to the master device."
         case invalidOperatorCount = "The number of operators must be greater than 0."
         case invalidMemberCount = "The number of members must be greater than 2."
@@ -954,6 +1005,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 return "The cryptographic signature verification failed"
             case .missingSignature:
                 return "The expected signature was not found"
+            case .peerSigningKeyOutOfSync:
+                return "The peer's account signing key no longer matches the locally pinned contact identity"
             case .invalidPassword:
                 return "The provided password is incorrect or invalid"
             case .saltError:
@@ -985,6 +1038,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 return "Ensure the device salt is properly initialized"
             case .signingKeyOutOfSync:
                 return "Re-link this device from a trusted device or reset account keys"
+            case .peerSigningKeyOutOfSync:
+                return "Pause communication with this peer until the user verifies and accepts the new safety number"
             case .compromiseRotationRequiresMasterDevice:
                 return "Initiate compromise rotation from the master device, then re-link secondary devices if needed"
             case .deviceIdentityCorrupted:
@@ -1413,7 +1468,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 userConfiguration = linkedConfiguration
             } else {
                 // Legacy link delegates only return bare devices. Keep this as a compatibility
-                // fallback, but modern Signal-like linking should supply `userConfiguration`.
+                // fallback, but modern device linking should supply `userConfiguration`.
                 userConfiguration = try await createNewUser(
                     configuration: bundle.userConfiguration,
                     signingPrivateKeyData: bundle.deviceKeys.signingPrivateKey,
@@ -2458,7 +2513,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
         switch type {
         case .curve:
+            let deviceId = sessionContext.sessionUser.deviceId
             let publicKeys = sessionContext.activeUserConfiguration.signedOneTimePublicKeys
+            let currentDevicePublicKeys = publicKeys.filter { $0.deviceId == deviceId }
+            let otherDevicePublicKeys = publicKeys.filter { $0.deviceId != deviceId }
             let remoteKeySet = Set(keys)
 
             // Only prune the public key list to stop advertising keys the server
@@ -2466,12 +2524,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             // key means an in-flight message needs the private counterpart for
             // decryption. Private keys are removed after use via updateOneTimeKey(remove:).
             if remoteKeySet.isEmpty {
-                sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll()
-                didUpdate = true
+                if !currentDevicePublicKeys.isEmpty {
+                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys = otherDevicePublicKeys
+                    didUpdate = true
+                }
             } else {
-                let filteredPublic = publicKeys.filter { remoteKeySet.contains($0.id) }
-                if filteredPublic.count != publicKeys.count {
-                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys = filteredPublic
+                let filteredPublic = currentDevicePublicKeys.filter { remoteKeySet.contains($0.id) }
+                if filteredPublic.count != currentDevicePublicKeys.count {
+                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys = otherDevicePublicKeys + filteredPublic
                     didUpdate = true
                 }
             }
@@ -2487,22 +2547,27 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
                 try await cache.updateLocalSessionContext(encryptedConfig)
 
-                if sessionContext.activeUserConfiguration.signedOneTimePublicKeys.isEmpty {
+                if sessionContext.activeUserConfiguration.signedOneTimePublicKeys.allSatisfy({ $0.deviceId != deviceId }) {
                     try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
                 }
             }
-            return sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count
+            return sessionContext.activeUserConfiguration.signedOneTimePublicKeys.filter { $0.deviceId == deviceId }.count
         case .mlKEM:
+            let deviceId = sessionContext.sessionUser.deviceId
             let publicKeys = sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
+            let currentDevicePublicKeys = publicKeys.filter { $0.deviceId == deviceId }
+            let otherDevicePublicKeys = publicKeys.filter { $0.deviceId != deviceId }
             let remoteKeySet = Set(keys)
 
             if remoteKeySet.isEmpty {
-                sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll()
-                didUpdate = true
+                if !currentDevicePublicKeys.isEmpty {
+                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys = otherDevicePublicKeys
+                    didUpdate = true
+                }
             } else {
-                let filteredPublic = publicKeys.filter { remoteKeySet.contains($0.id) }
-                if filteredPublic.count != publicKeys.count {
-                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys = filteredPublic
+                let filteredPublic = currentDevicePublicKeys.filter { remoteKeySet.contains($0.id) }
+                if filteredPublic.count != currentDevicePublicKeys.count {
+                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys = otherDevicePublicKeys + filteredPublic
                     didUpdate = true
                 }
             }
@@ -2518,11 +2583,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
                 try await cache.updateLocalSessionContext(encryptedConfig)
 
-                if sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.isEmpty {
+                if sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.allSatisfy({ $0.deviceId != deviceId }) {
                     try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
                 }
             }
-            return sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count
+            return sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.filter { $0.deviceId == deviceId }.count
         }
     }
 
@@ -2653,6 +2718,22 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             symmetricKey: getDatabaseSymmetricKey(),
             session: self
         )
+    }
+
+    /// Blocks until pending encrypt/send jobs finish (used after OTK bootstrap notify).
+    public func waitForOutboundJobDrain(timeout: TimeInterval = 8.0) async {
+        guard let cache else { return }
+        await taskProcessor.waitForOutboundJobDrain(cache: cache, session: self, timeout: timeout)
+    }
+
+    /// Sends OTK notify for a new peer session and waits for outbound encrypt jobs to drain.
+    /// Call before the first friendship request so the receiver ratchet is ready.
+    public func bootstrapPeerContactSession(secretName: String) async throws {
+        _ = try await refreshIdentities(
+            secretName: secretName,
+            createIdentity: true,
+            sendOneTimeIdentities: true)
+        await waitForOutboundJobDrain()
     }
 
     /// Shuts down the session, clearing sensitive state.

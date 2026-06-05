@@ -64,7 +64,7 @@ import PostQuantumSolace
 ## 🆕 What's New in 3.0.0
 
 Version 3.0.0 hardens the trust model, formalizes the per-device identity
-invariant, and exposes the building blocks needed to ship a Signal-grade
+invariant, and exposes the building blocks needed to ship a production-grade
 verification experience.
 
 ### ✨ New Features

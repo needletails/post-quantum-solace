@@ -263,7 +263,7 @@ public extension PQSSession {
                 // Do not silently mask critical verification/rotation failures; callers
                 // need to react (e.g. force re-sync / re-link) instead of using stale identities.
                 switch sessionError {
-                case .invalidSignature, .signingKeyOutOfSync, .longTermKeyRotationFailed:
+                case .invalidSignature, .signingKeyOutOfSync, .peerSigningKeyOutOfSync, .longTermKeyRotationFailed:
                     logger.log(level: .error, message: "Critical refreshIdentities failure for \(secretName): \(sessionError)")
                     throw sessionError
                 default:
@@ -468,11 +468,12 @@ public extension PQSSession {
         let symmetricKey = try await getDatabaseSymmetricKey()
         let configuration = try await transportDelegate.findConfiguration(for: secretName)
 
-        let accountSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: configuration.signingPublicKey)
-        for signedDevice in configuration.signedDevices {
-            if try (signedDevice.verified(using: accountSigningPublicKey) != nil) == false {
-                throw PQSSession.SessionErrors.invalidSignature
-            }
+        try validateUserConfigurationSignatures(configuration)
+        if secretName != sessionUser.secretName {
+            try await enforcePeerAccountSigningKeyPin(
+                for: secretName,
+                configuration: configuration,
+                symmetricKey: symmetricKey)
         }
 
         let verifiedDevices = try configuration.getVerifiedDevices().map {
@@ -617,9 +618,23 @@ public extension PQSSession {
 
             // Get the user configuration for the recipient
             let configuration = try await transportDelegate.findConfiguration(for: secretName)
-            var verifiedDevices = try configuration.getVerifiedDevices().map {
-                try configuration.deviceWithCurrentKeyBundle($0)
+            try validateUserConfigurationSignatures(configuration)
+
+            if isSelfSecretName, forceRefresh {
+                // For linked-device convergence, force-refreshing self identities should also
+                // synchronize the persisted active account bundle.
+                try await synchronizeActiveUserConfiguration(configuration)
+            } else if !isSelfSecretName {
+                try await enforcePeerAccountSigningKeyPin(
+                    for: secretName,
+                    configuration: configuration,
+                    symmetricKey: symmetricKey)
             }
+
+            var verifiedDevices = try verifiedDevicesWithUsableKeyMaterial(
+                in: configuration,
+                secretName: secretName,
+                source: "remote")
             var collected = [UserDeviceConfiguration]()
             // Create a set of existing device IDs from the existing identities for quick lookup
             let existingDeviceIds = await Set(identities.asyncCompactMap {
@@ -632,22 +647,6 @@ public extension PQSSession {
                     collected.append(device)
                 }
             }
-
-            // Ensure that the identities of the user configuration are legitimate
-            let signingPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: configuration.signingPublicKey)
-
-            for device in configuration.signedDevices {
-                if try (device.verified(using: signingPublicKey) != nil) == false {
-                    throw PQSSession.SessionErrors.invalidSignature
-                }
-            }
-            
-            // For linked-device convergence, force-refreshing self identities should also
-            // synchronize the persisted active account bundle.
-            if isSelfSecretName, forceRefresh {
-                try await synchronizeActiveUserConfiguration(configuration)
-            }
-
             var generatedSessionContextIds = Set<Int>()
             for device in collected {
                 // Check if the device ID is already in the existing identities
@@ -694,9 +693,10 @@ public extension PQSSession {
             })
 
             guard let localConfiguration = await sessionContext?.activeUserConfiguration else { return [] }
-            let myDevices = try localConfiguration.getVerifiedDevices().map {
-                try localConfiguration.deviceWithCurrentKeyBundle($0)
-            }
+            let myDevices = try verifiedDevicesWithUsableKeyMaterial(
+                in: localConfiguration,
+                secretName: secretName,
+                source: "local")
             verifiedDevices.append(contentsOf: myDevices)
 
             for deviceId in newDeviceIds {
@@ -834,6 +834,107 @@ public extension PQSSession {
             }
         }
         return identities
+    }
+
+    private func verifiedDevicesWithUsableKeyMaterial(
+        in configuration: UserConfiguration,
+        secretName: String,
+        source: String
+    ) throws -> [UserDeviceConfiguration] {
+        let verifiedDevices = try configuration.getVerifiedDevices()
+        var usableDevices = [UserDeviceConfiguration]()
+
+        for device in verifiedDevices {
+            do {
+                _ = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
+                let currentDevice = try configuration.deviceWithCurrentKeyBundle(device)
+                _ = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: currentDevice.longTermPublicKey)
+                _ = try MLKEMPublicKey(
+                    id: currentDevice.finalMLKEMPublicKey.id,
+                    currentDevice.finalMLKEMPublicKey.rawRepresentation)
+                usableDevices.append(currentDevice)
+            } catch {
+                logger.log(
+                    level: .warning,
+                    message: "Skipping malformed \(source) device during identity refresh for \(secretName): deviceId=\(device.deviceId), error=\(error)")
+            }
+        }
+
+        return usableDevices
+    }
+
+    private func validateUserConfigurationSignatures(_ configuration: UserConfiguration) throws {
+        do {
+            let accountSigningPublicKey = try Curve25519.Signing.PublicKey(
+                rawRepresentation: configuration.signingPublicKey
+            )
+            var verifiedDevices = [UserDeviceConfiguration]()
+
+            for signedDevice in configuration.signedDevices {
+                guard let device = try signedDevice.verified(using: accountSigningPublicKey) else {
+                    throw PQSSession.SessionErrors.invalidSignature
+                }
+                verifiedDevices.append(device)
+            }
+
+            for signedBundle in configuration.signedDeviceKeyBundles {
+                guard let device = verifiedDevices.first(where: { $0.deviceId == signedBundle.id }) else {
+                    throw PQSSession.SessionErrors.invalidDeviceIdentity
+                }
+                let deviceSigningPublicKey = try Curve25519.Signing.PublicKey(
+                    rawRepresentation: device.signingPublicKey
+                )
+                guard let bundle = try signedBundle.verified(using: deviceSigningPublicKey),
+                      bundle.deviceId == device.deviceId
+                else {
+                    throw PQSSession.SessionErrors.invalidSignature
+                }
+            }
+        } catch let sessionError as PQSSession.SessionErrors {
+            throw sessionError
+        } catch {
+            throw PQSSession.SessionErrors.invalidSignature
+        }
+    }
+
+    private func enforcePeerAccountSigningKeyPin(
+        for secretName: String,
+        configuration: UserConfiguration,
+        symmetricKey: SymmetricKey
+    ) async throws {
+        guard let cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+
+        let contacts = try await cache.fetchContacts()
+        var foundPinnedContact = false
+
+        for contact in contacts {
+            guard let props = await contact.props(symmetricKey: symmetricKey),
+                  props.secretName == secretName
+            else {
+                continue
+            }
+
+            let pinnedSigningPublicKey = props.configuration.signingPublicKey
+            guard !pinnedSigningPublicKey.isEmpty else {
+                continue
+            }
+
+            foundPinnedContact = true
+            if pinnedSigningPublicKey != configuration.signingPublicKey {
+                logger.log(
+                    level: .error,
+                    message: "[refreshSessionIdentities] peer account signing key changed without authenticated reestablishment; refusing to refresh \(secretName)")
+                throw PQSSession.SessionErrors.peerSigningKeyOutOfSync
+            }
+        }
+
+        if foundPinnedContact {
+            logger.log(
+                level: .debug,
+                message: "Verified pinned peer account signing key for \(secretName)")
+        }
     }
     
     func createOneTimeKeys(

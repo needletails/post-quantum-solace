@@ -612,6 +612,14 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         }
         
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
+        if let pendingTransport = pendingOutboundTransport(sharedId: outboundTask.sharedId) {
+            try await sendPendingOutboundTransport(
+                pendingTransport,
+                outboundTask: outboundTask,
+                session: session)
+            return
+        }
+        
         var sessionIdentity = try await resolveSessionIdentityForOutbound(
             embeddedRecipient: outboundTask.recipientIdentity,
             session: session,
@@ -725,15 +733,30 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             throw error
         }
         
-        try await session.transportDelegate?.sendMessage(signedMessage, metadata: SignedRatchetMessageMetadata(
+        let transportMetadata = SignedRatchetMessageMetadata(
             secretName: props.secretName,
             deviceId: props.deviceId,
             recipient: outboundTask.message.recipient,
             transportMetadata: outboundTask.message.transportInfo,
             sharedMessageId: outboundTask.sharedId,
-            transportEvent: transportEvent))
+            transportEvent: transportEvent)
+        let shouldRememberPendingTransport = shouldRememberPendingOutboundTransport(outboundTask.message)
+        if shouldRememberPendingTransport {
+            rememberPendingOutboundTransport(
+                sharedId: outboundTask.sharedId,
+                message: signedMessage,
+                metadata: transportMetadata,
+                needsRemoteDeletion: results.needsRemoteDeletion,
+                curveOneTimeKeyId: results.localOneTimePrivateKey?.id.uuidString,
+                mlKEMOneTimeKeyId: results.localMLKEMPrivateKey.id.uuidString)
+        }
+        try await session.transportDelegate?.sendMessage(signedMessage, metadata: transportMetadata)
+        logRecoveryTransportSendSuccess(transportEvent, sharedId: outboundTask.sharedId)
+        if shouldRememberPendingTransport {
+            pendingOutboundTransportBySharedId.removeValue(forKey: outboundTask.sharedId)
+        }
 
-        rememberRecentOutboundReplayIfNeeded(outboundTask)
+        await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
 
         if outboundTask.isPersistedOutbound {
             await markPersistedOutboundPastSendingIfNeeded(session: session, localMessageId: outboundTask.localId)
@@ -882,6 +905,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             
             if let transportInfo = decodedMessage.transportInfo,
                let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo) {
+                var processedReestablishment: SessionReestablishmentEnvelope?
                 do {
                     switch event {
                     case .sessionReestablishment(let envelope):
@@ -918,6 +942,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                             )
                             return
                         case .process:
+                            processedReestablishment = envelope
                             break
                         }
 
@@ -984,6 +1009,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                         recipient: recipient,
                                         respondingTo: envelope)
                                 } catch {
+                                    await session.forgetReceivedSessionReestablishment(
+                                        envelope: envelope,
+                                        senderDeviceId: inboundTask.senderDeviceId)
                                     logger.log(level: .warning, message: "Failed to emit peerRefresh response: \(error)")
                                 }
                             }
@@ -1018,36 +1046,12 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         canSaveMessage = false
                     case .requestMessageResend(let request):
                         canSaveMessage = false
-                        
-                        
-                        let symmetricKey = try await session.getDatabaseSymmetricKey()
-                        let cryptoMessage: CryptoMessage
-                        if let replay = recentOutboundReplayMessage(sharedId: request.failedSharedMessageId) {
-                            cryptoMessage = replay.message
-                            logger.log(
-                                level: .info,
-                                message: "Replaying recent non-persistent outbound control sharedMessageId=\(request.failedSharedMessageId) replayCount=\(replay.replayCount)")
-                        } else {
-                            let foundMessage: EncryptedMessage?
-                            do {
-                                foundMessage = try await session.cache?.fetchMessage(sharedId: request.failedSharedMessageId)
-                            } catch {
-                                logger.log(
-                                    level: .info,
-                                    message: "Ignoring requestMessageResend for missing local message sharedMessageId=\(request.failedSharedMessageId): \(error)")
-                                break
-                            }
 
-                            guard let fetchedCryptoMessage = await foundMessage?.props(symmetricKey: symmetricKey)?.message else {
-                                logger.log(
-                                    level: .info,
-                                    message: "Ignoring requestMessageResend for unreadable local message sharedMessageId=\(request.failedSharedMessageId)")
-                                break
-                            }
-                            cryptoMessage = fetchedCryptoMessage
-                        }
-                        
+                        let symmetricKey = try await session.getDatabaseSymmetricKey()
                         let identities = try await session.cache?.fetchSessionIdentities() ?? []
+                        logger.log(
+                            level: .info,
+                            message: "pqs.recovery.resendRequestReceived sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) requestingDeviceId=\(request.requestingDeviceId) requestedCount=\(request.failedSharedMessageIds.count) ids=\(request.failedSharedMessageIds.joined(separator: ","))")
                         let requestedDevice = await currentDeviceConfiguration(
                             secretName: inboundTask.senderSecretName,
                             deviceId: request.requestingDeviceId,
@@ -1071,23 +1075,73 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                             preferredDevice: senderDevice
                         )
                         guard let identity = requestedIdentity ?? senderIdentity else {
+                            logger.log(
+                                level: .warning,
+                                message: "pqs.recovery.resendReplayFailed reason=missingIdentity sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) requestingDeviceId=\(request.requestingDeviceId) requestedCount=\(request.failedSharedMessageIds.count)")
                             throw PQSSession.SessionErrors.missingSessionIdentity
                         }
-                        
-                        let task = EncryptableTask(
-                            task: .writeMessage(OutboundTaskMessage(
-                                message: cryptoMessage,
-                                recipientIdentity: identity,
-                                localId: UUID(),
-                                sharedId: request.failedSharedMessageId,
-                                isPersistedOutbound: false
-                            ))
-                        )
-                        
-                        try await feedTask(task, session: session)
+
+                        var replayQueuedCount = 0
+                        var replayMissingCount = 0
+                        for failedSharedMessageId in request.failedSharedMessageIds {
+                            let cryptoMessage: CryptoMessage
+                            if let replay = recentOutboundReplayMessage(sharedId: failedSharedMessageId) {
+                                cryptoMessage = replay.message
+                                logger.log(
+                                    level: .info,
+                                    message: "pqs.recovery.resendReplayUsingRecentControl sharedId=\(failedSharedMessageId) replayCount=\(replay.replayCount)")
+                            } else {
+                                let foundMessage: EncryptedMessage?
+                                do {
+                                    foundMessage = try await session.cache?.fetchMessage(sharedId: failedSharedMessageId)
+                                } catch {
+                                    replayMissingCount += 1
+                                    logger.log(
+                                        level: .info,
+                                        message: "pqs.recovery.resendReplaySkipped reason=missingLocalMessage sharedId=\(failedSharedMessageId) error=\(error)")
+                                    continue
+                                }
+
+                                guard let fetchedCryptoMessage = await foundMessage?.props(symmetricKey: symmetricKey)?.message else {
+                                    replayMissingCount += 1
+                                    logger.log(
+                                        level: .info,
+                                        message: "pqs.recovery.resendReplaySkipped reason=unreadableLocalMessage sharedId=\(failedSharedMessageId)")
+                                    continue
+                                }
+                                cryptoMessage = fetchedCryptoMessage
+                            }
+
+                            let task = EncryptableTask(
+                                task: .writeMessage(OutboundTaskMessage(
+                                    message: cryptoMessage,
+                                    recipientIdentity: identity,
+                                    localId: UUID(),
+                                    sharedId: failedSharedMessageId,
+                                    isPersistedOutbound: false
+                                ))
+                            )
+
+                            try await feedTask(task, session: session)
+                            replayQueuedCount += 1
+                        }
+                        if replayQueuedCount > 0 {
+                            logger.log(
+                                level: .info,
+                                message: "pqs.recovery.resendReplayQueued sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) queuedCount=\(replayQueuedCount) skippedCount=\(replayMissingCount) requestedCount=\(request.failedSharedMessageIds.count)")
+                        } else {
+                            logger.log(
+                                level: .warning,
+                                message: "pqs.recovery.resendReplayFailed reason=noReplayableMessages sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) skippedCount=\(replayMissingCount) requestedCount=\(request.failedSharedMessageIds.count)")
+                        }
                         
                     }
                 } catch {
+                    if let processedReestablishment {
+                        await session.forgetReceivedSessionReestablishment(
+                            envelope: processedReestablishment,
+                            senderDeviceId: inboundTask.senderDeviceId)
+                    }
                     logger.log(level: .error, message: "Error handling transport event from \(inboundTask.senderSecretName): \(error)")
                 }
             }
@@ -1099,6 +1153,16 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     inboundTask: inboundTask,
                     session: session,
                     sessionIdentity: decryptionSessionIdentity)
+
+                let recoveredFailureClasses = await session.takeInboundFailureClasses(
+                    sender: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId,
+                    messageId: inboundTask.sharedMessageId)
+                if !recoveredFailureClasses.isEmpty {
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.messageDecrypted sharedId=\(inboundTask.sharedMessageId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) priorFailureClasses=\(recoveredFailureClasses.joined(separator: ","))")
+                }
 
                 let pending = await session.takePendingResendsAfterReestablishment(
                     sender: inboundTask.senderSecretName,
@@ -1125,7 +1189,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             
         } catch {
 #if DEBUG
-            logger.log(level: .error, message: "RatchetError during ratchet decryption: \(error)")
+            logger.log(
+                level: .debug,
+                message: "pqs.recovery.decryptAttemptFailed sharedId=\(inboundTask.sharedMessageId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) action=handOffToRecoveryPolicy error=\(error)")
 #endif
             throw error
         }
@@ -1149,10 +1215,123 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         }
     }
 
-    private func rememberRecentOutboundReplayIfNeeded(_ outboundTask: OutboundTaskMessage, now: Date = Date()) {
+    private func pendingOutboundTransport(
+        sharedId: String,
+        now: Date = Date()
+    ) -> PendingOutboundTransport? {
+        cleanupPendingOutboundTransport(now: now)
+        return pendingOutboundTransportBySharedId[sharedId]
+    }
+
+    private func logRecoveryTransportSendSuccess(_ event: TransportEvent?, sharedId: String) {
+        guard let event else { return }
+
+        switch event {
+        case .sessionReestablishment(let envelope):
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.reestablishmentSent sharedId=\(sharedId) kind=\(envelope.kind.rawValue) response=\(envelope.isResponse) epoch=\(envelope.epoch) intent=\(envelope.intentId?.uuidString ?? "nil")")
+        case .requestMessageResend(let request):
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.resendRequestSent sharedId=\(sharedId) requestingDeviceId=\(request.requestingDeviceId) requestedCount=\(request.failedSharedMessageIds.count) ids=\(request.failedSharedMessageIds.joined(separator: ","))")
+        case .linkedDeviceReprovisioning(let bundle):
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.linkedDeviceReprovisioningSent sharedId=\(sharedId) targetDeviceId=\(bundle.targetDeviceId)")
+        case .synchronizeOneTimeKeys, .refreshOneTimeKeys:
+            break
+        }
+    }
+
+    private func shouldRememberPendingOutboundTransport(_ message: CryptoMessage) -> Bool {
+        guard let transportInfo = message.transportInfo,
+              let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo)
+        else {
+            return true
+        }
+
+        switch event {
+        case .requestMessageResend,
+             .sessionReestablishment,
+             .linkedDeviceReprovisioning,
+             .synchronizeOneTimeKeys,
+             .refreshOneTimeKeys:
+            return true
+        }
+    }
+
+    private func rememberPendingOutboundTransport(
+        sharedId: String,
+        message: SignedRatchetMessage,
+        metadata: SignedRatchetMessageMetadata,
+        needsRemoteDeletion: Bool,
+        curveOneTimeKeyId: String?,
+        mlKEMOneTimeKeyId: String,
+        now: Date = Date()
+    ) {
+        cleanupPendingOutboundTransport(now: now)
+        pendingOutboundTransportBySharedId[sharedId] = PendingOutboundTransport(
+            message: message,
+            metadata: metadata,
+            needsRemoteDeletion: needsRemoteDeletion,
+            curveOneTimeKeyId: curveOneTimeKeyId,
+            mlKEMOneTimeKeyId: mlKEMOneTimeKeyId,
+            createdAt: now)
+
+        guard pendingOutboundTransportBySharedId.count > pendingOutboundTransportLimit else { return }
+        let overflow = pendingOutboundTransportBySharedId.count - pendingOutboundTransportLimit
+        let oldestKeys = pendingOutboundTransportBySharedId
+            .sorted { $0.value.createdAt < $1.value.createdAt }
+            .prefix(overflow)
+            .map(\.key)
+        for key in oldestKeys {
+            pendingOutboundTransportBySharedId.removeValue(forKey: key)
+        }
+    }
+
+    private func sendPendingOutboundTransport(
+        _ pendingTransport: PendingOutboundTransport,
+        outboundTask: OutboundTaskMessage,
+        session: PQSSession
+    ) async throws {
+        try await session.transportDelegate?.sendMessage(
+            pendingTransport.message,
+            metadata: pendingTransport.metadata)
+        logRecoveryTransportSendSuccess(
+            pendingTransport.metadata.transportEvent,
+            sharedId: outboundTask.sharedId)
+        pendingOutboundTransportBySharedId.removeValue(forKey: outboundTask.sharedId)
+
+        await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
+
+        if outboundTask.isPersistedOutbound {
+            await markPersistedOutboundPastSendingIfNeeded(session: session, localMessageId: outboundTask.localId)
+        }
+
+        if pendingTransport.needsRemoteDeletion {
+            try await removeKeys(
+                session: session,
+                curveId: pendingTransport.curveOneTimeKeyId,
+                mlKEMId: pendingTransport.mlKEMOneTimeKeyId)
+        }
+    }
+
+    private func cleanupPendingOutboundTransport(now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-pendingOutboundTransportTTL)
+        pendingOutboundTransportBySharedId = pendingOutboundTransportBySharedId.filter { _, pendingTransport in
+            pendingTransport.createdAt > cutoff
+        }
+    }
+
+    private func rememberRecentOutboundReplayIfNeeded(
+        _ outboundTask: OutboundTaskMessage,
+        session: PQSSession,
+        now: Date = Date()
+    ) async {
         cleanupRecentOutboundReplay(now: now)
         guard !outboundTask.isPersistedOutbound else { return }
-        guard isReplayableNonPersistentControl(outboundTask.message) else { return }
+        guard await isReplayableNonPersistentControl(outboundTask.message, session: session) else { return }
         guard recentOutboundReplayBySharedId[outboundTask.sharedId] == nil else { return }
 
         recentOutboundReplayBySharedId[outboundTask.sharedId] = RecentOutboundReplay(
@@ -1195,11 +1374,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         }
     }
 
-    private func isReplayableNonPersistentControl(_ message: CryptoMessage) -> Bool {
+    private func isReplayableNonPersistentControl(
+        _ message: CryptoMessage,
+        session: PQSSession
+    ) async -> Bool {
         guard let transportInfo = message.transportInfo,
               let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo)
         else {
-            return false
+            return await session.sessionDelegate?
+                .shouldReplayNonPersistentOutbound(transportInfo: message.transportInfo) == true
         }
 
         switch event {
@@ -1280,44 +1463,72 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     ) async {
         guard !pendingRequests.isEmpty else { return }
 
-        for pending in pendingRequests {
-            guard await session.canSendPeerResendRequest(
-                sender: pending.senderName,
-                deviceId: pending.senderDeviceId,
-                failedMessageId: pending.failedSharedMessageId
-            ) else {
-                await session.deferPeerResendUntilReestablished(
+        struct ResendGroupKey: Hashable {
+            let senderName: String
+            let senderDeviceId: UUID
+        }
+
+        let grouped = Dictionary(grouping: pendingRequests) {
+            ResendGroupKey(senderName: $0.senderName, senderDeviceId: $0.senderDeviceId)
+        }
+
+        for (key, groupedRequests) in grouped {
+            var ready: [PQSSession.PendingResendAfterReestablishment] = []
+            for pending in groupedRequests {
+                guard await session.canSendPeerResendRequest(
                     sender: pending.senderName,
                     deviceId: pending.senderDeviceId,
-                    failedMessageId: pending.failedSharedMessageId,
-                    failureClass: pending.failureClass)
-                logger.log(
-                    level: .info,
-                    message: "Skipping deferred resend request still in cooldown sharedMessageId=\(pending.failedSharedMessageId)")
-                continue
+                    failedMessageId: pending.failedSharedMessageId
+                ) else {
+                    await session.deferPeerResendUntilReestablished(
+                        sender: pending.senderName,
+                        deviceId: pending.senderDeviceId,
+                        failedMessageId: pending.failedSharedMessageId,
+                        failureClass: pending.failureClass)
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.resendDeferredStillWaiting reason=cooldown sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId) failureClass=\(pending.failureClass)")
+                    continue
+                }
+                ready.append(pending)
             }
 
+            guard !ready.isEmpty else { continue }
+
             do {
+                let sharedIds = ready.map(\.failedSharedMessageId)
                 logger.log(
                     level: .info,
-                    message: "Requesting deferred resend after \(reason) sharedMessageId=\(pending.failedSharedMessageId)")
+                    message: "pqs.recovery.resendDrainStarted reason=\(reason) count=\(sharedIds.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) ids=\(sharedIds.joined(separator: ","))")
                 try await session.requestMessageResend(
-                    sharedMessageId: pending.failedSharedMessageId,
-                    senderName: pending.senderName,
-                    senderDeviceId: pending.senderDeviceId)
-                await session.markPeerResendRequestSent(
-                    sender: pending.senderName,
-                    deviceId: pending.senderDeviceId,
-                    failedMessageId: pending.failedSharedMessageId)
+                    sharedMessageIds: sharedIds,
+                    senderName: key.senderName,
+                    senderDeviceId: key.senderDeviceId)
+                for pending in ready {
+                    await session.markPeerResendRequestSent(
+                        sender: pending.senderName,
+                        deviceId: pending.senderDeviceId,
+                        failedMessageId: pending.failedSharedMessageId)
+                    await session.markInboundFailure(
+                        sender: pending.senderName,
+                        deviceId: pending.senderDeviceId,
+                        messageId: pending.failedSharedMessageId,
+                        failureClass: pending.failureClass)
+                }
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.resendDrainSubmitted reason=\(reason) count=\(sharedIds.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) ids=\(sharedIds.joined(separator: ","))")
             } catch {
-                await session.deferPeerResendUntilReestablished(
-                    sender: pending.senderName,
-                    deviceId: pending.senderDeviceId,
-                    failedMessageId: pending.failedSharedMessageId,
-                    failureClass: pending.failureClass)
+                for pending in ready {
+                    await session.deferPeerResendUntilReestablished(
+                        sender: pending.senderName,
+                        deviceId: pending.senderDeviceId,
+                        failedMessageId: pending.failedSharedMessageId,
+                        failureClass: pending.failureClass)
+                }
                 logger.log(
                     level: .warning,
-                    message: "Failed to request deferred resend after \(reason) sharedMessageId=\(pending.failedSharedMessageId): \(error)")
+                    message: "pqs.recovery.resendDrainFailed reason=\(reason) count=\(ready.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) error=\(error)")
             }
         }
     }

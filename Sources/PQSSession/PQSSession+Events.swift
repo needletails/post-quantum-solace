@@ -185,13 +185,22 @@ public extension PQSSession {
     }
   
     func requestMessageResend(sharedMessageId: String, senderName: String, senderDeviceId: UUID) async throws {
-        
+        try await requestMessageResend(
+            sharedMessageIds: [sharedMessageId],
+            senderName: senderName,
+            senderDeviceId: senderDeviceId)
+    }
+
+    func requestMessageResend(sharedMessageIds: [String], senderName: String, senderDeviceId: UUID) async throws {
+        let sharedMessageIds = sharedMessageIds.filter { !$0.isEmpty }
+        guard !sharedMessageIds.isEmpty else { return }
+
         guard let context = await sessionContext else {
             throw SessionErrors.sessionNotInitialized
         }
 
         let packet = FailedMessageResendRequest(
-            failedSharedMessageId: sharedMessageId,
+            failedSharedMessageIds: sharedMessageIds,
             requestingDeviceId: context.sessionUser.deviceId)
         let info = TransportEvent.requestMessageResend(packet)
         let encoded = try BinaryEncoder().encode(info)
@@ -218,6 +227,9 @@ public extension PQSSession {
         }
 
         guard let identity = selected?.identity else {
+            logger.log(
+                level: .warning,
+                message: "pqs.recovery.resendRequestFailed reason=missingIdentity sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(sharedMessageIds.count)")
             throw SessionErrors.invalidDeviceIdentity
         }
         
@@ -232,6 +244,9 @@ public extension PQSSession {
         )
     
         try await taskProcessor.feedTask(task, session: self)
+        logger.log(
+            level: .info,
+            message: "pqs.recovery.resendRequestSubmitted sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(sharedMessageIds.count) ids=\(sharedMessageIds.joined(separator: ","))")
     }
     
     // MARK: Outbound
@@ -381,6 +396,27 @@ public extension PQSSession {
             session: self,
             cache: cache,
             metadata: metadata)
+    }
+
+    func updateChannelMembership(
+        channelName: String,
+        administrator: String,
+        members: Set<String>,
+        operators: Set<String>,
+        shouldSynchronize: Bool
+    ) async throws {
+        guard let cache else {
+            throw SessionErrors.databaseNotInitialized
+        }
+        try await taskProcessor.updateChannelMembership(
+            channelName: channelName,
+            administrator: administrator,
+            members: members,
+            operators: operators,
+            symmetricKey: getDatabaseSymmetricKey(),
+            session: self,
+            cache: cache,
+            shouldSynchronize: shouldSynchronize)
     }
 }
 

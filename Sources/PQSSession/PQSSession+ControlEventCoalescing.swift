@@ -296,6 +296,26 @@ extension PQSSession {
         return .process
     }
 
+    func forgetReceivedSessionReestablishment(
+        envelope: SessionReestablishmentEnvelope,
+        senderDeviceId: UUID
+    ) {
+        let key = ProcessedControlEventKey(senderDeviceId: senderDeviceId, kind: envelope.kind)
+        guard let existing = processedControlEvents[key] else { return }
+
+        if envelope.epoch > 0, existing.lastProcessedEpoch == envelope.epoch {
+            processedControlEvents.removeValue(forKey: key)
+            return
+        }
+
+        if envelope.epoch == 0,
+           let existingIntent = existing.lastProcessedIntentId,
+           let incomingIntent = envelope.intentId,
+           existingIntent == incomingIntent {
+            processedControlEvents.removeValue(forKey: key)
+        }
+    }
+
     /// Returns `true` if a forced identity refresh for `secretName` should run now,
     /// throttled to one fire per `forcedIdentityRefreshCoalesceWindowSeconds`.
     /// The act of returning `true` records the timestamp so subsequent calls within

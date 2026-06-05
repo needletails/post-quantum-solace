@@ -242,11 +242,13 @@ public enum TransportEvent: Sendable, Codable {
 
 public struct FailedMessageResendRequest: Sendable, Codable {
     public let failedSharedMessageId: String
+    public let failedSharedMessageIds: [String]
     public let requestingDeviceId: UUID
     
     private enum CodingKeys: String, CodingKey {
         case failedSharedMessageId = "a"
         case requestingDeviceId = "b"
+        case failedSharedMessageIds = "c"
     }
     
     public init(
@@ -254,6 +256,52 @@ public struct FailedMessageResendRequest: Sendable, Codable {
         requestingDeviceId: UUID
     ) {
         self.failedSharedMessageId = failedSharedMessageId
+        self.failedSharedMessageIds = [failedSharedMessageId]
         self.requestingDeviceId = requestingDeviceId
+    }
+
+    public init(
+        failedSharedMessageIds: [String],
+        requestingDeviceId: UUID
+    ) {
+        let ids = Self.normalizedIds(failedSharedMessageIds)
+        self.failedSharedMessageId = ids.first ?? ""
+        self.failedSharedMessageIds = ids
+        self.requestingDeviceId = requestingDeviceId
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let single = try container.decodeIfPresent(String.self, forKey: .failedSharedMessageId)
+        let batch = try container.decodeIfPresent([String].self, forKey: .failedSharedMessageIds)
+        let ids = Self.normalizedIds(batch?.isEmpty == false ? batch! : single.map { [$0] } ?? [])
+        guard let first = ids.first else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .failedSharedMessageId,
+                in: container,
+                debugDescription: "Missing failed shared message id")
+        }
+        failedSharedMessageId = first
+        failedSharedMessageIds = ids
+        requestingDeviceId = try container.decode(UUID.self, forKey: .requestingDeviceId)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(failedSharedMessageId, forKey: .failedSharedMessageId)
+        try container.encode(requestingDeviceId, forKey: .requestingDeviceId)
+        if failedSharedMessageIds.count > 1 {
+            try container.encode(failedSharedMessageIds, forKey: .failedSharedMessageIds)
+        }
+    }
+
+    private static func normalizedIds(_ ids: [String]) -> [String] {
+        var seen = Set<String>()
+        var normalized: [String] = []
+        for id in ids where !id.isEmpty && !seen.contains(id) {
+            seen.insert(id)
+            normalized.append(id)
+        }
+        return normalized
     }
 }

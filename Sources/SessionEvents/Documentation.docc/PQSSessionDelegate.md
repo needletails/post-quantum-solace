@@ -141,6 +141,15 @@ final class AppSessionDelegate: PQSSessionDelegate {
                                                  intentId: UUID?) async {
         await UI.surfaceCompromiseAlert(deviceId: deviceId, intentId: intentId)
     }
+
+    func peerAccountIdentityChanged(secretName: String,
+                                    deviceId: UUID,
+                                    failedSharedMessageId: String?) async {
+        await UI.surfacePeerSafetyNumberChange(
+            secretName: secretName,
+            deviceId: deviceId,
+            failedMessageId: failedSharedMessageId)
+    }
 }
 ```
 

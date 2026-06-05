@@ -43,6 +43,7 @@ actor SessionIdentityTests {
 
         var sessionContext: Data?
         var identities = [SessionIdentity]()
+        var contacts = [ContactModel]()
         var failNextSessionIdentityDelete = false
         var failNextSessionIdentityUpdate = false
         
@@ -92,9 +93,12 @@ actor SessionIdentityTests {
         func fetchAllMediaJobs() async throws -> [DataPacket] { [] }
         func fetchMediaJob(id _: UUID) async throws -> DataPacket? { nil }
         func deleteMediaJob(_: UUID) async throws {}
-        func fetchContacts() async throws -> [ContactModel] { [] }
-        func createContact(_: ContactModel) async throws {}
-        func updateContact(_: ContactModel) async throws {}
+        func fetchContacts() async throws -> [ContactModel] { contacts }
+        func createContact(_ contact: ContactModel) async throws { contacts.append(contact) }
+        func updateContact(_ contact: ContactModel) async throws {
+            contacts.removeAll(where: { $0.id == contact.id })
+            contacts.append(contact)
+        }
         func fetchCommunications() async throws -> [BaseCommunication] { [] }
         func createCommunication(_: BaseCommunication) async throws {}
         func updateCommunication(_: BaseCommunication) async throws {}
@@ -419,6 +423,58 @@ actor SessionIdentityTests {
             } catch let error as PQSSession.SessionErrors {
                 #expect(error == .invalidSignature)
             }
+
+            await session.shutdown()
+        } catch {
+            await session.shutdown()
+            throw error
+        }
+    }
+
+    @Test("Force refresh rejects peer account signing key drift from pinned contact")
+    func testForceRefreshRejectsPeerAccountSigningKeyDriftFromPinnedContact() async throws {
+        do {
+            let (store, transport) = try await setupTestSession()
+
+            let trustedBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            let trustedConfiguration = trustedBundle.userConfiguration
+            transport.configurations["alice"] = trustedConfiguration
+
+            let symmetricKey = try await session.getDatabaseSymmetricKey()
+            let pinnedContact = try ContactModel(
+                id: UUID(),
+                props: .init(
+                    secretName: "alice",
+                    configuration: trustedConfiguration,
+                    metadata: [:]
+                ),
+                symmetricKey: symmetricKey
+            )
+            try await store.createContact(pinnedContact)
+
+            let initial = try await session.refreshIdentities(secretName: "alice", forceRefresh: true)
+            #expect(!initial.isEmpty, "The trusted configuration should establish at least one peer identity")
+            let initialIdentityIds = Set(initial.map(\.id))
+            let initialStoredIds = Set(store.identities.map(\.id))
+
+            let foreignBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            #expect(foreignBundle.userConfiguration.signingPublicKey != trustedConfiguration.signingPublicKey)
+            transport.configurations["alice"] = foreignBundle.userConfiguration
+
+            await #expect(throws: PQSSession.SessionErrors.peerSigningKeyOutOfSync) {
+                _ = try await session.refreshIdentities(secretName: "alice", forceRefresh: true)
+            }
+
+            #expect(Set(store.identities.map(\.id)) == initialStoredIds)
+            let after = try await session.getSessionIdentities(with: "alice")
+            #expect(Set(after.map(\.id)) == initialIdentityIds)
+
+            guard let contactProps = await store.contacts.first?.props(symmetricKey: symmetricKey) else {
+                Issue.record("Expected pinned contact to remain decryptable")
+                await session.shutdown()
+                return
+            }
+            #expect(contactProps.configuration.signingPublicKey == trustedConfiguration.signingPublicKey)
 
             await session.shutdown()
         } catch {

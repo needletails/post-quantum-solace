@@ -234,15 +234,13 @@ extension TaskProcessor {
             case .streamMessage(let message):
                 let failureClass = "ratchet.maxSkippedHeadersExceeded"
 
-                logger.log(
-                    level: .warning,
-                    message: "\(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId); using fresh SessionIdentity repair without compromise rotation")
                 return try await handleFreshSessionRepair(
                     message: message,
                     failureClass: failureClass,
                     job: job,
                     cache: cache,
-                    session: session)
+                    session: session,
+                    diagnostic: "compromiseRotation=false")
             case .writeMessage(let message):
                 logger.log(level: .error, message: "MaxSkippedHeadersExceeded for writeMessage to recipient: \(message.message.recipient)")
                 try await cache.deleteJob(job)
@@ -251,6 +249,16 @@ extension TaskProcessor {
         } catch let ratchetError as RatchetError where isFreshSessionRepairError(ratchetError) {
             switch props.task.task {
             case .streamMessage(let message):
+                if let deferred = try await tryDeferInboundDuringContactBootstrap(
+                    message: message,
+                    error: ratchetError,
+                    job: job,
+                    props: props,
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey) {
+                    return deferred
+                }
                 return try await handleFreshSessionRepair(
                     message: message,
                     failureClass: freshSessionFailureClass(ratchetError),
@@ -277,17 +285,20 @@ extension TaskProcessor {
                     return .deleted
                 }
 
-                logger.log(level: .warning, message: "missingOneTimeKey for sender \(message.senderSecretName) — replacing OTK batch and notifying peer to refresh")
+                logger.log(
+                    level: .warning,
+                    message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=replaceOTKBatchThenPeerRefresh")
                 let curveReplaced = await session.refreshOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
                 let mlKEMReplaced = await session.refreshMLKEMOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
                 if !curveReplaced || !mlKEMReplaced {
-                    logger.log(level: .error, message: "OTK batch replacement failed; cannot recover from missingOneTimeKey")
+                    logger.log(
+                        level: .error,
+                        message: "pqs.recovery.failed failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=otkBatchReplacementFailed")
                 }
 
                 let mySecretName = await session.sessionContext?.sessionUser.secretName
                 let isSelf = message.senderSecretName == mySecretName
 
-                await session.markInboundFailure(message, failureClass: failureClass)
                 await session.deferPeerResendUntilReestablished(
                     sender: message.senderSecretName,
                     deviceId: message.senderDeviceId,
@@ -295,7 +306,7 @@ extension TaskProcessor {
                     failureClass: failureClass)
                 logger.log(
                     level: .info,
-                    message: "Deferred resend request for sharedMessageId=\(message.sharedMessageId) until peerRefresh completes for \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+                    message: "pqs.recovery.deferred failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) waitingFor=peerRefresh")
 
                 do {
                     _ = try await session.emitSessionReestablishment(
@@ -303,8 +314,13 @@ extension TaskProcessor {
                         recipient: isSelf ? .personalMessage : .nickname(message.senderSecretName),
                         scope: isSelf ? .personal : .peer(secretName: message.senderSecretName),
                         forceReemit: true)
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.reestablishmentQueued kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
                 } catch {
-                    logger.log(level: .warning, message: "Failed to emit peerRefresh after \(failureClass): \(error)")
+                    logger.log(
+                        level: .warning,
+                        message: "pqs.recovery.reestablishmentFailed kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) error=\(error)")
                 }
 
                 try await cache.deleteJob(job)
@@ -316,13 +332,13 @@ extension TaskProcessor {
         } catch let cryptoError as CryptoKitError {
             switch props.task.task {
             case .streamMessage(let message):
-                logger.log(level: .error, message: "Decryption failure (\(cryptoError)) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId) — preparing fresh peer session and deferring resend until reestablishment")
                 return try await handleFreshSessionRepair(
                     message: message,
                     failureClass: "crypto.bodyDecryptionFailed",
                     job: job,
                     cache: cache,
-                    session: session)
+                    session: session,
+                    diagnostic: "error=\(cryptoError)")
             case .writeMessage(let message):
                 logger.log(level: .error, message: "CryptoKitError for writeMessage to recipient: \(message.message.recipient) — \(cryptoError)")
                 try await cache.deleteJob(job)
@@ -350,6 +366,21 @@ extension TaskProcessor {
                 logger.log(level: .error, message: "sessionDecryptionError for writeMessage to recipient: \(message.message.recipient)")
                 try await cache.deleteJob(job)
             }
+        } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
+            switch props.task.task {
+            case .streamMessage(let message):
+                return try await handlePeerSigningKeyOutOfSync(
+                    message: message,
+                    job: job,
+                    cache: cache,
+                    session: session)
+            case .writeMessage(let message):
+                logger.log(
+                    level: .error,
+                    message: "peerSigningKeyOutOfSync for writeMessage to recipient: \(message.message.recipient); dropping until peer identity is reverified")
+            }
+            try await cache.deleteJob(job)
+            return .deleted
         } catch let sessionError as PQSSession.SessionErrors where sessionError == .signingKeyOutOfSync {
             logger.log(level: .error, message: "signingKeyOutOfSync during job processing; child device likely needs reprovisioning from master")
             switch props.task.task {
@@ -380,6 +411,15 @@ extension TaskProcessor {
                 try await cache.deleteJob(job)
             }
         } catch {
+            if case .writeMessage(let message) = props.task.task,
+               pendingOutboundTransportBySharedId[message.sharedId] != nil {
+                return try await deferPendingOutboundTransportRetry(
+                    job: job,
+                    props: props,
+                    cache: cache,
+                    symmetricKey: symmetricKey,
+                    error: error)
+            }
             logger.log(level: .error, message: "Unhandled error during job processing: \(error)")
             try await cache.deleteJob(job)
         }
@@ -416,6 +456,110 @@ extension TaskProcessor {
     private func inboundTask(from task: TaskType) -> InboundTaskMessage? {
         guard case let .streamMessage(inbound) = task else { return nil }
         return inbound
+    }
+
+    /// When OTK bootstrap is in flight (`addingContactData` set), friendship packets can
+    /// arrive before the handshake ratchet message finishes decrypting. Briefly defer instead
+    /// of entering full SessionIdentity repair; fall through to existing repair after timeout.
+    private func tryDeferInboundDuringContactBootstrap(
+        message: InboundTaskMessage,
+        error: RatchetError,
+        job: JobModel,
+        props: JobModel.UnwrappedProps,
+        cache: SessionCache,
+        session: PQSSession,
+        symmetricKey: SymmetricKey
+    ) async throws -> JobProcessingOutcome? {
+        guard error == .initialMessageNotReceived else { return nil }
+        guard await session.addingContactData != nil else { return nil }
+
+        let maxAttempts = 24
+        guard props.attempts < maxAttempts else { return nil }
+
+        logger.log(
+            level: .info,
+            message: "Deferring inbound message during contact OTK bootstrap for \(message.senderSecretName) deviceId=\(message.senderDeviceId) attempt=\(props.attempts + 1)/\(maxAttempts)")
+
+        var updatedProps = props
+        updatedProps.attempts += 1
+        updatedProps.delayedUntil = Date().addingTimeInterval(0.25)
+        _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
+        try await cache.updateJob(job)
+        Task {
+            try? await session.resumeJobQueue()
+        }
+        return .paused
+    }
+
+    private func deferPendingOutboundTransportRetry(
+        job: JobModel,
+        props: JobModel.UnwrappedProps,
+        cache: SessionCache,
+        symmetricKey: SymmetricKey,
+        error: Error
+    ) async throws -> JobProcessingOutcome {
+        var updatedProps = props
+        updatedProps.attempts += 1
+        updatedProps.delayedUntil = Date().addingTimeInterval(min(0.10 * Double(updatedProps.attempts), 1.0))
+        _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
+        try await cache.updateJob(job)
+        try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
+        if let recoveryLog = recoveryTransportSendFailureLog(
+            props: props,
+            attempt: updatedProps.attempts,
+            error: error)
+        {
+            logger.log(level: .warning, message: .init(stringLiteral: recoveryLog))
+        } else {
+            logger.log(
+                level: .warning,
+                message: "Deferred outbound transport retry for pending signed frame attempt=\(updatedProps.attempts): \(error)")
+        }
+        return .paused
+    }
+
+    private func recoveryTransportSendFailureLog(
+        props: JobModel.UnwrappedProps,
+        attempt: Int,
+        error: Error
+    ) -> String? {
+        guard case .writeMessage(let outboundTask) = props.task.task,
+              let transportEvent = pendingOutboundTransportBySharedId[outboundTask.sharedId]?.metadata.transportEvent
+        else {
+            return nil
+        }
+
+        switch transportEvent {
+        case .sessionReestablishment(let envelope):
+            return "pqs.recovery.reestablishmentSendFailed sharedId=\(outboundTask.sharedId) kind=\(envelope.kind.rawValue) response=\(envelope.isResponse) epoch=\(envelope.epoch) intent=\(envelope.intentId?.uuidString ?? "nil") retryAttempt=\(attempt) error=\(error)"
+        case .requestMessageResend(let request):
+            return "pqs.recovery.resendRequestSendFailed sharedId=\(outboundTask.sharedId) requestingDeviceId=\(request.requestingDeviceId) requestedCount=\(request.failedSharedMessageIds.count) ids=\(request.failedSharedMessageIds.joined(separator: ",")) retryAttempt=\(attempt) error=\(error)"
+        case .linkedDeviceReprovisioning(let bundle):
+            return "pqs.recovery.linkedDeviceReprovisioningSendFailed sharedId=\(outboundTask.sharedId) targetDeviceId=\(bundle.targetDeviceId) retryAttempt=\(attempt) error=\(error)"
+        case .synchronizeOneTimeKeys, .refreshOneTimeKeys:
+            return nil
+        }
+    }
+
+    /// Waits until outbound encrypt jobs drain so OTK notify completes before friendship send.
+    func waitForOutboundJobDrain(
+        cache: SessionCache,
+        session: PQSSession,
+        timeout: TimeInterval = 8.0
+    ) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let jobs = (try? await cache.fetchJobs()) ?? []
+            if jobs.isEmpty, !isRunning {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                let remaining = (try? await cache.fetchJobs()) ?? []
+                if remaining.isEmpty, !isRunning {
+                    return
+                }
+            }
+            try? await Task.sleep(nanoseconds: 75_000_000)
+        }
+        logger.log(level: .info, message: "Timed out waiting for outbound job drain; continuing")
     }
 
     private func isFreshSessionRepairError(_ error: RatchetError) -> Bool {
@@ -457,7 +601,7 @@ extension TaskProcessor {
         else {
             logger.log(
                 level: .info,
-                message: "Skipping resend request after \(failureClass); cooldown active sharedMessageId=\(message.sharedMessageId)")
+                message: "pqs.recovery.resendRequestSkipped reason=cooldown failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId)")
             return false
         }
 
@@ -470,11 +614,14 @@ extension TaskProcessor {
                 sender: message.senderSecretName,
                 deviceId: message.senderDeviceId,
                 failedMessageId: message.sharedMessageId)
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.resendRequestSubmitted failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId)")
             return true
         } catch {
             logger.log(
                 level: .warning,
-                message: "Failed to request resend after \(failureClass) for sharedMessageId=\(message.sharedMessageId): \(error)")
+                message: "pqs.recovery.resendRequestFailed failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) error=\(error)")
             return false
         }
     }
@@ -564,6 +711,7 @@ extension TaskProcessor {
         job: JobModel,
         cache: SessionCache,
         session: PQSSession,
+        diagnostic: String? = nil,
         retryOriginalAfterReset: Bool = true
     ) async throws -> JobProcessingOutcome {
         if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
@@ -572,9 +720,10 @@ extension TaskProcessor {
             return .deleted
         }
 
+        let diagnosticSuffix = diagnostic.map { " \($0)" } ?? ""
         logger.log(
             level: .warning,
-            message: "\(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId); repairing peer SessionIdentity")
+            message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=freshSessionRepairThenDeferredResend\(diagnosticSuffix)")
 
         let canReset = await session.canAttemptReconciliation(
             sender: message.senderSecretName,
@@ -592,6 +741,12 @@ extension TaskProcessor {
                     deviceId: message.senderDeviceId,
                     sendOneTimeIdentities: true)
                 resetSucceeded = true
+            } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
+                return try await handlePeerSigningKeyOutOfSync(
+                    message: message,
+                    job: job,
+                    cache: cache,
+                    session: session)
             } catch {
                 logger.log(level: .warning, message: "Fresh session reset failed for \(message.senderSecretName) (\(message.senderDeviceId)): \(error)")
             }
@@ -614,12 +769,13 @@ extension TaskProcessor {
             logger.log(level: .info, message: "Prepared fresh SessionIdentity for repair controls to \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
         }
 
-        await session.markInboundFailure(message, failureClass: failureClass)
-
         let mySecretName = await session.sessionContext?.sessionUser.secretName
         let isSelf = message.senderSecretName == mySecretName
         let recipient: MessageRecipient = isSelf ? .personalMessage : .nickname(message.senderSecretName)
         let scope: ControlEventScope = isSelf ? .personal : .peer(secretName: message.senderSecretName)
+        let hadPendingRecovery = await session.hasPendingResendAfterReestablishment(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId)
 
         await session.deferPeerResendUntilReestablished(
             sender: message.senderSecretName,
@@ -628,20 +784,57 @@ extension TaskProcessor {
             failureClass: failureClass)
         logger.log(
             level: .info,
-            message: "Deferred resend request for sharedMessageId=\(message.sharedMessageId) until peerRefresh completes for \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+            message: "pqs.recovery.deferred failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) waitingFor=peerRefresh")
 
         do {
-            _ = try await session.emitSessionReestablishment(
+            let emitted = try await session.emitSessionReestablishment(
                 kind: .peerRefresh,
                 recipient: recipient,
                 scope: scope,
+                forceReemit: !hadPendingRecovery,
                 freshOutboundRepair: resetSucceeded ? nil : (
                     secretName: message.senderSecretName,
                     deviceId: message.senderDeviceId,
                     failureClass: failureClass))
+            if !emitted {
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.reestablishmentSuppressed reason=coalescedPending failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
+            } else {
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.reestablishmentQueued kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
+            }
         } catch {
-            logger.log(level: .warning, message: "Failed to emit peerRefresh after \(failureClass): \(error)")
+            logger.log(
+                level: .warning,
+                message: "pqs.recovery.reestablishmentFailed kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) error=\(error)")
         }
+
+        try await cache.deleteJob(job)
+        return .deleted
+    }
+
+    private func handlePeerSigningKeyOutOfSync(
+        message: InboundTaskMessage,
+        job: JobModel,
+        cache: SessionCache,
+        session: PQSSession
+    ) async throws -> JobProcessingOutcome {
+        let failureClass = "identity.peerSigningKeyOutOfSync"
+        logger.log(
+            level: .error,
+            message: "pqs.recovery.blocked.trust failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=notifyPeerAccountIdentityChanged")
+
+        await session.markInboundFailure(message, failureClass: failureClass)
+        await session.quarantineInboundFailure(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            messageId: message.sharedMessageId)
+        await session.sessionDelegate?.peerAccountIdentityChanged(
+            secretName: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            failedSharedMessageId: message.sharedMessageId)
 
         try await cache.deleteJob(job)
         return .deleted

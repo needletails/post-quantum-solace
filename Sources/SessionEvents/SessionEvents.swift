@@ -498,7 +498,6 @@ public extension SessionEvents {
             )
             
             try await cache.createContact(contactModel)
-            try await receiver.createdContact(contact)
             
             logger.log(level: .debug, message: "Creating Communication Model")
             // Create communication model
@@ -517,6 +516,10 @@ public extension SessionEvents {
             try await cache.createCommunication(communicationModel)
             await receiver.updatedCommunication(communicationModel, members: [contactInfo.secretName])
             logger.log(level: .debug, message: "Created Communication Model for \(contactInfo.secretName)")
+            
+            // Notify UI only after the communication shell exists so sidebar loaders
+            // can resolve the nickname bundle immediately (QR / friendship inbound).
+            try await receiver.createdContact(contact)
             
             try await requestMetadata(
                 from: contact.secretName,
@@ -713,7 +716,6 @@ public extension SessionEvents {
             )
             
             try await cache.createContact(contactModel)
-            try await receiver.createdContact(contact)
             
             _ = try await updateOrCreateCommunication(
                 mySecretName: mySecretName,
@@ -722,6 +724,10 @@ public extension SessionEvents {
                 receiver: receiver,
                 symmetricKey: symmetricKey,
                 logger: logger)
+            
+            // Notify UI only after the communication shell exists so sidebar loaders
+            // can resolve the nickname bundle immediately (QR scan / inbound friendship).
+            try await receiver.createdContact(contact)
             
             try await receiver.synchronize(
                 contact: contact,
@@ -1050,6 +1056,10 @@ public extension SessionEvents {
             blockData: blockUnblockData,
             metadata: metadata,
             currentState: currentMetadata.myState)
+
+        if state == .accepted {
+            try await receiver.pushContactMetadata(to: contact.secretName)
+        }
         
         logger.log(level: .info, message: "Sent Friendship State Change Request")
     }

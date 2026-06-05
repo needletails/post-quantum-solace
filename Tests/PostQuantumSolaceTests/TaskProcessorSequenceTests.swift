@@ -90,6 +90,37 @@ actor TaskProcessorSequenceTests {
 
         await session.shutdown()
     }
+
+    @Test("Inbound recovery failure classes clear after successful replay")
+    func testInboundRecoveryFailureClassesClearAfterSuccessfulReplay() async {
+        let sender = "alice"
+        let deviceId = UUID()
+        let messageId = "replayed-shared-id"
+
+        await session.markInboundFailure(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: messageId,
+            failureClass: "crypto.bodyDecryptionFailed")
+        await session.markInboundFailure(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: messageId,
+            failureClass: "ratchet.initialMessageNotReceived")
+
+        let first = await session.takeInboundFailureClasses(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: messageId)
+        let second = await session.takeInboundFailureClasses(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: messageId)
+
+        #expect(Set(first) == ["crypto.bodyDecryptionFailed", "ratchet.initialMessageNotReceived"])
+        #expect(second.isEmpty)
+        await session.shutdown()
+    }
     
     @Test("Basic FIFO - Single Message")
     func testBasicFIFOSingleMessage() async throws {
@@ -651,6 +682,141 @@ actor TaskProcessorSequenceTests {
 
         #expect(await probe.contains(claimedDeviceId), "Master should report same-account invalidSignature as linked-device compromise")
         #expect(await probe.count() == 1, "Same invalidSignature should produce one compromise report")
+
+        await session.shutdown()
+    }
+
+    @Test("Peer signing-key pin mismatch reports peer identity change")
+    func testPeerSigningKeyOutOfSyncReportsPeerIdentityChange() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let probe = LinkedDeviceCompromiseProbe()
+        let peerProbe = PeerIdentityTrustProbe()
+        await session.setPQSSessionDelegate(conformer: SessionDelegate(
+            session: session,
+            compromiseProbe: probe,
+            peerIdentityTrustProbe: peerProbe))
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: PQSSession.SessionErrors.peerSigningKeyOutOfSync)
+        )
+
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let header = EncryptedHeader(
+            remoteLongTermPublicKey: Data(repeating: 1, count: 32),
+            remoteOneTimePublicKey: nil,
+            remoteMLKEMPublicKey: try MLKEMPublicKey(Data(repeating: 2, count: 1568)),
+            headerCiphertext: Data([0x01]),
+            messageCiphertext: Data([0x02]),
+            oneTimeKeyId: nil,
+            mlKEMOneTimeKeyId: UUID(),
+            encrypted: Data([0x04])
+        )
+        let ratchetMessage = RatchetMessage(header: header, encryptedData: Data([0x03]))
+        let signed = try SignedRatchetMessage(
+            message: ratchetMessage,
+            signingPrivateKey: signingKey.rawRepresentation
+        )
+        let peerDeviceId = UUID()
+        let inbound = InboundTaskMessage(
+            message: signed,
+            senderSecretName: "bob",
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "peer_signing_key_out_of_sync"
+        )
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+
+        #expect(await probe.count() == 0, "Peer identity pin failures must not be routed as local linked-device compromise")
+        #expect(await peerProbe.contains(
+            secretName: "bob",
+            deviceId: peerDeviceId,
+            failedSharedMessageId: "peer_signing_key_out_of_sync"))
+        #expect(await session.isInboundFailureQuarantined(
+            sender: "bob",
+            deviceId: peerDeviceId,
+            messageId: "peer_signing_key_out_of_sync"))
+
+        await session.shutdown()
+    }
+
+    @Test("Fresh-session repair reports peer identity change when pin mismatch blocks reset")
+    func testFreshSessionRepairPeerSigningKeyMismatchReportsTrustChange() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let peerName = "bob_pin_mismatch"
+        let trustedBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let foreignBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let trustedConfiguration = trustedBundle.userConfiguration
+        let foreignConfiguration = foreignBundle.userConfiguration
+        #expect(trustedConfiguration.signingPublicKey != foreignConfiguration.signingPublicKey)
+
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        let pinnedContact = try ContactModel(
+            id: UUID(),
+            props: .init(
+                secretName: peerName,
+                configuration: trustedConfiguration,
+                metadata: [:]),
+            symmetricKey: symmetricKey)
+        try await store.createContact(pinnedContact)
+
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: foreignBundle.deviceKeys.deviceId,
+            config: foreignConfiguration)
+
+        let peerProbe = PeerIdentityTrustProbe()
+        await session.setPQSSessionDelegate(conformer: SessionDelegate(
+            session: session,
+            peerIdentityTrustProbe: peerProbe))
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
+        )
+
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let header = EncryptedHeader(
+            remoteLongTermPublicKey: Data(repeating: 1, count: 32),
+            remoteOneTimePublicKey: nil,
+            remoteMLKEMPublicKey: try MLKEMPublicKey(Data(repeating: 2, count: 1568)),
+            headerCiphertext: Data([0x01]),
+            messageCiphertext: Data([0x02]),
+            oneTimeKeyId: nil,
+            mlKEMOneTimeKeyId: UUID(),
+            encrypted: Data([0x04])
+        )
+        let ratchetMessage = RatchetMessage(header: header, encryptedData: Data([0x03]))
+        let signed = try SignedRatchetMessage(
+            message: ratchetMessage,
+            signingPrivateKey: signingKey.rawRepresentation
+        )
+        let inbound = InboundTaskMessage(
+            message: signed,
+            senderSecretName: peerName,
+            senderDeviceId: foreignBundle.deviceKeys.deviceId,
+            sharedMessageId: "fresh_repair_peer_signing_key_out_of_sync"
+        )
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+
+        #expect(await peerProbe.contains(
+            secretName: peerName,
+            deviceId: foreignBundle.deviceKeys.deviceId,
+            failedSharedMessageId: "fresh_repair_peer_signing_key_out_of_sync"))
+        #expect(await session.isInboundFailureQuarantined(
+            sender: peerName,
+            deviceId: foreignBundle.deviceKeys.deviceId,
+            messageId: "fresh_repair_peer_signing_key_out_of_sync"))
+        #expect(!(await session.hasPendingResendAfterReestablishment(
+            sender: peerName,
+            deviceId: foreignBundle.deviceKeys.deviceId)))
 
         await session.shutdown()
     }

@@ -181,6 +181,93 @@ actor SessionTests {
     }
 
     @Test
+    func synchronizeLocalKeysPreservesSiblingDevicePublicKeys() async throws {
+        await session.shutdown()
+        let store = MockIdentityStore(
+            mockUserData: .init(session: session),
+            session: session,
+            isSender: false
+        )
+
+        let localDeviceId = UUID()
+        let siblingDeviceId = UUID()
+        let localSigningKey = crypto.generateCurve25519SigningPrivateKey()
+        let siblingSigningKey = crypto.generateCurve25519SigningPrivateKey()
+        let localLongTermKey = crypto.generateCurve25519PrivateKey()
+        let databaseKey = SymmetricKey(size: .bits256)
+
+        let localKeys = try generateBatch()
+        let siblingKeys = try generateBatch()
+        let localSignedKeys = try localKeys.map {
+            try UserConfiguration.SignedOneTimePublicKey(
+                key: $0.publicKey,
+                deviceId: localDeviceId,
+                signingKey: localSigningKey)
+        }
+        let siblingSignedKeys = try siblingKeys.map {
+            try UserConfiguration.SignedOneTimePublicKey(
+                key: $0.publicKey,
+                deviceId: siblingDeviceId,
+                signingKey: siblingSigningKey)
+        }
+        let mlKEMKey = try crypto.generateMLKem1024PrivateKey()
+        let sessionUser = try SessionUser(
+            secretName: "linked-account",
+            deviceId: localDeviceId,
+            deviceKeys: .init(
+                deviceId: localDeviceId,
+                signingPrivateKey: localSigningKey.rawRepresentation,
+                longTermPrivateKey: localLongTermKey.rawRepresentation,
+                oneTimePrivateKeys: localKeys.map(\.privateKey),
+                mlKEMOneTimePrivateKeys: [],
+                finalMLKEMPrivateKey: .init(mlKEMKey.encode())
+            ))
+        let context = SessionContext(
+            sessionUser: sessionUser,
+            databaseEncryptionKey: databaseKey.withUnsafeBytes { Data($0) },
+            sessionContextId: 456,
+            activeUserConfiguration: .init(
+                signingPublicKey: localSigningKey.publicKey.rawRepresentation,
+                signedDevices: [],
+                signedOneTimePublicKeys: localSignedKeys + siblingSignedKeys,
+                signedMLKEMOneTimePublicKeys: []
+            ),
+            registrationState: .registered
+        )
+
+        await session.setAppPassword("test")
+        let passwordData = await session.appPassword.data(using: .utf8)!
+        let saltData = try await store.fetchLocalDeviceSalt(keyData: passwordData)
+        let symmetricKey = await crypto.deriveStrictSymmetricKey(data: passwordData, salt: saltData)
+        let encryptedData = try crypto.encrypt(data: try BinaryEncoder().encode(context), symmetricKey: symmetricKey)
+        try await store.createLocalSessionContext(encryptedData!)
+        await session.setDatabaseDelegate(conformer: store)
+
+        let retainedLocalKeyIds = Array(localKeys.prefix(1).map(\.id))
+        let retainedCount = try await session.synchronizeLocalKeys(
+            cache: session.cache!,
+            keys: retainedLocalKeyIds,
+            type: .curve
+        )
+
+        let updatedData = try await store.fetchLocalSessionContext()
+        let decrypted = try crypto.decrypt(data: updatedData, symmetricKey: symmetricKey)!
+        let decoded = try BinaryDecoder().decode(SessionContext.self, from: decrypted)
+        let localPublicKeys = decoded.activeUserConfiguration.signedOneTimePublicKeys.filter {
+            $0.deviceId == localDeviceId
+        }
+        let siblingPublicKeys = decoded.activeUserConfiguration.signedOneTimePublicKeys.filter {
+            $0.deviceId == siblingDeviceId
+        }
+
+        #expect(retainedCount == 1)
+        #expect(localPublicKeys.map(\.id) == retainedLocalKeyIds)
+        #expect(siblingPublicKeys.count == siblingSignedKeys.count)
+
+        await session.shutdown()
+    }
+
+    @Test
     func refreshOneTimeKeys_createsKeys_whenBelowThreshold() async throws {
         await #expect(throws: Never.self, "One-time key refresh should complete without throwing any errors when keys are below threshold") {
             let mockCache = MockCache()

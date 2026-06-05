@@ -367,6 +367,30 @@ struct SessionReestablishmentCoalescingTests {
         await session.shutdown()
     }
 
+    @Test("Receiver can retry a reestablishment event after partial handling failure")
+    func receiverCanRetryAfterPartialHandlingFailure() async {
+        let session = PQSSession()
+        let senderDeviceId = UUID()
+        let envelope = SessionReestablishmentEnvelope(
+            kind: .peerRefresh,
+            intentId: UUID(),
+            epoch: 1)
+
+        let first = await session.recordReceivedSessionReestablishment(
+            envelope: envelope,
+            senderDeviceId: senderDeviceId)
+        await session.forgetReceivedSessionReestablishment(
+            envelope: envelope,
+            senderDeviceId: senderDeviceId)
+        let retry = await session.recordReceivedSessionReestablishment(
+            envelope: envelope,
+            senderDeviceId: senderDeviceId)
+
+        #expect(first == .process)
+        #expect(retry == .process, "Failed peerRefresh handling should allow the same event to be retried")
+        await session.shutdown()
+    }
+
     @Test("Receiver treats same epoch+different intentId as duplicate")
     func receiverTreatsSameEpochAsDuplicate() async {
         let session = PQSSession()

@@ -59,6 +59,34 @@ actor LinkedDeviceCompromiseProbe {
     }
 }
 
+actor PeerIdentityTrustProbe {
+    struct Event: Equatable {
+        let secretName: String
+        let deviceId: UUID
+        let failedSharedMessageId: String?
+    }
+
+    private var events: [Event] = []
+
+    func mark(secretName: String, deviceId: UUID, failedSharedMessageId: String?) {
+        events.append(.init(
+            secretName: secretName,
+            deviceId: deviceId,
+            failedSharedMessageId: failedSharedMessageId))
+    }
+
+    func count() -> Int {
+        events.count
+    }
+
+    func contains(secretName: String, deviceId: UUID, failedSharedMessageId: String?) -> Bool {
+        events.contains(.init(
+            secretName: secretName,
+            deviceId: deviceId,
+            failedSharedMessageId: failedSharedMessageId))
+    }
+}
+
 @Suite(.serialized)
 actor EndToEndTests {
     let crypto = NeedleTailCrypto()
@@ -1789,6 +1817,242 @@ actor EndToEndTests {
             await waitUntil { await probe.count() >= 1 },
             "Outbound sendingKeyIsNil should reset the SessionIdentity and retry the original message"
         )
+    }
+
+    @Test("transport send failure replays first encrypted outbound without ratchet desync")
+    func testTransportSendFailureReplaysFirstEncryptedOutboundWithoutRatchetDesync() async throws {
+        enum SyntheticTransportError: Error {
+            case failed
+        }
+
+        actor OneShotSendFailure {
+            private(set) var failures = 0
+            private var shouldFail = true
+
+            func consumeFailure() -> Bool {
+                guard shouldFail else { return false }
+                shouldFail = false
+                failures += 1
+                return true
+            }
+        }
+
+        actor PacketReplayProbe {
+            private var failedPacket: Data?
+            private var deliveredPacket: Data?
+
+            func markFailed(_ data: Data?) {
+                failedPacket = data
+            }
+
+            func markDelivered(_ data: Data?) {
+                if deliveredPacket == nil {
+                    deliveredPacket = data
+                }
+            }
+
+            func replayedSamePacket() -> Bool {
+                failedPacket != nil && failedPacket == deliveredPacket
+            }
+        }
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 8,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return false
+        }
+
+        let failureGate = OneShotSendFailure()
+        let packetProbe = PacketReplayProbe()
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+
+        aliceTransport.transformOutgoing = { received in
+            if await failureGate.consumeFailure() {
+                await packetProbe.markFailed(received.message.signed?.data)
+                throw SyntheticTransportError.failed
+            }
+            await packetProbe.markDelivered(received.message.signed?.data)
+            return received
+        }
+
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        @Sendable func recipientHasAliceContact() async -> Bool {
+            guard let symmetricKey = try? await _recipientSession.getDatabaseSymmetricKey() else {
+                return false
+            }
+            let contacts = await recipientStore.contacts
+            for contact in contacts {
+                if await contact.props(symmetricKey: symmetricKey)?.secretName == "alice" {
+                    return true
+                }
+            }
+            return false
+        }
+
+        bobTask = Task {
+            for await received in bobStream {
+                do {
+                    _ = try await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received)
+                } catch {
+                    continue
+                }
+            }
+        }
+
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd
+        )
+
+        #expect(await failureGate.failures == 1, "Transport should fail exactly once after encryption")
+        #expect(await packetProbe.replayedSamePacket(), "Retry must replay the same signed ratchet frame instead of re-encrypting")
+        #expect(
+            await waitUntil { await recipientHasAliceContact() },
+            "The first encrypted outbound frame should be replayed after transport failure instead of losing the job or re-encrypting into a ratchet desync"
+        )
+    }
+
+    @Test("transport send failure replays peerRefresh recovery control")
+    func testTransportSendFailureReplaysPeerRefreshRecoveryControl() async throws {
+        enum SyntheticTransportError: Error {
+            case failed
+        }
+
+        actor OneShotPeerRefreshSendFailure {
+            private(set) var failures = 0
+            private var shouldFail = true
+
+            func consumeFailure(for event: TransportEvent?) -> Bool {
+                guard shouldFail else { return false }
+                guard case .sessionReestablishment(let envelope)? = event,
+                      envelope.kind == .peerRefresh
+                else { return false }
+                shouldFail = false
+                failures += 1
+                return true
+            }
+        }
+
+        actor PeerRefreshReplayProbe {
+            private var failedPacket: Data?
+            private var deliveredPacket: Data?
+
+            func markFailed(_ data: Data?) {
+                if failedPacket == nil {
+                    failedPacket = data
+                }
+            }
+
+            func markDelivered(_ data: Data?) {
+                deliveredPacket = data
+            }
+
+            func replayedSamePacket() -> Bool {
+                failedPacket != nil && failedPacket == deliveredPacket
+            }
+
+            func delivered() -> Bool {
+                deliveredPacket != nil
+            }
+        }
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 8,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return false
+        }
+
+        let failureGate = OneShotPeerRefreshSendFailure()
+        let packetProbe = PeerRefreshReplayProbe()
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        aliceTransport.transformOutgoing = { received in
+            if await failureGate.consumeFailure(for: received.transportEvent) {
+                await packetProbe.markFailed(received.message.signed?.data)
+                throw SyntheticTransportError.failed
+            }
+            if case .sessionReestablishment(let envelope)? = received.transportEvent,
+               envelope.kind == .peerRefresh {
+                await packetProbe.markDelivered(received.message.signed?.data)
+            }
+            return received
+        }
+
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._recipientSession,
+                    received: received)
+            }
+        }
+
+        _ = try await _senderSession.emitSessionReestablishment(
+            kind: .peerRefresh,
+            recipient: .nickname("bob"),
+            scope: .peer(secretName: "bob"))
+
+        #expect(await failureGate.failures == 1, "Transport should fail exactly once for peerRefresh")
+        #expect(
+            await waitUntil { await packetProbe.delivered() },
+            "peerRefresh recovery control should be retried after transport send failure")
+        #expect(
+            await packetProbe.replayedSamePacket(),
+            "peerRefresh retry must replay the same signed ratchet frame instead of advancing the ratchet again")
     }
 
     @Test("peerRefresh control survives outbound repair cooldown")
@@ -5672,6 +5936,119 @@ actor EndToEndTests {
         #expect(rotationCount == 0, "Expected maxSkipped repair to avoid key rotation, got \(rotationCount)")
     }
 
+    @Test("maxSkipped repair forces peerRefresh reemit inside cooldown")
+    func testMaxSkippedRepairForcesPeerRefreshReemitInsideCooldown() async throws {
+        actor Counters {
+            private var peerRefreshes = 0
+
+            func saw(_ event: TransportEvent?) {
+                if case .sessionReestablishment(let envelope) = event,
+                   envelope.kind == .peerRefresh {
+                    peerRefreshes += 1
+                }
+            }
+
+            func getPeerRefreshes() -> Int {
+                peerRefreshes
+            }
+        }
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 8,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return false
+        }
+
+        var bobTask: Task<Void, Never>?
+        var aliceRepairTask: Task<Void, Never>?
+        defer {
+            Task {
+                bobTask?.cancel()
+                aliceRepairTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+        let aliceRepairStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+
+        let counters = Counters()
+        aliceRepairTask = Task {
+            for await received in aliceRepairStream {
+                await counters.saw(received.transportEvent)
+            }
+        }
+
+        let sd = SessionDelegate(session: _senderMaxSkipSession)
+        let rsd = SessionDelegate(session: _recipientMaxSkipSession)
+        try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(aliceSession: _senderMaxSkipSession, sd: sd, bobSession: _recipientMaxSkipSession, rsd: rsd)
+
+        bobTask = Task {
+            for await received in bobStream {
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._recipientMaxSkipSession,
+                    received: received)
+            }
+        }
+
+        try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await Task.sleep(until: .now + .milliseconds(200))
+
+        _ = try await _recipientMaxSkipSession.emitSessionReestablishment(
+            kind: .peerRefresh,
+            recipient: .nickname("alice"),
+            scope: .peer(secretName: "alice"))
+
+        #expect(
+            await waitUntil { await counters.getPeerRefreshes() == 1 },
+            "The seeded peerRefresh should establish the sender-side cooldown episode")
+
+        actor Dropper {
+            var remaining: Int
+            init(_ n: Int) { remaining = n }
+            func shouldDrop() -> Bool {
+                if remaining > 0 {
+                    remaining -= 1
+                    return true
+                }
+                return false
+            }
+        }
+
+        let dropper = Dropper(11)
+        aliceTransport.shouldDeliver = { received in
+            guard received.recipient == "bob" else { return true }
+            return !(await dropper.shouldDrop())
+        }
+
+        for i in 1...15 {
+            try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "msg \(i)")
+        }
+
+        #expect(
+            await waitUntil { await counters.getPeerRefreshes() >= 2 },
+            "maxSkipped repair should force one recovery peerRefresh even when an earlier peerRefresh is still inside cooldown")
+
+        let peerRefreshCount = await counters.getPeerRefreshes()
+        let rotationCount = await bobTransport.publishRotatedKeysCallCount
+        #expect(peerRefreshCount == 2, "Expected one seeded peerRefresh and one forced recovery peerRefresh. Got \(peerRefreshCount)")
+        #expect(rotationCount == 0, "Expected maxSkipped repair to avoid key rotation, got \(rotationCount)")
+    }
+
     @Test("maxSkipped does not invoke rotation publish")
     func testMaxSkippedDoesNotInvokeRotationPublish() async throws {
         // Contract test:
@@ -8521,10 +8898,16 @@ struct SessionDelegate: PQSSessionDelegate {
     
     let session: PQSSession
     let compromiseProbe: LinkedDeviceCompromiseProbe?
+    let peerIdentityTrustProbe: PeerIdentityTrustProbe?
     
-    init(session: PQSSession, compromiseProbe: LinkedDeviceCompromiseProbe? = nil) {
+    init(
+        session: PQSSession,
+        compromiseProbe: LinkedDeviceCompromiseProbe? = nil,
+        peerIdentityTrustProbe: PeerIdentityTrustProbe? = nil
+    ) {
         self.session = session
         self.compromiseProbe = compromiseProbe
+        self.peerIdentityTrustProbe = peerIdentityTrustProbe
     }
     
     func synchronizeCommunication(
@@ -8631,6 +9014,17 @@ struct SessionDelegate: PQSSessionDelegate {
 
     func linkedDeviceReportedPotentialCompromise(deviceId: UUID, intentId: UUID?) async {
         await compromiseProbe?.mark(deviceId: deviceId)
+    }
+
+    func peerAccountIdentityChanged(
+        secretName: String,
+        deviceId: UUID,
+        failedSharedMessageId: String?
+    ) async {
+        await peerIdentityTrustProbe?.mark(
+            secretName: secretName,
+            deviceId: deviceId,
+            failedSharedMessageId: failedSharedMessageId)
     }
 }
 
@@ -8762,6 +9156,7 @@ actor ReceiverDelegate: EventReceiver {
         }
     }
     func transportContactMetadata() async throws {}
+    func pushContactMetadata(to _: String) async throws {}
     func updatedCommunication(_: SessionModels.BaseCommunication, members _: Set<String>) async {}
 }
 
@@ -8816,6 +9211,14 @@ actor TransportStore {
     
     func setUserConfigurations(index: Int, config: UserConfiguration) async {
         userConfigurations[index].config = config
+    }
+
+    func upsertUserConfiguration(secretName: String, deviceId: UUID, config: UserConfiguration) async {
+        if let index = userConfigurations.firstIndex(where: { $0.secretName == secretName }) {
+            userConfigurations[index] = User(secretName: secretName, deviceId: deviceId, config: config)
+        } else {
+            userConfigurations.append(User(secretName: secretName, deviceId: deviceId, config: config))
+        }
     }
     
     func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> SessionModels.OneTimeKeys {
