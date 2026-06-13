@@ -15,6 +15,7 @@
 //
 
 import DoubleRatchetKit
+import BinaryCodable
 import Foundation
 import NeedleTailCrypto
 import SessionModels
@@ -240,6 +241,7 @@ public extension PQSSession {
         
         if needsRefresh {
             do {
+                
                 let refreshed = try await refreshSessionIdentities(
                     for: secretName,
                     from: existingIdentities,
@@ -248,11 +250,25 @@ public extension PQSSession {
                     sendOneTimeIdentities: sendOneTimeIdentities,
                     oneTime: syncKeys?.curveId,
                     oneTime: syncKeys?.mlKEMId)
+                
                 // Ensure we never return inactive snapshots.
                 let symmetricKey = try await getDatabaseSymmetricKey()
+                
                 return await refreshed.asyncFilter { identity in
                     guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
                     return !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+                }
+                
+            } catch let sessionError as PQSSession.SessionErrors {
+                // Do not silently mask critical verification/rotation failures; callers
+                // need to react (e.g. force re-sync / re-link) instead of using stale identities.
+                switch sessionError {
+                case .invalidSignature, .signingKeyOutOfSync, .peerSigningKeyOutOfSync, .longTermKeyRotationFailed:
+                    logger.log(level: .error, message: "Critical refreshIdentities failure for \(secretName): \(sessionError)")
+                    throw sessionError
+                default:
+                    logger.log(level: .error, message: "Error in refreshIdentities for \(secretName): \(sessionError)")
+                    return existingIdentities
                 }
             } catch {
                 logger.log(level: .error, message: "Error in refreshIdentities for \(secretName): \(error)")
@@ -261,6 +277,77 @@ public extension PQSSession {
         } else {
             return existingIdentities
         }
+    }
+
+    internal func refreshIdentitiesAssessingImpact(
+        secretName: String,
+        deviceId: UUID,
+        createIdentity: Bool = true,
+        forceRefresh: Bool = false,
+        sendOneTimeIdentities: Bool = false
+    ) async throws -> PeerIdentityRefreshAssessment {
+        let symmetricKey = try await getDatabaseSymmetricKey()
+
+        struct Snapshot: Sendable, Equatable {
+            let signingPublicKey: Data
+            let longTermPublicKey: Data
+            let oneTimeKeyId: UUID?
+            let mlKEMKeyId: UUID
+        }
+
+        func snapshot(
+            from identities: [SessionIdentity]
+        ) async -> Snapshot? {
+            for identity in identities {
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+                guard props.secretName == secretName else { continue }
+                guard props.deviceId == deviceId else { continue }
+                guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+                return Snapshot(
+                    signingPublicKey: props.signingPublicKey,
+                    longTermPublicKey: props.longTermPublicKey,
+                    oneTimeKeyId: props.oneTimePublicKey?.id,
+                    mlKEMKeyId: props.mlKEMPublicKey.id
+                )
+            }
+            return nil
+        }
+
+        let beforeIdentities = try await getSessionIdentities(with: secretName)
+        let before = await snapshot(from: beforeIdentities)
+        let refreshed = try await refreshIdentities(
+            secretName: secretName,
+            createIdentity: createIdentity,
+            forceRefresh: forceRefresh,
+            sendOneTimeIdentities: sendOneTimeIdentities
+        )
+        let after = await snapshot(from: refreshed)
+
+        let impact: PeerIdentityRefreshImpact = {
+            switch (before, after) {
+            case (nil, nil):
+                return .noSessionImpact
+            case (nil, .some):
+                return .freshSessionRecommended
+            case (.some, nil):
+                return .freshSessionRecommended
+            case let (.some(before), .some(after)):
+                if before.signingPublicKey != after.signingPublicKey
+                    || before.longTermPublicKey != after.longTermPublicKey {
+                    return .freshSessionRecommended
+                }
+                if before.oneTimeKeyId != after.oneTimeKeyId
+                    || before.mlKEMKeyId != after.mlKEMKeyId {
+                    return .resendRecommended
+                }
+                return .noSessionImpact
+            }
+        }()
+
+        return PeerIdentityRefreshAssessment(
+            identities: refreshed,
+            impact: impact
+        )
     }
 
     /// Checks if there are valid identities for a specific recipient
@@ -309,10 +396,9 @@ public extension PQSSession {
                 guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
                 // Never surface inactive snapshot identities to callers.
                 if props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) { return false }
-                // Check if the identity is not the current user's identity
-                let myChildIdentity = props.secretName == sessionContext.sessionUser.secretName && props.deviceId != sessionContext.sessionUser.deviceId
-                // Return true if the secret name matches the recipient name or if it's a different identity
-                return (props.secretName == recipientName) || myChildIdentity
+                // Never surface this device's own identity as a recipient row.
+                if props.deviceId == sessionContext.sessionUser.deviceId { return false }
+                return props.secretName == recipientName
             } catch {
                 return false
             }
@@ -320,6 +406,175 @@ public extension PQSSession {
     }
 
 
+
+    /// Fetches archived (inactive) session identities for a specific peer device, sorted newest-first.
+    ///
+    /// Unlike `getSessionIdentities` and `refreshIdentities`, this method returns **only** rows
+    /// that carry the `inactiveSessionDeviceNamePrefix`. These are ratchet-state snapshots preserved
+    /// during compromise recovery so that delayed in-flight messages encrypted under the old epoch
+    /// can still be decrypted.
+    ///
+    /// - Parameters:
+    ///   - secretName: The secret name of the peer whose archived identities should be fetched.
+    ///   - deviceId: The device ID to filter on.
+    /// - Returns: Archived `SessionIdentity` rows sorted by `sessionContextId` descending (newest first).
+    internal func fetchArchivedSessionIdentities(
+        secretName: String,
+        deviceId: UUID
+    ) async throws -> [SessionIdentity] {
+        guard let cache else { return [] }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let all = try await cache.fetchSessionIdentities()
+
+        struct Ranked: Sendable {
+            let identity: SessionIdentity
+            let contextId: Int
+        }
+
+        var ranked = [Ranked]()
+        for identity in all {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+            guard props.secretName == secretName, props.deviceId == deviceId else { continue }
+            ranked.append(Ranked(identity: identity, contextId: props.sessionContextId))
+        }
+
+        ranked.sort { $0.contextId > $1.contextId }
+        return ranked.map(\.identity)
+    }
+
+    /// Archives and replaces the active identity for one peer device with a fresh,
+    /// state-less identity built from the currently advertised key bundle.
+    ///
+    /// This is the PostQuantumSolace-side session reestablishment primitive. A
+    /// rotated peer key bundle must never be grafted onto an existing ratchet
+    /// state; doing so leaves the ratchet with old state and new identity keys.
+    @discardableResult
+    internal func resetSessionIdentityForFreshSession(
+        secretName: String,
+        deviceId: UUID,
+        sendOneTimeIdentities: Bool = true
+    ) async throws -> SessionIdentity {
+        guard let cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        guard let transportDelegate else {
+            throw PQSSession.SessionErrors.transportNotInitialized
+        }
+        guard let sessionUser = await sessionContext?.sessionUser else {
+            throw PQSSession.SessionErrors.sessionNotInitialized
+        }
+
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let configuration = try await transportDelegate.findConfiguration(for: secretName)
+
+        try validateUserConfigurationSignatures(configuration)
+        if secretName != sessionUser.secretName {
+            try await enforcePeerAccountSigningKeyPin(
+                for: secretName,
+                configuration: configuration,
+                symmetricKey: symmetricKey)
+        }
+
+        let verifiedDevices = try configuration.getVerifiedDevices().map {
+            try configuration.deviceWithCurrentKeyBundle($0)
+        }
+
+        guard let device = verifiedDevices.first(where: { $0.deviceId == deviceId }),
+              device.deviceId != sessionUser.deviceId else {
+            throw PQSSession.SessionErrors.invalidDeviceIdentity
+        }
+
+        if secretName == sessionUser.secretName {
+            try await synchronizeActiveUserConfiguration(configuration)
+        }
+
+        let allIdentities = try await cache.fetchSessionIdentities()
+        var generatedSessionContextIds = Set<Int>()
+        var deletedActiveCount = 0
+        var archivedActiveCount = 0
+
+        for identity in allIdentities {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            generatedSessionContextIds.insert(props.sessionContextId)
+            guard props.secretName == secretName,
+                  props.deviceId == deviceId,
+                  !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            else { continue }
+
+            if props.state != nil {
+                try await archiveActiveSessionIdentitySnapshot(
+                    props: props,
+                    symmetricKey: symmetricKey,
+                    cache: cache)
+                archivedActiveCount += 1
+            }
+
+            try await cache.deleteSessionIdentity(identity.id)
+            deletedActiveCount += 1
+        }
+
+        var sessionContextId: Int
+        repeat {
+            sessionContextId = Int.random(in: 1 ..< Int.max)
+        } while generatedSessionContextIds.contains(sessionContextId)
+
+        let (curve, mlKEM) = try await createOneTimeKeys(
+            secretName: secretName,
+            deviceId: device.deviceId,
+            curveId: nil,
+            mlKEMId: nil,
+            configuration: configuration,
+            fetchOneTimeKeys: sendOneTimeIdentities)
+
+        let identity = try await createEncryptableSessionIdentityModel(
+            with: device,
+            oneTimePublicKey: curve,
+            mlKEMPublicKey: mlKEM,
+            for: secretName,
+            associatedWith: device.deviceId,
+            new: sessionContextId)
+
+        removeIdentity(with: secretName)
+        await cleanupInactiveSessionSnapshots(
+            cache: cache,
+            symmetricKey: symmetricKey,
+            secretName: secretName,
+            deviceId: device.deviceId)
+
+        logger.log(
+            level: .info,
+            message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); archived=\(archivedActiveCount) deletedActive=\(deletedActiveCount)")
+
+        return identity
+    }
+
+    private func archiveActiveSessionIdentitySnapshot(
+        props: SessionIdentity.UnwrappedProps,
+        symmetricKey: SymmetricKey,
+        cache: SessionCache
+    ) async throws {
+        let archived = try SessionIdentity(
+            id: UUID(),
+            props: .init(
+                secretName: props.secretName,
+                deviceId: props.deviceId,
+                sessionContextId: Int(Date().timeIntervalSince1970),
+                longTermPublicKey: props.longTermPublicKey,
+                signingPublicKey: props.signingPublicKey,
+                mlKEMPublicKey: props.mlKEMPublicKey,
+                oneTimePublicKey: props.oneTimePublicKey,
+                state: props.state,
+                deviceName: PQSSessionConstants.inactiveSessionDeviceNamePrefix + props.deviceName,
+                serverTrusted: props.serverTrusted,
+                previousRekey: props.previousRekey,
+                isMasterDevice: props.isMasterDevice,
+                verifiedIdentity: props.verifiedIdentity,
+                verificationCode: props.verificationCode
+            ),
+            symmetricKey: symmetricKey)
+        try await cache.createSessionIdentity(archived)
+    }
 
     /// Refreshes the session identities for a specified recipient name based on the provided filtered identities.
     /// This method verifies the devices and removes any stale identities that are no longer valid.
@@ -338,11 +593,13 @@ public extension PQSSession {
         oneTime mlKEMId: String?
     ) async throws -> [SessionIdentity] {
         
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-            await refreshOneTimeKeysTask()
-        }
-        if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-            await refreshMLKEMOneTimeKeysTask()
+        if !otkUploadCircuitOpen {
+            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                await refreshOneTimeKeysTask()
+            }
+            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                await refreshMLKEMOneTimeKeysTask()
+            }
         }
         
         var identities = existingIdentities
@@ -353,6 +610,7 @@ public extension PQSSession {
         guard let sessionUser = await sessionContext?.sessionUser else {
             throw PQSSession.SessionErrors.sessionNotInitialized
         }
+        let isSelfSecretName = secretName == sessionUser.secretName
 
         let symmetricKey = try await getDatabaseSymmetricKey()
         
@@ -360,7 +618,23 @@ public extension PQSSession {
 
             // Get the user configuration for the recipient
             let configuration = try await transportDelegate.findConfiguration(for: secretName)
-            var verifiedDevices = try configuration.getVerifiedDevices()
+            try validateUserConfigurationSignatures(configuration)
+
+            if isSelfSecretName, forceRefresh {
+                // For linked-device convergence, force-refreshing self identities should also
+                // synchronize the persisted active account bundle.
+                try await synchronizeActiveUserConfiguration(configuration)
+            } else if !isSelfSecretName {
+                try await enforcePeerAccountSigningKeyPin(
+                    for: secretName,
+                    configuration: configuration,
+                    symmetricKey: symmetricKey)
+            }
+
+            var verifiedDevices = try verifiedDevicesWithUsableKeyMaterial(
+                in: configuration,
+                secretName: secretName,
+                source: "remote")
             var collected = [UserDeviceConfiguration]()
             // Create a set of existing device IDs from the existing identities for quick lookup
             let existingDeviceIds = await Set(identities.asyncCompactMap {
@@ -373,16 +647,6 @@ public extension PQSSession {
                     collected.append(device)
                 }
             }
-
-            // Ensure that the identities of the user configuration are legitimate
-            let signingPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: configuration.signingPublicKey)
-
-            for device in configuration.signedDevices {
-                if try (device.verified(using: signingPublicKey) != nil) == false {
-                    throw PQSSession.SessionErrors.invalidSignature
-                }
-            }
-
             var generatedSessionContextIds = Set<Int>()
             for device in collected {
                 // Check if the device ID is already in the existing identities
@@ -408,8 +672,8 @@ public extension PQSSession {
                         mlKEMPublicKey: mlKEM,
                         for: secretName,
                         associatedWith: device.deviceId,
-                        new: sessionContextId
-                    )
+                        new: sessionContextId)
+                    
                     logger.log(level: .info, message: "Created Session Identity: \(identity)")
                     identities.append(identity)
 
@@ -428,7 +692,11 @@ public extension PQSSession {
                 await $0.props(symmetricKey: symmetricKey)?.deviceId
             })
 
-            guard let myDevices = try await sessionContext?.activeUserConfiguration.getVerifiedDevices() else { return [] }
+            guard let localConfiguration = await sessionContext?.activeUserConfiguration else { return [] }
+            let myDevices = try verifiedDevicesWithUsableKeyMaterial(
+                in: localConfiguration,
+                secretName: secretName,
+                source: "local")
             verifiedDevices.append(contentsOf: myDevices)
 
             for deviceId in newDeviceIds {
@@ -471,11 +739,32 @@ public extension PQSSession {
                 }
                 for device in verifiedDevices {
                     if currentProps.deviceId == device.deviceId {
+                        let identityKeyChanged = currentProps.longTermPublicKey != device.longTermPublicKey
+                            || currentProps.signingPublicKey != device.signingPublicKey
+
+                        if identityKeyChanged {
+                            logger.log(
+                                level: .info,
+                                message: "Detected rotated identity keys for \(secretName) (\(device.deviceId)); replacing active SessionIdentity")
+
+                            let replacement = try await resetSessionIdentityForFreshSession(
+                                secretName: secretName,
+                                deviceId: device.deviceId,
+                                sendOneTimeIdentities: sendOneTimeIdentities)
+
+                            identities.removeAll(where: { identity in
+                                identity.id == foundIdentity.id
+                            })
+                            identities.append(replacement)
+                            break
+                        }
+
                         currentProps.setLongTermPublicKey(device.longTermPublicKey)
                         currentProps.setSigningPublicKey(device.signingPublicKey)
                         
-                        if forceRefresh {
+                        if forceRefresh, currentProps.state == nil {
                             do {
+                                let deviceSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
                                 // Curve one-time keys are optional.
                                 let curveIds = try await transportDelegate.fetchOneTimeKeyIdentities(
                                     for: secretName,
@@ -485,7 +774,7 @@ public extension PQSSession {
                                 if let curveId = curveIds.last,
                                    let signedCurve = try configuration.signedOneTimePublicKeys
                                        .first(where: { $0.id == curveId })?
-                                       .verified(using: signingPublicKey) {
+                                       .verified(using: deviceSigningPublicKey) {
                                     currentProps.oneTimePublicKey = signedCurve
                                 } else {
                                     currentProps.oneTimePublicKey = nil
@@ -500,7 +789,7 @@ public extension PQSSession {
                                 if let mlKEMId = mlKEMIds.last,
                                    let signedMLKEM = try configuration.signedMLKEMOneTimePublicKeys
                                        .first(where: { $0.id == mlKEMId })?
-                                       .verified(using: signingPublicKey) {
+                                       .verified(using: deviceSigningPublicKey) {
                                     currentProps.mlKEMPublicKey = signedMLKEM
                                 } else {
                                     currentProps.mlKEMPublicKey = device.finalMLKEMPublicKey
@@ -508,6 +797,10 @@ public extension PQSSession {
                             } catch {
                                 logger.log(level: .warning, message: "Failed to refresh one-time keys for \(secretName) (\(device.deviceId)): \(error)")
                             }
+                        } else if forceRefresh {
+                            logger.log(
+                                level: .debug,
+                                message: "Skipping one-time key refresh for initialized SessionIdentity \(secretName) (\(device.deviceId))")
                         }
                         try await foundIdentity.updateIdentityProps(symmetricKey: symmetricKey, props: currentProps)
                         try await cache?.updateSessionIdentity(foundIdentity)
@@ -519,9 +812,129 @@ public extension PQSSession {
                 }
             }
             
-            sessionIdentities.insert(secretName)
+            // Do not memoize "refreshed" for the local account until sibling rows exist when the
+            // account configuration lists other devices. Otherwise the next `refreshIdentities`
+            // skips this block (`sessionIdentities` already contains `secretName`) while the cache
+            // is still empty — linked devices never get SessionIdentity rows and personal/control
+            // delivery to siblings silently no-ops.
+            let accountDevices = try configuration.getVerifiedDevices()
+            let accountListsPeerDevices = accountDevices.contains { $0.deviceId != sessionUser.deviceId }
+            let hasSiblingIdentity = await identities.asyncContains(where: { identity in
+                guard let p = await identity.props(symmetricKey: symmetricKey) else { return false }
+                return p.secretName == secretName && p.deviceId != sessionUser.deviceId
+            })
+            if isSelfSecretName {
+                if !accountListsPeerDevices {
+                    sessionIdentities.insert(secretName)
+                } else if hasSiblingIdentity {
+                    sessionIdentities.insert(secretName)
+                }
+            } else {
+                sessionIdentities.insert(secretName)
+            }
         }
         return identities
+    }
+
+    private func verifiedDevicesWithUsableKeyMaterial(
+        in configuration: UserConfiguration,
+        secretName: String,
+        source: String
+    ) throws -> [UserDeviceConfiguration] {
+        let verifiedDevices = try configuration.getVerifiedDevices()
+        var usableDevices = [UserDeviceConfiguration]()
+
+        for device in verifiedDevices {
+            do {
+                _ = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
+                let currentDevice = try configuration.deviceWithCurrentKeyBundle(device)
+                _ = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: currentDevice.longTermPublicKey)
+                _ = try MLKEMPublicKey(
+                    id: currentDevice.finalMLKEMPublicKey.id,
+                    currentDevice.finalMLKEMPublicKey.rawRepresentation)
+                usableDevices.append(currentDevice)
+            } catch {
+                logger.log(
+                    level: .warning,
+                    message: "Skipping malformed \(source) device during identity refresh for \(secretName): deviceId=\(device.deviceId), error=\(error)")
+            }
+        }
+
+        return usableDevices
+    }
+
+    private func validateUserConfigurationSignatures(_ configuration: UserConfiguration) throws {
+        do {
+            let accountSigningPublicKey = try Curve25519.Signing.PublicKey(
+                rawRepresentation: configuration.signingPublicKey
+            )
+            var verifiedDevices = [UserDeviceConfiguration]()
+
+            for signedDevice in configuration.signedDevices {
+                guard let device = try signedDevice.verified(using: accountSigningPublicKey) else {
+                    throw PQSSession.SessionErrors.invalidSignature
+                }
+                verifiedDevices.append(device)
+            }
+
+            for signedBundle in configuration.signedDeviceKeyBundles {
+                guard let device = verifiedDevices.first(where: { $0.deviceId == signedBundle.id }) else {
+                    throw PQSSession.SessionErrors.invalidDeviceIdentity
+                }
+                let deviceSigningPublicKey = try Curve25519.Signing.PublicKey(
+                    rawRepresentation: device.signingPublicKey
+                )
+                guard let bundle = try signedBundle.verified(using: deviceSigningPublicKey),
+                      bundle.deviceId == device.deviceId
+                else {
+                    throw PQSSession.SessionErrors.invalidSignature
+                }
+            }
+        } catch let sessionError as PQSSession.SessionErrors {
+            throw sessionError
+        } catch {
+            throw PQSSession.SessionErrors.invalidSignature
+        }
+    }
+
+    private func enforcePeerAccountSigningKeyPin(
+        for secretName: String,
+        configuration: UserConfiguration,
+        symmetricKey: SymmetricKey
+    ) async throws {
+        guard let cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+
+        let contacts = try await cache.fetchContacts()
+        var foundPinnedContact = false
+
+        for contact in contacts {
+            guard let props = await contact.props(symmetricKey: symmetricKey),
+                  props.secretName == secretName
+            else {
+                continue
+            }
+
+            let pinnedSigningPublicKey = props.configuration.signingPublicKey
+            guard !pinnedSigningPublicKey.isEmpty else {
+                continue
+            }
+
+            foundPinnedContact = true
+            if pinnedSigningPublicKey != configuration.signingPublicKey {
+                logger.log(
+                    level: .error,
+                    message: "[refreshSessionIdentities] peer account signing key changed without authenticated reestablishment; refusing to refresh \(secretName)")
+                throw PQSSession.SessionErrors.peerSigningKeyOutOfSync
+            }
+        }
+
+        if foundPinnedContact {
+            logger.log(
+                level: .debug,
+                message: "Verified pinned peer account signing key for \(secretName)")
+        }
     }
     
     func createOneTimeKeys(
@@ -536,7 +949,16 @@ public extension PQSSession {
         var curveId = curveId
         var mlKEMId = mlKEMId
         
-        let signingPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: configuration.signingPublicKey)
+        let accountSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: configuration.signingPublicKey)
+        guard let accountSignedDevice = configuration.signedDevices.first(where: {
+            (try? $0.verified(using: accountSigningPublicKey))?.deviceId == deviceId
+        }),
+              let verifiedDevice = try accountSignedDevice.verified(using: accountSigningPublicKey)
+        else {
+            throw PQSSession.SessionErrors.invalidDeviceIdentity
+        }
+        let currentDevice = try configuration.deviceWithCurrentKeyBundle(verifiedDevice)
+        let deviceSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: verifiedDevice.signingPublicKey)
         
         guard let transportDelegate else {
             throw PQSSession.SessionErrors.transportNotInitialized
@@ -549,19 +971,13 @@ public extension PQSSession {
             mlKEMId = keys.mlKEM?.id.uuidString
         }
         
-        let curvePublicKey = try configuration.signedOneTimePublicKeys.first(where: { $0.id.uuidString == curveId })?.verified(using: signingPublicKey)
+        let curvePublicKey = try configuration.signedOneTimePublicKeys.first(where: { $0.id.uuidString == curveId })?.verified(using: deviceSigningPublicKey)
 
         var mlKEMPublicKey: MLKEMPublicKey
-        if let signedKey = try configuration.signedMLKEMOneTimePublicKeys.first(where: { $0.id.uuidString == mlKEMId })?.verified(using: signingPublicKey) {
+        if let signedKey = try configuration.signedMLKEMOneTimePublicKeys.first(where: { $0.id.uuidString == mlKEMId })?.verified(using: deviceSigningPublicKey) {
             mlKEMPublicKey = signedKey
-        } else if let verifiedDevice = configuration.signedDevices.first(where: {
-            (try? $0.verified(using: signingPublicKey))?.deviceId == deviceId
-        }),
-            let finalKey = try verifiedDevice.verified(using: signingPublicKey)?.finalMLKEMPublicKey
-        {
-            mlKEMPublicKey = finalKey
         } else {
-            throw PQSSession.SessionErrors.drainedKeys
+            mlKEMPublicKey = currentDevice.finalMLKEMPublicKey
         }
         return (curvePublicKey, mlKEMPublicKey)
     }
@@ -593,5 +1009,11 @@ public extension PQSSession {
             text: "",
             transportInfo: metadata,
             metadata: metadata)
+    }
+    
+    private func synchronizeActiveUserConfiguration(_ configuration: UserConfiguration) async throws {
+        // Route through the public TOFU-pinned adoption helper so the account
+        // signing key cannot silently change via a self-refresh path.
+        try await adoptVerifiedUserConfiguration(configuration)
     }
 }

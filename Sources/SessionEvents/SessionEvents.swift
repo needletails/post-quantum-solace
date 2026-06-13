@@ -89,6 +89,50 @@ enum EventErrors: Error, LocalizedError {
     }
 }
 
+/// Returns the more "settled" of two `FriendshipMetadata` records when reconciling
+/// concurrent updates (e.g. an out-of-order `synchronizeContacts` carrying stale
+/// `pending`/`requested` state arriving after a faster `friendshipStateRequest`
+/// already moved the relationship to `accepted`/`blocked`/`rejected`).
+///
+/// "Settled" priority is derived from `myState`:
+/// - `.pending` / `.requested` → transient
+/// - everything else → settled (block/unblock/accept/reject variants)
+///
+/// When both sides are at the same settlement tier we keep `passed`, preserving the
+/// caller's explicit intent for inbound `friendshipStateRequest` packets.
+fileprivate func preferSettledFriendshipMetadata(
+    passed: FriendshipMetadata,
+    stored: FriendshipMetadata
+) -> FriendshipMetadata {
+    func isTransient(_ state: FriendshipMetadata.State) -> Bool {
+        switch state {
+        case .pending, .requested:
+            return true
+        case .accepted, .rejected, .rejectedByOther, .mutuallyRejected,
+             .blocked, .blockedByOther, .unblocked:
+            return false
+        }
+    }
+    if isTransient(passed.myState) && !isTransient(stored.myState) {
+        return stored
+    }
+    return passed
+}
+
+public enum FriendshipMetadataConflictPolicy: Sendable {
+    case preferSettled
+    case incoming
+
+    fileprivate func resolve(passed: FriendshipMetadata, stored: FriendshipMetadata) -> FriendshipMetadata {
+        switch self {
+        case .preferSettled:
+            return preferSettledFriendshipMetadata(passed: passed, stored: stored)
+        case .incoming:
+            return passed
+        }
+    }
+}
+
 /// A protocol that defines methods for handling session events in a post-quantum secure messaging system.
 ///
 /// The `SessionEvents` protocol provides a comprehensive interface for managing session-related operations
@@ -250,8 +294,9 @@ public protocol SessionEvents: Sendable {
     /// - `.pending` → `resetToPendingState()` - Resets the friendship to initial state
     /// - `.requested` → `setRequestedState()` - Initiates a friendship request
     /// - `.accepted` → `setAcceptedState()` - Accepts a friendship request
-    /// - `.blocked`/`.blockedByOther` → `setBlockState(isBlocking: false)` - Blocks the contact
-    /// - `.unblocked` → `setAcceptedState()` - Unblocks the contact (resets to accepted)
+    /// - `.blocked` → `setBlockState(isBlocking: true)` - Current user blocks the other party
+    /// - `.blockedByOther` → `setBlockState(isBlocking: false)` - Other party blocks the current user (symmetric / protocol use)
+    /// - `.unblocked` → `unblockUser()` - Unblocks the contact and restores its pre-block relationship state when known
     /// - `.rejected`/`.rejectedByOther`/`.mutuallyRejected` → `rejectRequest()` - Rejects the request
     ///
     /// - Parameters:
@@ -453,7 +498,6 @@ public extension SessionEvents {
             )
             
             try await cache.createContact(contactModel)
-            try await receiver.createdContact(contact)
             
             logger.log(level: .debug, message: "Creating Communication Model")
             // Create communication model
@@ -472,6 +516,10 @@ public extension SessionEvents {
             try await cache.createCommunication(communicationModel)
             await receiver.updatedCommunication(communicationModel, members: [contactInfo.secretName])
             logger.log(level: .debug, message: "Created Communication Model for \(contactInfo.secretName)")
+            
+            // Notify UI only after the communication shell exists so sidebar loaders
+            // can resolve the nickname bundle immediately (QR / friendship inbound).
+            try await receiver.createdContact(contact)
             
             try await requestMetadata(
                 from: contact.secretName,
@@ -524,7 +572,40 @@ public extension SessionEvents {
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws -> ContactModel {
-        let newContactSecretName = secretName.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        try await createContact(
+            secretName: secretName,
+            metadata: metadata,
+            friendshipMetadata: friendshipMetadata,
+            requestFriendship: requestFriendship,
+            sessionContext: sessionContext,
+            cache: cache,
+            transport: transport,
+            receiver: receiver,
+            symmetricKey: symmetricKey,
+            logger: logger,
+            friendshipMetadataConflictPolicy: .preferSettled
+        )
+    }
+
+    func createContact(
+        secretName: String,
+        metadata: Data = .init(),
+        friendshipMetadata: FriendshipMetadata?,
+        requestFriendship: Bool,
+        sessionContext: SessionContext,
+        cache: PQSSessionStore,
+        transport: SessionTransport,
+        receiver: EventReceiver,
+        symmetricKey: SymmetricKey,
+        logger: NeedleTailLogger,
+        friendshipMetadataConflictPolicy: FriendshipMetadataConflictPolicy = .preferSettled
+    ) async throws -> ContactModel {
+        // Use the same canonical form the transport layer applies before
+        // handing names to PQS so that lookups against `cache.fetchContacts()`
+        // can't miss records whose `secretName` contains IRC-equivalent
+        // characters (`[`, `]`, `\`, `~`). Plain `lowercased()` would silently
+        // disagree with the stored value in that case.
+        let newContactSecretName = secretName.pqsCanonicalSecretName
         let mySecretName = sessionContext.sessionUser.secretName
         
         guard newContactSecretName != mySecretName else {
@@ -539,20 +620,38 @@ public extension SessionEvents {
             
             // Simplified metadata handling
             let configuration = props.configuration
-            var friendshipMetadata = friendshipMetadata
-            
-            if friendshipMetadata == nil, let metadata = props.metadata["friendshipMetadata"] {
-                friendshipMetadata = try BinaryDecoder().decode(FriendshipMetadata.self, from: metadata)
+            let storedFriendshipMetadata: FriendshipMetadata?
+            if let metadata = props.metadata["friendshipMetadata"] {
+                storedFriendshipMetadata = try? BinaryDecoder().decode(FriendshipMetadata.self, from: metadata)
+            } else {
+                storedFriendshipMetadata = nil
             }
-            
-            guard let friendshipMetadata else {
-                throw EventErrors.missingMetadata
-            }
+
+            // Prefer the *more settled* of (passed, stored) so an out-of-order
+            // `synchronizeContacts` message (which still carries the old pending/
+            // requested state) can't downgrade an already accepted/blocked/rejected
+            // relationship that the local device learned about first via a faster
+            // path. A pre-existing contact may also legitimately lack metadata
+            // entirely (e.g. bootstrapped via `synchronizeContacts` from a sibling
+            // device or migrated from an older client); falling back to a fresh
+            // record lets the rest of the flow proceed instead of aborting with
+            // `missingMetadata`.
+            let resolvedFriendshipMetadata: FriendshipMetadata = {
+                switch (friendshipMetadata, storedFriendshipMetadata) {
+                case let (.some(passed), .some(stored)):
+                    return friendshipMetadataConflictPolicy.resolve(passed: passed, stored: stored)
+                case let (.some(passed), .none):
+                    return passed
+                case let (.none, .some(stored)):
+                    return stored
+                case (.none, .none):
+                    return FriendshipMetadata()
+                }
+            }()
             let updatedProps = try await foundContact.updatePropsMetadata(
                 symmetricKey: symmetricKey,
-                metadata: try BinaryEncoder().encode(friendshipMetadata),
-                with: "friendshipMetadata"
-            )
+                metadata: try BinaryEncoder().encode(resolvedFriendshipMetadata),
+                with: "friendshipMetadata")
             
             guard let updatedMetadata = updatedProps?.metadata else {
                 throw EventErrors.propsError
@@ -564,9 +663,7 @@ public extension SessionEvents {
                 configuration: configuration,
                 metadata: updatedMetadata
             )
-            
-            try await receiver.updateContact(updatedContact)
-            
+
             let contactModel = try ContactModel(
                 id: updatedContact.id, // Use the same UUID
                 props: .init(
@@ -578,6 +675,18 @@ public extension SessionEvents {
             )
             
             try await cache.updateContact(contactModel)
+            try await receiver.updateContact(updatedContact)
+
+            // Mirror the new-contact branch: when a UI add (re-)requests friendship,
+            // ensure a request actually goes out. Without this, re-adding a contact
+            // that was created by side-channel sync would update local state but
+            // never reach the recipient. `requestFriendshipStateChange` already
+            // guards against re-spamming `.accepted`/`.rejected` peers.
+            if requestFriendship {
+                try await receiver.synchronize(
+                    contact: updatedContact,
+                    requestFriendship: true)
+            }
             return contactModel
         } else {
             var userConfiguration = try await transport.findConfiguration(for: newContactSecretName)
@@ -607,7 +716,6 @@ public extension SessionEvents {
             )
             
             try await cache.createContact(contactModel)
-            try await receiver.createdContact(contact)
             
             _ = try await updateOrCreateCommunication(
                 mySecretName: mySecretName,
@@ -616,6 +724,10 @@ public extension SessionEvents {
                 receiver: receiver,
                 symmetricKey: symmetricKey,
                 logger: logger)
+            
+            // Notify UI only after the communication shell exists so sidebar loaders
+            // can resolve the nickname bundle immediately (QR scan / inbound friendship).
+            try await receiver.createdContact(contact)
             
             try await receiver.synchronize(
                 contact: contact,
@@ -784,8 +896,9 @@ public extension SessionEvents {
     /// - `.pending` → `resetToPendingState()` - Resets the friendship to initial state
     /// - `.requested` → `setRequestedState()` - Initiates a friendship request
     /// - `.accepted` → `setAcceptedState()` - Accepts a friendship request
-    /// - `.blocked`/`.blockedByOther` → `setBlockState(isBlocking: false)` - Blocks the contact
-    /// - `.unblocked` → `setAcceptedState()` - Unblocks the contact (resets to accepted)
+    /// - `.blocked` → `setBlockState(isBlocking: true)` - Current user blocks the other party
+    /// - `.blockedByOther` → `setBlockState(isBlocking: false)` - Other party blocks the current user (symmetric / protocol use)
+    /// - `.unblocked` → `unblockUser()` - Unblocks the contact and restores its pre-block relationship state when known
     /// - `.rejected`/`.rejectedByOther`/`.mutuallyRejected` → `rejectRequest()` - Rejects the request
     ///
     /// - Parameters:
@@ -831,23 +944,43 @@ public extension SessionEvents {
         guard let foundContact = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.secretName == contact.secretName }) else { throw EventErrors.cannotFindContact }
         
         var currentMetadata: FriendshipMetadata?
-        
-        if let friendshipData = contact.metadata["friendshipMetadata"], !friendshipData.isEmpty {
+        // Prefer cache metadata so we branch from DB truth; the UI `contact` can lag behind.
+        if let foundProps = await foundContact.props(symmetricKey: symmetricKey),
+           let friendshipData = foundProps.metadata["friendshipMetadata"], !friendshipData.isEmpty {
+            currentMetadata = try BinaryDecoder().decode(FriendshipMetadata.self, from: friendshipData)
+        } else if let friendshipData = contact.metadata["friendshipMetadata"], !friendshipData.isEmpty {
             currentMetadata = try BinaryDecoder().decode(FriendshipMetadata.self, from: friendshipData)
         }
         if currentMetadata == nil {
             currentMetadata = FriendshipMetadata()
         }
         
-        if currentMetadata?.myState == .blocked {
-            throw EventErrors.userIsBlocked
-        }
-        
         guard var currentMetadata else { return }
         
-        // Do not allow state changes that are not different, i.e. my state is .accepted cannot acceptFriendRequest() again
-        if currentMetadata.ourState == .accepted && state == .accepted { return }
-        if currentMetadata.myState == .rejected { return }
+        // Capture the pre-transition state so we can compute the server-side
+        // block/unblock flag from intent rather than the post-transition state.
+        // (newer metadata may restore `.accepted`, while older metadata may fall
+        // back to `.pending`, so the post-transition state is not a reliable
+        // signal for the server-side unblock packet.)
+        let priorMyState = currentMetadata.myState
+        let priorTheirState = currentMetadata.theirState
+        let wasBlocked = (priorMyState == .blocked || priorTheirState == .blocked)
+
+        // Throw a typed error rather than silently `return`ing so the UI can
+        // surface a banner explaining why the action did nothing — the previous
+        // silent no-op masked legitimate user feedback (e.g. tapping "Add" on
+        // someone who'd already accepted, or trying to re-request a contact
+        // who'd previously declined).
+        if currentMetadata.ourState == .accepted && (state == .accepted || state == .requested) {
+            throw FriendshipRequestError.alreadyAccepted
+        }
+        // `myState == .rejected` means the *other* party rejected this user.
+        // Allow defensive actions (block / unblock / cancel) but block re-
+        // requesting someone who already declined so the rejected user can't
+        // spam the rejecter.
+        if currentMetadata.myState == .rejected && state == .requested {
+            throw FriendshipRequestError.previouslyRejectedByContact
+        }
         switch state {
         case .pending:
             currentMetadata.resetToPendingState()
@@ -855,10 +988,19 @@ public extension SessionEvents {
             currentMetadata.setRequestedState()
         case .accepted:
             currentMetadata.setAcceptedState()
-        case .blocked, .blockedByOther:
+        case .blocked:
+            currentMetadata.setBlockState(isBlocking: true)
+        case .blockedByOther:
             currentMetadata.setBlockState(isBlocking: false)
         case .unblocked:
-            currentMetadata.setAcceptedState()
+            // Was `setAcceptedState()`, which silently re-friended a previously
+            // blocked contact and (because the post-transition `theirState`
+            // became `.accepted`) suppressed the server-side unblock packet.
+            // `unblockUser()` restores the pre-block relationship when newer
+            // metadata contains that history, and falls back to pending for
+            // older metadata. The explicit `wasBlocked` flag below tells the
+            // server to drop its block entry.
+            currentMetadata.unblockUser()
         case .rejectedByOther, .mutuallyRejected, .rejected:
             currentMetadata.rejectRequest()
         }
@@ -867,20 +1009,21 @@ public extension SessionEvents {
         let updatedProps = try await foundContact.updatePropsMetadata(
             symmetricKey: symmetricKey,
             metadata: metadata,
-            with: "friendshipMetadata"
-        )
+            with: "friendshipMetadata")
         
         try await cache.updateContact(foundContact)
         
-        guard let updatedMetadata = updatedProps?.metadata else {
+        guard let updatedProps = updatedProps else {
             throw EventErrors.propsError
         }
         
+        // Use cache-truth identity/config so downstream bundle matching and metadata
+        // refresh listeners compare against the canonical contact record.
         let updatedContact = Contact(
-            id: contact.id,
-            secretName: contact.secretName,
-            configuration: contact.configuration,
-            metadata: updatedMetadata
+            id: foundContact.id,
+            secretName: updatedProps.secretName,
+            configuration: updatedProps.configuration,
+            metadata: updatedProps.metadata
         )
         
         try await receiver.updateContact(updatedContact)
@@ -892,13 +1035,19 @@ public extension SessionEvents {
             return Data([byte])
         }
         
+        // Derive the server block/unblock flag from the requested transition rather
+        // than from the resulting metadata so unblock still produces an
+        // explicit `false` packet for the server to act on.
         var blockUnblockData: Data?
-        if currentMetadata.theirState == .blocked || currentMetadata.theirState == .blockedByOther {
+        switch state {
+        case .blocked:
             blockUnblockData = convertBoolToData(true)
-        }
-        
-        if currentMetadata.theirState == .unblocked {
-            blockUnblockData = convertBoolToData(false)
+        case .unblocked:
+            if wasBlocked {
+                blockUnblockData = convertBoolToData(false)
+            }
+        default:
+            break
         }
         
         // Transport
@@ -907,6 +1056,10 @@ public extension SessionEvents {
             blockData: blockUnblockData,
             metadata: metadata,
             currentState: currentMetadata.myState)
+
+        if state == .accepted {
+            try await receiver.pushContactMetadata(to: contact.secretName)
+        }
         
         logger.log(level: .info, message: "Sent Friendship State Change Request")
     }
@@ -940,6 +1093,10 @@ public extension SessionEvents {
         symmetricKey: SymmetricKey
     ) async throws {
         guard var props = await message.props(symmetricKey: symmetricKey) else { throw EventErrors.propsError }
+        guard props.deliveryState != deliveryState else {
+            // Already in target state; skip update and avoid sending duplicate receipt.
+            return
+        }
         props.deliveryState = deliveryState
         let updatedMessage = try await message.updateMessage(with: props, symmetricKey: symmetricKey)
         try await cache.updateMessage(updatedMessage, symmetricKey: symmetricKey)

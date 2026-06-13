@@ -119,6 +119,15 @@ public protocol EventReceiver: Sendable {
     ///   authentication failures, or transport layer issues.
     func transportContactMetadata() async throws
 
+    /// Pushes this user's profile metadata to a single peer contact.
+    ///
+    /// Used when friendship becomes mutually accepted so each side sends one
+    /// `contactUpdated` without a `requestMetadata` round-trip.
+    ///
+    /// - Parameter secretName: The peer contact to receive the profile update.
+    /// - Throws: An error if the push fails.
+    func pushContactMetadata(to secretName: String) async throws
+
     /// Updates an existing contact in the system.
     ///
     /// This method is invoked when an existing contact's information has been

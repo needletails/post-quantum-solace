@@ -58,6 +58,69 @@ actor TaskProcessorSequenceTests {
     }
     
     // MARK: - Basic FIFO Tests
+
+    @Test("Reconciliation cooldowns are directional")
+    func testReconciliationCooldownIsDirectional() async {
+        let peerDeviceId = UUID()
+        let now = Date()
+
+        #expect(await session.canAttemptReconciliation(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            flow: .inbound,
+            now: now))
+
+        await session.markReconciliationAttempt(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            flow: .inbound,
+            now: now)
+
+        #expect(!(await session.canAttemptReconciliation(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            flow: .inbound,
+            now: now.addingTimeInterval(1))))
+
+        #expect(await session.canAttemptReconciliation(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            flow: .outbound,
+            now: now.addingTimeInterval(1)))
+
+        await session.shutdown()
+    }
+
+    @Test("Inbound recovery failure classes clear after successful replay")
+    func testInboundRecoveryFailureClassesClearAfterSuccessfulReplay() async {
+        let sender = "alice"
+        let deviceId = UUID()
+        let messageId = "replayed-shared-id"
+
+        await session.markInboundFailure(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: messageId,
+            failureClass: "crypto.bodyDecryptionFailed")
+        await session.markInboundFailure(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: messageId,
+            failureClass: "ratchet.initialMessageNotReceived")
+
+        let first = await session.takeInboundFailureClasses(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: messageId)
+        let second = await session.takeInboundFailureClasses(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: messageId)
+
+        #expect(Set(first) == ["crypto.bodyDecryptionFailed", "ratchet.initialMessageNotReceived"])
+        #expect(second.isEmpty)
+        await session.shutdown()
+    }
     
     @Test("Basic FIFO - Single Message")
     func testBasicFIFOSingleMessage() async throws {
@@ -506,6 +569,520 @@ actor TaskProcessorSequenceTests {
         
         await session.shutdown()
     }
+
+    @Test("Error Handling - Outbound Invalid Signature Drops Bad Job And Continues")
+    func testErrorHandlingOutboundInvalidSignatureDropsBadJobAndContinues() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        let recipientIdentity = createTestRecipientIdentity()
+
+        let firstTask = EncryptableTask(task: .writeMessage(.init(
+            message: createTestMessage("fatal_invalid_signature"),
+            recipientIdentity: recipientIdentity,
+            localId: localId,
+            sharedId: "fatal_invalid_signature_shared"
+        )))
+        let secondTask = EncryptableTask(task: .writeMessage(.init(
+            message: createTestMessage("processed_after_resume"),
+            recipientIdentity: recipientIdentity,
+            localId: localId,
+            sharedId: "processed_after_resume_shared"
+        )))
+
+        let firstJob = try await session.taskProcessor.createJobModel(
+            sequenceId: await session.taskProcessor.incrementId(),
+            task: firstTask,
+            symmetricKey: symmetricKey
+        )
+        let secondJob = try await session.taskProcessor.createJobModel(
+            sequenceId: await session.taskProcessor.incrementId(),
+            task: secondTask,
+            symmetricKey: symmetricKey
+        )
+
+        try await cache.createJob(firstJob)
+        try await cache.createJob(secondJob)
+
+        let failingDelegate = MockTaskDelegateWithOneShotError(
+            failingMessage: "fatal_invalid_signature",
+            error: PQSSession.SessionErrors.invalidSignature
+        )
+        await session.taskProcessor.setTaskDelegate(failingDelegate)
+
+        try await session.resumeJobQueue()
+
+        #expect(await failingDelegate.getErrorCount() == 1, "Expected one invalid signature failure")
+        #expect(
+            await failingDelegate.getProcessedMessages() == ["processed_after_resume"],
+            "Outbound invalidSignature should drop the failed job and keep draining later jobs"
+        )
+
+        let jobsAfterFailure = try await cache.fetchJobs()
+        #expect(jobsAfterFailure.isEmpty, "Outbound invalidSignature should remove the failed job and any successfully processed later jobs")
+
+        await session.shutdown()
+    }
+
+    @Test("Error Handling - Same Account Invalid Signature Reports Linked Device Compromise")
+    func testSameAccountInvalidSignatureReportsLinkedDeviceCompromise() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let probe = LinkedDeviceCompromiseProbe()
+        await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session, compromiseProbe: probe))
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: PQSSession.SessionErrors.invalidSignature)
+        )
+
+        guard let context = await session.sessionContext else {
+            Issue.record("Session context should be available")
+            await session.shutdown()
+            return
+        }
+
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let header = EncryptedHeader(
+            remoteLongTermPublicKey: Data(repeating: 1, count: 32),
+            remoteOneTimePublicKey: nil,
+            remoteMLKEMPublicKey: try MLKEMPublicKey(Data(repeating: 2, count: 1568)),
+            headerCiphertext: Data([0x01]),
+            messageCiphertext: Data([0x02]),
+            oneTimeKeyId: nil,
+            mlKEMOneTimeKeyId: UUID(),
+            encrypted: Data([0x04])
+        )
+        let ratchetMessage = RatchetMessage(header: header, encryptedData: Data([0x03]))
+        let signed = try SignedRatchetMessage(
+            message: ratchetMessage,
+            signingPrivateKey: signingKey.rawRepresentation
+        )
+        let claimedDeviceId = UUID()
+        let inbound = InboundTaskMessage(
+            message: signed,
+            senderSecretName: context.sessionUser.secretName,
+            senderDeviceId: claimedDeviceId,
+            sharedMessageId: "same_account_invalid_signature"
+        )
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+
+        #expect(await probe.contains(claimedDeviceId), "Master should report same-account invalidSignature as linked-device compromise")
+        #expect(await probe.count() == 1, "Same invalidSignature should produce one compromise report")
+
+        await session.shutdown()
+    }
+
+    @Test("Peer signing-key pin mismatch reports peer identity change")
+    func testPeerSigningKeyOutOfSyncReportsPeerIdentityChange() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let probe = LinkedDeviceCompromiseProbe()
+        let peerProbe = PeerIdentityTrustProbe()
+        await session.setPQSSessionDelegate(conformer: SessionDelegate(
+            session: session,
+            compromiseProbe: probe,
+            peerIdentityTrustProbe: peerProbe))
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: PQSSession.SessionErrors.peerSigningKeyOutOfSync)
+        )
+
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let header = EncryptedHeader(
+            remoteLongTermPublicKey: Data(repeating: 1, count: 32),
+            remoteOneTimePublicKey: nil,
+            remoteMLKEMPublicKey: try MLKEMPublicKey(Data(repeating: 2, count: 1568)),
+            headerCiphertext: Data([0x01]),
+            messageCiphertext: Data([0x02]),
+            oneTimeKeyId: nil,
+            mlKEMOneTimeKeyId: UUID(),
+            encrypted: Data([0x04])
+        )
+        let ratchetMessage = RatchetMessage(header: header, encryptedData: Data([0x03]))
+        let signed = try SignedRatchetMessage(
+            message: ratchetMessage,
+            signingPrivateKey: signingKey.rawRepresentation
+        )
+        let peerDeviceId = UUID()
+        let inbound = InboundTaskMessage(
+            message: signed,
+            senderSecretName: "bob",
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "peer_signing_key_out_of_sync"
+        )
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+
+        #expect(await probe.count() == 0, "Peer identity pin failures must not be routed as local linked-device compromise")
+        #expect(await peerProbe.contains(
+            secretName: "bob",
+            deviceId: peerDeviceId,
+            failedSharedMessageId: "peer_signing_key_out_of_sync"))
+        #expect(await session.isInboundFailureQuarantined(
+            sender: "bob",
+            deviceId: peerDeviceId,
+            messageId: "peer_signing_key_out_of_sync"))
+
+        await session.shutdown()
+    }
+
+    @Test("Fresh-session repair reports peer identity change when pin mismatch blocks reset")
+    func testFreshSessionRepairPeerSigningKeyMismatchReportsTrustChange() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let peerName = "bob_pin_mismatch"
+        let trustedBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let foreignBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let trustedConfiguration = trustedBundle.userConfiguration
+        let foreignConfiguration = foreignBundle.userConfiguration
+        #expect(trustedConfiguration.signingPublicKey != foreignConfiguration.signingPublicKey)
+
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        let pinnedContact = try ContactModel(
+            id: UUID(),
+            props: .init(
+                secretName: peerName,
+                configuration: trustedConfiguration,
+                metadata: [:]),
+            symmetricKey: symmetricKey)
+        try await store.createContact(pinnedContact)
+
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: foreignBundle.deviceKeys.deviceId,
+            config: foreignConfiguration)
+
+        let peerProbe = PeerIdentityTrustProbe()
+        await session.setPQSSessionDelegate(conformer: SessionDelegate(
+            session: session,
+            peerIdentityTrustProbe: peerProbe))
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
+        )
+
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let header = EncryptedHeader(
+            remoteLongTermPublicKey: Data(repeating: 1, count: 32),
+            remoteOneTimePublicKey: nil,
+            remoteMLKEMPublicKey: try MLKEMPublicKey(Data(repeating: 2, count: 1568)),
+            headerCiphertext: Data([0x01]),
+            messageCiphertext: Data([0x02]),
+            oneTimeKeyId: nil,
+            mlKEMOneTimeKeyId: UUID(),
+            encrypted: Data([0x04])
+        )
+        let ratchetMessage = RatchetMessage(header: header, encryptedData: Data([0x03]))
+        let signed = try SignedRatchetMessage(
+            message: ratchetMessage,
+            signingPrivateKey: signingKey.rawRepresentation
+        )
+        let inbound = InboundTaskMessage(
+            message: signed,
+            senderSecretName: peerName,
+            senderDeviceId: foreignBundle.deviceKeys.deviceId,
+            sharedMessageId: "fresh_repair_peer_signing_key_out_of_sync"
+        )
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+
+        #expect(await peerProbe.contains(
+            secretName: peerName,
+            deviceId: foreignBundle.deviceKeys.deviceId,
+            failedSharedMessageId: "fresh_repair_peer_signing_key_out_of_sync"))
+        #expect(await session.isInboundFailureQuarantined(
+            sender: peerName,
+            deviceId: foreignBundle.deviceKeys.deviceId,
+            messageId: "fresh_repair_peer_signing_key_out_of_sync"))
+        #expect(!(await session.hasPendingResendAfterReestablishment(
+            sender: peerName,
+            deviceId: foreignBundle.deviceKeys.deviceId)))
+
+        await session.shutdown()
+    }
+
+    @Test("Ratchet desync errors route to fresh-session repair")
+    func testRatchetDesyncErrorsRouteToFreshSessionRepair() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let recoverableErrors: [(error: RatchetError, failureClass: String)] = [
+            (.headerDecryptFailed, "ratchet.headerDecryptFailed"),
+            (.receivingKeyIsNil, "ratchet.receivingKeyIsNil"),
+            (.receivingHeaderKeyIsNil, "ratchet.receivingHeaderKeyIsNil")
+        ]
+
+        for (index, recoverable) in recoverableErrors.enumerated() {
+            await session.taskProcessor.setTaskDelegate(
+                MockTaskDelegateWithStreamError(error: recoverable.error)
+            )
+
+            let peerDeviceId = UUID()
+            let peerName = "bob_desync_\(index)"
+            let inbound = try makeTestInboundTaskMessage(
+                senderSecretName: peerName,
+                senderDeviceId: peerDeviceId,
+                sharedMessageId: "desync_\(index)")
+
+            try await session.taskProcessor.feedTask(
+                EncryptableTask(task: .streamMessage(inbound)),
+                session: session
+            )
+
+            let hasPendingRepair = try await waitForPendingRepair(
+                sender: peerName,
+                deviceId: peerDeviceId)
+            #expect(hasPendingRepair, "\(recoverable.failureClass) should defer resend until peerRefresh")
+        }
+
+        await session.shutdown()
+    }
+
+    @Test("Expired skipped key is treated as replay and does not reset session")
+    func testExpiredKeyDropsWithoutFreshSessionRepair() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.expiredKey)
+        )
+
+        let peerDeviceId = UUID()
+        let inbound = try makeTestInboundTaskMessage(
+            senderSecretName: "bob_replay",
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "expired_key_replay")
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+
+        try await Task.sleep(until: .now + .milliseconds(250))
+        #expect(!(await session.hasPendingResendAfterReestablishment(
+            sender: "bob_replay",
+            deviceId: peerDeviceId)))
+        #expect(await session.shouldSuppressInboundFailure(
+            inbound,
+            failureClass: "ratchet.expiredKey"))
+
+        await session.shutdown()
+    }
+
+    @Test("missingOneTimeKey marks failure so redelivery is suppressed")
+    func testMissingOneTimeKeySuppressesRedelivery() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+
+        let peerDeviceId = UUID()
+        let inbound = try makeTestInboundTaskMessage(
+            senderSecretName: "bob_missing_otk",
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "missing_otk_replay")
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+
+        let hasPendingRepair = try await waitForPendingRepair(
+            sender: "bob_missing_otk",
+            deviceId: peerDeviceId)
+        #expect(hasPendingRepair, "missingOneTimeKey should defer resend until peerRefresh")
+
+        // The accepted recovery (OTK batch replacement + forced peerRefresh) must be
+        // recorded, otherwise every redelivery of the same frame repeats the full
+        // recovery: two OTK batch replacements and a cooldown-bypassing re-emit.
+        #expect(
+            await session.shouldSuppressInboundFailure(
+                inbound,
+                failureClass: "ratchet.missingOneTimeKey"),
+            "First missingOneTimeKey failure must be marked so the redelivered frame is suppressed")
+
+        // Redelivery of the identical frame must not trigger another OTK batch replacement.
+        let otkCallsAfterFirst = await transport.updateOneTimeKeysCallCount
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+        try await Task.sleep(until: .now + .milliseconds(500))
+        let otkCallsAfterSecond = await transport.updateOneTimeKeysCallCount
+        #expect(
+            otkCallsAfterSecond == otkCallsAfterFirst,
+            "Redelivered missingOneTimeKey frame must not replace the OTK batch again")
+
+        await session.shutdown()
+    }
+
+    @Test("Peer resend request tracking is pruned and capped")
+    func testPeerResendRequestTrackingIsBounded() async {
+        let deviceId = UUID()
+        let now = Date()
+
+        // Stale entries (older than the cooldown that makes them meaningful) are pruned on insert.
+        for index in 0..<10 {
+            await session.markPeerResendRequestSent(
+                sender: "stale\(index)",
+                deviceId: deviceId,
+                failedMessageId: "m",
+                now: now.addingTimeInterval(-3600))
+        }
+        await session.markPeerResendRequestSent(
+            sender: "fresh",
+            deviceId: deviceId,
+            failedMessageId: "m",
+            now: now)
+        #expect(
+            await session.lastResendRequestAtByPeer.count == 1,
+            "Stale resend-request entries must be pruned on insert")
+
+        // A flood of unique failed-message keys must not grow the map unboundedly.
+        for index in 0..<(PQSSessionConstants.recoveryTrackingMaxEntries + 100) {
+            await session.markPeerResendRequestSent(
+                sender: "flood",
+                deviceId: deviceId,
+                failedMessageId: "m\(index)",
+                now: now)
+        }
+        #expect(
+            await session.lastResendRequestAtByPeer.count <= PQSSessionConstants.recoveryTrackingMaxEntries,
+            "Resend-request tracking must be capped")
+        await session.shutdown()
+    }
+
+    @Test("Reconciliation tracking is pruned and capped")
+    func testReconciliationTrackingIsBounded() async {
+        let deviceId = UUID()
+        let now = Date()
+
+        for index in 0..<10 {
+            await session.markReconciliationAttempt(
+                sender: "stale\(index)",
+                deviceId: deviceId,
+                now: now.addingTimeInterval(-3600))
+        }
+        await session.markReconciliationAttempt(
+            sender: "fresh",
+            deviceId: deviceId,
+            now: now)
+        #expect(
+            await session.lastReconciliationAtByPeer.count == 1,
+            "Stale reconciliation entries must be pruned on insert")
+
+        for index in 0..<(PQSSessionConstants.recoveryTrackingMaxEntries + 100) {
+            await session.markReconciliationAttempt(
+                sender: "flood\(index)",
+                deviceId: deviceId,
+                now: now)
+        }
+        #expect(
+            await session.lastReconciliationAtByPeer.count <= PQSSessionConstants.recoveryTrackingMaxEntries,
+            "Reconciliation tracking must be capped")
+        await session.shutdown()
+    }
+
+    @Test("Automatic rotation tracking is pruned and capped")
+    func testAutomaticRotationTrackingIsBounded() async {
+        let deviceId = UUID()
+        let now = Date()
+
+        for index in 0..<10 {
+            await session.markAutomaticRotationAttempt(
+                sender: "stale\(index)",
+                deviceId: deviceId,
+                now: now.addingTimeInterval(-3600))
+        }
+        await session.markAutomaticRotationAttempt(
+            sender: "fresh",
+            deviceId: deviceId,
+            now: now)
+        #expect(
+            await session.lastAutomaticRotationAtByPeer.count == 1,
+            "Stale rotation entries must be pruned on insert")
+
+        for index in 0..<(PQSSessionConstants.recoveryTrackingMaxEntries + 100) {
+            await session.markAutomaticRotationAttempt(
+                sender: "flood\(index)",
+                deviceId: deviceId,
+                now: now)
+        }
+        #expect(
+            await session.lastAutomaticRotationAtByPeer.count <= PQSSessionConstants.recoveryTrackingMaxEntries,
+            "Rotation tracking must be capped")
+        await session.shutdown()
+    }
+
+    @Test("Pending resend-after-reestablishment tracking is capped")
+    func testPendingResendTrackingIsCapped() async {
+        let deviceId = UUID()
+        for index in 0..<(PQSSessionConstants.recoveryTrackingMaxEntries + 100) {
+            await session.deferPeerResendUntilReestablished(
+                sender: "flood",
+                deviceId: deviceId,
+                failedMessageId: "m\(index)",
+                failureClass: "ratchet.missingOneTimeKey")
+        }
+        #expect(
+            await session.pendingResendAfterReestablishment.count <= PQSSessionConstants.recoveryTrackingMaxEntries,
+            "Pending resend tracking must be capped against unique failed-message floods")
+        await session.shutdown()
+    }
+
+    @Test("Ratchet decryption failure retries first and repairs on repeat")
+    func testRatchetDecryptionFailedRetriesFirstThenRepairsOnRepeat() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.decryptionFailed)
+        )
+
+        let peerDeviceId = UUID()
+        let inbound = try makeTestInboundTaskMessage(
+            senderSecretName: "bob_decrypt_failed",
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "decrypt_failed_repeat")
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+
+        try await Task.sleep(until: .now + .milliseconds(250))
+        #expect(await session.shouldSuppressInboundFailure(
+            inbound,
+            failureClass: "ratchet.decryptionFailed"))
+        #expect(!(await session.hasPendingResendAfterReestablishment(
+            sender: "bob_decrypt_failed",
+            deviceId: peerDeviceId)))
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+
+        let hasPendingRepair = try await waitForPendingRepair(
+            sender: "bob_decrypt_failed",
+            deviceId: peerDeviceId)
+        #expect(hasPendingRepair, "Repeated ratchet.decryptionFailed should escalate to peerRefresh repair")
+
+        await session.shutdown()
+    }
     
     // MARK: - Task Type Tests
     
@@ -886,6 +1463,112 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
     
+    // MARK: - Job Stranding Race Condition Tests
+
+    /// Feeds multiple tasks from separate concurrent tasks and verifies
+    /// all jobs are drained from the cache afterwards.
+    ///
+    /// Without the defensive post-loop drain check in `startProcessingIfNeeded`,
+    /// a task fed while the processing loop is between its final deque-empty check
+    /// and `stop()` can be stranded in cache indefinitely (until another feedTask
+    /// or resumeJobQueue happens to pick it up).
+    @Test("Job Stranding - concurrent feedTask calls should not strand jobs in cache")
+    func concurrentFeedTaskDoesNotStrandJobs() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let mockDelegate = MockTaskDelegate()
+        await session.taskProcessor.setTaskDelegate(mockDelegate)
+
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+
+        let recipientIdentity = createTestRecipientIdentity()
+        let iterations = 20
+
+        for iteration in 0..<iterations {
+            let task1 = EncryptableTask(task: .writeMessage(.init(
+                message: createTestMessage("strand_A_\(iteration)"),
+                recipientIdentity: recipientIdentity,
+                localId: localId,
+                sharedId: "strand_A_\(iteration)")))
+            let task2 = EncryptableTask(task: .writeMessage(.init(
+                message: createTestMessage("strand_B_\(iteration)"),
+                recipientIdentity: recipientIdentity,
+                localId: localId,
+                sharedId: "strand_B_\(iteration)")))
+
+            let t1 = Task {
+                try? await session.taskProcessor.feedTask(task1, session: session)
+            }
+            await Task.yield()
+            let t2 = Task {
+                try? await session.taskProcessor.feedTask(task2, session: session)
+            }
+
+            await t1.value
+            await t2.value
+        }
+
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            let remaining = try await cache.fetchJobs()
+            if remaining.isEmpty { break }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+
+        let remaining = try await cache.fetchJobs()
+        #expect(remaining.isEmpty, "Expected all jobs to be drained from cache, but \(remaining.count) remain stranded")
+
+        let processedMessages = await mockDelegate.getProcessedMessages()
+        let expectedCount = iterations * 2
+        #expect(processedMessages.count == expectedCount, "Expected \(expectedCount) messages processed, got \(processedMessages.count)")
+
+        await session.shutdown()
+    }
+
+    /// Feeds a rapid burst of tasks and ensures none remain stranded in cache.
+    @Test("Job Stranding - rapid sequential feedTask should drain all jobs from cache")
+    func rapidSequentialFeedTaskDrainsAllFromCache() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let mockDelegate = MockTaskDelegate()
+        await session.taskProcessor.setTaskDelegate(mockDelegate)
+
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+
+        let recipientIdentity = createTestRecipientIdentity()
+        let count = 10
+
+        for i in 0..<count {
+            let task = EncryptableTask(task: .writeMessage(.init(
+                message: createTestMessage("rapid_\(i)"),
+                recipientIdentity: recipientIdentity,
+                localId: localId,
+                sharedId: "rapid_\(i)")))
+            try await session.taskProcessor.feedTask(task, session: session)
+        }
+
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline {
+            let remaining = try await cache.fetchJobs()
+            if remaining.isEmpty { break }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+
+        let remaining = try await cache.fetchJobs()
+        #expect(remaining.isEmpty, "Expected all jobs to be drained from cache, but \(remaining.count) remain")
+
+        let processedMessages = await mockDelegate.getProcessedMessages()
+        #expect(processedMessages.count == count, "Expected \(count) messages processed, got \(processedMessages.count)")
+
+        await session.shutdown()
+    }
+
     // MARK: - Helper Methods
     
     private func createTestRecipientIdentity() -> SessionIdentity {
@@ -911,6 +1594,54 @@ actor TaskProcessorSequenceTests {
             recipient: .nickname("bob"),
             sentDate: Date(),
             destructionTime: nil)
+    }
+
+    private func makeTestInboundTaskMessage(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        sharedMessageId: String
+    ) throws -> InboundTaskMessage {
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let header = EncryptedHeader(
+            remoteLongTermPublicKey: Data(repeating: 1, count: 32),
+            remoteOneTimePublicKey: nil,
+            remoteMLKEMPublicKey: try MLKEMPublicKey(Data(repeating: 2, count: 1568)),
+            headerCiphertext: Data([0x01]),
+            messageCiphertext: Data([0x02]),
+            oneTimeKeyId: nil,
+            mlKEMOneTimeKeyId: UUID(),
+            encrypted: Data([0x04])
+        )
+        let ratchetMessage = RatchetMessage(header: header, encryptedData: Data([0x03]))
+        let signed = try SignedRatchetMessage(
+            message: ratchetMessage,
+            signingPrivateKey: signingKey.rawRepresentation
+        )
+        return InboundTaskMessage(
+            message: signed,
+            senderSecretName: senderSecretName,
+            senderDeviceId: senderDeviceId,
+            sharedMessageId: sharedMessageId
+        )
+    }
+
+    private func waitForPendingRepair(
+        sender: String,
+        deviceId: UUID,
+        timeout: TimeInterval = 3
+    ) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await session.hasPendingResendAfterReestablishment(
+                sender: sender,
+                deviceId: deviceId) {
+                return true
+            }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        return await session.hasPendingResendAfterReestablishment(
+            sender: sender,
+            deviceId: deviceId)
     }
     
     
@@ -1098,6 +1829,58 @@ final class MockTaskDelegateWithMixedErrors: TaskSequenceDelegate, @unchecked Se
     }
 }
 
+final class MockTaskDelegateWithOneShotError: TaskSequenceDelegate, @unchecked Sendable {
+    private let messageTracker = MessageTracker()
+    private let errorTracker = ErrorTracker()
+    private let failingMessage: String
+    private let error: Error
+    private var hasThrown = false
+
+    init(failingMessage: String, error: Error) {
+        self.failingMessage = failingMessage
+        self.error = error
+    }
+
+    func performRatchet(task: SessionModels.TaskType, session: PQSSession) async throws {
+        switch task {
+        case .writeMessage(let task):
+            if !hasThrown && task.message.text == failingMessage {
+                hasThrown = true
+                await errorTracker.incrementErrorCount()
+                throw error
+            }
+            await messageTracker.addMessage(task.message.text)
+        case .streamMessage(let task):
+            await messageTracker.addMessage(task.sharedMessageId)
+        }
+    }
+
+    func getProcessedMessages() async -> [String] {
+        await messageTracker.getMessages()
+    }
+
+    func getErrorCount() async -> Int {
+        await errorTracker.getErrorCount()
+    }
+}
+
+final class MockTaskDelegateWithStreamError: TaskSequenceDelegate, @unchecked Sendable {
+    private let error: Error
+
+    init(error: Error) {
+        self.error = error
+    }
+
+    func performRatchet(task: SessionModels.TaskType, session: PQSSession) async throws {
+        switch task {
+        case .streamMessage:
+            throw error
+        case .writeMessage:
+            break
+        }
+    }
+}
+
 final class MockTaskDelegateWithDelay: TaskSequenceDelegate, @unchecked Sendable {
     private let messageTracker = MessageTracker()
     private let delaySeconds: Int
@@ -1152,4 +1935,3 @@ actor ErrorTracker {
         errorCount
     }
 }
-

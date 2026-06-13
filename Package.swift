@@ -17,8 +17,9 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "2.0.3"),
-        .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.4"),
+        .package(url: "https://github.com/needletails/binary-codable.git", from: "1.0.5"),
+        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "3.0.0"),
+        .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.5"),
         .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.5")
     ],
     targets: [
@@ -26,6 +27,7 @@ let package = Package(
             name: "PQSSession", dependencies: [
                 "SessionEvents",
                 "SessionModels",
+                .product(name: "BinaryCodable", package: "binary-codable"),
                 .product(name: "DoubleRatchetKit", package: "double-ratchet-kit"),
                 .product(name: "NeedleTailLogger", package: "needletail-logger")
             ]
@@ -35,12 +37,16 @@ let package = Package(
             .product(name: "DoubleRatchetKit", package: "double-ratchet-kit"),
         ]),
         .target(name: "SessionModels", dependencies: [
+            .product(name: "BinaryCodable", package: "binary-codable"),
             .product(name: "DoubleRatchetKit", package: "double-ratchet-kit"),
             .product(name: "NeedleTailAlgorithms", package: "needletail-algorithms")
         ]),
         .testTarget(
             name: "PostQuantumSolaceTests",
-            dependencies: ["PQSSession"]
+            dependencies: [
+                "PQSSession",
+                .product(name: "BinaryCodable", package: "binary-codable")
+            ]
         ),
     ]
 )

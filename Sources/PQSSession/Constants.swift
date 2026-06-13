@@ -80,11 +80,9 @@ public enum PQSSessionConstants: Sendable {
     /// Channels must have at least this many members to be considered valid.
     /// This ensures channels have sufficient participants for meaningful communication.
     ///
-    /// - Default: `3`
+    /// - Default: `2`
     /// - See also: `PQSSessionConstants.minimumChannelOperators`
     public static let minimumChannelMembers = 2
-
-    // MARK: - Sesame-style inactive session support
 
     /// Prefix used to mark "inactive session" identities in the local store.
     ///
@@ -106,5 +104,56 @@ public enum PQSSessionConstants: Sendable {
     /// States older than this are deleted opportunistically during invalidation and on inbound recovery.
     /// This should be aligned with your transport's offline mailbox retention window.
     public static let inactiveSessionMaxAgeSeconds: TimeInterval = 60 * 60 * 48 // 48 hours
+
+    // MARK: - Session Reestablishment Coalescing
+
+    /// Cooldown window during which repeated `peerRefresh` emissions to the same scope are suppressed.
+    ///
+    /// Lowered relative to other kinds because peer refresh is naturally re-driven by inbound traffic.
+    public static let peerRefreshCooldownSeconds: TimeInterval = 30
+
+    /// Cooldown window during which repeated `linkedDeviceRepair` emissions to the same scope are suppressed.
+    public static let linkedDeviceRepairCooldownSeconds: TimeInterval = 60
+
+    /// Cooldown window during which repeated `linkedDeviceCompromiseObserved` emissions to the same scope
+    /// are suppressed. Compromise events trigger user-visible prompts on the master device, so a generous
+    /// window is used to bound how often a single episode can re-notify if recovery has not completed.
+    public static let linkedDeviceCompromiseObservedCooldownSeconds: TimeInterval = 300
+
+    /// Maximum lifetime of a single sender-side control episode. After this, a new `intentId` is minted
+    /// for the next emission, treating the situation as a fresh problem worthy of fresh attention.
+    public static let controlEventEpisodeMaxLifetimeSeconds: TimeInterval = 60 * 60 * 24
+
+    /// Maximum number of in-memory sender-side episode entries before LRU eviction is triggered.
+    public static let controlEventEpisodeMaxEntries = 256
+
+    /// Maximum age (in seconds) of receiver-side processed-event state retained for dedup decisions.
+    public static let processedControlEventMaxAgeSeconds: TimeInterval = 60 * 60 * 24
+
+    /// Maximum number of in-memory receiver-side processed-event entries before LRU eviction is triggered.
+    public static let processedControlEventMaxEntries = 1024
+
+    /// Throttle window for the post-control-event identity refresh per sender secretName.
+    /// Coalesces the bursts of `refreshIdentities(forceRefresh: true)` that would otherwise fire
+    /// once per inbound control message when a backlog drains.
+    public static let forcedIdentityRefreshCoalesceWindowSeconds: TimeInterval = 30
+
+    /// Maximum number of in-memory entries retained per recovery bookkeeping map
+    /// (resend-request cooldowns, reconciliation cooldowns, rotation cooldowns,
+    /// pending resend-after-reestablishment). Oldest entries are evicted first.
+    /// Bounds memory growth under floods of unique failed-message identifiers.
+    public static let recoveryTrackingMaxEntries = 512
+
+    // MARK: - Schema versioning
+
+    /// Current schema version for persisted session state.
+    ///
+    /// Bumped whenever a code change makes existing on-disk state semantically incompatible with
+    /// the current runtime — for example the per-device identity invariant fix which
+    /// requires devices that were corrupted by the prior overwrite-on-reprovision behavior to be
+    /// re-linked instead of silently rolling forward. The runtime `startSession` path also
+    /// performs a per-device signing key consistency check that catches such corruption directly,
+    /// so this constant is primarily a forward-looking marker for future migrations.
+    public static let sessionSchemaVersion: Int = 1
 }
 

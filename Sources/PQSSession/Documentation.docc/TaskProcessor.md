@@ -1,46 +1,34 @@
 # ``TaskProcessor``
 
-An actor that manages asynchronous encryption/decryption tasks using dedicated cryptographic executors.
+Internal `actor` that owns the SDK's cryptographic and message-processing
+work queues. You do not interact with it directly — `PQSSession` enqueues
+all heavy work here so that public API calls remain responsive and
+in-flight cryptographic work proceeds on a dedicated executor.
 
 ## Overview
 
-`TaskProcessor` handles all cryptographic operations for the SDK, including message encryption/decryption, key management, and Double Ratchet protocol operations.
+`TaskProcessor`:
+
+- Maintains separate queues for outbound (encrypt) and inbound (decrypt)
+  cryptographic operations so that a busy inbox never blocks sending.
+- Coalesces and deduplicates control events (key rotation, OTK refresh,
+  identity-change probes) using the windows defined in
+  ``PQSSessionConstants``.
+- Restarts itself across `start`/`shutdown` cycles via
+  ``PQSSession/resumeJobQueue()``.
 
 ## Topics
 
-### Essentials
+### Related coalescing constants
 
-- ``TaskProcessor/init(logger:ratchetConfiguration:)``
+- ``PQSSessionConstants/peerRefreshCooldownSeconds``
+- ``PQSSessionConstants/linkedDeviceRepairCooldownSeconds``
+- ``PQSSessionConstants/linkedDeviceCompromiseObservedCooldownSeconds``
+- ``PQSSessionConstants/controlEventEpisodeMaxLifetimeSeconds``
+- ``PQSSessionConstants/forcedIdentityRefreshCoalesceWindowSeconds``
 
-### Error Handling
+## See also
 
-- ``TaskProcessor/JobProcessorErrors``
-
-## Key Features
-
-- **Dedicated Executors**: Cryptographic operations on separate queues
-- **Thread Safety**: Actor-based concurrent access
-- **Task Sequencing**: Ensures proper ordering of cryptographic operations
-- **Error Handling**: Comprehensive error handling with `LocalizedError`
-
-## Error Handling
-
-All errors conform to `LocalizedError`:
-
-```swift
-do {
-    try await taskProcessor.performRatchet(...)
-} catch let error as TaskProcessor.JobProcessorErrors {
-    if let localizedError = error as? LocalizedError {
-        print("Error: \(localizedError.errorDescription ?? "")")
-        if let suggestion = localizedError.recoverySuggestion {
-            print("Suggestion: \(suggestion)")
-        }
-    }
-}
-```
-
-## See Also
-
-- ``CryptoExecutor``
-- ``TaskProcessor/JobProcessorErrors``
+- <doc:ControlEventCoalescing>
+- ``PQSSession``
+- ``SessionCache``

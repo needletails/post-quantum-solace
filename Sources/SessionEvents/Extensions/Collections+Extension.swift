@@ -112,6 +112,17 @@ public extension Array {
         return nil
     }
 
+    /// Asynchronously transforms every element of the array, preserving order.
+    ///
+    /// Equivalent to `Sequence.map`, but the transform is `async` and is
+    /// awaited serially so each element is fully processed before the
+    /// next one begins. Use this when ordering or back-pressure matters;
+    /// for fan-out parallelism, use `withTaskGroup` directly.
+    ///
+    /// - Parameter transform: A `@Sendable` `async` closure applied to
+    ///   every element.
+    /// - Returns: An array containing the transformed elements, in the
+    ///   same order as the source.
     func asyncMap<T>(transform: @Sendable (Element) async -> T) async -> [T] {
         var results = [T]()
         for element in self {
@@ -121,6 +132,16 @@ public extension Array {
         return results
     }
 
+    /// Asynchronously maps over the array and discards `nil` results.
+    ///
+    /// Combines `asyncMap` and `compactMap`: the transform may return
+    /// `nil` to drop the corresponding element. Used internally to
+    /// decrypt and filter encrypted models in a single pass.
+    ///
+    /// - Parameter transform: A `@Sendable` `async` closure that returns
+    ///   either a value or `nil`.
+    /// - Returns: An array of the non-`nil` transformed values, in the
+    ///   same order as the source.
     func asyncCompactMap<T>(transform: @Sendable (Element) async -> T?) async -> [T] {
         var results = [T]()
         for element in self {

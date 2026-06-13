@@ -1,46 +1,49 @@
 # ``SessionCache``
 
-A two-tier caching system providing in-memory and persistent storage for session data.
+A two-tier `actor` that backs ``PQSSession`` with an in-memory hot path
+sitting on top of any application-supplied ``PQSSessionStore``.
 
 ## Overview
 
-`SessionCache` is an actor that implements `PQSSessionStore` and provides efficient caching of session data with both in-memory and persistent storage layers.
+`SessionCache` is the only `PQSSessionStore` consumer the SDK ever wires up
+itself. When you call ``PQSSession/setDatabaseDelegate(conformer:)`` (or
+``PQSSession/configure(with:)``), the SDK wraps your concrete store in a
+`SessionCache` and uses *that* for all storage operations. You normally do
+not construct one directly; the SDK does it for you.
+
+The cache:
+
+- Conforms to ``PQSSessionStore`` itself, so call sites are uniform.
+- Keeps the most-recently-touched session identities and contacts in memory
+  to avoid hammering the persistent store on the hot encrypt/decrypt path.
+- Coordinates writes through its actor executor, providing serialized
+  consistency with respect to the active session.
 
 ## Topics
 
-### Essentials
+### Initialization
 
-- ``SessionCache/init(store:)``
+- ``init(store:)``
 
-### Error Handling
+### Errors
 
-- ``SessionCache/CacheErrors``
+- ``CacheErrors``
 
-## Key Features
+## Error handling
 
-- **Two-Tier Caching**: In-memory cache with persistent storage backing
-- **Thread Safety**: Actor-based concurrent access
-- **Comprehensive Error Handling**: All errors conform to `LocalizedError`
-- **Efficient Lookups**: Fast in-memory access with persistent fallback
-
-## Error Handling
-
-All errors conform to `LocalizedError`:
+`CacheErrors` conforms to `LocalizedError`:
 
 ```swift
 do {
-    try await cache.fetchMessage(id: messageId)
+    let message = try await session.cache?.fetchMessage(id: messageId)
 } catch let error as SessionCache.CacheErrors {
-    if let localizedError = error as? LocalizedError {
-        print("Error: \(localizedError.errorDescription ?? "")")
-        if let suggestion = localizedError.recoverySuggestion {
-            print("Suggestion: \(suggestion)")
-        }
-    }
+    print(error.errorDescription ?? "")
+    print(error.recoverySuggestion ?? "")
 }
 ```
 
-## See Also
+## See also
 
+- ``PQSSession/cache``
 - ``PQSSessionStore``
-- ``SessionCache/CacheErrors``
+- ``CacheErrors``

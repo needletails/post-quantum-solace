@@ -80,6 +80,10 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     /// A flag indicating if this device is the master device.
     public let isMasterDevice: Bool
 
+    /// Last time this device was observed online by a master device.
+    /// Used for stale linked-device pruning.
+    public let lastSeenAt: Date?
+
     /// Coding keys for encoding and decoding the struct.
     /// Single-letter keys are used for obfuscation and reduced payload size.
     enum CodingKeys: String, CodingKey, Codable, Sendable {
@@ -90,6 +94,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         case deviceName = "e" // Key for the device name
         case hmacData = "f" // Key for the HMAC data
         case isMasterDevice = "g" // Key for the master device flag
+        case lastSeenAt = "h" // Key for last seen timestamp
     }
 
     /// Initializes a new `UserDeviceConfiguration` instance.
@@ -102,6 +107,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
     ///   - deviceName: An optional name for the device.
     ///   - hmacData: The HMAC data for JWT authentication.
     ///   - isMasterDevice: A flag indicating if this is the master device.
+    ///   - lastSeenAt: Last observed online timestamp for stale-device pruning.
     public init(
         deviceId: UUID,
         signingPublicKey: Data,
@@ -109,7 +115,8 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         finalMLKEMPublicKey: MLKEMPublicKey,
         deviceName: String?,
         hmacData: Data,
-        isMasterDevice: Bool
+        isMasterDevice: Bool,
+        lastSeenAt: Date? = nil
     ) {
         self.deviceId = deviceId
         self.signingPublicKey = signingPublicKey
@@ -118,6 +125,7 @@ public struct UserDeviceConfiguration: Codable, Sendable {
         self.deviceName = deviceName
         self.hmacData = hmacData
         self.isMasterDevice = isMasterDevice
+        self.lastSeenAt = lastSeenAt
     }
 
     /// Updates the signing public key with new data.
@@ -245,6 +253,64 @@ public struct LongTermKeys: Codable, Sendable {
 
 /// A struct representing rotated public keys that have been updated during a key rotation event.
 /// Contains the new pre-shared key data and the signed device configuration after rotation.
+public struct RotatedKeysRecovery: Codable, Sendable {
+    /// The sole trusted device that is authorizing prune-and-recover.
+    public let recoveringDeviceId: UUID
+
+    /// Device IDs to remove from the account state because their attestations no longer verify.
+    public let prunedDeviceIds: [UUID]
+
+    /// Signature by the previous account signing key over the recovery authorization payload.
+    public let oldAccountSignature: Data
+
+    public init(
+        recoveringDeviceId: UUID,
+        prunedDeviceIds: [UUID],
+        oldAccountSignature: Data
+    ) {
+        self.recoveringDeviceId = recoveringDeviceId
+        self.prunedDeviceIds = prunedDeviceIds
+        self.oldAccountSignature = oldAccountSignature
+    }
+}
+
+public struct RotatedKeysRecoveryAuthorization: Codable, Sendable {
+    public let secretName: String
+    public let recoveringDeviceId: UUID
+    public let newSigningPublicKey: Data
+    public let newSignedDeviceData: Data
+    public let prunedDeviceIds: [UUID]
+
+    public init(
+        secretName: String,
+        recoveringDeviceId: UUID,
+        newSigningPublicKey: Data,
+        newSignedDeviceData: Data,
+        prunedDeviceIds: [UUID]
+    ) {
+        self.secretName = secretName
+        self.recoveringDeviceId = recoveringDeviceId
+        self.newSigningPublicKey = newSigningPublicKey
+        self.newSignedDeviceData = newSignedDeviceData
+        self.prunedDeviceIds = prunedDeviceIds.sorted { $0.uuidString < $1.uuidString }
+    }
+
+    /// Stable, encoder-independent bytes for recovery proof signatures.
+    /// Keeps signatures consistent even if BinaryCodable versions differ.
+    public func canonicalSigningData() -> Data {
+        let pruned = prunedDeviceIds.map(\.uuidString).joined(separator: ",")
+        let text = """
+        v1
+        secretName=\(secretName)
+        recoveringDeviceId=\(recoveringDeviceId.uuidString)
+        newSigningPublicKeyB64=\(newSigningPublicKey.base64EncodedString())
+        newSignedDeviceDataB64=\(newSignedDeviceData.base64EncodedString())
+        prunedDeviceIds=\(pruned)
+        """
+        return Data(text.utf8)
+    }
+}
+
 public struct RotatedPublicKeys: Codable, Sendable {
     /// The pre-shared key data used for the key rotation.
     public let pskData: Data
@@ -252,17 +318,36 @@ public struct RotatedPublicKeys: Codable, Sendable {
     /// The signed device configuration after the key rotation has been completed.
     public let signedDevice: UserConfiguration.SignedDeviceConfiguration
 
+    /// When non-empty, server replaces the entire `signedDevices` array in one write (required for
+    /// multi-device rotation so `signingPublicKey` and every device attestation stay consistent).
+    public let allSignedDevices: [UserConfiguration.SignedDeviceConfiguration]?
+
+    /// Optional proof signed by the old account signing key authorizing prune-and-recover when only
+    /// one trusted device remains from a corrupted multi-device account state.
+    public let recovery: RotatedKeysRecovery?
+
+    /// Device-signed current key bundle for routine per-device rotation. When present,
+    /// the server verifies it with the device's account-authorized signing public key and
+    /// updates only `signedDeviceKeyBundles`, not account membership.
+    public let deviceKeyBundle: UserConfiguration.SignedDeviceKeyBundle?
+
     /// Initializes a new `RotatedPublicKeys` instance.
     ///
     /// - Parameters:
     ///   - pskData: The pre-shared key data used during the key rotation process.
     ///   - signedDevice: The signed device configuration after key rotation.
+    ///   - allSignedDevices: Full re-signed device list for atomic multi-device updates; omit for single-device.
     public init(
         pskData: Data,
-        signedDevice: UserConfiguration.SignedDeviceConfiguration
+        signedDevice: UserConfiguration.SignedDeviceConfiguration,
+        allSignedDevices: [UserConfiguration.SignedDeviceConfiguration]? = nil,
+        recovery: RotatedKeysRecovery? = nil,
+        deviceKeyBundle: UserConfiguration.SignedDeviceKeyBundle? = nil
     ) {
         self.pskData = pskData
         self.signedDevice = signedDevice
+        self.allSignedDevices = allSignedDevices
+        self.recovery = recovery
+        self.deviceKeyBundle = deviceKeyBundle
     }
 }
-

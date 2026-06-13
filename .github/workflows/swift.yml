@@ -47,9 +47,14 @@ jobs:
         run: |
           set -euo pipefail
           echo "Expecting Xcode major: ${{ matrix.required_xcode_major }}"
-          XCODE_VERSION_LINE=$(xcodebuild -version | head -n 1)
+          XCODE_VERSION_OUTPUT="$(xcodebuild -version)"
+          XCODE_VERSION_LINE="${XCODE_VERSION_OUTPUT%%$'\n'*}"
           echo "$XCODE_VERSION_LINE"
-          XCODE_MAJOR=$(echo "$XCODE_VERSION_LINE" | awk '{print $2}' | cut -d. -f1)
+          if [[ ! "$XCODE_VERSION_LINE" =~ ^Xcode[[:space:]]+([0-9]+) ]]; then
+            echo "Unable to parse Xcode version from: $XCODE_VERSION_LINE" >&2
+            exit 1
+          fi
+          XCODE_MAJOR="${BASH_REMATCH[1]}"
           if [[ "$XCODE_MAJOR" != "${{ matrix.required_xcode_major }}" ]]; then
             echo "Xcode ${{ matrix.required_xcode_major }} is required on this runner. Found: $XCODE_VERSION_LINE" >&2
             exit 1

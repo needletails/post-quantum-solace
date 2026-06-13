@@ -29,6 +29,62 @@ actor SessionSecurityTests {
     let store = TransportStore()
     var session = PQSSession()
 
+    enum CreateSessionFailure: Error {
+        case publishFailed
+    }
+
+    final class CreateSessionFailClosedTransport: SessionTransport, @unchecked Sendable {
+        func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {}
+
+        func findConfiguration(for secretName: String) async throws -> UserConfiguration {
+            throw PQSSession.SessionErrors.userNotFound
+        }
+
+        func publishUserConfiguration(
+            _ configuration: UserConfiguration,
+            recipient secretName: String,
+            recipient identity: UUID
+        ) async throws {
+            throw CreateSessionFailure.publishFailed
+        }
+
+        func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys {
+            OneTimeKeys(curve: nil, mlKEM: nil)
+        }
+
+        func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] {
+            []
+        }
+
+        func updateOneTimeKeys(
+            for secretName: String,
+            deviceId: String,
+            keys: [UserConfiguration.SignedOneTimePublicKey]
+        ) async throws {}
+
+        func updateOneTimeMLKEMKeys(
+            for secretName: String,
+            deviceId: String,
+            keys: [UserConfiguration.SignedMLKEMOneTimeKey]
+        ) async throws {}
+
+        func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
+        func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
+
+        func publishRotatedKeys(
+            for secretName: String,
+            deviceId: String,
+            rotated keys: RotatedPublicKeys
+        ) async throws {}
+
+        func createUploadPacket(
+            secretName: String,
+            deviceId: UUID,
+            recipient: MessageRecipient,
+            metadata: Data
+        ) async throws {}
+    }
+
     // MARK: - Helpers
 
     private func setupSession(secretName: String = "alice", password: String = "123") async throws {
@@ -56,6 +112,33 @@ actor SessionSecurityTests {
     }
 
     // MARK: - Tests
+
+    @Test("createSession rethrows registration publish failures")
+    func testCreateSessionRethrowsRegistrationPublishFailure() async throws {
+        let testSession = PQSSession()
+        let mockUserData = MockUserData(session: testSession)
+        let cacheStore = MockIdentityStore(mockUserData: mockUserData, session: testSession, isSender: true)
+
+        await cacheStore.setLocalSalt("securitySalt")
+        await testSession.setDatabaseDelegate(conformer: cacheStore)
+        await testSession.setTransportDelegate(conformer: CreateSessionFailClosedTransport())
+        testSession.isViable = true
+
+        do {
+            _ = try await testSession.createSession(
+                secretName: "alice",
+                appPassword: "123"
+            ) {}
+            Issue.record("Expected createSession to rethrow registration publish failure")
+        } catch CreateSessionFailure.publishFailed {
+            // Expected.
+        } catch {
+            Issue.record("Expected CreateSessionFailure.publishFailed, got \(error)")
+        }
+
+        await testSession.shutdown()
+        await session.shutdown()
+    }
 
     @Test("verifyAppPassword should return true only for correct password")
     func testVerifyAppPassword() async throws {

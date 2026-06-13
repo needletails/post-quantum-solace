@@ -172,8 +172,37 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     private(set) var receiverDelegate: (any EventReceiver)?
     private(set) var sessionDelegate: (any PQSSessionDelegate)?
     private(set) var eventDelegate: (any SessionEvents)?
-    private var refreshOTKeysTask: Task<Void, Never>?
-    private var refreshMLKEMOTKeysTask: Task<Void, Never>?
+    private var refreshOTKeysTask: Task<Bool, Never>?
+    private var refreshMLKEMOTKeysTask: Task<Bool, Never>?
+
+    var otkUploadCircuitOpen = false
+    var otkUploadCircuitOpenedAt: Date?
+    private let otkCircuitCooldownSeconds: TimeInterval = 300
+
+    private func openOTKUploadCircuitAndScheduleRecovery() {
+        otkUploadCircuitOpen = true
+        otkUploadCircuitOpenedAt = Date()
+        Task { [weak self] in
+            guard let self else { return }
+            try? await self.recoverFromSigningKeyMismatch()
+        }
+    }
+
+    // MARK: - Session Reestablishment Coalescing State
+    //
+    // These dictionaries throttle outbound emissions and coalesce inbound control events
+    // (`peerRefresh`, `linkedDeviceRepair`, `linkedDeviceCompromiseObserved`) so that an
+    // offline mailbox replaying many copies of the same control event collapses to a
+    // single application-visible reaction. State is intentionally in-memory: receiver-side
+    // deduplication on cold start still collapses each backlog burst to one delegate fire
+    // because all backlogged emissions share the same sender-issued `intentId`/`epoch`.
+    //
+    // See `PQSSession+ControlEventCoalescing.swift` for the helpers operating on this state.
+    var senderControlEpisodes: [ControlEventEpisodeKey: ControlEventEpisode] = [:]
+    var senderControlEpochCounters: [SessionReestablishmentKind: UInt64] = [:]
+    var processedControlEvents: [ProcessedControlEventKey: ProcessedControlEventState] = [:]
+    var lastForcedIdentityRefresh: [String: Date] = [:]
+
     /// Optional delegate for device linking operations
     public nonisolated(unsafe) weak var linkDelegate: DeviceLinkingDelegate?
     
@@ -184,16 +213,95 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     var logger = NeedleTailLogger("[PQSSession]")
     var sessionIdentities = Set<String>()
     var addingContactData: Data?
-    var hasRotatedForMaxSkipped = false
-    /// Cooldown gate to prevent rotation storms when an offline backlog triggers repeated
-    /// `.maxSkippedHeadersExceeded` failures in rapid succession.
-    ///
-    /// This is intentionally internal state (actor-isolated) rather than a delegate callback.
-    /// The SDK will attempt rotation once per cooldown window, then rethrow the error so the
-    /// SDK consumer can delete offline backlog and request resend.
-    var maxSkippedRotationCooldownUntil: Date?
+    /// Last successful automatic key-rotation attempt by inbound peer key.
+    /// Key format: "<secretName>|<deviceUUID>".
+    var lastAutomaticRotationAtByPeer: [String: Date] = [:]
+    
+    /// Global timestamp for the last successful automatic key-rotation attempt.
+    /// Helps cap account-wide churn when many peers fail at once.
+    var lastAutomaticRotationAt: Date?
+    
+    /// Cooldown window for automatic rotation attempts per peer.
+    let automaticRotationPeerCooldown: TimeInterval = 60
+    
+    /// Cooldown window for automatic rotation attempts globally.
+    let automaticRotationGlobalCooldown: TimeInterval = 20
 
-    // MARK: - Sesame-style inactive session support (backward compatible)
+    enum ReconciliationFlow: String, Sendable {
+        case inbound
+        case outbound
+    }
+
+    /// Per-peer timestamp for the last key-reconciliation recovery (archive + identity reset).
+    var lastReconciliationAtByPeer: [String: Date] = [:]
+    let reconciliationPeerCooldown: TimeInterval = 15
+
+#if DEBUG
+    /// Test-only hook: when set, replaces decrypted payload bytes before CryptoMessage decode.
+    /// Used to simulate sessionDecryptionError without fighting AEAD.
+    var _testDecryptedPayloadTransform: (@Sendable (Data) -> Data)?
+
+    func setTestDecryptedPayloadTransform(_ transform: (@Sendable (Data) -> Data)?) {
+        _testDecryptedPayloadTransform = transform
+    }
+#endif
+
+    func canAttemptReconciliation(
+        sender: String,
+        deviceId: UUID,
+        flow: ReconciliationFlow = .inbound,
+        now: Date = Date()
+    ) -> Bool {
+        let key = reconciliationPeerKey(sender: sender, deviceId: deviceId, flow: flow)
+        if let last = lastReconciliationAtByPeer[key],
+           now.timeIntervalSince(last) < reconciliationPeerCooldown { return false }
+        return true
+    }
+
+    func markReconciliationAttempt(
+        sender: String,
+        deviceId: UUID,
+        flow: ReconciliationFlow = .inbound,
+        now: Date = Date()
+    ) {
+        let key = reconciliationPeerKey(sender: sender, deviceId: deviceId, flow: flow)
+        pruneRecoveryTimestamps(&lastReconciliationAtByPeer, ttl: reconciliationPeerCooldown, now: now)
+        lastReconciliationAtByPeer[key] = now
+    }
+
+    private func reconciliationPeerKey(sender: String, deviceId: UUID, flow: ReconciliationFlow) -> String {
+        "\(automaticRotationPeerKey(sender: sender, deviceId: deviceId))|\(flow.rawValue)"
+    }
+
+    /// Unified inbound-failure policy table.
+    /// Keys are either:
+    /// - "<sender>|<deviceUUID>|<messageId>" for explicit whole-tuple quarantine
+    /// - "<sender>|<deviceUUID>|<messageId>|<failureClass>" for failure-class suppression
+    var inboundFailurePolicyUntil: [String: Date] = [:]
+    
+    /// Suppression duration for replayed/failed inbound frames.
+    let inboundFailurePolicyTTL: TimeInterval = 60 * 10
+    
+    /// Last resend/refresh control request timestamp per request key.
+    /// Key format: "<secretName>|<deviceUUID>|<failedSharedMessageId>".
+    var lastResendRequestAtByPeer: [String: Date] = [:]
+
+    struct PendingResendAfterReestablishment: Sendable, Equatable {
+        let senderName: String
+        let senderDeviceId: UUID
+        let failedSharedMessageId: String
+        let failureClass: String
+        let createdAt: Date
+    }
+
+    /// Failed inbound messages whose replay should be requested only after the
+    /// peer/device has completed the reestablishment round.
+    var pendingResendAfterReestablishment: [String: PendingResendAfterReestablishment] = [:]
+    
+    /// Cooldown for peer resend/refresh requests triggered by inbound failures.
+    let peerResendRequestCooldown: TimeInterval = 15
+
+    // MARK: - Inactive session support (backward compatible)
 
     /// Determines how ratchet invalidation is handled.
     ///
@@ -203,6 +311,27 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         case archive
         case drop
     }
+
+    enum InactiveSessionSnapshotScope: Sendable {
+        case peer(secretName: String)
+        case allPeersExcludingLocalUser
+    }
+
+    /// Strategy used by the one-time pre-key refresh tasks
+    /// (``refreshOneTimeKeysTask(policy:)`` and
+    /// ``refreshMLKEMOneTimeKeysTask(policy:)``).
+    public enum OneTimeKeyRefreshPolicy: Sendable {
+        /// Let the SDK decide based on remaining server-side OTK count and
+        /// configured low-water marks.
+        case automatic
+        /// Top up the local pool back to ``PQSSessionConstants/oneTimeKeyBatchSize``
+        /// even if the server still reports a healthy count.
+        case replenishBatch
+        /// Generate a brand-new batch and replace the *current device's* OTKs
+        /// on the server, deleting the previous batch first. Used during
+        /// device-key rotation flows.
+        case replaceCurrentDeviceBatch
+    }
     
     enum KeyLoadingState: Sendable {
         case initial, rotating, complete
@@ -211,6 +340,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     var keyLoadingState: KeyLoadingState = .initial
     func setKeyLoadingState(_ newState: KeyLoadingState) {
         keyLoadingState = newState
+    }
+
+    var pendingLinkedDeviceRepair = false
+    func setPendingLinkedDeviceRepair(_ isPending: Bool) {
+        pendingLinkedDeviceRepair = isPending
+    }
+    func hasPendingLinkedDeviceRepair() -> Bool {
+        pendingLinkedDeviceRepair
     }
     
     //MARK: Media Encryption
@@ -249,6 +386,290 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     // Sets the application password
     func setAppPassword(_ password: String) async {
         _appPassword = password
+    }
+    
+    /// Builds a stable key for peer-scoped automatic rotation throttling.
+    func automaticRotationPeerKey(sender: String, deviceId: UUID) -> String {
+        "\(sender)|\(deviceId.uuidString)"
+    }
+    
+    enum InboundFailureDisposition: Sendable, Equatable {
+        case dropAndIgnore
+        case reconcileThenRequestResend
+        case rotateAndRequestResend
+        case rotate
+    }
+
+    enum InboundFailureKind: Sendable, Equatable {
+        case securityViolation
+        case sessionRepairNeeded
+        case payloadRepairNeeded
+        case dropOrQuarantine
+    }
+
+    enum PeerIdentityRefreshImpact: Sendable, Equatable {
+        case noSessionImpact
+        case resendRecommended
+        case freshSessionRecommended
+    }
+
+    struct PeerIdentityRefreshAssessment: Sendable {
+        let identities: [SessionIdentity]
+        let impact: PeerIdentityRefreshImpact
+    }
+    
+    struct InboundFailureClassification: Sendable {
+        let failureClass: String
+        let disposition: InboundFailureDisposition
+        let kind: InboundFailureKind
+
+        init(
+            failureClass: String,
+            disposition: InboundFailureDisposition,
+            kind: InboundFailureKind? = nil
+        ) {
+            self.failureClass = failureClass
+            self.disposition = disposition
+            self.kind = kind ?? {
+                switch disposition {
+                case .dropAndIgnore:
+                    return .dropOrQuarantine
+                case .reconcileThenRequestResend:
+                    return .sessionRepairNeeded
+                case .rotateAndRequestResend, .rotate:
+                    return .securityViolation
+                }
+            }()
+        }
+    }
+    
+    /// Builds a stable key for inbound failure policy.
+    func inboundFailureKey(sender: String, deviceId: UUID, messageId: String, failureClass: String? = nil) -> String {
+        guard let failureClass else {
+            return "\(sender)|\(deviceId.uuidString)|\(messageId)"
+        }
+        return "\(sender)|\(deviceId.uuidString)|\(messageId)|\(failureClass)"
+    }
+    
+    /// Builds a stable key for whole-message inbound failure quarantine.
+    func inboundFailureQuarantineKey(sender: String, deviceId: UUID, messageId: String) -> String {
+        "\(sender)|\(deviceId.uuidString)|\(messageId)"
+    }
+
+    /// Builds a stable key for resend requests scoped to a failed message for a peer/device.
+    func peerResendRequestKey(sender: String, deviceId: UUID, failedMessageId: String) -> String {
+        "\(sender)|\(deviceId.uuidString)|\(failedMessageId)"
+    }
+    
+    /// Drops expired entries from inbound-failure policy state.
+    func cleanupInboundFailurePolicy(now: Date = Date()) {
+        inboundFailurePolicyUntil = inboundFailurePolicyUntil.filter { _, expiry in
+            expiry > now
+        }
+    }
+    
+    /// Returns `true` when this inbound tuple has been recently quarantined.
+    func isInboundFailureQuarantined(sender: String, deviceId: UUID, messageId: String, now: Date = Date()) -> Bool {
+        cleanupInboundFailurePolicy(now: now)
+        let key = inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: messageId)
+        guard let expiry = inboundFailurePolicyUntil[key] else {
+            return false
+        }
+        return expiry > now
+    }
+    
+    /// Quarantines a failed inbound tuple to suppress replay-induced loops.
+    func quarantineInboundFailure(sender: String, deviceId: UUID, messageId: String, now: Date = Date()) {
+        cleanupInboundFailurePolicy(now: now)
+        let key = inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: messageId)
+        inboundFailurePolicyUntil[key] = now.addingTimeInterval(inboundFailurePolicyTTL)
+    }
+    
+    /// Returns whether a specific inbound failure class should be suppressed for this tuple.
+    func shouldSuppressInboundFailure(_ inbound: InboundTaskMessage, failureClass: String, now: Date = Date()) -> Bool {
+        cleanupInboundFailurePolicy(now: now)
+        let key = inboundFailureKey(
+            sender: inbound.senderSecretName,
+            deviceId: inbound.senderDeviceId,
+            messageId: inbound.sharedMessageId,
+            failureClass: failureClass
+        )
+        guard let expiry = inboundFailurePolicyUntil[key] else {
+            return false
+        }
+        return expiry > now
+    }
+    
+    /// Records failure-class suppression for a final inbound failure.
+    /// Intentionally does not quarantine the whole message tuple: resend recovery reuses the same
+    /// `sharedMessageId`, so tuple-wide quarantine would drop the replay before decryption.
+    func markInboundFailure(_ inbound: InboundTaskMessage, failureClass: String, now: Date = Date()) {
+        markInboundFailure(
+            sender: inbound.senderSecretName,
+            deviceId: inbound.senderDeviceId,
+            messageId: inbound.sharedMessageId,
+            failureClass: failureClass,
+            now: now)
+    }
+
+    /// Records failure-class suppression once the associated recovery side effect is accepted.
+    func markInboundFailure(
+        sender: String,
+        deviceId: UUID,
+        messageId: String,
+        failureClass: String,
+        now: Date = Date()
+    ) {
+        cleanupInboundFailurePolicy(now: now)
+        let key = inboundFailureKey(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: messageId,
+            failureClass: failureClass
+        )
+        inboundFailurePolicyUntil[key] = now.addingTimeInterval(inboundFailurePolicyTTL)
+    }
+
+    func takeInboundFailureClasses(
+        sender: String,
+        deviceId: UUID,
+        messageId: String,
+        now: Date = Date()
+    ) -> [String] {
+        cleanupInboundFailurePolicy(now: now)
+        let prefix = "\(sender)|\(deviceId.uuidString)|\(messageId)|"
+        let matches = inboundFailurePolicyUntil.keys.filter { $0.hasPrefix(prefix) }
+        for key in matches {
+            inboundFailurePolicyUntil.removeValue(forKey: key)
+        }
+        return matches.map { String($0.dropFirst(prefix.count)) }
+    }
+    
+    /// Returns whether automatic key rotation is currently allowed for this peer.
+    func canAttemptAutomaticRotation(sender: String, deviceId: UUID, now: Date = Date()) -> Bool {
+        let peerKey = automaticRotationPeerKey(sender: sender, deviceId: deviceId)
+        if let lastGlobal = lastAutomaticRotationAt, now.timeIntervalSince(lastGlobal) < automaticRotationGlobalCooldown {
+            return false
+        }
+        if let lastPeer = lastAutomaticRotationAtByPeer[peerKey], now.timeIntervalSince(lastPeer) < automaticRotationPeerCooldown {
+            return false
+        }
+        return true
+    }
+    
+    /// Records a successful automatic rotation attempt for cooldown gating.
+    func markAutomaticRotationAttempt(sender: String, deviceId: UUID, now: Date = Date()) {
+        let peerKey = automaticRotationPeerKey(sender: sender, deviceId: deviceId)
+        lastAutomaticRotationAt = now
+        pruneRecoveryTimestamps(&lastAutomaticRotationAtByPeer, ttl: automaticRotationPeerCooldown, now: now)
+        lastAutomaticRotationAtByPeer[peerKey] = now
+    }
+
+    /// Bounds an in-memory recovery bookkeeping map: drops entries whose cooldown/TTL
+    /// has already lapsed (they can no longer influence gating decisions) and evicts
+    /// oldest entries beyond `PQSSessionConstants.recoveryTrackingMaxEntries`.
+    private func pruneRecoveryTimestamps(
+        _ map: inout [String: Date],
+        ttl: TimeInterval,
+        now: Date
+    ) {
+        map = map.filter { now.timeIntervalSince($0.value) < ttl }
+        let cap = PQSSessionConstants.recoveryTrackingMaxEntries
+        guard map.count >= cap else { return }
+        let overflowKeys = map
+            .sorted { $0.value < $1.value }
+            .prefix(map.count - cap + 1)
+            .map(\.key)
+        for key in overflowKeys {
+            map.removeValue(forKey: key)
+        }
+    }
+    
+    /// Returns whether a resend/refresh control request can be sent for this failed message.
+    func canSendPeerResendRequest(sender: String, deviceId: UUID, failedMessageId: String, now: Date = Date()) -> Bool {
+        let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        if let lastSentAt = lastResendRequestAtByPeer[requestKey],
+           now.timeIntervalSince(lastSentAt) < peerResendRequestCooldown {
+            return false
+        }
+        return true
+    }
+    
+    /// Marks a resend/refresh control request as sent for this failed message.
+    func markPeerResendRequestSent(sender: String, deviceId: UUID, failedMessageId: String, now: Date = Date()) {
+        let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        pruneRecoveryTimestamps(&lastResendRequestAtByPeer, ttl: peerResendRequestCooldown, now: now)
+        lastResendRequestAtByPeer[requestKey] = now
+    }
+
+    func deferPeerResendUntilReestablished(
+        sender: String,
+        deviceId: UUID,
+        failedMessageId: String,
+        failureClass: String,
+        now: Date = Date()
+    ) {
+        cleanupPendingResendAfterReestablishment(now: now)
+        let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        pendingResendAfterReestablishment[requestKey] = PendingResendAfterReestablishment(
+            senderName: sender,
+            senderDeviceId: deviceId,
+            failedSharedMessageId: failedMessageId,
+            failureClass: failureClass,
+            createdAt: now)
+        let delegate = sessionDelegate
+        Task {
+            await delegate?.inboundRecoveryDeferred(
+                senderSecretName: sender,
+                senderDeviceId: deviceId,
+                failedSharedMessageId: failedMessageId,
+                failureClass: failureClass)
+        }
+    }
+
+    func hasPendingResendAfterReestablishment(
+        sender: String,
+        deviceId: UUID,
+        now: Date = Date()
+    ) -> Bool {
+        cleanupPendingResendAfterReestablishment(now: now)
+        return pendingResendAfterReestablishment.values.contains { pending in
+            pending.senderName == sender && pending.senderDeviceId == deviceId
+        }
+    }
+
+    func takePendingResendsAfterReestablishment(
+        sender: String,
+        deviceId: UUID,
+        satisfiedSharedMessageId: String? = nil,
+        now: Date = Date()
+    ) -> [PendingResendAfterReestablishment] {
+        cleanupPendingResendAfterReestablishment(now: now)
+        let matches = pendingResendAfterReestablishment.filter { _, pending in
+            pending.senderName == sender && pending.senderDeviceId == deviceId
+        }
+        for (key, _) in matches {
+            pendingResendAfterReestablishment.removeValue(forKey: key)
+        }
+        return matches.values.filter { pending in
+            pending.failedSharedMessageId != satisfiedSharedMessageId
+        }
+    }
+
+    private func cleanupPendingResendAfterReestablishment(now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-inboundFailurePolicyTTL)
+        pendingResendAfterReestablishment = pendingResendAfterReestablishment.filter { _, pending in
+            pending.createdAt > cutoff
+        }
+        let cap = PQSSessionConstants.recoveryTrackingMaxEntries
+        guard pendingResendAfterReestablishment.count >= cap else { return }
+        let overflowKeys = pendingResendAfterReestablishment
+            .sorted { $0.value.createdAt < $1.value.createdAt }
+            .prefix(pendingResendAfterReestablishment.count - cap + 1)
+            .map(\.key)
+        for key in overflowKeys {
+            pendingResendAfterReestablishment.removeValue(forKey: key)
+        }
     }
 
     /// Sets the logger log level for both the session and task processor
@@ -290,7 +711,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// Deletes expired/excess inactive session snapshots for a given peer device.
-    private func cleanupInactiveSessionSnapshots(
+    func cleanupInactiveSessionSnapshots(
         cache: SessionCache,
         symmetricKey: SymmetricKey,
         secretName: String,
@@ -335,24 +756,74 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
     
     
-    /// Keeps a record of inactive session identities for authorized past messages
+    /// Prunes all stale inactive session snapshots across every `(secretName, deviceId)` pair.
+    /// Called at session startup to clean up archives that expired while the app was offline.
+    func cleanupAllInactiveSessionSnapshots() async {
+        guard let cache else { return }
+        do {
+            let symmetricKey = try await getDatabaseSymmetricKey()
+            let all = try await cache.fetchSessionIdentities()
+
+            var seen = Set<String>()
+            for identity in all {
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+                guard isInactiveSessionIdentity(deviceName: props.deviceName) else { continue }
+                let key = "\(props.secretName)|\(props.deviceId)"
+                guard seen.insert(key).inserted else { continue }
+                await cleanupInactiveSessionSnapshots(
+                    cache: cache,
+                    symmetricKey: symmetricKey,
+                    secretName: props.secretName,
+                    deviceId: props.deviceId)
+            }
+        } catch {
+            logger.log(level: .warning, message: "Startup inactive session cleanup failed: \(error)")
+        }
+    }
+
+    /// Keeps a record of inactive session identities for one peer.
     func createInactiveSessionSnapshot(
-        for secretName: String? = nil,
+        for secretName: String,
+        policy: RatchetInvalidationPolicy
+    ) async throws {
+        try await createInactiveSessionSnapshots(
+            scope: .peer(secretName: secretName),
+            policy: policy
+        )
+    }
+
+    /// Keeps a record of inactive session identities for all peers except the local user.
+    func createInactiveSessionSnapshotsForAllPeers(
+        policy: RatchetInvalidationPolicy
+    ) async throws {
+        try await createInactiveSessionSnapshots(
+            scope: .allPeersExcludingLocalUser,
+            policy: policy
+        )
+    }
+
+    /// Keeps a record of inactive session identities for authorized past messages.
+    private func createInactiveSessionSnapshots(
+        scope: InactiveSessionSnapshotScope,
         policy: RatchetInvalidationPolicy
     ) async throws {
         let symmetricKey = try await getDatabaseSymmetricKey()
         let mySecretName = await sessionContext?.sessionUser.secretName
         guard let cache else { return }
         for identity in try await cache.fetchSessionIdentities() {
-            guard var props = await identity.props(symmetricKey: symmetricKey) else { continue }
-            if let secretName, props.secretName != secretName { continue }
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            switch scope {
+            case .peer(let secretName):
+                guard props.secretName == secretName else { continue }
+            case .allPeersExcludingLocalUser:
+                // Global archival exists for compromise recovery, but our own identities are not
+                // used for peer-to-peer ratchet reestablishment.
+                if let mySecretName, props.secretName == mySecretName { continue }
+            }
             // Never invalidate archived/inactive snapshots.
             if isInactiveSessionIdentity(deviceName: props.deviceName) { continue }
-            // When invalidating globally, avoid touching our own identities; those are not used for
-            // peer-to-peer ratchet reestablishment.
-            if secretName == nil, let mySecretName, props.secretName == mySecretName { continue }
             guard props.state != nil else { continue }
-            guard let props = try await identity.props(symmetricKey: symmetricKey) else {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else {
                 throw RatchetError.missingProps
             }
             switch policy {
@@ -420,19 +891,42 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
 
-    // Sets the receiver delegate
+    /// Sets (or clears) the application-facing event receiver.
+    ///
+    /// The receiver hears about lifecycle changes — created/updated/deleted
+    /// messages, new contacts, new channels — and is what your UI layer
+    /// usually conforms to. Pass `nil` to detach the current receiver
+    /// (e.g. on logout). Prefer ``configure(with:)`` for the initial wiring.
+    ///
+    /// - Parameter conformer: An ``EventReceiver`` conformer or `nil`.
     public func setReceiverDelegate(conformer: (any EventReceiver)?) {
         receiverDelegate = conformer
     }
 
-    // Sets the crypto session delegate
+    /// Sets the policy delegate for sender resolution, persistence, and
+    /// compromise notifications.
+    ///
+    /// Unlike ``setReceiverDelegate(conformer:)`` this method only updates
+    /// the delegate when a non-`nil` value is passed; pass an explicit
+    /// implementation to swap policies without nulling out the current one.
+    ///
+    /// - Parameter conformer: A ``PQSSessionDelegate`` conformer.
     public func setPQSSessionDelegate(conformer: (any PQSSessionDelegate)?) async {
         if let conformer {
             sessionDelegate = conformer
         }
     }
 
-    // Sets the session event delegate
+    /// Overrides the default ``SessionEvents`` implementation with a custom
+    /// conformer.
+    ///
+    /// `SessionEvents` is an *override surface* — the SDK ships a complete
+    /// default in a protocol extension. Only call this when you need to
+    /// replace the default contact, friendship, or message-state
+    /// side effects. As with ``setPQSSessionDelegate(conformer:)``, this
+    /// method only updates the delegate when a non-`nil` value is passed.
+    ///
+    /// - Parameter conformer: A ``SessionEvents`` conformer.
     public func setSessionEventDelegate(conformer: (any SessionEvents)?) async {
         if let conformer {
             eventDelegate = conformer
@@ -509,8 +1003,13 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         case invalidKeyId = "The Key ID is invalid."
         case drainedKeys = "The Local Keys are drained."
         case longTermKeyRotationFailed = "Failed to rotate the long-term key."
+        case signingKeyOutOfSync = "Local signing key is out of sync with server-trusted account state."
+        case peerSigningKeyOutOfSync = "Peer account signing key is out of sync with the locally pinned contact identity."
+        case compromiseRotationRequiresMasterDevice = "Compromise key rotation is restricted to the master device."
         case invalidOperatorCount = "The number of operators must be greater than 0."
-        case invalidMemberCount = "The number of members must be greater than 2."
+        case invalidMemberCount = "The number of members must be at least 2."
+        case signingKeyMismatchWithServer = "Local signing key does not match server's stored device signing key."
+        case deviceIdentityCorrupted = "This device's identity is unrecoverable; re-link from your master device."
         
         public var errorDescription: String? {
             rawValue
@@ -538,6 +1037,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 return "The cryptographic signature verification failed"
             case .missingSignature:
                 return "The expected signature was not found"
+            case .peerSigningKeyOutOfSync:
+                return "The peer's account signing key no longer matches the locally pinned contact identity"
             case .invalidPassword:
                 return "The provided password is incorrect or invalid"
             case .saltError:
@@ -567,24 +1068,51 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 return "Verify the password is correct and try again"
             case .saltError:
                 return "Ensure the device salt is properly initialized"
+            case .signingKeyOutOfSync:
+                return "Re-link this device from a trusted device or reset account keys"
+            case .peerSigningKeyOutOfSync:
+                return "Pause communication with this peer until the user verifies and accepts the new safety number"
+            case .compromiseRotationRequiresMasterDevice:
+                return "Initiate compromise rotation from the master device, then re-link secondary devices if needed"
+            case .deviceIdentityCorrupted:
+                return "This device's local identity no longer matches the server. Re-link this device from your master device."
             default:
                 return nil
             }
         }
     }
 
-    /// A struct representing a bundle of cryptographic data for a device.
+    /// A bundle of cryptographic material produced for a single device.
+    ///
+    /// Returned by ``createDeviceCryptographicBundle(isMaster:)`` during
+    /// account creation and device-link bootstrap. Bundles the freshly
+    /// generated long-term ``DeviceKeys``, the resulting
+    /// ``UserDeviceConfiguration`` (signed and ready to be added to a
+    /// ``UserConfiguration``), and the in-memory ``UserConfiguration``
+    /// snapshot the SDK uses to publish the new device.
     public struct CryptographicBundle: Sendable {
-        public let deviceKeys: DeviceKeys // Keys associated with the device
-        public let deviceConfiguration: UserDeviceConfiguration // Configuration for the device
-        public let userConfiguration: UserConfiguration // User configuration associated with the device
+        /// Long-term curve / signing / ML-KEM material for this device.
+        public let deviceKeys: DeviceKeys
+        /// Per-device configuration to be added to the account-level
+        /// ``UserConfiguration``.
+        public let deviceConfiguration: UserDeviceConfiguration
+        /// The (possibly newly minted) account-level ``UserConfiguration``
+        /// containing this device.
+        public let userConfiguration: UserConfiguration
     }
 
-    /// A struct to represent a key pair with a UUID for both public and private keys.
+    /// A typed `(publicKey, privateKey)` pair tagged with a stable UUID.
+    ///
+    /// The SDK uses `KeyPair` for one-time prekey generation and for the
+    /// long-term signing / agreement keys so every key has a unique
+    /// identifier independent of its serialized representation.
     public struct KeyPair<Public, Private> {
-        public let id: UUID // Unique identifier for the key pair
-        public let publicKey: Public // Public key
-        public let privateKey: Private // Private key
+        /// Stable identifier for the pair.
+        public let id: UUID
+        /// Public half of the pair.
+        public let publicKey: Public
+        /// Private half of the pair. Treat as secret.
+        public let privateKey: Private
 
         public init(id: UUID, publicKey: Public, privateKey: Private) {
             self.id = id
@@ -675,7 +1203,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             finalMLKEMPublicKey: mlKEMPublicKey,
             deviceName: getDeviceName(),
             hmacData: hmacData,
-            isMasterDevice: isMaster
+            isMasterDevice: isMaster,
+            lastSeenAt: Date()
         )
 
         // Sign the device configuration
@@ -701,12 +1230,22 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             )
         }
 
+        let signedDeviceKeyBundle = try UserConfiguration.SignedDeviceKeyBundle(
+            bundle: .init(
+                deviceId: deviceId,
+                longTermPublicKey: longTerm.curve.publicKey.rawRepresentation,
+                finalMLKEMPublicKey: mlKEMPublicKey
+            ),
+            signingKey: longTerm.signing
+        )
+
         // Create the user configuration with the signed device and keys
         let userConfiguration = UserConfiguration(
             signingPublicKey: longTerm.signing.publicKey.rawRepresentation,
             signedDevices: [signedDeviceConfiguration],
             signedOneTimePublicKeys: signedOneTimePublicKeys,
-            signedMLKEMOneTimePublicKeys: signedPublicMLKEMOneTimeKeys
+            signedMLKEMOneTimePublicKeys: signedPublicMLKEMOneTimeKeys,
+            signedDeviceKeyBundles: [signedDeviceKeyBundle]
         )
 
         // Return the complete cryptographic bundle
@@ -745,7 +1284,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         createInitialTransport: @Sendable @escaping () async throws -> Void
     ) async throws -> PQSSession {
         await setAppPassword(appPassword)
-        let secretName = secretName.lowercased()
+        // Match the canonical normalization used by the transport layer and
+        // by `createContact` so the local user's identity stays consistent
+        // with how it'll be referenced by every other code path.
+        let secretName = secretName.pqsCanonicalSecretName
         // Ensure identity store is initialized
         guard let cache else {
             throw SessionErrors.databaseNotInitialized
@@ -846,6 +1388,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             }
         } catch {
             logger.log(level: .error, message: "Error Creating Session, \(error)")
+            throw error
         }
         return self
     }
@@ -885,7 +1428,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             finalMLKEMPublicKey: .init(Data(count: 1568)),
             deviceName: bundle.deviceConfiguration.deviceName,
             hmacData: bundle.deviceConfiguration.hmacData,
-            isMasterDevice: bundle.deviceConfiguration.isMasterDevice
+            isMasterDevice: bundle.deviceConfiguration.isMasterDevice,
+            lastSeenAt: Date()
         )
 
         // Encode the device configuration to prepare for QR code generation
@@ -909,13 +1453,62 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             // Generate a symmetric key for encrypting local database models
             let databaseEncryptionKey = generateDatabaseEncryptionKey()
 
-            // Create a new user configuration with the provided device keys and configurations
-            let userConfiguration = try await createNewUser(
-                configuration: bundle.userConfiguration,
-                signingPrivateKeyData: bundle.deviceKeys.signingPrivateKey,
-                devices: credentials.devices,
-                keys: bundle.userConfiguration.getVerifiedCurveKeys(deviceId: bundle.deviceKeys.deviceId),
-                mlKEMKeys: bundle.userConfiguration.getVerifiedMLKEMKeys(deviceId: bundle.deviceKeys.deviceId))
+            let userConfiguration: UserConfiguration
+            if var linkedConfiguration = credentials.userConfiguration {
+                let verifiedDevices = try linkedConfiguration.getVerifiedDevices()
+                guard let localDevice = verifiedDevices.first(where: { $0.deviceId == bundle.deviceKeys.deviceId }) else {
+                    throw SessionErrors.invalidDeviceIdentity
+                }
+                let localSigningKey = try Curve25519.Signing.PrivateKey(
+                    rawRepresentation: bundle.deviceKeys.signingPrivateKey)
+                guard localDevice.signingPublicKey == localSigningKey.publicKey.rawRepresentation else {
+                    throw SessionErrors.deviceIdentityCorrupted
+                }
+
+                let localCurveKeys = bundle.userConfiguration.signedOneTimePublicKeys.filter {
+                    $0.deviceId == bundle.deviceKeys.deviceId
+                }
+                var curveKeysById = Dictionary(uniqueKeysWithValues: linkedConfiguration.signedOneTimePublicKeys.map {
+                    ($0.id, $0)
+                })
+                for key in localCurveKeys {
+                    curveKeysById[key.id] = key
+                }
+                linkedConfiguration.signedOneTimePublicKeys = Array(curveKeysById.values)
+
+                let localMLKEMKeys = bundle.userConfiguration.signedMLKEMOneTimePublicKeys.filter {
+                    $0.deviceId == bundle.deviceKeys.deviceId
+                }
+                var mlkemKeysById = Dictionary(uniqueKeysWithValues: linkedConfiguration.signedMLKEMOneTimePublicKeys.map {
+                    ($0.id, $0)
+                })
+                for key in localMLKEMKeys {
+                    mlkemKeysById[key.id] = key
+                }
+                linkedConfiguration.signedMLKEMOneTimePublicKeys = Array(mlkemKeysById.values)
+
+                if let localBundle = bundle.userConfiguration.signedDeviceKeyBundles.last(where: {
+                    $0.id == bundle.deviceKeys.deviceId
+                }), !linkedConfiguration.signedDeviceKeyBundles.contains(where: {
+                    $0.id == bundle.deviceKeys.deviceId
+                }) {
+                    linkedConfiguration.signedDeviceKeyBundles.append(localBundle)
+                }
+                try validateLinkedDeviceConfiguration(
+                    linkedConfiguration,
+                    localDeviceId: bundle.deviceKeys.deviceId
+                )
+                userConfiguration = linkedConfiguration
+            } else {
+                // Legacy link delegates only return bare devices. Keep this as a compatibility
+                // fallback, but modern device linking should supply `userConfiguration`.
+                userConfiguration = try await createNewUser(
+                    configuration: bundle.userConfiguration,
+                    signingPrivateKeyData: bundle.deviceKeys.signingPrivateKey,
+                    devices: credentials.devices,
+                    keys: bundle.userConfiguration.getVerifiedCurveKeys(deviceId: bundle.deviceKeys.deviceId),
+                    mlKEMKeys: bundle.userConfiguration.getVerifiedMLKEMKeys(deviceId: bundle.deviceKeys.deviceId))
+            }
 
             // Create a new session context with the session user and user configuration
             var sessionContext = SessionContext(
@@ -986,6 +1579,242 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
 
+    /// The local user's stable `SecurityIdentity`, suitable for computing safety
+    /// numbers against a remote contact (`SecurityIdentity.safetyNumber(local:remote:)`).
+    ///
+    /// Returns `nil` if the session is not yet initialized.
+    public func localSecurityIdentity() async -> SecurityIdentity? {
+        guard let context = await sessionContext else { return nil }
+        return SecurityIdentity(
+            secretName: context.sessionUser.secretName,
+            configuration: context.activeUserConfiguration
+        )
+    }
+
+    private func validateLinkedDeviceConfiguration(
+        _ configuration: UserConfiguration,
+        localDeviceId: UUID
+    ) throws {
+        let verified = try configuration.getVerifiedDevices()
+        guard verified.count == configuration.signedDevices.count,
+              verified.contains(where: { $0.deviceId == localDeviceId })
+        else {
+            throw SessionErrors.invalidSignature
+        }
+
+        for signedBundle in configuration.signedDeviceKeyBundles {
+            guard let device = verified.first(where: { $0.deviceId == signedBundle.id }) else {
+                throw SessionErrors.invalidDeviceIdentity
+            }
+            let deviceSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
+            guard let bundle = try signedBundle.verified(using: deviceSigningKey),
+                  bundle.deviceId == device.deviceId
+            else {
+                throw SessionErrors.invalidSignature
+            }
+        }
+    }
+
+    func userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+        _ incomingConfiguration: UserConfiguration,
+        currentContext: SessionContext
+    ) -> UserConfiguration {
+        let deviceId = currentContext.sessionUser.deviceId
+        guard let verifiedDevice = try? incomingConfiguration.getVerifiedDevices().first(where: {
+            $0.deviceId == deviceId
+        }),
+              let deviceSigningKey = try? Curve25519.Signing.PublicKey(
+                rawRepresentation: verifiedDevice.signingPublicKey
+              )
+        else {
+            return incomingConfiguration
+        }
+
+        let localCurveKeys = currentContext.activeUserConfiguration.signedOneTimePublicKeys
+            .filter { $0.deviceId == deviceId }
+            .filter { (try? $0.verified(using: deviceSigningKey)) != nil }
+        let localMLKEMKeys = currentContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
+            .filter { $0.deviceId == deviceId }
+            .filter { (try? $0.verified(using: deviceSigningKey)) != nil }
+
+        guard !localCurveKeys.isEmpty || !localMLKEMKeys.isEmpty else {
+            return incomingConfiguration
+        }
+
+        var mergedConfiguration = incomingConfiguration
+        if !localCurveKeys.isEmpty {
+            mergedConfiguration.signedOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
+            mergedConfiguration.signedOneTimePublicKeys.append(contentsOf: localCurveKeys)
+        }
+        if !localMLKEMKeys.isEmpty {
+            mergedConfiguration.signedMLKEMOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
+            mergedConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: localMLKEMKeys)
+        }
+
+        return mergedConfiguration
+    }
+
+    /// Adopts a `UserConfiguration` that has already been verified against its own
+    /// `signingPublicKey` (e.g. one returned from the server's `findConfiguration`
+    /// endpoint, where every signed entry was produced by the master's account-level
+    /// signing key).
+    ///
+    /// Use this from refresh / sync paths where the configuration originates from a
+    /// trusted, already-verified source. Unlike `updateUserConfiguration(_:)`, this
+    /// does NOT re-sign anything with the local device's per-device signing key, so it
+    /// is safe on linked (child) devices whose per-device signing key intentionally
+    /// differs from the account-level `signingPublicKey`.
+    ///
+    /// ## Trust model (TOFU)
+    /// The account-level `signingPublicKey` is pinned on first set. A subsequent
+    /// adoption whose `signingPublicKey` differs from the locally pinned value is
+    /// rejected with `SessionErrors.signingKeyOutOfSync`. Legitimate rotations must
+    /// arrive over a verified rotation channel (e.g. a master-signed reprovisioning
+    /// bundle via `installLinkedDeviceReprovisioningBundle`, or this device performing
+    /// its own `rotateKeysOnPotentialCompromise`), not a server refresh.
+    ///
+    /// - Parameter configuration: The fully-signed `UserConfiguration` to adopt.
+    /// - Throws: `SessionErrors.invalidSignature` if `configuration` is not
+    ///           internally consistent; `SessionErrors.signingKeyOutOfSync` if the
+    ///           account signing key differs from the pinned value; plus the usual
+    ///           session/cache errors.
+    public func adoptVerifiedUserConfiguration(_ configuration: UserConfiguration) async throws {
+        // 1. Internal consistency: every signed device must verify under the
+        //    configuration's own signingPublicKey. `getVerifiedDevices` silently filters
+        //    bad entries via compactMap, so cross-check the count.
+        let verified = try configuration.getVerifiedDevices()
+        guard verified.count == configuration.signedDevices.count else {
+            throw SessionErrors.invalidSignature
+        }
+        for signedBundle in configuration.signedDeviceKeyBundles {
+            guard let device = verified.first(where: { $0.deviceId == signedBundle.id }) else {
+                throw SessionErrors.invalidDeviceIdentity
+            }
+            let deviceSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
+            guard let bundle = try signedBundle.verified(using: deviceSigningKey),
+                  bundle.deviceId == device.deviceId
+            else {
+                throw SessionErrors.invalidSignature
+            }
+        }
+
+        guard let cache else { return }
+        let data = try await cache.fetchLocalSessionContext()
+        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
+            throw SessionErrors.sessionDecryptionError
+        }
+
+        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+
+        // 2. TOFU pin on the account-level signing key. A change here is a security
+        //    event (potential server-side identity swap) and must NOT be silently
+        //    accepted. Legitimate rotations install via the reprovisioning bundle
+        //    or `rotateKeysOnPotentialCompromise`, both of which update the local
+        //    pin first, so a subsequent refresh sees a matching key.
+        let pinnedKey = sessionContext.activeUserConfiguration.signingPublicKey
+        if !pinnedKey.isEmpty, pinnedKey != configuration.signingPublicKey {
+            logger.log(
+                level: .error,
+                message: "[adoptVerifiedUserConfiguration] account signing key changed without an authenticated rotation; refusing to adopt. pinnedPrefix=\(pinnedKey.prefix(8).map { String(format: "%02x", $0) }.joined()) incomingPrefix=\(configuration.signingPublicKey.prefix(8).map { String(format: "%02x", $0) }.joined())"
+            )
+            throw SessionErrors.signingKeyOutOfSync
+        }
+
+        sessionContext.activeUserConfiguration = userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+            configuration,
+            currentContext: sessionContext
+        )
+        await setSessionContext(sessionContext)
+
+        let encodedData = try BinaryEncoder().encode(sessionContext)
+        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
+            throw PQSSession.SessionErrors.sessionEncryptionError
+        }
+        try await cache.updateLocalSessionContext(encryptedConfig)
+    }
+
+    /// Explicitly clears the locally pinned account-level signing key and adopts
+    /// `proposedConfiguration`'s signing key in its place. This is the **only**
+    /// path allowed to overwrite the TOFU pin via a server-supplied configuration
+    /// and is intended exclusively for an authenticated, user-initiated trust
+    /// re-establishment after a legitimate rotation that bypassed the normal
+    /// channels (lost master, restore-from-backup, server reset during private
+    /// beta, etc.).
+    ///
+    /// > Important: Callers MUST gate this behind a strong, explicit user
+    /// > confirmation (e.g. an in-app passcode, OS biometrics, or a typed
+    /// > destructive phrase). Anyone who can call this can replace the trust
+    /// > anchor for the local account; treat it like "remove all locks and
+    /// > re-key the front door".
+    ///
+    /// On success, the new configuration's `signingPublicKey` becomes the new
+    /// pin. Subsequent `adoptVerifiedUserConfiguration(_:)` calls (e.g. the
+    /// background refresh path) will accept matching configurations and reject
+    /// any further drift, restoring the normal TOFU invariant.
+    ///
+    /// The transition is logged at `.error` so it is grep-able in support
+    /// triage even if the device's logs are filtered to errors only.
+    ///
+    /// - Parameter proposedConfiguration: A `UserConfiguration` whose internal
+    ///   signatures verify against its own `signingPublicKey`. Typically
+    ///   obtained by re-fetching `findConfiguration(for:)` from the transport.
+    /// - Throws:
+    ///   - `SessionErrors.invalidSignature` if the proposed configuration is
+    ///     not internally consistent (signed devices don't all verify under
+    ///     the configuration's own signing key).
+    ///   - `SessionErrors.sessionDecryptionError` / `sessionEncryptionError`
+    ///     for the usual cache/crypto failure modes.
+    public func acknowledgeAccountIdentityChange(_ proposedConfiguration: UserConfiguration) async throws {
+        // Internal consistency: never overwrite the pin with a malformed config.
+        let verified = try proposedConfiguration.getVerifiedDevices()
+        guard verified.count == proposedConfiguration.signedDevices.count else {
+            throw SessionErrors.invalidSignature
+        }
+
+        guard let cache else { return }
+        let data = try await cache.fetchLocalSessionContext()
+        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
+            throw SessionErrors.sessionDecryptionError
+        }
+
+        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+
+        let oldKey = sessionContext.activeUserConfiguration.signingPublicKey
+        let newKey = proposedConfiguration.signingPublicKey
+
+        // Idempotent no-op: nothing to acknowledge.
+        guard oldKey != newKey else {
+            sessionContext.activeUserConfiguration = userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+                proposedConfiguration,
+                currentContext: sessionContext
+            )
+            await setSessionContext(sessionContext)
+            let encodedData = try BinaryEncoder().encode(sessionContext)
+            guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
+                throw PQSSession.SessionErrors.sessionEncryptionError
+            }
+            try await cache.updateLocalSessionContext(encryptedConfig)
+            return
+        }
+
+        logger.log(
+            level: .error,
+            message: "[acknowledgeAccountIdentityChange] user-acknowledged account signing key change. oldPrefix=\(oldKey.prefix(8).map { String(format: "%02x", $0) }.joined()) newPrefix=\(newKey.prefix(8).map { String(format: "%02x", $0) }.joined()) deviceCount=\(verified.count)"
+        )
+
+        sessionContext.activeUserConfiguration = userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+            proposedConfiguration,
+            currentContext: sessionContext
+        )
+        await setSessionContext(sessionContext)
+
+        let encodedData = try BinaryEncoder().encode(sessionContext)
+        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
+            throw PQSSession.SessionErrors.sessionEncryptionError
+        }
+        try await cache.updateLocalSessionContext(encryptedConfig)
+    }
+
     /// Updates the user's configuration with new device configurations.
     ///
     /// This asynchronous function updates the user's configuration by incorporating
@@ -993,10 +1822,19 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// cache, decrypts it, creates a new user configuration with the updated devices,
     /// and then re-encrypts the session context before saving it back to the cache.
     ///
+    /// > Important: This is a **master-only** operation. It re-signs the resulting
+    /// > `UserConfiguration` with the local device's signing key. On a linked (child)
+    /// > device the per-device signing key intentionally differs from the account-level
+    /// > `signingPublicKey`, so the resulting configuration would fail signature
+    /// > verification. Calling this on a child throws `SessionErrors.signingKeyOutOfSync`.
+    /// > Children should use `adoptVerifiedUserConfiguration(_:)` instead, which adopts
+    /// > a server-signed configuration verbatim.
+    ///
     /// - Parameter devices: An array of `UserDeviceConfiguration` objects representing
     ///                     the new devices to be associated with the user's configuration.
     ///
     /// - Throws:
+    ///   - `SessionErrors.signingKeyOutOfSync`: If invoked on a linked (child) device.
     ///   - `SessionErrors.sessionDecryptionError`: If the session context cannot be
     ///     decrypted successfully.
     ///   - `PQSSession.SessionErrors.sessionEncryptionError`: If the updated session
@@ -1012,6 +1850,21 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
         // Decode the session context from the decrypted data
         var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+
+        // Master-only invariant: the local device must own the account signing key.
+        // On a linked child this comparison fails because the per-device signing key
+        // intentionally differs from the account-level `signingPublicKey`.
+        let localSigningPrivateKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey
+        )
+        let localSigningPublicKey = localSigningPrivateKey.publicKey.rawRepresentation
+        guard localSigningPublicKey == sessionContext.activeUserConfiguration.signingPublicKey else {
+            logger.log(
+                level: .error,
+                message: "[updateUserConfiguration] refusing to re-sign configuration on a non-master device. This path requires the account signing key; child devices must call adoptVerifiedUserConfiguration."
+            )
+            throw SessionErrors.signingKeyOutOfSync
+        }
 
         // Create a new user configuration with the updated devices
         let userConfiguration = try await createNewUser(
@@ -1073,7 +1926,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             signingPublicKey: sessionContext.activeUserConfiguration.signingPublicKey,
             signedDevices: sessionContext.activeUserConfiguration.signedDevices,
             signedOneTimePublicKeys: keys,
-            signedMLKEMOneTimePublicKeys: sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
+            signedMLKEMOneTimePublicKeys: sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys,
+            signedDeviceKeyBundles: sessionContext.activeUserConfiguration.signedDeviceKeyBundles
         )
 
         // Update the last user configuration in the session context
@@ -1152,34 +2006,62 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             )
         }
 
-        // Create signed public one-time keys for each device
-        let signedKeys: [UserConfiguration.SignedOneTimePublicKey] = try devices.flatMap { device in
-            try keys.map { key in
+        let activeDeviceIds = Set(devices.map(\.deviceId))
+        let localDevice = devices.first {
+            $0.signingPublicKey == signingPrivateKey.publicKey.rawRepresentation
+        }
+        let retainedSignedKeys = configuration.signedOneTimePublicKeys.filter { signedKey in
+            activeDeviceIds.contains(signedKey.deviceId) && signedKey.deviceId != localDevice?.deviceId
+        }
+        let retainedSignedMLKEMKeys = configuration.signedMLKEMOneTimePublicKeys.filter { signedKey in
+            activeDeviceIds.contains(signedKey.deviceId) && signedKey.deviceId != localDevice?.deviceId
+        }
+
+        let signedKeys: [UserConfiguration.SignedOneTimePublicKey]
+        let signedMLKEMKeys: [UserConfiguration.SignedMLKEMOneTimeKey]
+        if let localDevice {
+            signedKeys = try retainedSignedKeys + keys.map { key in
                 try UserConfiguration.SignedOneTimePublicKey(
                     key: key,
-                    deviceId: device.deviceId,
+                    deviceId: localDevice.deviceId,
                     signingKey: signingPrivateKey
                 )
             }
-        }
-
-        // Create signed public one-time keys for each device
-        let signedMLKEMKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try devices.flatMap { device in
-            try mlKEMKeys.map { key in
+            signedMLKEMKeys = try retainedSignedMLKEMKeys + mlKEMKeys.map { key in
                 try UserConfiguration.SignedMLKEMOneTimeKey(
                     key: key,
-                    deviceId: device.deviceId,
+                    deviceId: localDevice.deviceId,
                     signingKey: signingPrivateKey
                 )
             }
+        } else {
+            signedKeys = retainedSignedKeys
+            signedMLKEMKeys = retainedSignedMLKEMKeys
         }
 
-        // 4) Return the new per-device-signed UserConfiguration
+        var signedDeviceKeyBundles = configuration.signedDeviceKeyBundles.filter { signedBundle in
+            devices.contains(where: { $0.deviceId == signedBundle.id })
+        }
+        if let localDevice {
+            let localBundle = try UserConfiguration.SignedDeviceKeyBundle(
+                bundle: .init(
+                    deviceId: localDevice.deviceId,
+                    longTermPublicKey: localDevice.longTermPublicKey,
+                    finalMLKEMPublicKey: localDevice.finalMLKEMPublicKey
+                ),
+                signingKey: signingPrivateKey
+            )
+            signedDeviceKeyBundles.removeAll { $0.id == localDevice.deviceId }
+            signedDeviceKeyBundles.append(localBundle)
+        }
+
+        // 4) Return the new account-signed membership plus device-owned key bundles.
         return UserConfiguration(
             signingPublicKey: signingPublicKey.rawRepresentation,
             signedDevices: signedDevices,
             signedOneTimePublicKeys: signedKeys,
-            signedMLKEMOneTimePublicKeys: signedMLKEMKeys
+            signedMLKEMOneTimePublicKeys: signedMLKEMKeys,
+            signedDeviceKeyBundles: signedDeviceKeyBundles
         )
     }
 
@@ -1225,10 +2107,82 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
             // Decode the session context from the decrypted data
             let sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+
+            // Diagnostic-only per-device identity check. Logs (does not throw) when the
+            // local `signingPrivateKey` does not match this device's `signingPublicKey` entry in
+            // the cached `activeUserConfiguration.signedDevices`. The original write-master-key-
+            // onto-child overwrite bug is prevented at the source by:
+            //   1. `LinkedDeviceReprovisioningBundle` carrying no private signing material,
+            //   2. `installLinkedDeviceReprovisioningBundle` rejecting bundles that re-attest us
+            //      with a foreign per-device key,
+            //   3. `DeviceKeys.signingPrivateKey` being `private(set)` so future code cannot
+            //      silently overwrite it.
+            // The startup check is kept as a non-fatal observer because legitimate transient
+            // states (right after a fresh link, before the first `refreshIdentities`) can also
+            // produce divergence and should not block the user from completing a re-link.
+            checkPerDeviceSigningKeyConsistency(sessionContext: sessionContext)
+
             await setSessionContext(sessionContext)
+
+            // Prune archived session identities that expired while offline.
+            await cleanupAllInactiveSessionSnapshots()
+
             return self
         } catch {
             throw error
+        }
+    }
+
+    /// Diagnostic-only per-device identity health check.
+    ///
+    /// Inspects the persisted `activeUserConfiguration` and the local `signingPrivateKey` and
+    /// emits a warning log on every form of inconsistency we know how to spot. Never throws.
+    /// The historical write-master-key-onto-child corruption is prevented at the source by the
+    /// invariants documented in `startSession`; this runtime check exists only so we can see in
+    /// the logs if a device ever drifts back into a divergent state.
+    private func checkPerDeviceSigningKeyConsistency(sessionContext: SessionContext) {
+        let accountKey: Curve25519.Signing.PublicKey
+        do {
+            accountKey = try Curve25519.Signing.PublicKey(
+                rawRepresentation: sessionContext.activeUserConfiguration.signingPublicKey
+            )
+        } catch {
+            logger.log(level: .warning, message: "Cached account signing public key is malformed; identity inspection skipped")
+            return
+        }
+
+        let myDeviceId = sessionContext.sessionUser.deviceId
+        guard let signedSelf = sessionContext.activeUserConfiguration.signedDevices.first(where: { $0.id == myDeviceId }) else {
+            logger.log(level: .warning, message: "This device is missing from the cached signedDevices list; identity inspection skipped")
+            return
+        }
+
+        let verifiedSelf: UserDeviceConfiguration?
+        do {
+            verifiedSelf = try signedSelf.verified(using: accountKey)
+        } catch {
+            verifiedSelf = nil
+        }
+        guard let verifiedSelf else {
+            logger.log(level: .warning, message: "This device's signed entry fails verification under cached account key; identity inspection skipped")
+            return
+        }
+
+        let localPublicKey: Data
+        do {
+            localPublicKey = try Curve25519.Signing.PrivateKey(
+                rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey
+            ).publicKey.rawRepresentation
+        } catch {
+            logger.log(level: .warning, message: "Local signing private key is unreadable; identity inspection skipped")
+            return
+        }
+
+        if verifiedSelf.signingPublicKey != localPublicKey {
+            logger.log(
+                level: .warning,
+                message: "Per-device signing key divergence detected: local key does not match this device's entry in signedDevices. This is non-fatal; investigate if peer signature verification fails downstream."
+            )
         }
     }
 
@@ -1242,151 +2196,343 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
     /// Manually triggers a refresh of Curve25519 one-time keys
     ///
-    /// This method cancels any existing refresh task and starts a new one to generate
-    /// a batch of one-time keys. Keys are automatically refreshed when the count drops
-    /// below `PQSSessionConstants.oneTimeKeyLowWatermark`, but this method allows
-    /// manual triggering if needed.
+    /// By default this matches automatic refresh: after syncing with the server, new keys are
+    /// generated and uploaded only when the remaining count is at or below
+    /// `PQSSessionConstants.oneTimeKeyLowWatermark`. Use `policy` to request an explicit top-up
+    /// or to fully replace this device's current batch.
     ///
-    /// - Note: The refresh task runs asynchronously and generates
-    ///   `PQSSessionConstants.oneTimeKeyBatchSize` keys.
-    public func refreshOneTimeKeysTask() async {
-        refreshOTKeysTask?.cancel()
-        
-        refreshOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
-            guard let self else { return }
-            do {
-                try await refreshOneTimeKeys(refreshType: .curve)
-            } catch {
-                // Handle any errors that may occur during the refresh
-                await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
+    /// - Note: The refresh task runs asynchronously. When a replenish runs, it creates up to
+    ///   enough keys to reach `PQSSessionConstants.oneTimeKeyBatchSize`.
+    /// - Parameter policy: Controls whether the task only refreshes when low, forces a top-up,
+    ///   or replaces the current device's one-time-key batch entirely.
+    @discardableResult
+    public func refreshOneTimeKeysTask(policy: OneTimeKeyRefreshPolicy = .automatic) async -> Bool {
+        if otkUploadCircuitOpen {
+            if let openedAt = otkUploadCircuitOpenedAt,
+               Date().timeIntervalSince(openedAt) < otkCircuitCooldownSeconds {
+                let remaining = Int(otkCircuitCooldownSeconds - Date().timeIntervalSince(openedAt))
+                logger.log(level: .info, message: "OTK upload circuit breaker open; skipping curve refresh (\(remaining)s until probe)")
+                return false
             }
-
-            // Clean up the task reference after completion
-            await removeExpiredOTKeys()
+            logger.log(level: .info, message: "OTK circuit breaker cooldown elapsed; allowing probe attempt for curve keys")
         }
-        
-        _ = await refreshOTKeysTask?.value
+
+        // Coalesce concurrent refresh requests to avoid cancel/restart storms that
+        // surface as URLSession cancellation errors (-999) under load.
+        if policy != .automatic, let existingTask = refreshOTKeysTask {
+            _ = await existingTask.value
+        } else if let existingTask = refreshOTKeysTask {
+            return await existingTask.value
+        }
+
+        refreshOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
+            guard let self else { return false }
+            let retryDelays: [UInt64] = [1_000_000_000, 3_000_000_000]
+            for attempt in 0...retryDelays.count {
+                do {
+                    try await refreshOneTimeKeys(refreshType: .curve, policy: policy)
+                    await removeExpiredOTKeys()
+                    return true
+                } catch let sessionError as SessionErrors where sessionError == .signingKeyMismatchWithServer {
+                    await self.logger.log(level: .error, message: "Signing key mismatch detected during curve OTK upload; opening circuit breaker and initiating recovery")
+                    await self.openOTKUploadCircuitAndScheduleRecovery()
+                    return false
+                } catch let sessionError as SessionErrors where sessionError == .oneTimeKeyUploadFailed {
+                    if attempt < retryDelays.count {
+                        await logger.log(level: .warning, message: "Curve OTK upload failed (attempt \(attempt + 1)/\(retryDelays.count + 1)), retrying after backoff")
+                        try? await Task.sleep(nanoseconds: retryDelays[attempt])
+                    } else {
+                        await logger.log(level: .error, message: "Curve OTK upload failed after \(attempt + 1) attempts")
+                        await removeExpiredOTKeys()
+                        return false
+                    }
+                } catch {
+                    await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
+                    await logger.log(level: .warning, message: "Curve one-time-key refresh failed; local/server state may remain out of sync")
+                    await removeExpiredOTKeys()
+                    return false
+                }
+            }
+            return false
+        }
+
+        return await refreshOTKeysTask?.value ?? false
     }
 
     /// Manually triggers a refresh of MLKEM one-time keys
     ///
-    /// This method cancels any existing refresh task and starts a new one to generate
-    /// a batch of post-quantum MLKEM one-time keys. Keys are automatically refreshed
-    /// when needed, but this method allows manual triggering if needed.
+    /// Default behavior matches automatic refresh (see `refreshOneTimeKeysTask`). Use `policy`
+    /// for reconciliation paths that must top up even when above the low watermark or for
+    /// compromise-recovery paths that must replace the current device batch.
     ///
-    /// - Note: The refresh task runs asynchronously and generates
-    ///   `PQSSessionConstants.oneTimeKeyBatchSize` keys.
-    public func refreshMLKEMOneTimeKeysTask() async {
-        refreshMLKEMOTKeysTask?.cancel()
+    /// - Parameter policy: Controls whether the task only refreshes when low, forces a top-up,
+    ///   or replaces the current device's one-time-key batch entirely.
+    @discardableResult
+    public func refreshMLKEMOneTimeKeysTask(policy: OneTimeKeyRefreshPolicy = .automatic) async -> Bool {
+        if otkUploadCircuitOpen {
+            if let openedAt = otkUploadCircuitOpenedAt,
+               Date().timeIntervalSince(openedAt) < otkCircuitCooldownSeconds {
+                let remaining = Int(otkCircuitCooldownSeconds - Date().timeIntervalSince(openedAt))
+                logger.log(level: .info, message: "OTK upload circuit breaker open; skipping MLKEM refresh (\(remaining)s until probe)")
+                return false
+            }
+            logger.log(level: .info, message: "OTK circuit breaker cooldown elapsed; allowing probe attempt for MLKEM keys")
+        }
+
+        // Coalesce concurrent refresh requests to avoid cancel/restart storms that
+        // surface as URLSession cancellation errors (-999) under load.
+        if policy != .automatic, let existingTask = refreshMLKEMOTKeysTask {
+            _ = await existingTask.value
+        } else if let existingTask = refreshMLKEMOTKeysTask {
+            return await existingTask.value
+        }
 
         refreshMLKEMOTKeysTask = Task(executorPreference: taskProcessor.keyTransportExecutor) { [weak self] in
-            guard let self else { return }
-
-            do {
-                try await refreshOneTimeKeys(refreshType: .mlKEM)
-            } catch {
-                // Handle any errors that may occur during the refresh
-                await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
+            guard let self else { return false }
+            let retryDelays: [UInt64] = [1_000_000_000, 3_000_000_000]
+            for attempt in 0...retryDelays.count {
+                do {
+                    try await refreshOneTimeKeys(refreshType: .mlKEM, policy: policy)
+                    await removeExpiredMLKEMOTKeys()
+                    return true
+                } catch let sessionError as SessionErrors where sessionError == .signingKeyMismatchWithServer {
+                    await self.logger.log(level: .error, message: "Signing key mismatch detected during MLKEM OTK upload; opening circuit breaker and initiating recovery")
+                    await self.openOTKUploadCircuitAndScheduleRecovery()
+                    return false
+                } catch let sessionError as SessionErrors where sessionError == .oneTimeKeyUploadFailed {
+                    if attempt < retryDelays.count {
+                        await logger.log(level: .warning, message: "MLKEM OTK upload failed (attempt \(attempt + 1)/\(retryDelays.count + 1)), retrying after backoff")
+                        try? await Task.sleep(nanoseconds: retryDelays[attempt])
+                    } else {
+                        await logger.log(level: .error, message: "MLKEM OTK upload failed after \(attempt + 1) attempts")
+                        await removeExpiredMLKEMOTKeys()
+                        return false
+                    }
+                } catch {
+                    await logger.log(level: .error, message: "Error refreshing one-time keys: \(error)")
+                    await logger.log(level: .warning, message: "MLKEM one-time-key refresh failed; local/server state may remain out of sync")
+                    await removeExpiredMLKEMOTKeys()
+                    return false
+                }
             }
-
-            // Clean up the task reference after completion
-            await removeExpiredMLKEMOTKeys()
+            return false
         }
-        _ = await refreshMLKEMOTKeysTask?.value
+        return await refreshMLKEMOTKeysTask?.value ?? false
     }
 
-    func refreshOneTimeKeys(refreshType: KeysType) async throws {
-        guard let sessionContext = await sessionContext else { return }
+    /// - Parameter policy: Controls whether the device only tops up when low, always tops up to the
+    ///   configured batch size, or replaces the current device's entire one-time-key batch.
+    func refreshOneTimeKeys(refreshType: KeysType, policy: OneTimeKeyRefreshPolicy = .automatic) async throws {
+        guard await sessionContext != nil else { return }
         guard let cache else { return }
+        if policy == .replaceCurrentDeviceBatch {
+            try await replaceCurrentDeviceOneTimeKeys(cache: cache, refreshType: refreshType)
+            return
+        }
         var keys = [UUID]()
 
-        if let fetched = try await transportDelegate?.fetchOneTimeKeyIdentities(for: sessionContext.sessionUser.secretName, deviceId: sessionContext.sessionUser.deviceId.uuidString, type: refreshType) {
+        if let sessionContext = await sessionContext,
+           let fetched = try await transportDelegate?.fetchOneTimeKeyIdentities(
+            for: sessionContext.sessionUser.secretName,
+            deviceId: sessionContext.sessionUser.deviceId.uuidString,
+            type: refreshType
+           ) {
             keys = fetched
         }
 
-        if !keys.isEmpty {
-            let publicKeysCount = try await synchronizeLocalKeys(cache: cache, keys: keys, type: refreshType)
-            if publicKeysCount <= PQSSessionConstants.oneTimeKeyLowWatermark {
-                // 1. Delete all local keys that are not on the server
-                let config = try await cache.fetchLocalSessionContext()
-
-                // Decrypt the session context data using the app's symmetric key
-                guard let configurationData = try await crypto.decrypt(data: config, symmetricKey: getAppSymmetricKey()) else {
-                    throw SessionErrors.sessionDecryptionError
-                }
-
-                // Decode the session context from the decrypted data
-                var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
-
-                logger.log(level: .info, message: "Creating Key Pairs, count: \(PQSSessionConstants.oneTimeKeyBatchSize - publicKeysCount)")
-                switch refreshType {
-                case .curve:
-                    // Create needed key pairs
-                    let privateOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize - publicKeysCount).map { _ in
-                        let id = UUID()
-                        let privateKey = crypto.generateCurve25519PrivateKey()
-                        let privateKeyRep = try CurvePrivateKey(id: id, privateKey.rawRepresentation)
-                        let publicKey = try CurvePublicKey(id: id, privateKey.publicKey.rawRepresentation)
-                        return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
-                    }
-
-                    sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
-                    let signedOneTimePublicKeys: [UserConfiguration.SignedOneTimePublicKey] = try privateOneTimeKeyPairs.map { keyPair in
-                        try UserConfiguration.SignedOneTimePublicKey(
-                            key: keyPair.publicKey,
-                            deviceId: sessionContext.sessionUser.deviceId,
-                            signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
-                        )
-                    }
-
-                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
-
-                    try await transportDelegate?.updateOneTimeKeys(
-                        for: sessionContext.sessionUser.secretName,
-                        deviceId: sessionContext.sessionUser.deviceId.uuidString,
-                        keys: signedOneTimePublicKeys
-                    )
-
-                case .mlKEM:
-                    // Create needed key pairs
-                    let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
-                        let id = UUID()
-                        let privateKey = try crypto.generateMLKem1024PrivateKey()
-                        let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
-                        let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
-                        return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
-                    }
-
-                    sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
-                    let signedMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
-                        try UserConfiguration.SignedMLKEMOneTimeKey(
-                            key: keyPair.publicKey,
-                            deviceId: sessionContext.sessionUser.deviceId,
-                            signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
-                        )
-                    }
-
-                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
-
-                    try await transportDelegate?.updateOneTimeMLKEMKeys(
-                        for: sessionContext.sessionUser.secretName,
-                        deviceId: sessionContext.sessionUser.deviceId.uuidString,
-                        keys: signedMLKEMOneTimeKeys
-                    )
-                }
-
-                sessionContext.updateSessionUser(sessionContext.sessionUser)
-                await setSessionContext(sessionContext)
-
-                // Encrypt and persist
-                let encodedData = try BinaryEncoder().encode(sessionContext)
-                guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
-                    throw PQSSession.SessionErrors.sessionEncryptionError
-                }
-
-                try await cache.updateLocalSessionContext(encryptedConfig)
-            }
+        if keys.isEmpty {
+            logger.log(level: .warning, message: "No remote one-time key identities found for \(refreshType); regenerating local batch")
         }
+
+        let publicKeysCount = try await synchronizeLocalKeys(cache: cache, keys: keys, type: refreshType)
+        let shouldReplenish: Bool
+        switch policy {
+        case .automatic:
+            shouldReplenish = publicKeysCount <= PQSSessionConstants.oneTimeKeyLowWatermark
+        case .replenishBatch:
+            shouldReplenish = true
+        case .replaceCurrentDeviceBatch:
+            shouldReplenish = false
+        }
+        if shouldReplenish {
+            // 1. Delete all local keys that are not on the server
+            let config = try await cache.fetchLocalSessionContext()
+
+            // Decrypt the session context data using the app's symmetric key
+            guard let configurationData = try await crypto.decrypt(data: config, symmetricKey: getAppSymmetricKey()) else {
+                throw SessionErrors.sessionDecryptionError
+            }
+
+            // Decode the session context from the decrypted data
+            var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+            let keyPairsToCreate = max(0, PQSSessionConstants.oneTimeKeyBatchSize - publicKeysCount)
+
+            logger.log(level: .info, message: "Creating Key Pairs, count: \(keyPairsToCreate)")
+            switch refreshType {
+            case .curve:
+                // Create needed key pairs
+                let privateOneTimeKeyPairs: [KeyPair] = try (0 ..< keyPairsToCreate).map { _ in
+                    let id = UUID()
+                    let privateKey = crypto.generateCurve25519PrivateKey()
+                    let privateKeyRep = try CurvePrivateKey(id: id, privateKey.rawRepresentation)
+                    let publicKey = try CurvePublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                    return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+                }
+
+                sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
+                let signedOneTimePublicKeys: [UserConfiguration.SignedOneTimePublicKey] = try privateOneTimeKeyPairs.map { keyPair in
+                    try UserConfiguration.SignedOneTimePublicKey(
+                        key: keyPair.publicKey,
+                        deviceId: sessionContext.sessionUser.deviceId,
+                        signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey))
+                }
+
+                try await transportDelegate?.updateOneTimeKeys(
+                    for: sessionContext.sessionUser.secretName,
+                    deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                    keys: signedOneTimePublicKeys
+                )
+
+                sessionContext.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
+
+            case .mlKEM:
+                // Create needed key pairs
+                let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< keyPairsToCreate).map { _ in
+                    let id = UUID()
+                    let privateKey = try crypto.generateMLKem1024PrivateKey()
+                    let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
+                    let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                    return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+                }
+
+                sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
+                let signedMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
+                    try UserConfiguration.SignedMLKEMOneTimeKey(
+                        key: keyPair.publicKey,
+                        deviceId: sessionContext.sessionUser.deviceId,
+                        signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
+                    )
+                }
+
+                try await transportDelegate?.updateOneTimeMLKEMKeys(
+                    for: sessionContext.sessionUser.secretName,
+                    deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                    keys: signedMLKEMOneTimeKeys
+                )
+
+                sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
+            }
+
+            sessionContext.updateSessionUser(sessionContext.sessionUser)
+            await setSessionContext(sessionContext)
+
+            // Encrypt and persist
+            let encodedData = try BinaryEncoder().encode(sessionContext)
+            guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
+                throw PQSSession.SessionErrors.sessionEncryptionError
+            }
+
+            try await cache.updateLocalSessionContext(encryptedConfig)
+        }
+    }
+
+    private func replaceCurrentDeviceOneTimeKeys(
+        cache: SessionCache,
+        refreshType: KeysType
+    ) async throws {
+        guard let transportDelegate else {
+            throw SessionErrors.transportNotInitialized
+        }
+
+        let config = try await cache.fetchLocalSessionContext()
+        guard let configurationData = try await crypto.decrypt(data: config, symmetricKey: getAppSymmetricKey()) else {
+            throw SessionErrors.sessionDecryptionError
+        }
+
+        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+        let signingKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey
+        )
+        let secretName = sessionContext.sessionUser.secretName
+        let deviceId = sessionContext.sessionUser.deviceId
+
+        try await transportDelegate.batchDeleteOneTimeKeys(
+            for: secretName,
+            with: deviceId.uuidString,
+            type: refreshType
+        )
+
+        switch refreshType {
+        case .curve:
+            sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
+            sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
+
+            let privateOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
+                let id = UUID()
+                let privateKey = crypto.generateCurve25519PrivateKey()
+                let privateKeyRep = try CurvePrivateKey(id: id, privateKey.rawRepresentation)
+                let publicKey = try CurvePublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+            }
+
+            sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
+            let signedOneTimePublicKeys: [UserConfiguration.SignedOneTimePublicKey] = try privateOneTimeKeyPairs.map { keyPair in
+                try UserConfiguration.SignedOneTimePublicKey(
+                    key: keyPair.publicKey,
+                    deviceId: deviceId,
+                    signingKey: signingKey
+                )
+            }
+
+            try await transportDelegate.updateOneTimeKeys(
+                for: secretName,
+                deviceId: deviceId.uuidString,
+                keys: signedOneTimePublicKeys
+            )
+
+            sessionContext.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
+            logger.log(level: .debug, message: "Replaced local curve OTK batch; count=\(signedOneTimePublicKeys.count)")
+
+        case .mlKEM:
+            sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
+            sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
+
+            let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
+                let id = UUID()
+                let privateKey = try crypto.generateMLKem1024PrivateKey()
+                let privateKeyRep = try MLKEMPrivateKey(id: id, privateKey.encode())
+                let publicKey = try MLKEMPublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
+            }
+
+            sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
+            let signedMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
+                try UserConfiguration.SignedMLKEMOneTimeKey(
+                    key: keyPair.publicKey,
+                    deviceId: deviceId,
+                    signingKey: signingKey
+                )
+            }
+
+            try await transportDelegate.updateOneTimeMLKEMKeys(
+                for: secretName,
+                deviceId: deviceId.uuidString,
+                keys: signedMLKEMOneTimeKeys
+            )
+
+            sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
+            logger.log(level: .debug, message: "Replaced local MLKEM OTK batch; count=\(signedMLKEMOneTimeKeys.count)")
+        }
+
+        sessionContext.updateSessionUser(sessionContext.sessionUser)
+        await setSessionContext(sessionContext)
+
+        let encodedData = try BinaryEncoder().encode(sessionContext)
+        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
+            throw PQSSession.SessionErrors.sessionEncryptionError
+        }
+
+        try await cache.updateLocalSessionContext(encryptedConfig)
     }
 
     func synchronizeLocalKeys(cache: SessionCache, keys: [UUID], type: KeysType) async throws -> Int {
@@ -1400,31 +2546,25 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
         switch type {
         case .curve:
-            let privateKeys = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys
+            let deviceId = sessionContext.sessionUser.deviceId
             let publicKeys = sessionContext.activeUserConfiguration.signedOneTimePublicKeys
-            let privateKeyIDs = Set(privateKeys.map(\.id))
-            let publicKeyIDs = Set(publicKeys.map(\.id))
+            let currentDevicePublicKeys = publicKeys.filter { $0.deviceId == deviceId }
+            let otherDevicePublicKeys = publicKeys.filter { $0.deviceId != deviceId }
             let remoteKeySet = Set(keys)
 
-            let privateIntersection = privateKeyIDs.intersection(remoteKeySet)
-            let publicIntersection = publicKeyIDs.intersection(remoteKeySet)
-
-            if privateIntersection.isEmpty, publicIntersection.isEmpty {
-                // No shared keys — remove all
-                sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
-                sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll()
-                didUpdate = true
-            } else {
-                // Remove only keys not in remote list
-                let filteredPrivate = privateKeys.filter { remoteKeySet.contains($0.id) }
-                if filteredPrivate.count != privateKeys.count {
-                    sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys = filteredPrivate
+            // Only prune the public key list to stop advertising keys the server
+            // no longer holds. Private keys are preserved — a consumed-on-server
+            // key means an in-flight message needs the private counterpart for
+            // decryption. Private keys are removed after use via updateOneTimeKey(remove:).
+            if remoteKeySet.isEmpty {
+                if !currentDevicePublicKeys.isEmpty {
+                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys = otherDevicePublicKeys
                     didUpdate = true
                 }
-
-                let filteredPublic = publicKeys.filter { remoteKeySet.contains($0.id) }
-                if filteredPublic.count != publicKeys.count {
-                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys = filteredPublic
+            } else {
+                let filteredPublic = currentDevicePublicKeys.filter { remoteKeySet.contains($0.id) }
+                if filteredPublic.count != currentDevicePublicKeys.count {
+                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys = otherDevicePublicKeys + filteredPublic
                     didUpdate = true
                 }
             }
@@ -1440,38 +2580,27 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
                 try await cache.updateLocalSessionContext(encryptedConfig)
 
-                // if we have no keys delete all public keys on the server so we can regenerated a fresh batch
-                if sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.isEmpty || sessionContext.activeUserConfiguration.signedOneTimePublicKeys.isEmpty {
+                if sessionContext.activeUserConfiguration.signedOneTimePublicKeys.allSatisfy({ $0.deviceId != deviceId }) {
                     try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
                 }
             }
-            return sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count
+            return sessionContext.activeUserConfiguration.signedOneTimePublicKeys.filter { $0.deviceId == deviceId }.count
         case .mlKEM:
-            let privateKeys = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys
+            let deviceId = sessionContext.sessionUser.deviceId
             let publicKeys = sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
-            let privateKeyIDs = Set(privateKeys.map(\.id))
-            let publicKeyIDs = Set(publicKeys.map(\.id))
+            let currentDevicePublicKeys = publicKeys.filter { $0.deviceId == deviceId }
+            let otherDevicePublicKeys = publicKeys.filter { $0.deviceId != deviceId }
             let remoteKeySet = Set(keys)
 
-            let privateIntersection = privateKeyIDs.intersection(remoteKeySet)
-            let publicIntersection = publicKeyIDs.intersection(remoteKeySet)
-
-            if privateIntersection.isEmpty, publicIntersection.isEmpty {
-                // No shared keys — remove all
-                sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
-                sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll()
-                didUpdate = true
-            } else {
-                // Remove only keys not in remote list
-                let filteredPrivate = privateKeys.filter { remoteKeySet.contains($0.id) }
-                if filteredPrivate.count != privateKeys.count {
-                    sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys = filteredPrivate
+            if remoteKeySet.isEmpty {
+                if !currentDevicePublicKeys.isEmpty {
+                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys = otherDevicePublicKeys
                     didUpdate = true
                 }
-
-                let filteredPublic = publicKeys.filter { remoteKeySet.contains($0.id) }
-                if filteredPublic.count != publicKeys.count {
-                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys = filteredPublic
+            } else {
+                let filteredPublic = currentDevicePublicKeys.filter { remoteKeySet.contains($0.id) }
+                if filteredPublic.count != currentDevicePublicKeys.count {
+                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys = otherDevicePublicKeys + filteredPublic
                     didUpdate = true
                 }
             }
@@ -1487,12 +2616,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
                 try await cache.updateLocalSessionContext(encryptedConfig)
 
-                // if we have no keys delete all public keys on the server so we can regenerated a fresh batch
-                if sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.isEmpty || sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.isEmpty {
+                if sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.allSatisfy({ $0.deviceId != deviceId }) {
                     try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
                 }
             }
-            return sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count
+            return sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.filter { $0.deviceId == deviceId }.count
         }
     }
 
@@ -1625,6 +2753,22 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         )
     }
 
+    /// Blocks until pending encrypt/send jobs finish (used after OTK bootstrap notify).
+    public func waitForOutboundJobDrain(timeout: TimeInterval = 8.0) async {
+        guard let cache else { return }
+        await taskProcessor.waitForOutboundJobDrain(cache: cache, session: self, timeout: timeout)
+    }
+
+    /// Sends OTK notify for a new peer session and waits for outbound encrypt jobs to drain.
+    /// Call before the first friendship request so the receiver ratchet is ready.
+    public func bootstrapPeerContactSession(secretName: String) async throws {
+        _ = try await refreshIdentities(
+            secretName: secretName,
+            createIdentity: true,
+            sendOneTimeIdentities: true)
+        await waitForOutboundJobDrain()
+    }
+
     /// Shuts down the session, clearing sensitive state.
     ///
     /// This method performs a complete shutdown of the session, including:
@@ -1643,7 +2787,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         do {
             try await taskProcessor.ratchetManager.shutdown()
         } catch {
-            fatalError("Could not shutdown ratchet manager: \(error)")
+            // Teardown can race with in-flight session cleanup; do not crash the app.
+            logger.log(level: .warning, message: "Ratchet manager shutdown encountered non-fatal error: \(error)")
         }
         isViable = false
         cache = nil

@@ -50,7 +50,51 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     ///                      valid cryptographic keys and session state.
     /// - Throws: An error if the update fails due to cache unavailability or encryption errors.
     public func updateSessionIdentity(_ identity: DoubleRatchetKit.SessionIdentity) async throws {
-        try await session?.cache?.updateSessionIdentity(identity)
+        guard let session else {
+            throw PQSSession.SessionErrors.sessionNotInitialized
+        }
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        do {
+            try await cache.updateSessionIdentity(identity)
+        } catch SessionCache.CacheErrors.sessionIdentityNotFound {
+            if try await isRetiredSessionIdentity(identity, session: session, cache: cache) {
+                return
+            }
+            throw SessionCache.CacheErrors.sessionIdentityNotFound
+        }
+    }
+
+    private func isRetiredSessionIdentity(
+        _ identity: DoubleRatchetKit.SessionIdentity,
+        session: PQSSession,
+        cache: SessionCache
+    ) async throws -> Bool {
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        guard let retiredProps = await identity.props(symmetricKey: symmetricKey) else {
+            return false
+        }
+
+        let currentIdentities = try await cache.fetchSessionIdentities()
+        let hasActiveReplacement = await currentIdentities.asyncContains { current in
+            guard current.id != identity.id,
+                  let currentProps = await current.props(symmetricKey: symmetricKey),
+                  currentProps.secretName == retiredProps.secretName,
+                  currentProps.deviceId == retiredProps.deviceId,
+                  !currentProps.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            else {
+                return false
+            }
+            return true
+        }
+
+        if hasActiveReplacement {
+            logger.log(
+                level: .debug,
+                message: "Skipping persistence for retired SessionIdentity \(retiredProps.secretName) (\(retiredProps.deviceId)); active replacement exists")
+        }
+        return hasActiveReplacement
     }
     
     /// Fetches a private one-time key by its identifier.
@@ -145,7 +189,13 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 signedKeys.removeAll { $0.id == id }
                 signedKeys.append(newSignedKey)
                 
-                // Update the user configuration with the new signed keys
+                try await session.transportDelegate?.updateOneTimeKeys(
+                    for: sessionContext.sessionUser.secretName,
+                    deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                    keys: [newSignedKey]
+                )
+                
+                // Update the user configuration only after the server accepted the replacement key.
                 sessionContext.activeUserConfiguration.signedOneTimePublicKeys = signedKeys
                 await session.setSessionContext(sessionContext)
                 
@@ -156,12 +206,6 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 }
                 
                 try await session.cache?.updateLocalSessionContext(encryptedConfig)
-                
-                try await session.transportDelegate?.updateOneTimeKeys(
-                    for: sessionContext.sessionUser.secretName,
-                    deviceId: sessionContext.sessionUser.deviceId.uuidString,
-                    keys: [newSignedKey]
-                )
                 await cancelAndRemoveUpdateKeyTasks()
             } catch {
                 await cancelAndRemoveUpdateKeyTasks()
@@ -215,6 +259,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         task: TaskType,
         session: PQSSession
     ) async throws {
+        self.session = session
         await ratchetManager.setDelegate(self)
         switch task {
         case let .writeMessage(outboundTask):
@@ -227,7 +272,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 session: session)
         }
     }
-
+    
     struct LoadedKeysResult: Sendable {
         var localOneTimePrivateKey: CurvePrivateKey?
         var localMLKEMPrivateKey: MLKEMPrivateKey
@@ -255,17 +300,18 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         var remoteOneTimePublicKey: CurvePublicKey?
         var remoteMLKEMPublicKey: MLKEMPublicKey
         var needsRemoteDeletion = false
-
+        var effectiveSessionContext = sessionContext
+        
         switch await session.keyLoadingState {
         case .initial:
-            if let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last {
+            if let privateOneTimeKey = effectiveSessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last {
                 localOneTimePrivateKey = privateOneTimeKey
             }
             
-            if let mlKEMOneTimePrivateKey = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last {
+            if let mlKEMOneTimePrivateKey = effectiveSessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last {
                 localMLKEMPrivateKey = mlKEMOneTimePrivateKey
             } else {
-                localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
+                localMLKEMPrivateKey = effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
             }
         case .rotating:
             // `keyLoadingState` is session-scoped, but ratchet state is recipient-scoped.
@@ -276,18 +322,18 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 localOneTimePrivateKey = state.localOneTimePrivateKey
                 localMLKEMPrivateKey = state.localMLKEMPrivateKey
             } else {
-                localOneTimePrivateKey = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last
-                localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last
-                    ?? sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
+                localOneTimePrivateKey = effectiveSessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last
+                localMLKEMPrivateKey = effectiveSessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last
+                ?? effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
             }
         case .complete:
             if let state = props.state {
                 localOneTimePrivateKey = state.localOneTimePrivateKey
                 localMLKEMPrivateKey = state.localMLKEMPrivateKey
             } else {
-                localOneTimePrivateKey = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last
-                localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last
-                    ?? sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
+                localOneTimePrivateKey = effectiveSessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last
+                localMLKEMPrivateKey = effectiveSessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last
+                ?? effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
             }
         }
         
@@ -300,6 +346,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             await session.setKeyLoadingState(.complete)
         case .complete:
             if try await session.rotateMLKEMKeysIfNeeded() && !needsRemoteDeletion {
+                if let refreshedContext = await session.sessionContext {
+                    effectiveSessionContext = refreshedContext
+                }
                 guard let state = props.state else {
                     // No prior ratchet state for this recipient yet; skip rotate-on-complete path.
                     remoteLongTermPublicKey = props.longTermPublicKey
@@ -316,10 +365,10 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 }
                 needsRemoteDeletion = true
                 localOneTimePrivateKey = state.localOneTimePrivateKey
-                if let privateMLKEMOneTimeKey = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last {
+                if let privateMLKEMOneTimeKey = effectiveSessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last {
                     localMLKEMPrivateKey = privateMLKEMOneTimeKey
                 } else {
-                    localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
+                    localMLKEMPrivateKey = effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
                 }
             }
             remoteLongTermPublicKey = props.longTermPublicKey
@@ -383,26 +432,217 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     ///   - session: The current crypto session providing context and keys.
     /// - Throws: An error if the message handling fails due to missing keys,
     ///           cryptographic errors, or transport failures.
+    ///
+    /// Outbound jobs embed a `SessionIdentity` snapshot at enqueue time. Identity refresh can delete,
+    /// archive, and recreate rows while preserving `(secretName, deviceId)`, leaving jobs with stale ids.
+    /// Always reselect the current active row for that device so archived snapshots are never used to send.
+    private func resolveSessionIdentityForOutbound(
+        embeddedRecipient: SessionIdentity,
+        session: PQSSession,
+        databaseSymmetricKey: SymmetricKey
+    ) async throws -> SessionIdentity {
+        guard let cache = await session.cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let stored = try await cache.fetchSessionIdentities()
+
+        let lookupProps: SessionIdentity.UnwrappedProps?
+        if let embeddedProps = await embeddedRecipient.props(symmetricKey: databaseSymmetricKey) {
+            lookupProps = embeddedProps
+        } else if let direct = stored.first(where: { $0.id == embeddedRecipient.id }),
+                  let directProps = await direct.props(symmetricKey: databaseSymmetricKey) {
+            lookupProps = directProps
+        } else {
+            lookupProps = nil
+        }
+
+        guard let lookupProps else {
+            throw PQSSession.SessionErrors.missingSessionIdentity
+        }
+
+        let preferredDevice = await currentDeviceConfiguration(
+            secretName: lookupProps.secretName,
+            deviceId: lookupProps.deviceId,
+            session: session)
+        if let match = await bestSessionIdentity(
+            secretName: lookupProps.secretName,
+            deviceId: lookupProps.deviceId,
+            in: stored,
+            symmetricKey: databaseSymmetricKey,
+            preferredDevice: preferredDevice
+        ) {
+            return try await prepareStateLessPersonalSessionIdentityForOutbound(
+                match,
+                session: session,
+                databaseSymmetricKey: databaseSymmetricKey)
+        }
+        _ = try await session.refreshIdentities(secretName: lookupProps.secretName, forceRefresh: true)
+        let refreshed = try await cache.fetchSessionIdentities()
+        if let match = await bestSessionIdentity(
+            secretName: lookupProps.secretName,
+            deviceId: lookupProps.deviceId,
+            in: refreshed,
+            symmetricKey: databaseSymmetricKey,
+            preferredDevice: preferredDevice
+        ) {
+            return try await prepareStateLessPersonalSessionIdentityForOutbound(
+                match,
+                session: session,
+                databaseSymmetricKey: databaseSymmetricKey)
+        }
+        throw PQSSession.SessionErrors.missingSessionIdentity
+    }
+
+    private func prepareStateLessPersonalSessionIdentityForOutbound(
+        _ identity: SessionIdentity,
+        session: PQSSession,
+        databaseSymmetricKey: SymmetricKey
+    ) async throws -> SessionIdentity {
+        guard let context = await session.sessionContext else {
+            throw PQSSession.SessionErrors.sessionNotInitialized
+        }
+        guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else {
+            return identity
+        }
+
+        guard props.secretName == context.sessionUser.secretName,
+              props.deviceId != context.sessionUser.deviceId,
+              !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix),
+              props.state == nil
+        else {
+            return identity
+        }
+
+        logger.log(
+            level: .info,
+            message: "Refreshing state-less personal SessionIdentity for \(props.secretName) (\(props.deviceId)) before outbound establishment")
+
+        return try await session.resetSessionIdentityForFreshSession(
+            secretName: props.secretName,
+            deviceId: props.deviceId,
+            sendOneTimeIdentities: true)
+    }
+    
+    /// Picks the active identity row for a peer device.
+    ///
+    /// Active `sessionContextId`s are intentionally random, so they are not a recency signal.
+    /// If duplicate active rows survive from an older persistence failure, prefer the row whose
+    /// key bundle matches the peer's currently advertised device bundle, then prefer initialized
+    /// ratchet state, then preserve store order by choosing the last row.
+    /// Archived (inactive) identities are excluded so they are never used for outbound encryption.
+    private func bestSessionIdentity(
+        secretName: String,
+        deviceId: UUID,
+        in identities: [SessionIdentity],
+        symmetricKey: SymmetricKey,
+        preferredDevice: UserDeviceConfiguration? = nil
+    ) async -> SessionIdentity? {
+        var candidates: [(identity: SessionIdentity, props: SessionIdentity.UnwrappedProps, index: Int)] = []
+        for (index, identity) in identities.enumerated() {
+            guard let p = await identity.props(symmetricKey: symmetricKey),
+                  p.secretName == secretName,
+                  p.deviceId == deviceId,
+                  !p.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+            candidates.append((identity, p, index))
+        }
+
+        guard candidates.isEmpty == false else { return nil }
+        guard candidates.count > 1 else { return candidates[0].identity }
+
+        if let preferredDevice {
+            let currentBundleMatches = candidates.filter { candidate in
+                candidate.props.longTermPublicKey == preferredDevice.longTermPublicKey &&
+                candidate.props.signingPublicKey == preferredDevice.signingPublicKey
+            }
+            if let match = bestCandidatePreservingStoreOrder(currentBundleMatches) {
+                return match.identity
+            }
+        }
+
+        let initialized = candidates.filter { $0.props.state != nil }
+        if initialized.count == 1 {
+            return initialized[0].identity
+        }
+
+        let previouslyRekeyed = candidates.filter { $0.props.previousRekey != nil }
+        if let newestRekey = previouslyRekeyed.max(by: { lhs, rhs in
+            (lhs.props.previousRekey ?? .distantPast) < (rhs.props.previousRekey ?? .distantPast)
+        }) {
+            return newestRekey.identity
+        }
+
+        return bestCandidatePreservingStoreOrder(candidates)?.identity
+    }
+
+    private func bestCandidatePreservingStoreOrder(
+        _ candidates: [(identity: SessionIdentity, props: SessionIdentity.UnwrappedProps, index: Int)]
+    ) -> (identity: SessionIdentity, props: SessionIdentity.UnwrappedProps, index: Int)? {
+        candidates.max(by: { $0.index < $1.index })
+    }
+
+    private func currentDeviceConfiguration(
+        secretName: String,
+        deviceId: UUID,
+        session: PQSSession
+    ) async -> UserDeviceConfiguration? {
+        guard let transportDelegate = await session.transportDelegate else { return nil }
+        do {
+            let configuration = try await transportDelegate.findConfiguration(for: secretName)
+            let devices = try configuration.getVerifiedDevices().map {
+                try configuration.deviceWithCurrentKeyBundle($0)
+            }
+            return devices.first(where: { $0.deviceId == deviceId })
+        } catch {
+            logger.log(
+                level: .debug,
+                message: "Unable to load current device bundle for \(secretName) (\(deviceId)): \(error)")
+            return nil
+        }
+    }
+    
     private func handleWriteMessage(
         outboundTask: OutboundTaskMessage,
         session: PQSSession
     ) async throws {
         self.session = session
         var outboundTask = outboundTask
-
+        
         guard let sessionContext = await session.sessionContext else {
             throw PQSSession.SessionErrors.sessionNotInitialized
         }
         
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
-        guard var sessionIdentity = try await session.cache?.fetchSessionIdentities().first(where: { $0.id == outboundTask.recipientIdentity.id }) else {
-            throw PQSSession.SessionErrors.missingSessionIdentity
+        if let pendingTransport = pendingOutboundTransport(sharedId: outboundTask.sharedId) {
+            try await sendPendingOutboundTransport(
+                pendingTransport,
+                outboundTask: outboundTask,
+                session: session)
+            return
         }
-
+        
+        var sessionIdentity = try await resolveSessionIdentityForOutbound(
+            embeddedRecipient: outboundTask.recipientIdentity,
+            session: session,
+            databaseSymmetricKey: databaseSymmetricKey
+        )
+        
         if await session.keyLoadingState == .rotating {
-            if let secretName = await sessionIdentity.props(symmetricKey: databaseSymmetricKey)?.secretName {
+            if let secretName = await sessionIdentity.props(symmetricKey: databaseSymmetricKey)?.secretName,
+               let deviceId = await sessionIdentity.props(symmetricKey: databaseSymmetricKey)?.deviceId {
                 let refreshedIdentities = try await session.refreshIdentities(secretName: secretName, forceRefresh: true)
-                if let refreshed = refreshedIdentities.first(where: { $0.id == outboundTask.recipientIdentity.id }) {
+                let preferredDevice = await currentDeviceConfiguration(
+                    secretName: secretName,
+                    deviceId: deviceId,
+                    session: session)
+                if let refreshed = refreshedIdentities.first(where: { $0.id == sessionIdentity.id }) {
+                    sessionIdentity = refreshed
+                } else if let refreshed = await bestSessionIdentity(
+                    secretName: secretName,
+                    deviceId: deviceId,
+                    in: refreshedIdentities,
+                    symmetricKey: databaseSymmetricKey,
+                    preferredDevice: preferredDevice
+                ) {
                     sessionIdentity = refreshed
                 }
             }
@@ -424,14 +664,22 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 let event = try BinaryDecoder().decode(TransportEvent.self, from: data)
                 transportEvent = event
                 switch event {
-                case .sessionReestablishment:
-                    logger.log(level: .info, message: "Prepared to send session reestablishment")
+                case .sessionReestablishment(let envelope):
+                    logger.log(
+                        level: .info,
+                        message: "Prepared to send session reestablishment: \(envelope.kind.rawValue) intent=\(envelope.intentId?.uuidString ?? "nil") epoch=\(envelope.epoch)")
+                case .linkedDeviceReprovisioning(let bundle):
+                    logger.log(level: .info, message: "Prepared to send linked-device reprovisioning for target=\(bundle.targetDeviceId.uuidString)")
                 case .synchronizeOneTimeKeys(var info):
                     info.senderCurveId = results.localOneTimePrivateKey?.id.uuidString
                     info.senderMLKEMId = results.localMLKEMPrivateKey.id.uuidString
                     let encodedData = try BinaryEncoder().encode(info)
                     await session.setAddingContact(encodedData)
                     outboundTask.message.transportInfo = encodedData
+                case .refreshOneTimeKeys:
+                    logger.log(level: .info, message: "Prepared to send one-time-key refresh request")
+                case .requestMessageResend(let request):
+                    logger.log(level: .info, message: "Prepared to request resend for sharedMessageId=\(request.failedSharedMessageId)")
                 }
             } catch {}
         }
@@ -450,37 +698,69 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 """)
         }
         
-        try await ratchetManager.senderInitialization(
-            sessionIdentity: sessionIdentity,
-            sessionSymmetricKey: databaseSymmetricKey,
-            remoteKeys: RemoteKeys(
-                longTerm: .init(results.remoteLongTermPublicKey),
-                oneTime: results.remoteOneTimePublicKey,
-                mlKEM: results.remoteMLKEMPublicKey),
-            localKeys: LocalKeys(
-                longTerm: .init(sessionContext.sessionUser.deviceKeys.longTermPrivateKey),
-                oneTime: results.localOneTimePrivateKey,
-                mlKEM: results.localMLKEMPrivateKey))
-        
-        if let sessionDelegate = await session.sessionDelegate {
-            outboundTask.message = sessionDelegate.updateCryptoMessageMetadata(
-                outboundTask.message,
-                sharedMessageId: outboundTask.sharedId)
+        let outboundSessionIdentityDataBeforeAttempt = sessionIdentity.data
+        let signedMessage: SignedRatchetMessage
+        do {
+            try await ratchetManager.senderInitialization(
+                sessionIdentity: sessionIdentity,
+                sessionSymmetricKey: databaseSymmetricKey,
+                remoteKeys: RemoteKeys(
+                    longTerm: .init(results.remoteLongTermPublicKey),
+                    oneTime: results.remoteOneTimePublicKey,
+                    mlKEM: results.remoteMLKEMPublicKey),
+                localKeys: LocalKeys(
+                    longTerm: .init(sessionContext.sessionUser.deviceKeys.longTermPrivateKey),
+                    oneTime: results.localOneTimePrivateKey,
+                    mlKEM: results.localMLKEMPrivateKey))
+
+            if let sessionDelegate = await session.sessionDelegate {
+                outboundTask.message = sessionDelegate.updateCryptoMessageMetadata(
+                    outboundTask.message,
+                    sharedMessageId: outboundTask.sharedId)
+            }
+
+            let encodedData = try BinaryEncoder().encode(outboundTask.message)
+            let ratchetedMessage = try await ratchetManager.ratchetEncrypt(
+                plainText: encodedData,
+                sessionId: sessionIdentity.id)
+            signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
+        } catch {
+            try await restoreSessionIdentityData(
+                sessionIdentity,
+                data: outboundSessionIdentityDataBeforeAttempt,
+                session: session,
+                reason: "outbound ratchet failed before transport send")
+            throw error
         }
         
-        let encodedData = try BinaryEncoder().encode(outboundTask.message)
-        let ratchetedMessage = try await ratchetManager.ratchetEncrypt(
-            plainText: encodedData,
-            sessionId: sessionIdentity.id)
-        let signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
-        
-        try await session.transportDelegate?.sendMessage(signedMessage, metadata: SignedRatchetMessageMetadata(
+        let transportMetadata = SignedRatchetMessageMetadata(
             secretName: props.secretName,
             deviceId: props.deviceId,
             recipient: outboundTask.message.recipient,
             transportMetadata: outboundTask.message.transportInfo,
             sharedMessageId: outboundTask.sharedId,
-            transportEvent: transportEvent))
+            transportEvent: transportEvent)
+        let shouldRememberPendingTransport = shouldRememberPendingOutboundTransport(outboundTask.message)
+        if shouldRememberPendingTransport {
+            rememberPendingOutboundTransport(
+                sharedId: outboundTask.sharedId,
+                message: signedMessage,
+                metadata: transportMetadata,
+                needsRemoteDeletion: results.needsRemoteDeletion,
+                curveOneTimeKeyId: results.localOneTimePrivateKey?.id.uuidString,
+                mlKEMOneTimeKeyId: results.localMLKEMPrivateKey.id.uuidString)
+        }
+        try await session.transportDelegate?.sendMessage(signedMessage, metadata: transportMetadata)
+        logRecoveryTransportSendSuccess(transportEvent, sharedId: outboundTask.sharedId)
+        if shouldRememberPendingTransport {
+            pendingOutboundTransportBySharedId.removeValue(forKey: outboundTask.sharedId)
+        }
+
+        await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
+
+        if outboundTask.isPersistedOutbound {
+            await markPersistedOutboundPastSendingIfNeeded(session: session, localMessageId: outboundTask.localId)
+        }
         
         // Perform remote key deletion only after a successful send
         if results.needsRemoteDeletion {
@@ -534,14 +814,76 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         let verificationResult = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
         
         do {
-            try await initializeRecipient(
-                sessionIdentity: verificationResult.sessionIdentity,
-                session: session,
-                ratchetMessage: verificationResult.ratchetMessage)
-            
-            let decryptedData = try await ratchetManager.ratchetDecrypt(
-                verificationResult.ratchetMessage,
-                sessionId: verificationResult.sessionIdentity.id)
+            // Attempt decryption with the active identity first, falling back to archived
+            // identities if needed (previous-state decryption).
+            let activeSessionIdentity = verificationResult.sessionIdentity
+            let activeSessionIdentityDataBeforeAttempt = activeSessionIdentity.data
+            var decryptedFromArchivedIdentity = false
+            var decryptionSessionIdentity = activeSessionIdentity
+            var decryptedData: Data
+            do {
+                try await initializeRecipient(
+                    sessionIdentity: activeSessionIdentity,
+                    session: session,
+                    ratchetMessage: verificationResult.ratchetMessage)
+                
+                decryptedData = try await ratchetManager.ratchetDecrypt(
+                    verificationResult.ratchetMessage,
+                    sessionId: activeSessionIdentity.id)
+            } catch {
+                let activeError = error
+                try await restoreSessionIdentityData(
+                    activeSessionIdentity,
+                    data: activeSessionIdentityDataBeforeAttempt,
+                    session: session,
+                    reason: "active inbound decrypt failed before archived fallback")
+                let archivedIdentities = try await session.fetchArchivedSessionIdentities(
+                    secretName: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId)
+
+                var fallbackData: Data?
+                for archived in archivedIdentities {
+                    let archivedDataBeforeAttempt = archived.data
+                    do {
+                        try await initializeRecipient(
+                            sessionIdentity: archived,
+                            session: session,
+                            ratchetMessage: verificationResult.ratchetMessage)
+
+                        let data = try await ratchetManager.ratchetDecrypt(
+                            verificationResult.ratchetMessage,
+                            sessionId: archived.id)
+                        logger.log(level: .info, message: "Archived identity fallback succeeded for \(inboundTask.senderSecretName)")
+                        decryptedFromArchivedIdentity = true
+                        decryptionSessionIdentity = archived
+                        fallbackData = data
+                        break
+                    } catch {
+                        try? await restoreSessionIdentityData(
+                            archived,
+                            data: archivedDataBeforeAttempt,
+                            session: session,
+                            reason: "archived inbound fallback attempt failed")
+                        continue
+                    }
+                }
+
+                guard let data = fallbackData else {
+                    throw activeError
+                }
+                try await replaceRestoredSessionIdentityObject(
+                    activeSessionIdentity,
+                    data: activeSessionIdentityDataBeforeAttempt,
+                    session: session,
+                    reason: "archived inbound fallback succeeded after active decrypt failure")
+                decryptedData = data
+            }
+
+#if DEBUG
+            if let transform = await session._testDecryptedPayloadTransform {
+                decryptedData = transform(decryptedData)
+            }
+#endif
             
             guard !decryptedData.isEmpty else {
                 throw PQSSession.SessionErrors.sessionDecryptionError
@@ -561,23 +903,247 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     senderDeviceId: inboundTask.senderDeviceId)
             }
             
-            if let transportInfo = decodedMessage.transportInfo {
+            if let transportInfo = decodedMessage.transportInfo,
+               let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo) {
+                var processedReestablishment: SessionReestablishmentEnvelope?
                 do {
-                    let event = try BinaryDecoder().decode(TransportEvent.self, from: transportInfo)
                     switch event {
-                    case .sessionReestablishment:
+                    case .sessionReestablishment(let envelope):
                         canSaveMessage = false
-                        try await session.createInactiveSessionSnapshot(for: inboundTask.senderSecretName, policy: .archive)
+
+                        guard let context = await session.sessionContext else { return }
+
+                        if decryptedFromArchivedIdentity,
+                           envelope.kind == .peerRefresh {
+                            logger.log(
+                                level: .info,
+                                message: "Ignoring archived peerRefresh control from \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId)); waiting for active reestablishment before continuing recovery"
+                            )
+                            return
+                        }
+
+                        // Receiver-side coalescing: drop duplicates and stale-epoch replays from
+                        // an offline mailbox before any expensive work or delegate dispatch.
+                        let dedupDecision = await session.recordReceivedSessionReestablishment(
+                            envelope: envelope,
+                            senderDeviceId: inboundTask.senderDeviceId)
+
+                        switch dedupDecision {
+                        case .skipDuplicate:
+                            logger.log(
+                                level: .info,
+                                message: "[control-event] coalesced duplicate kind=\(envelope.kind.rawValue) sender=\(inboundTask.senderDeviceId) intent=\(envelope.intentId?.uuidString ?? "nil") epoch=\(envelope.epoch)"
+                            )
+                            return
+                        case .skipStale:
+                            logger.log(
+                                level: .info,
+                                message: "[control-event] dropping stale kind=\(envelope.kind.rawValue) sender=\(inboundTask.senderDeviceId) epoch=\(envelope.epoch)"
+                            )
+                            return
+                        case .process:
+                            processedReestablishment = envelope
+                            break
+                        }
+
+                        let kind = envelope.kind
+                        let disposition = try sessionReestablishmentDisposition(
+                            for: kind,
+                            inboundTask: inboundTask,
+                            decodedMessage: decodedMessage,
+                            context: context)
+                        var shouldSendRefreshResponse = false
+                        switch disposition {
+                        case .ignore:
+                            logger.log(level: .warning, message: "Ignoring unauthorized session reestablishment control event")
+                        case .refreshOnly:
+                            shouldSendRefreshResponse = kind == .peerRefresh && !envelope.isResponse
+                            break
+                        case .rotateCurrentDevice:
+                            // Sync local activeUserConfiguration before checking signing-key
+                            // agreement; the post-disposition refresh below cannot cover this
+                            // because the check needs to run on fresh state.
+                            if await session.shouldForceIdentityRefresh(secretName: inboundTask.senderSecretName) {
+                                _ = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
+                            }
+                            if await session.localSigningKeyMatchesActiveConfiguration() {
+                                try await performPendingLinkedDeviceRepair(session: session)
+                            } else {
+                                await session.setPendingLinkedDeviceRepair(true)
+                                logger.log(level: .info, message: "Linked-device repair requested; waiting for reprovisioning bundle before rotating")
+                            }
+                        case .compromiseObserved:
+                            logger.log(
+                                level: .error,
+                                message: "Linked device reported possible compromise; notifying delegate (intent=\(envelope.intentId?.uuidString ?? "nil") epoch=\(envelope.epoch))")
+
+                            await session.sessionDelegate?.linkedDeviceReportedPotentialCompromise(
+                                deviceId: inboundTask.senderDeviceId,
+                                intentId: envelope.intentId)
+                        }
+
+                        // Throttled refresh after the disposition. Without this, a 30-message
+                        // backlog from the same sender would each force-refresh identities.
+                        if await session.shouldForceIdentityRefresh(secretName: inboundTask.senderSecretName) {
+                            _ = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
+                            logger.log(level: .info, message: "Received Session Reestablishment, refreshed session identities")
+                        } else {
+                            logger.log(level: .debug, message: "[control-event] coalesced redundant identity refresh for sender=\(inboundTask.senderSecretName)")
+                        }
+
+                        if kind == .peerRefresh {
+                            if envelope.isResponse {
+                                let pending = await session.takePendingResendsAfterReestablishment(
+                                    sender: inboundTask.senderSecretName,
+                                    deviceId: inboundTask.senderDeviceId)
+                                await sendDeferredResendRequests(
+                                    pending,
+                                    session: session,
+                                    reason: "peerRefresh response")
+                            } else if shouldSendRefreshResponse {
+                                let isSelf = inboundTask.senderSecretName == context.sessionUser.secretName
+                                let recipient: MessageRecipient = isSelf ? .personalMessage : .nickname(inboundTask.senderSecretName)
+                                do {
+                                    _ = try await session.emitSessionReestablishmentResponse(
+                                        kind: .peerRefresh,
+                                        recipient: recipient,
+                                        respondingTo: envelope)
+                                } catch {
+                                    await session.forgetReceivedSessionReestablishment(
+                                        envelope: envelope,
+                                        senderDeviceId: inboundTask.senderDeviceId)
+                                    logger.log(level: .warning, message: "Failed to emit peerRefresh response: \(error)")
+                                }
+                            }
+                        }
+                    case .linkedDeviceReprovisioning(let bundle):
+                        canSaveMessage = false
+                        guard let context = await session.sessionContext else { return }
+                        guard try shouldAcceptLinkedDeviceReprovisioning(
+                            bundle: bundle,
+                            inboundTask: inboundTask,
+                            decodedMessage: decodedMessage,
+                            context: context
+                        ) else {
+                            logger.log(level: .warning, message: "Ignoring unauthorized linked-device reprovisioning bundle")
+                            return
+                        }
+                        try await session.installLinkedDeviceReprovisioningBundle(bundle)
                         _ = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
-                        logger.log(level: .info, message: "Received Session Reestablishment, refreshed session identities")
+                        if await session.hasPendingLinkedDeviceRepair() {
+                            try await performPendingLinkedDeviceRepair(session: session)
+                        } else {
+                            logger.log(level: .info, message: "Installed linked-device reprovisioning bundle; awaiting repair signal")
+                        }
+                        
                     case .synchronizeOneTimeKeys(let info):
                         try await removeKeys(
                             session: session,
                             curveId: info.recipientCurveId,
                             mlKEMId: info.recipientMLKEMId)
                         canSaveMessage = false
+                    case .refreshOneTimeKeys:
+                        canSaveMessage = false
+                    case .requestMessageResend(let request):
+                        canSaveMessage = false
+
+                        let symmetricKey = try await session.getDatabaseSymmetricKey()
+                        let identities = try await session.cache?.fetchSessionIdentities() ?? []
+                        logger.log(
+                            level: .info,
+                            message: "pqs.recovery.resendRequestReceived sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) requestingDeviceId=\(request.requestingDeviceId) requestedCount=\(request.failedSharedMessageIds.count) ids=\(request.failedSharedMessageIds.joined(separator: ","))")
+                        let requestedDevice = await currentDeviceConfiguration(
+                            secretName: inboundTask.senderSecretName,
+                            deviceId: request.requestingDeviceId,
+                            session: session)
+                        let senderDevice = await currentDeviceConfiguration(
+                            secretName: inboundTask.senderSecretName,
+                            deviceId: inboundTask.senderDeviceId,
+                            session: session)
+                        let requestedIdentity = await bestSessionIdentity(
+                            secretName: inboundTask.senderSecretName,
+                            deviceId: request.requestingDeviceId,
+                            in: identities,
+                            symmetricKey: symmetricKey,
+                            preferredDevice: requestedDevice
+                        )
+                        let senderIdentity = await bestSessionIdentity(
+                            secretName: inboundTask.senderSecretName,
+                            deviceId: inboundTask.senderDeviceId,
+                            in: identities,
+                            symmetricKey: symmetricKey,
+                            preferredDevice: senderDevice
+                        )
+                        guard let identity = requestedIdentity ?? senderIdentity else {
+                            logger.log(
+                                level: .warning,
+                                message: "pqs.recovery.resendReplayFailed reason=missingIdentity sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) requestingDeviceId=\(request.requestingDeviceId) requestedCount=\(request.failedSharedMessageIds.count)")
+                            throw PQSSession.SessionErrors.missingSessionIdentity
+                        }
+
+                        var replayQueuedCount = 0
+                        var replayMissingCount = 0
+                        for failedSharedMessageId in request.failedSharedMessageIds {
+                            let cryptoMessage: CryptoMessage
+                            if let replay = recentOutboundReplayMessage(sharedId: failedSharedMessageId) {
+                                cryptoMessage = replay.message
+                                logger.log(
+                                    level: .info,
+                                    message: "pqs.recovery.resendReplayUsingRecentControl sharedId=\(failedSharedMessageId) replayCount=\(replay.replayCount)")
+                            } else {
+                                let foundMessage: EncryptedMessage?
+                                do {
+                                    foundMessage = try await session.cache?.fetchMessage(sharedId: failedSharedMessageId)
+                                } catch {
+                                    replayMissingCount += 1
+                                    logger.log(
+                                        level: .info,
+                                        message: "pqs.recovery.resendReplaySkipped reason=missingLocalMessage sharedId=\(failedSharedMessageId) error=\(error)")
+                                    continue
+                                }
+
+                                guard let fetchedCryptoMessage = await foundMessage?.props(symmetricKey: symmetricKey)?.message else {
+                                    replayMissingCount += 1
+                                    logger.log(
+                                        level: .info,
+                                        message: "pqs.recovery.resendReplaySkipped reason=unreadableLocalMessage sharedId=\(failedSharedMessageId)")
+                                    continue
+                                }
+                                cryptoMessage = fetchedCryptoMessage
+                            }
+
+                            let task = EncryptableTask(
+                                task: .writeMessage(OutboundTaskMessage(
+                                    message: cryptoMessage,
+                                    recipientIdentity: identity,
+                                    localId: UUID(),
+                                    sharedId: failedSharedMessageId,
+                                    isPersistedOutbound: false
+                                ))
+                            )
+
+                            try await feedTask(task, session: session)
+                            replayQueuedCount += 1
+                        }
+                        if replayQueuedCount > 0 {
+                            logger.log(
+                                level: .info,
+                                message: "pqs.recovery.resendReplayQueued sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) queuedCount=\(replayQueuedCount) skippedCount=\(replayMissingCount) requestedCount=\(request.failedSharedMessageIds.count)")
+                        } else {
+                            logger.log(
+                                level: .warning,
+                                message: "pqs.recovery.resendReplayFailed reason=noReplayableMessages sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) skippedCount=\(replayMissingCount) requestedCount=\(request.failedSharedMessageIds.count)")
+                        }
+                        
                     }
-                } catch {}
+                } catch {
+                    if let processedReestablishment {
+                        await session.forgetReceivedSessionReestablishment(
+                            envelope: processedReestablishment,
+                            senderDeviceId: inboundTask.senderDeviceId)
+                    }
+                    logger.log(level: .error, message: "Error handling transport event from \(inboundTask.senderSecretName): \(error)")
+                }
             }
             
             if canSaveMessage {
@@ -586,193 +1152,274 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     decodedMessage,
                     inboundTask: inboundTask,
                     session: session,
-                    sessionIdentity: verificationResult.sessionIdentity)
+                    sessionIdentity: decryptionSessionIdentity)
+
+                let recoveredFailureClasses = await session.takeInboundFailureClasses(
+                    sender: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId,
+                    messageId: inboundTask.sharedMessageId)
+                if !recoveredFailureClasses.isEmpty {
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.messageDecrypted sharedId=\(inboundTask.sharedMessageId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) priorFailureClasses=\(recoveredFailureClasses.joined(separator: ","))")
+                }
+
+                let pending = await session.takePendingResendsAfterReestablishment(
+                    sender: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId,
+                    satisfiedSharedMessageId: inboundTask.sharedMessageId)
+                if decryptedFromArchivedIdentity {
+                    logger.log(
+                        level: .debug,
+                        message: "Keeping deferred resend requests pending after archived fallback for \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId))")
+                    for pendingRequest in pending {
+                        await session.deferPeerResendUntilReestablished(
+                            sender: pendingRequest.senderName,
+                            deviceId: pendingRequest.senderDeviceId,
+                            failedMessageId: pendingRequest.failedSharedMessageId,
+                            failureClass: pendingRequest.failureClass)
+                    }
+                } else {
+                    await sendDeferredResendRequests(
+                        pending,
+                        session: session,
+                        reason: "successful inbound message")
+                }
             }
             
-        } catch let ratchetError as RatchetError where ratchetError == .stateUninitialized {
-            try await attemptInactiveSessionRecovery(
-                session: session,
-                inboundTask: inboundTask,
-                verificationResult: verificationResult)
-        } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-            try await attemptInactiveSessionRecovery(
-                session: session,
-                inboundTask: inboundTask,
-                verificationResult: verificationResult)
         } catch {
 #if DEBUG
-            logger.log(level: .error, message: "RatchetError during ratchet decryption: \(error)")
+            logger.log(
+                level: .debug,
+                message: "pqs.recovery.decryptAttemptFailed sharedId=\(inboundTask.sharedMessageId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) action=handOffToRecoveryPolicy error=\(error)")
 #endif
             throw error
         }
-        
-        func attemptInactiveSessionRecovery(
-            session: PQSSession,
-            inboundTask: InboundTaskMessage,
-            verificationResult: VerificationResult
-        ) async throws {
-            do {
-                // Attempt Sesame-style recovery using bounded inactive snapshots.
-                if let recovered = try await performInactiveSessionRecovery(
-                    session: session,
-                    inboundTask: inboundTask,
-                    verificationResult: verificationResult
-                ) {
-                    let decodedMessage = try BinaryDecoder().decode(CryptoMessage.self, from: recovered)
-                    var canSaveMessage = true
-                    if let sessionDelegate = await session.sessionDelegate {
-                        canSaveMessage = await sessionDelegate.processMessage(
-                            decodedMessage,
-                            senderSecretName: inboundTask.senderSecretName,
-                            senderDeviceId: inboundTask.senderDeviceId)
-                    }
-                    if canSaveMessage {
-                        try await handleDecodedMessage(
-                            decodedMessage,
-                            inboundTask: inboundTask,
-                            session: session,
-                            sessionIdentity: verificationResult.sessionIdentity)
-                    }
-                } else {
-                    // Recovery failed: archive current state (best-effort) and clear active ratchet state
-                    // for this sender device, so subsequent resend can reinitialize from fresh keys.
-                    do {
-                        try await session.createInactiveSessionSnapshot(
-                            for: inboundTask.senderSecretName,
-                            policy: .archive)
-                        try await clearActiveRatchetState(
-                            session: session,
-                            senderSecretName: inboundTask.senderSecretName,
-                            senderDeviceId: inboundTask.senderDeviceId)
-                    } catch {
-#if DEBUG
-                        logger.log(level: .warning, message: "Failed to archive/clear active ratchet state after maxSkipped: \(error)")
-#endif
-                    }
-                    throw RatchetError.maxSkippedHeadersExceeded
-                }
-            } catch {
-#if DEBUG
-                logger.log(level: .error, message: "RatchetError during ratchet decryption: \(error)")
-#endif
-                throw error
-            }
-        }
     }
 
-    /// Clears the active (non-inactive-snapshot) ratchet state for a specific sender device.
-    /// This forces the next inbound decrypt to reinitialize using current identity keys.
-    private func clearActiveRatchetState(
+    private func restoreSessionIdentityData(
+        _ identity: SessionIdentity,
+        data: Data,
         session: PQSSession,
-        senderSecretName: String,
-        senderDeviceId: UUID
+        reason: String
     ) async throws {
+        identity.data = data
         guard let cache = await session.cache else { return }
-        let symmetricKey = try await session.getDatabaseSymmetricKey()
 
-        for identity in try await cache.fetchSessionIdentities() {
-            guard var props = await identity.props(symmetricKey: symmetricKey) else { continue }
-            guard props.secretName == senderSecretName, props.deviceId == senderDeviceId else { continue }
-            // Never mutate inactive snapshots here.
-            if props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) { continue }
-
-            if props.state != nil {
-                props.state = nil
-                try await identity.updateIdentityProps(symmetricKey: symmetricKey, props: props)
-                try await cache.updateSessionIdentity(identity)
-            }
-            return
+        do {
+            try await cache.updateSessionIdentity(identity)
+        } catch SessionCache.CacheErrors.sessionIdentityNotFound {
+            logger.log(
+                level: .info,
+                message: "Skipped restoring SessionIdentity after \(reason); identity no longer exists in cache")
         }
     }
 
-    /// Attempts to recover from `stateUninitialized` by temporarily restoring ratchet state from
-    /// bounded inactive snapshot identities for this sender device.
-    ///
-    /// This is intentionally best-effort and does not change public APIs or DB schemas.
-    private func performInactiveSessionRecovery(
-        session: PQSSession,
-        inboundTask: InboundTaskMessage,
-        verificationResult: VerificationResult
-    ) async throws -> Data? {
-        guard let cache = await session.cache else { return nil }
-        let symmetricKey = try await session.getDatabaseSymmetricKey()
+    private func pendingOutboundTransport(
+        sharedId: String,
+        now: Date = Date()
+    ) -> PendingOutboundTransport? {
+        cleanupPendingOutboundTransport(now: now)
+        return pendingOutboundTransportBySharedId[sharedId]
+    }
 
-        // Find the "active" identity (non-inactive) for this device. If none exists, we cannot promote.
-        let all = try await cache.fetchSessionIdentities()
-        let candidates = await all.asyncFilter { identity in
-            guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
-            return props.secretName == inboundTask.senderSecretName && props.deviceId == inboundTask.senderDeviceId
+    private func logRecoveryTransportSendSuccess(_ event: TransportEvent?, sharedId: String) {
+        guard let event else { return }
+
+        switch event {
+        case .sessionReestablishment(let envelope):
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.reestablishmentSent sharedId=\(sharedId) kind=\(envelope.kind.rawValue) response=\(envelope.isResponse) epoch=\(envelope.epoch) intent=\(envelope.intentId?.uuidString ?? "nil")")
+        case .requestMessageResend(let request):
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.resendRequestSent sharedId=\(sharedId) requestingDeviceId=\(request.requestingDeviceId) requestedCount=\(request.failedSharedMessageIds.count) ids=\(request.failedSharedMessageIds.joined(separator: ","))")
+        case .linkedDeviceReprovisioning(let bundle):
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.linkedDeviceReprovisioningSent sharedId=\(sharedId) targetDeviceId=\(bundle.targetDeviceId)")
+        case .synchronizeOneTimeKeys, .refreshOneTimeKeys:
+            break
+        }
+    }
+
+    private func shouldRememberPendingOutboundTransport(_ message: CryptoMessage) -> Bool {
+        guard let transportInfo = message.transportInfo,
+              let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo)
+        else {
+            return true
         }
 
-        guard let activeIdentity = await candidates.asyncFirst(where: { identity in
-            guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
-            return !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
-        }) else {
+        switch event {
+        case .requestMessageResend,
+             .sessionReestablishment,
+             .linkedDeviceReprovisioning,
+             .synchronizeOneTimeKeys,
+             .refreshOneTimeKeys:
+            return true
+        }
+    }
+
+    private func rememberPendingOutboundTransport(
+        sharedId: String,
+        message: SignedRatchetMessage,
+        metadata: SignedRatchetMessageMetadata,
+        needsRemoteDeletion: Bool,
+        curveOneTimeKeyId: String?,
+        mlKEMOneTimeKeyId: String,
+        now: Date = Date()
+    ) {
+        cleanupPendingOutboundTransport(now: now)
+        pendingOutboundTransportBySharedId[sharedId] = PendingOutboundTransport(
+            message: message,
+            metadata: metadata,
+            needsRemoteDeletion: needsRemoteDeletion,
+            curveOneTimeKeyId: curveOneTimeKeyId,
+            mlKEMOneTimeKeyId: mlKEMOneTimeKeyId,
+            createdAt: now)
+
+        guard pendingOutboundTransportBySharedId.count > pendingOutboundTransportLimit else { return }
+        let overflow = pendingOutboundTransportBySharedId.count - pendingOutboundTransportLimit
+        let oldestKeys = pendingOutboundTransportBySharedId
+            .sorted { $0.value.createdAt < $1.value.createdAt }
+            .prefix(overflow)
+            .map(\.key)
+        for key in oldestKeys {
+            pendingOutboundTransportBySharedId.removeValue(forKey: key)
+        }
+    }
+
+    private func sendPendingOutboundTransport(
+        _ pendingTransport: PendingOutboundTransport,
+        outboundTask: OutboundTaskMessage,
+        session: PQSSession
+    ) async throws {
+        try await session.transportDelegate?.sendMessage(
+            pendingTransport.message,
+            metadata: pendingTransport.metadata)
+        logRecoveryTransportSendSuccess(
+            pendingTransport.metadata.transportEvent,
+            sharedId: outboundTask.sharedId)
+        pendingOutboundTransportBySharedId.removeValue(forKey: outboundTask.sharedId)
+
+        await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
+
+        if outboundTask.isPersistedOutbound {
+            await markPersistedOutboundPastSendingIfNeeded(session: session, localMessageId: outboundTask.localId)
+        }
+
+        if pendingTransport.needsRemoteDeletion {
+            try await removeKeys(
+                session: session,
+                curveId: pendingTransport.curveOneTimeKeyId,
+                mlKEMId: pendingTransport.mlKEMOneTimeKeyId)
+        }
+    }
+
+    private func cleanupPendingOutboundTransport(now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-pendingOutboundTransportTTL)
+        pendingOutboundTransportBySharedId = pendingOutboundTransportBySharedId.filter { _, pendingTransport in
+            pendingTransport.createdAt > cutoff
+        }
+    }
+
+    private func rememberRecentOutboundReplayIfNeeded(
+        _ outboundTask: OutboundTaskMessage,
+        session: PQSSession,
+        now: Date = Date()
+    ) async {
+        cleanupRecentOutboundReplay(now: now)
+        guard !outboundTask.isPersistedOutbound else { return }
+        guard await isReplayableNonPersistentControl(outboundTask.message, session: session) else { return }
+        guard recentOutboundReplayBySharedId[outboundTask.sharedId] == nil else { return }
+
+        recentOutboundReplayBySharedId[outboundTask.sharedId] = RecentOutboundReplay(
+            message: outboundTask.message,
+            createdAt: now,
+            replayCount: 0)
+
+        guard recentOutboundReplayBySharedId.count > recentOutboundReplayLimit else { return }
+        let overflow = recentOutboundReplayBySharedId.count - recentOutboundReplayLimit
+        let oldestKeys = recentOutboundReplayBySharedId
+            .sorted { $0.value.createdAt < $1.value.createdAt }
+            .prefix(overflow)
+            .map(\.key)
+        for key in oldestKeys {
+            recentOutboundReplayBySharedId.removeValue(forKey: key)
+        }
+    }
+
+    private func recentOutboundReplayMessage(
+        sharedId: String,
+        now: Date = Date()
+    ) -> (message: CryptoMessage, replayCount: Int)? {
+        cleanupRecentOutboundReplay(now: now)
+        guard var replay = recentOutboundReplayBySharedId[sharedId] else {
             return nil
         }
-
-        guard var activeProps = await activeIdentity.props(symmetricKey: symmetricKey) else { return nil }
-        let originalState = activeProps.state
-
-        // Collect inactive snapshot identities (newest-first by sessionContextId, which we set to epoch seconds).
-        var inactive: [(identity: SessionIdentity, ts: Int)] = []
-        for identity in candidates {
-            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
-            guard props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
-            guard props.state != nil else { continue }
-            inactive.append((identity, props.sessionContextId))
+        guard replay.replayCount < recentOutboundReplayMaxReplays else {
+            recentOutboundReplayBySharedId.removeValue(forKey: sharedId)
+            return nil
         }
-        inactive.sort { $0.ts > $1.ts }
+        replay.replayCount += 1
+        recentOutboundReplayBySharedId[sharedId] = replay
+        return (replay.message, replay.replayCount)
+    }
 
-        guard !inactive.isEmpty else { return nil }
+    private func cleanupRecentOutboundReplay(now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-recentOutboundReplayTTL)
+        recentOutboundReplayBySharedId = recentOutboundReplayBySharedId.filter { _, replay in
+            replay.createdAt > cutoff
+        }
+    }
 
-        let now = Date().timeIntervalSince1970
-
-        // Try each snapshot: load its ratchet state into the active identity and retry decrypt.
-        for snapshot in inactive {
-            guard let snapshotProps = await snapshot.identity.props(symmetricKey: symmetricKey) else { continue }
-
-            // Age expiry (best-effort)
-            let archivedAt = TimeInterval(snapshotProps.sessionContextId)
-            if now - archivedAt > PQSSessionConstants.inactiveSessionMaxAgeSeconds {
-                try await cache.deleteSessionIdentity(snapshot.identity.id)
-                continue
-            }
-
-            guard let snapshotState = snapshotProps.state else { continue }
-
-            // Restore snapshot state into active identity.
-            activeProps.state = snapshotState
-            try await activeIdentity.updateIdentityProps(symmetricKey: symmetricKey, props: activeProps)
-            try await cache.updateSessionIdentity(activeIdentity)
-
-            do {
-                try await initializeRecipient(
-                    sessionIdentity: activeIdentity,
-                    session: session,
-                    ratchetMessage: verificationResult.ratchetMessage
-                )
-
-                let decrypted = try await ratchetManager.ratchetDecrypt(
-                    verificationResult.ratchetMessage,
-                    sessionId: activeIdentity.id
-                )
-
-                // Success: delete the used snapshot so we converge onto the recovered state.
-                try await cache.deleteSessionIdentity(snapshot.identity.id)
-
-                // Restore-in-place succeeded; keep the activeProps as-is (ratchetManager will advance it).
-                return decrypted
-            } catch {
-                // Revert active identity to its original state before trying the next snapshot.
-                activeProps.state = originalState
-                try await activeIdentity.updateIdentityProps(symmetricKey: symmetricKey, props: activeProps)
-                try await cache.updateSessionIdentity(activeIdentity)
-                continue
-            }
+    private func isReplayableNonPersistentControl(
+        _ message: CryptoMessage,
+        session: PQSSession
+    ) async -> Bool {
+        guard let transportInfo = message.transportInfo,
+              let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo)
+        else {
+            return await session.sessionDelegate?
+                .shouldReplayNonPersistentOutbound(transportInfo: message.transportInfo) == true
         }
 
-        return nil
+        switch event {
+        case .sessionReestablishment(let envelope):
+            return envelope.isResponse
+        case .linkedDeviceReprovisioning:
+            return true
+        case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .requestMessageResend:
+            return false
+        }
+    }
+
+    private func replaceRestoredSessionIdentityObject(
+        _ identity: SessionIdentity,
+        data: Data,
+        session: PQSSession,
+        reason: String
+    ) async throws {
+        guard let cache = await session.cache else { return }
+
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        guard let props = await identity.props(symmetricKey: symmetricKey) else { return }
+        guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { return }
+
+        let replacement = SessionIdentity(id: UUID(), data: data)
+        try await cache.createSessionIdentity(replacement)
+
+        do {
+            try await cache.deleteSessionIdentity(identity.id)
+            await session.removeIdentity(with: props.secretName)
+            logger.log(
+                level: .info,
+                message: "Replaced restored active SessionIdentity for \(props.secretName) (\(props.deviceId)) after \(reason)")
+        } catch {
+            try? await cache.deleteSessionIdentity(replacement.id)
+            throw error
+        }
     }
     
     private func removeKeys(session: PQSSession, curveId: String?, mlKEMId: String) async throws {
@@ -807,6 +1454,83 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         }
         try await cache.updateLocalSessionContext(encryptedConfig)
         logger.log(level: .info, message: "Removed Local Curve and MLKEM One Time Keys")
+    }
+
+    private func sendDeferredResendRequests(
+        _ pendingRequests: [PQSSession.PendingResendAfterReestablishment],
+        session: PQSSession,
+        reason: String
+    ) async {
+        guard !pendingRequests.isEmpty else { return }
+
+        struct ResendGroupKey: Hashable {
+            let senderName: String
+            let senderDeviceId: UUID
+        }
+
+        let grouped = Dictionary(grouping: pendingRequests) {
+            ResendGroupKey(senderName: $0.senderName, senderDeviceId: $0.senderDeviceId)
+        }
+
+        for (key, groupedRequests) in grouped {
+            var ready: [PQSSession.PendingResendAfterReestablishment] = []
+            for pending in groupedRequests {
+                guard await session.canSendPeerResendRequest(
+                    sender: pending.senderName,
+                    deviceId: pending.senderDeviceId,
+                    failedMessageId: pending.failedSharedMessageId
+                ) else {
+                    await session.deferPeerResendUntilReestablished(
+                        sender: pending.senderName,
+                        deviceId: pending.senderDeviceId,
+                        failedMessageId: pending.failedSharedMessageId,
+                        failureClass: pending.failureClass)
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.resendDeferredStillWaiting reason=cooldown sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId) failureClass=\(pending.failureClass)")
+                    continue
+                }
+                ready.append(pending)
+            }
+
+            guard !ready.isEmpty else { continue }
+
+            do {
+                let sharedIds = ready.map(\.failedSharedMessageId)
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.resendDrainStarted reason=\(reason) count=\(sharedIds.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) ids=\(sharedIds.joined(separator: ","))")
+                try await session.requestMessageResend(
+                    sharedMessageIds: sharedIds,
+                    senderName: key.senderName,
+                    senderDeviceId: key.senderDeviceId)
+                for pending in ready {
+                    await session.markPeerResendRequestSent(
+                        sender: pending.senderName,
+                        deviceId: pending.senderDeviceId,
+                        failedMessageId: pending.failedSharedMessageId)
+                    await session.markInboundFailure(
+                        sender: pending.senderName,
+                        deviceId: pending.senderDeviceId,
+                        messageId: pending.failedSharedMessageId,
+                        failureClass: pending.failureClass)
+                }
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.resendDrainSubmitted reason=\(reason) count=\(sharedIds.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) ids=\(sharedIds.joined(separator: ","))")
+            } catch {
+                for pending in ready {
+                    await session.deferPeerResendUntilReestablished(
+                        sender: pending.senderName,
+                        deviceId: pending.senderDeviceId,
+                        failedMessageId: pending.failedSharedMessageId,
+                        failureClass: pending.failureClass)
+                }
+                logger.log(
+                    level: .warning,
+                    message: "pqs.recovery.resendDrainFailed reason=\(reason) count=\(ready.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) error=\(error)")
+            }
+        }
     }
     
     /// Initializes the recipient for a session based on the provided ratchet message.
@@ -860,31 +1584,48 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             throw DoubleRatchetKit.CryptoError.propsError
         }
         
-        // Header key IDs are authoritative for recipient key selection.
-        // If a header ID is nil, this message uses "no one-time key" semantics for that algorithm.
+        let localPrivateKeys = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys
+        let localMLKEMPrivateKeys = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys
+        
         if let oneTimeKeyId = ratchetMessage.header.oneTimeKeyId {
-            if let privateOneTimeKey = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.first(where: { $0.id == oneTimeKeyId }) {
+            if let privateOneTimeKey = localPrivateKeys.first(where: { $0.id == oneTimeKeyId }) {
                 localOneTimePrivateKey = privateOneTimeKey
             } else if let state = props.state, state.localOneTimePrivateKey?.id == oneTimeKeyId {
-                // Backward-compatible fallback only when state key ID exactly matches header key ID.
                 localOneTimePrivateKey = state.localOneTimePrivateKey
             } else {
+                if shouldEmitKeyPayloadLogs {
+                    logger.log(level: .debug, message: """
+                        OTK mismatch: headerOTK=\(oneTimeKeyId.uuidString) \
+                        localPoolSize=\(localPrivateKeys.count) \
+                        localPoolIDs=\(localPrivateKeys.prefix(5).map(\.id.uuidString)) \
+                        hasState=\(props.state != nil) \
+                        stateOTK=\(props.state?.localOneTimePrivateKey?.id.uuidString ?? "nil") \
+                        sender=\(props.secretName) deviceId=\(props.deviceId)
+                        """)
+                }
                 throw RatchetError.missingOneTimeKey
             }
         } else {
             localOneTimePrivateKey = nil
         }
-
+        
         if let mlKEMOneTimeKeyId = ratchetMessage.header.mlKEMOneTimeKeyId {
-            if let privateMLKEMOneTimeKey = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.first(where: { $0.id == mlKEMOneTimeKeyId }) {
+            if let privateMLKEMOneTimeKey = localMLKEMPrivateKeys.first(where: { $0.id == mlKEMOneTimeKeyId }) {
                 localMLKEMPrivateKey = privateMLKEMOneTimeKey
             } else if sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey.id == mlKEMOneTimeKeyId {
-                // Header can legitimately reference the recipient's final MLKEM key.
                 localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
             } else if let state = props.state, state.localMLKEMPrivateKey.id == mlKEMOneTimeKeyId {
-                // Backward-compatible fallback only when state key ID exactly matches header key ID.
                 localMLKEMPrivateKey = state.localMLKEMPrivateKey
             } else {
+                if shouldEmitKeyPayloadLogs {
+                    logger.log(level: .debug, message: """
+                        MLKEM OTK mismatch: headerMLKEM=\(mlKEMOneTimeKeyId.uuidString) \
+                        localPoolSize=\(localMLKEMPrivateKeys.count) \
+                        finalMLKEM=\(sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey.id.uuidString) \
+                        hasState=\(props.state != nil) \
+                        sender=\(props.secretName) deviceId=\(props.deviceId)
+                        """)
+                }
                 throw RatchetError.missingOneTimeKey
             }
         } else {
@@ -948,6 +1689,63 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     ///              Provides context and cryptographic keys.
     ///   - sessionIdentity: The `SessionIdentity` associated with the recipient of the message.
     ///                      Contains sender's cryptographic identity.
+    /// After the transport accepts an outbound ratchet payload, move the local persisted copy off `.sending`
+    /// so clients can show a stable "sent" state without waiting for a peer receipt.
+    private func markPersistedOutboundPastSendingIfNeeded(session: PQSSession, localMessageId: UUID) async {
+        guard let cache = await session.cache else { return }
+        let persisted: EncryptedMessage
+        do {
+            persisted = try await cache.fetchMessage(id: localMessageId)
+        } catch {
+            return
+        }
+        do {
+            let symmetricKey = try await session.getDatabaseSymmetricKey()
+            guard var props = await persisted.props(symmetricKey: symmetricKey) else { return }
+            guard case .sending = props.deliveryState else { return }
+            props.deliveryState = .waitingDelivery
+            let updated = try await persisted.updateMessage(with: props, symmetricKey: symmetricKey)
+            try await cache.updateMessage(updated, symmetricKey: symmetricKey)
+            await session.receiverDelegate?.updatedMessage(updated)
+        } catch {
+            logger.log(level: .debug, message: "markPersistedOutboundPastSendingIfNeeded failed: \(error)")
+        }
+    }
+    
+    /// Lets the original sender advance their outbound delivery glyph once we've decrypted and stored the message.
+    /// Skips channels (noise) and self-sent / multidevice echoes.
+    private func sendAutomaticDeliveredReceiptIfNeeded(
+        session: PQSSession,
+        inboundTask: InboundTaskMessage,
+        sharedId: String,
+        conversationRecipient: MessageRecipient
+    ) async {
+        switch conversationRecipient {
+        case .nickname, .personalMessage:
+            break
+        default:
+            return
+        }
+        guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return }
+        guard inboundTask.senderSecretName != mySecretName else { return }
+        guard let sessionDelegate = await session.sessionDelegate else { return }
+        guard await sessionDelegate.shouldSendAutomaticDeliveryReceipts() else { return }
+        
+        let metadata = DeliveryStateMetadata(state: .delivered, sharedId: sharedId)
+        let encoded: Data
+        do {
+            encoded = try BinaryEncoder().encode(metadata)
+        } catch {
+            return
+        }
+        let receiptRecipient = MessageRecipient.nickname(inboundTask.senderSecretName)
+        do {
+            try await sessionDelegate.deliveryStateChanged(recipient: receiptRecipient, metadata: encoded)
+        } catch {
+            logger.log(level: .debug, message: "Automatic delivered receipt failed for sharedId=\(sharedId): \(error)")
+        }
+    }
+    
     /// - Throws: An error if the message processing fails due to issues such as missing metadata,
     ///           session errors, or communication model errors.
     private func handleDecodedMessage(_ decodedMessage: CryptoMessage,
@@ -1021,9 +1819,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             }
             
             try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
             
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
+            await sendAutomaticDeliveredReceiptIfNeeded(
+                session: session,
+                inboundTask: inboundTask,
+                sharedId: messageModel.sharedId,
+                conversationRecipient: decodedMessage.recipient)
         case .personalMessage:
             let sender = inboundTask.senderSecretName
             guard let mySecretName = await session.sessionContext?.sessionUser.secretName else { return }
@@ -1083,9 +1887,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             }
             
             try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
             
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
+            await sendAutomaticDeliveredReceiptIfNeeded(
+                session: session,
+                inboundTask: inboundTask,
+                sharedId: messageModel.sharedId,
+                conversationRecipient: decodedMessage.recipient)
         case .channel:
             let sender = inboundTask.senderSecretName
             var communicationModel: BaseCommunication
@@ -1144,10 +1954,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 try await cache.updateCommunication(communicationModel)
             }
             try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            if shouldUpdateCommunication,
+               let members = await communicationModel.props(symmetricKey: databaseSymmetricKey)?.members {
+                await session.receiverDelegate?.updatedCommunication(communicationModel, members: members)
+            }
+            logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
         case .broadcast:
-            // Broadcast messages are not persiseted yet
+            // Outbound broadcast is fanned out as per-peer `.nickname` ciphertext; legacy `.broadcast` payloads are not used.
             break
         }
     }
@@ -1194,17 +2009,25 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         var identities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName)
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
         
-        var sessionIdentity = await identities.asyncFirst(where: { identity in
-            guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else { return false }
-            return props.deviceId == inboundTask.senderDeviceId
-        })
+        let preferredDevice = await currentDeviceConfiguration(
+            secretName: inboundTask.senderSecretName,
+            deviceId: inboundTask.senderDeviceId,
+            session: session)
+        var sessionIdentity = await bestSessionIdentity(
+            secretName: inboundTask.senderSecretName,
+            deviceId: inboundTask.senderDeviceId,
+            in: identities,
+            symmetricKey: databaseSymmetricKey,
+            preferredDevice: preferredDevice)
         
         if sessionIdentity == nil { // SessionIdentity shouldn't be nil, but in case refresh never occured force it.
             identities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
-            sessionIdentity = await identities.asyncFirst(where: { identity in
-                guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else { return false }
-                return props.deviceId == inboundTask.senderDeviceId
-            })
+            sessionIdentity = await bestSessionIdentity(
+                secretName: inboundTask.senderSecretName,
+                deviceId: inboundTask.senderDeviceId,
+                in: identities,
+                symmetricKey: databaseSymmetricKey,
+                preferredDevice: preferredDevice)
         }
         
         guard let sessionIdentity else {
@@ -1229,10 +2052,13 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             let refreshedIdentities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
             
             // Find the refreshed identity with updated keys
-            guard let refreshed = await refreshedIdentities.asyncFirst(where: { identity in
-                guard let refreshedProps = await identity.props(symmetricKey: databaseSymmetricKey) else { return false }
-                return refreshedProps.deviceId == inboundTask.senderDeviceId
-            }) else {
+            guard let refreshed = await bestSessionIdentity(
+                secretName: inboundTask.senderSecretName,
+                deviceId: inboundTask.senderDeviceId,
+                in: refreshedIdentities,
+                symmetricKey: databaseSymmetricKey,
+                preferredDevice: preferredDevice)
+            else {
                 throw PQSSession.SessionErrors.invalidSignature
             }
             
@@ -1242,6 +2068,23 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             let refreshedKey = try Curve25519.Signing.PublicKey(rawRepresentation: refreshedProps.signingPublicKey)
             
             guard try signedMessage.verifySignature(using: refreshedKey) else {
+                let archivedIdentities = try await session.fetchArchivedSessionIdentities(
+                    secretName: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId)
+                for archived in archivedIdentities {
+                    guard let archivedProps = await archived.props(symmetricKey: databaseSymmetricKey) else {
+                        continue
+                    }
+                    guard let archivedKey = try? Curve25519.Signing.PublicKey(rawRepresentation: archivedProps.signingPublicKey) else {
+                        continue
+                    }
+                    if try signedMessage.verifySignature(using: archivedKey) {
+                        logger.log(
+                            level: .info,
+                            message: "Verified inbound message from archived SessionIdentity for \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId))")
+                        return try decode(signedMessage, identity: archived)
+                    }
+                }
                 throw PQSSession.SessionErrors.invalidSignature
             }
             
@@ -1262,6 +2105,77 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     private struct VerificationResult: Sendable {
         let ratchetMessage: RatchetMessage
         let sessionIdentity: SessionIdentity //Still will be the old session identity, this will get updated in the Double Ratchet.
+    }
+    
+    private enum SessionReestablishmentDisposition {
+        case ignore
+        case refreshOnly
+        case rotateCurrentDevice
+        case compromiseObserved
+    }
+    
+    private func sessionReestablishmentDisposition(
+        for kind: SessionReestablishmentKind,
+        inboundTask: InboundTaskMessage,
+        decodedMessage: CryptoMessage,
+        context: SessionContext
+    ) throws -> SessionReestablishmentDisposition {
+        switch kind {
+        case .peerRefresh:
+            return .refreshOnly
+        case .linkedDeviceRepair, .linkedDeviceCompromiseObserved:
+            guard decodedMessage.recipient == .personalMessage else { return .ignore }
+            guard inboundTask.senderSecretName == context.sessionUser.secretName else { return .ignore }
+            guard inboundTask.senderDeviceId != context.sessionUser.deviceId else { return .ignore }
+            
+            let verifiedDevices = try context.activeUserConfiguration.getVerifiedDevices()
+            guard verifiedDevices.contains(where: { $0.deviceId == inboundTask.senderDeviceId }) else {
+                return .ignore
+            }
+            
+            switch kind {
+            case .linkedDeviceRepair:
+                return .rotateCurrentDevice
+            case .linkedDeviceCompromiseObserved:
+                return .compromiseObserved
+            case .peerRefresh:
+                return .refreshOnly
+            }
+        }
+    }
+
+    private func shouldAcceptLinkedDeviceReprovisioning(
+        bundle: LinkedDeviceReprovisioningBundle,
+        inboundTask: InboundTaskMessage,
+        decodedMessage: CryptoMessage,
+        context: SessionContext
+    ) throws -> Bool {
+        guard decodedMessage.recipient == .personalMessage else { return false }
+        guard inboundTask.senderSecretName == context.sessionUser.secretName else { return false }
+        guard inboundTask.senderDeviceId == bundle.issuedByDeviceId else { return false }
+        guard bundle.targetDeviceId == context.sessionUser.deviceId else { return false }
+
+        let verifiedDevices = try context.activeUserConfiguration.getVerifiedDevices()
+        guard let senderDevice = verifiedDevices.first(where: { $0.deviceId == inboundTask.senderDeviceId }) else {
+            return false
+        }
+        return senderDevice.isMasterDevice
+    }
+
+    private func performPendingLinkedDeviceRepair(session: PQSSession) async throws {
+        guard let refreshedContext = await session.sessionContext else { return }
+        guard let currentDevice = try refreshedContext.activeUserConfiguration
+            .getVerifiedDevices()
+            .first(where: { $0.deviceId == refreshedContext.sessionUser.deviceId }) else {
+            throw PQSSession.SessionErrors.invalidDeviceIdentity
+        }
+        if currentDevice.isMasterDevice {
+            logger.log(level: .info, message: "Master device received linked-device repair request; refreshing identities only")
+            await session.setPendingLinkedDeviceRepair(false)
+        } else {
+            try await session.rotateCurrentDeviceKeys()
+            await session.setPendingLinkedDeviceRepair(false)
+        }
     }
     
     /// Signs a ratchet message using the cryptographic session's signing capabilities.

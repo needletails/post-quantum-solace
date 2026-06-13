@@ -1,121 +1,189 @@
 # Post-Quantum Solace SDK
 
-A secure, post-quantum cryptographic messaging SDK with end-to-end encryption.
+A secure, post-quantum cryptographic messaging SDK with end-to-end encryption,
+account-level identity pinning, and per-device key custody.
 
 ## Overview
 
-The Post-Quantum Solace SDK provides a comprehensive solution for secure messaging with both classical (Curve25519) and post-quantum (MLKEM1024) cryptography. Built with Swift's modern concurrency features, it offers forward secrecy, device management, and automatic key rotation.
+The Post-Quantum Solace SDK gives Swift applications a complete pipeline for
+multi-device, post-quantum-secure messaging. Each user owns an **account-level
+signing key** (the trust anchor); each device owns its own per-device signing
+key, long-term Curve25519 / MLKEM1024 keys, and a continually-replenished pool
+of one-time pre-keys. The Double Ratchet (via the
+[`DoubleRatchetKit`](https://github.com/needletails/double-ratchet-kit) module)
+provides forward secrecy, while MLKEM1024 contributes the post-quantum half of
+each handshake.
+
+The SDK is designed around three jobs:
+
+- **`PQSSession`** — the singleton actor that owns session state, drives
+  encryption / decryption, schedules key rotation, and coordinates all other
+  components.
+- **`SessionEvents` / transport / store / receiver protocols** — the four
+  delegate surfaces an application implements to plug the SDK into its
+  network, database, and UI.
+- **`SessionModels`** — the on-disk and on-the-wire data types
+  (`UserConfiguration`, `EncryptedMessage`, `BaseCommunication`,
+  `SecurityIdentity`, etc.) that move between those pieces.
 
 ## Topics
 
 ### Getting Started
 
 - <doc:GettingStarted>
-- <doc:Tutorials>
-- <doc:Installation>
 
-### Core Modules
+### Guides
+
+- <doc:AccountIdentityRecovery>
+- <doc:ControlEventCoalescing>
+
+### Core entry point
 
 - ``PQSSession``
+- ``SessionConfiguration``
+- ``PQSSessionConstants``
+
+### Lifecycle & configuration
+
+- ``PQSSession/shared``
+- ``PQSSession/configure(with:)``
+- ``PQSSession/createSession(secretName:appPassword:createInitialTransport:)``
+- ``PQSSession/startSession(appPassword:)``
+- ``PQSSession/linkDevice(bundle:password:)``
+- ``PQSSession/shutdown()``
+- ``PQSSession/resumeJobQueue()``
+- ``PQSSession/isViable``
+
+### Account identity & TOFU trust
+
+- ``PQSSession/localSecurityIdentity()``
+- ``PQSSession/adoptVerifiedUserConfiguration(_:)``
+- ``PQSSession/acknowledgeAccountIdentityChange(_:)``
+- ``PQSSession/updateUserConfiguration(_:)``
+- ``PQSSession/updateUseroneTimePublicKeys(_:)``
+- ``PQSSession/createDeviceCryptographicBundle(isMaster:)``
+- ``PQSSession/CryptographicBundle``
+
+### Messaging & contacts
+
+- ``PQSSession/writeTextMessage(recipient:text:transportInfo:metadata:destructionTime:sharedIdOverride:)``
+- ``PQSSession/receiveMessage(message:sender:deviceId:messageId:)``
+- ``PQSSession/findCommunication(for:)``
+- ``PQSSession/addContacts(_:)``
+- ``PQSSession/createContact(secretName:metadata:friendshipMetadata:requestFriendship:)``
+- ``PQSSession/sendCommunicationSynchronization(contact:)``
+- ``PQSSession/requestFriendshipStateChange(state:contact:)``
+- ``PQSSession/updateMessageDeliveryState(_:deliveryState:messageRecipient:allowExternalUpdate:)``
+- ``PQSSession/editCurrentMessage(_:newText:)``
+
+### Key rotation
+
+- ``PQSSession/rotateCurrentDeviceKeys()``
+- ``PQSSession/rotateKeysOnPotentialCompromise()``
+- ``PQSSession/refreshOneTimeKeysTask(policy:)``
+- ``PQSSession/refreshMLKEMOneTimeKeysTask(policy:)``
+- ``PQSSession/OneTimeKeyRefreshPolicy``
+
+### Application password & app-data crypto
+
+- ``PQSSession/getAppSymmetricKey()``
+- ``PQSSession/getDatabaseSymmetricKey()``
+- ``PQSSession/verifyAppPassword(_:)``
+- ``PQSSession/changeAppPassword(_:)``
+
+### Errors
+
+- ``PQSSession/SessionErrors``
+
+### Delegate surfaces
+
+- ``SessionTransport``
+- ``PQSSessionStore``
+- ``EventReceiver``
+- ``PQSSessionDelegate``
+- ``SessionEvents``
+
+### Internal building blocks
+
 - ``TaskProcessor``
 - ``SessionCache``
-- ``SessionEvents``
-- ``SessionModels``
 
-### Key Features
+## Security model
 
-- **Post-Quantum Security**: MLKEM1024 for long-term security
-- **Forward Secrecy**: Double Ratchet protocol implementation
-- **Device Management**: Master/child device support
-- **Automatic Key Rotation**: Compromise recovery and key freshness
-- **End-to-End Encryption**: All communications are encrypted
-- **Thread Safety**: Actor-based concurrency model
+### Two layers of trust
 
-### Architecture
+The SDK enforces both **automatic** trust pinning and **manual** out-of-band
+verification:
 
-The SDK is built around several core components:
+1. **Trust On First Use (TOFU)** — the local account's
+   `signingPublicKey` is pinned the first time it is set. Any subsequent
+   server-supplied `UserConfiguration` whose account signing key differs from
+   the pin is rejected by ``PQSSession/adoptVerifiedUserConfiguration(_:)``
+   with ``PQSSession/SessionErrors/signingKeyOutOfSync``. Legitimate
+   rotations install via authenticated channels (master rotation,
+   linked-device reprovisioning) that update the pin first, so a subsequent
+   refresh sees a matching key.
+2. **Safety numbers** — ``SecurityIdentity``
+   60-digit safety numbers via ``SecurityIdentity/safetyNumber(local:remote:version:iterations:)``.
+   Two users compare these out of band (in-person scan, voice, etc.) to rule
+   out a man-in-the-middle.
 
-#### PQSSession
-The main session manager that orchestrates all cryptographic operations and manages the session lifecycle.
+When a TOFU mismatch is detected, the app should surface a confirmation flow
+and call ``PQSSession/acknowledgeAccountIdentityChange(_:)`` only after the
+user has positively re-verified the new identity (or, conversely, unlink the
+device and re-link from the master).
 
-#### TaskProcessor
-Handles asynchronous encryption/decryption tasks using dedicated cryptographic executors.
+### Cryptographic primitives
 
-#### SessionCache
-Provides two-tier caching with in-memory and persistent storage for optimal performance.
+- **Double Ratchet** — forward secrecy + message ordering (per-message keys).
+- **MLKEM1024** — post-quantum KEM contribution to every key agreement.
+- **Curve25519** — classical key agreement and signing for immediate security.
+- **AES-GCM** — authenticated symmetric encryption for ciphertext and
+  Binary-encoded `EncryptedMessage` / `BaseCommunication` payloads.
 
-#### SessionEvents
-Event-driven system for handling messages, contacts, and communication updates.
+### Per-device identity invariant
 
-#### SessionModels
-Core data structures with built-in encryption and secure serialization.
+Every device owns a stable per-device signing key for the lifetime of its
+`DeviceID`. Master rotations distribute a new account-level signing key, but
+they never replace a child's per-device key. Startup
+(``PQSSession/startSession(appPassword:)``) performs a non-fatal diagnostic
+check for cached divergence so fresh re-link flows can finish. Reprovisioning
+and key-rotation paths enforce the invariant and emit
+``PQSSession/SessionErrors/deviceIdentityCorrupted`` if a bundle tries to
+re-attest a child device with a foreign per-device key; that device should be
+re-linked.
 
-## Quick Start
+## Quick start
 
 ```swift
-import PostQuantumSolace
+import PQSSession
 
-// Initialize the session
 let session = PQSSession.shared
 
-// Set up delegates using SessionConfiguration (recommended)
-let config = SessionConfiguration(
+try await session.configure(with: SessionConfiguration(
     transport: myTransport,
     store: myStore,
-    receiver: myReceiver
-)
-try await session.configure(with: config)
+    receiver: myReceiver,
+    delegate: mySessionDelegate           // optional
+))
 
-// Create a new session
 try await session.createSession(
     secretName: "alice",
-    appPassword: "securePassword",
-    createInitialTransport: setupTransport
+    appPassword: "correct horse battery staple",
+    createInitialTransport: setupNetworkTransport
 )
+try await session.startSession(appPassword: "correct horse battery staple")
 
-// Start the session
-try await session.startSession(appPassword: "securePassword")
-
-// Send a message
 try await session.writeTextMessage(
     recipient: .nickname("bob"),
     text: "Hello, world!",
-    metadata: ["timestamp": Date()],
-    destructionTime: 3600
+    metadata: Data() // any application-defined Binary blob
 )
 ```
 
-## Security Model
+## Error handling
 
-### Cryptographic Protocols
-- **Double Ratchet**: For forward secrecy and message ordering
-- **MLKEM1024**: Post-quantum key exchange
-- **Curve25519**: Classical cryptography for immediate security
-- **AES-GCM**: Symmetric encryption for message content
-
-### Key Management
-- **One-Time Keys**: Pre-generated for immediate communication
-- **Long-Term Keys**: For persistent identity verification
-- **Automatic Rotation**: Scheduled and compromise-based key rotation
-- **Device Verification**: Signed device configurations
-
-### Privacy Features
-- **Secret Names**: Privacy-preserving user identification
-- **Device Isolation**: Separate cryptographic contexts per device
-- **Metadata Encryption**: All sensitive metadata is encrypted
-- **Forward Secrecy**: Keys are rotated after each message
-
-## Performance
-
-- **Async/Await**: Modern Swift concurrency throughout
-- **Actor Isolation**: Thread-safe concurrent access
-- **Dedicated Executors**: Cryptographic operations on separate queues
-- **Efficient Caching**: Two-tier cache system for optimal performance
-- **Batch Operations**: Key generation and updates in batches
-
-## Error Handling
-
-The SDK provides comprehensive error handling with `LocalizedError` conformance. All error types include detailed descriptions, failure reasons, and recovery suggestions:
+All public error types conform to `LocalizedError`:
 
 ```swift
 do {
@@ -124,92 +192,48 @@ do {
         text: "Hello, world!"
     )
 } catch let error as PQSSession.SessionErrors {
-    // Access localized error information
-    if let localizedError = error as? LocalizedError {
-        print("Error: \(localizedError.errorDescription ?? "Unknown")")
-        if let reason = localizedError.failureReason {
-            print("Reason: \(reason)")
-        }
-        if let suggestion = localizedError.recoverySuggestion {
-            print("Suggestion: \(suggestion)")
-        }
-    }
-    
-    // Pattern matching for specific error handling
     switch error {
-    case .sessionNotInitialized:
-        // Handle session setup issues
-    case .databaseNotInitialized:
-        // Handle storage issues
-    case .transportNotInitialized:
-        // Handle network issues
+    case .signingKeyOutOfSync:
+        await presentAccountIdentityRecovery()        // see GettingStarted
+
+    case .deviceIdentityCorrupted:
+        await unlinkAndPromptToReLink()
+
+    case .compromiseRotationRequiresMasterDevice:
+        await showMasterOnlyHint()
+
+    case .cannotFindOneTimeKey, .drainedKeys:
+        // Background tasks will refill; surface a transient retry banner.
+        break
+
     default:
-        // Handle other errors
+        await showError(error.errorDescription, error.recoverySuggestion)
     }
 }
 ```
 
-### Error Types
+### Error types
 
-All error enums conform to `LocalizedError`:
-- `PQSSession.SessionErrors` - Session-related errors
-- `SessionCache.CacheErrors` - Cache and storage errors
-- `CryptoError` - Cryptographic operation errors
-- `EventErrors` - Event handling errors
-- `SigningErrors` - Signature verification errors
+- ``PQSSession/SessionErrors`` — session lifecycle and operation errors.
+- ``SessionCache/CacheErrors`` — cache/storage failures.
+- `CryptoError` — encryption/decryption failures (re-exported from
+  `SessionModels`).
 
-## Thread Safety
+## Thread safety
 
-All public APIs are designed for concurrent access:
-- **Actor-based**: Core components use Swift actors
-- **Sendable**: All data types conform to Sendable
-- **Isolation**: Proper isolation for mutable state
-- **Async**: All operations are asynchronous
+- ``PQSSession`` is an `actor` — every public method is async and serializes
+  on the actor's executor.
+- All persisted/transmitted models conform to `Sendable`.
+- `TaskProcessor` runs cryptographic work on dedicated executors so heavy
+  encrypt/decrypt work does not contend with the rest of the app.
 
 ## Integration
 
-### Transport Layer
-Implement `SessionTransport` to provide network communication:
-- Message sending and receiving
-- Key distribution and management
-- User configuration synchronization
-
-### Storage Layer
-Implement `PQSSessionStore` to provide persistent storage:
-- Encrypted message storage
-- Contact and communication management
-- Session state persistence
-
-### Event Handling
-Implement `EventReceiver` to handle application events:
-- Message creation and updates
-- Contact management
-- Communication state changes
-
-## Best Practices
-
-### Security
-- Use strong application passwords
-- Implement proper key rotation
-- Monitor for potential compromises
-- Secure storage of sensitive data
-
-### Performance
-- Use dedicated queues for cryptographic operations
-- Implement proper caching strategies
-- Handle errors gracefully
-- Monitor memory usage
-
-### Integration
-- Implement proper error handling
-- Use async/await for all operations
-- Follow the delegate pattern
-- Test thoroughly with different scenarios
-
-## Support
-
-For more information, see:
-- <doc:APIReference>
-- <doc:Examples>
-- <doc:Troubleshooting>
-- <doc:SecurityGuide> 
+- **Transport** — implement ``SessionTransport`` to send signed ratchet
+  messages and to publish/fetch `UserConfiguration` and one-time keys.
+- **Store** — implement ``PQSSessionStore`` for encrypted persistence of
+  contexts, messages, contacts, communications, and queued jobs.
+- **Receiver** — implement ``EventReceiver`` to react to message and
+  contact lifecycle changes in your UI.
+- **Optional delegate** — implement ``PQSSessionDelegate`` to participate
+  in metadata redaction, transport routing, and compromise notifications.

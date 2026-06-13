@@ -99,6 +99,9 @@ public struct Communication: Sendable & Codable {
 /// - Note: This class is marked as `@unchecked Sendable` because the underlying cryptographic
 ///   operations are thread-safe, but the class itself doesn't automatically guarantee thread safety.
 public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
+    /// Thread-safe lock for protecting encryption/decryption operations.
+    private let lock = NSLock()
+
     /// The unique identifier for this communication.
     public let id: UUID
     
@@ -289,16 +292,19 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ///   used when you need to handle decryption errors explicitly. For a more
     ///   graceful approach, consider using `props(symmetricKey:)` instead.
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
-        let crypto = NeedleTailCrypto()
-        guard !data.isEmpty else { throw CryptoError.decryptionFailed }
-        guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
-            throw CryptoError.decryptionFailed
-        }
-        guard !decrypted.isEmpty else { throw CryptoError.decryptionFailed }
-        do {
-            return try BinaryDecoder().decode(SessionModels.BaseCommunication.UnwrappedProps.self, from: decrypted)
-        } catch {
-            throw CryptoError.decryptionFailed
+        try lock.withLock { [weak self] in
+            guard let self else { throw CryptoError.decryptionFailed }
+            let crypto = NeedleTailCrypto()
+            guard !data.isEmpty else { throw CryptoError.decryptionFailed }
+            guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
+                throw CryptoError.decryptionFailed
+            }
+            guard !decrypted.isEmpty else { throw CryptoError.decryptionFailed }
+            do {
+                return try BinaryDecoder().decode(SessionModels.BaseCommunication.UnwrappedProps.self, from: decrypted)
+            } catch {
+                throw CryptoError.decryptionFailed
+            }
         }
     }
     
@@ -321,12 +327,15 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ///   ensure that the update was successful. The returned properties can be
     ///   used to verify that the update was applied correctly.
     public func updateProps(symmetricKey: SymmetricKey, props: Codable & Sendable) async throws -> UnwrappedProps? {
-        let crypto = NeedleTailCrypto()
-        let data = try BinaryEncoder().encode(props)
-        guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-            throw CryptoError.encryptionFailed
+        try lock.withLock { [weak self] in
+            guard let self else { throw CryptoError.encryptionFailed }
+            let crypto = NeedleTailCrypto()
+            let data = try BinaryEncoder().encode(props)
+            guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
+                throw CryptoError.encryptionFailed
+            }
+            self.data = encryptedData
         }
-        self.data = encryptedData
         return try await decryptProps(symmetricKey: symmetricKey)
     }
     

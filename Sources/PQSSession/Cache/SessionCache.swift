@@ -163,8 +163,8 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter session: The session identity to be created.
     /// - Throws: An error if the creation fails.
     public func createSessionIdentity(_ session: SessionIdentity) async throws {
-        sessionIdentities.append(session)
         try await store.createSessionIdentity(session)
+        sessionIdentities.append(session)
     }
 
     /// Fetches all session identities from the store and updates the cache.
@@ -189,8 +189,8 @@ public actor SessionCache: PQSSessionStore {
             sessionIdentities = identities // Update the cache
         }
         if let index = sessionIdentities.firstIndex(where: { $0.id == session.id }) {
-            sessionIdentities[index] = session
             try await store.updateSessionIdentity(session)
+            sessionIdentities[index] = session
         } else {
             throw CacheErrors.sessionIdentityNotFound
         }
@@ -200,8 +200,8 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter id: The session identity to be removed.
     /// - Throws: An error if the removal fails.
     public func deleteSessionIdentity(_ id: UUID) async throws {
-        sessionIdentities.removeAll(where: { $0.id == id })
         try await store.deleteSessionIdentity(id)
+        sessionIdentities.removeAll(where: { $0.id == id })
     }
 
     // MARK: - Message Methods

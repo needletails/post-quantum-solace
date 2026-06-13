@@ -152,6 +152,14 @@ public struct LinkDeviceInfo: Sendable {
     /// It should be strong and kept confidential.
     public let password: String
 
+    /// The account-signed configuration the linked device should install.
+    ///
+    /// Older link payloads only carried `devices`, forcing the child to rebuild a
+    /// temporary self-signed configuration. When present, this is the source of
+    /// truth because it preserves the account signing key, device attestations,
+    /// one-time keys, and device-owned key bundles.
+    public let userConfiguration: UserConfiguration?
+
     /// Initializes a new instance of `LinkDeviceInfo`.
     ///
     /// - Parameters:
@@ -164,11 +172,39 @@ public struct LinkDeviceInfo: Sendable {
     public init(
         secretName: String,
         devices: [UserDeviceConfiguration],
-        password: String
+        password: String,
+        userConfiguration: UserConfiguration? = nil
     ) {
         self.secretName = secretName
         self.devices = devices
         self.password = password
+        self.userConfiguration = userConfiguration
+    }
+}
+
+/// A same-account configuration push from master to a linked child device.
+///
+/// Used to ship updated `activeUserConfiguration` (new account-level signing key, re-signed device
+/// list) after a master-side rotation. The bundle does NOT carry any signing **private** key —
+/// each device owns and retains its own per-device signing key for the lifetime of its `DeviceID`,
+/// per-device identity model. Children consume only the public account material to
+/// verify the new device list.
+public struct LinkedDeviceReprovisioningBundle: Codable, Sendable {
+    public let activeUserConfiguration: UserConfiguration
+    public let issuedByDeviceId: UUID
+    public let issuedAt: Date
+    public let targetDeviceId: UUID
+
+    public init(
+        activeUserConfiguration: UserConfiguration,
+        issuedByDeviceId: UUID,
+        issuedAt: Date,
+        targetDeviceId: UUID
+    ) {
+        self.activeUserConfiguration = activeUserConfiguration
+        self.issuedByDeviceId = issuedByDeviceId
+        self.issuedAt = issuedAt
+        self.targetDeviceId = targetDeviceId
     }
 }
 

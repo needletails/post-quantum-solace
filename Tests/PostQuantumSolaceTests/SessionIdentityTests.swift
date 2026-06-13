@@ -36,8 +36,16 @@ actor SessionIdentityTests {
     // MARK: - Mock Store
     
     final class MockSessionIdentityStore: PQSSessionStore, @unchecked Sendable {
+        enum MockError: Error {
+            case forcedDelete
+            case forcedUpdate
+        }
+
         var sessionContext: Data?
         var identities = [SessionIdentity]()
+        var contacts = [ContactModel]()
+        var failNextSessionIdentityDelete = false
+        var failNextSessionIdentityUpdate = false
         
         // Core session context methods
         func createLocalSessionContext(_ data: Data) async throws { sessionContext = data }
@@ -62,11 +70,19 @@ actor SessionIdentityTests {
         // Session identity methods
         func fetchSessionIdentities() async throws -> [SessionIdentity] { identities }
         func updateSessionIdentity(_ session: SessionIdentity) async throws {
+            if failNextSessionIdentityUpdate {
+                failNextSessionIdentityUpdate = false
+                throw MockError.forcedUpdate
+            }
             identities.removeAll(where: { $0.id == session.id })
             identities.append(session)
         }
         func createSessionIdentity(_ session: SessionIdentity) async throws { identities.append(session) }
         func deleteSessionIdentity(_ id: UUID) async throws {
+            if failNextSessionIdentityDelete {
+                failNextSessionIdentityDelete = false
+                throw MockError.forcedDelete
+            }
             identities.removeAll(where: { $0.id == id })
         }
         
@@ -77,9 +93,12 @@ actor SessionIdentityTests {
         func fetchAllMediaJobs() async throws -> [DataPacket] { [] }
         func fetchMediaJob(id _: UUID) async throws -> DataPacket? { nil }
         func deleteMediaJob(_: UUID) async throws {}
-        func fetchContacts() async throws -> [ContactModel] { [] }
-        func createContact(_: ContactModel) async throws {}
-        func updateContact(_: ContactModel) async throws {}
+        func fetchContacts() async throws -> [ContactModel] { contacts }
+        func createContact(_ contact: ContactModel) async throws { contacts.append(contact) }
+        func updateContact(_ contact: ContactModel) async throws {
+            contacts.removeAll(where: { $0.id == contact.id })
+            contacts.append(contact)
+        }
         func fetchCommunications() async throws -> [BaseCommunication] { [] }
         func createCommunication(_: BaseCommunication) async throws {}
         func updateCommunication(_: BaseCommunication) async throws {}
@@ -153,6 +172,45 @@ actor SessionIdentityTests {
         func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
         func publishRotatedKeys(for secretName: String, deviceId: String, rotated keys: RotatedPublicKeys) async throws {}
         func createUploadPacket(secretName: String, deviceId: UUID, recipient: MessageRecipient, metadata: Data) async throws {}
+    }
+
+    @Test("SessionCache keeps memory and disk aligned when delete persistence fails")
+    func testSessionCachePreservesIdentityWhenDeleteFails() async throws {
+        let store = MockSessionIdentityStore()
+        let cache = SessionCache(store: store)
+        let identity = SessionIdentity(id: UUID(), data: Data([0x01, 0x02, 0x03]))
+
+        try await cache.createSessionIdentity(identity)
+        store.failNextSessionIdentityDelete = true
+
+        await #expect(throws: MockSessionIdentityStore.MockError.self) {
+            try await cache.deleteSessionIdentity(identity.id)
+        }
+
+        let cached = try await cache.fetchSessionIdentities()
+        #expect(cached.contains(where: { $0.id == identity.id }))
+        #expect(store.identities.contains(where: { $0.id == identity.id }))
+        await session.shutdown()
+    }
+
+    @Test("SessionCache keeps previous identity when update persistence fails")
+    func testSessionCachePreservesIdentityWhenUpdateFails() async throws {
+        let store = MockSessionIdentityStore()
+        let cache = SessionCache(store: store)
+        let original = SessionIdentity(id: UUID(), data: Data([0x01]))
+        let updated = SessionIdentity(id: original.id, data: Data([0x02]))
+
+        try await cache.createSessionIdentity(original)
+        store.failNextSessionIdentityUpdate = true
+
+        await #expect(throws: MockSessionIdentityStore.MockError.self) {
+            try await cache.updateSessionIdentity(updated)
+        }
+
+        let cached = try await cache.fetchSessionIdentities()
+        #expect(cached.first(where: { $0.id == original.id })?.data == original.data)
+        #expect(store.identities.first(where: { $0.id == original.id })?.data == original.data)
+        await session.shutdown()
     }
     
     // MARK: - Helper Methods
@@ -348,6 +406,82 @@ actor SessionIdentityTests {
             throw error
         }
     }
+
+    @Test("Should rethrow critical invalid-signature refresh failures")
+    func testRefreshIdentitiesRethrowsCriticalInvalidSignature() async throws {
+        do {
+            let (_, transport) = try await setupTestSession()
+
+            let bundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            var invalidConfiguration = bundle.userConfiguration
+            invalidConfiguration.signingPublicKey = Curve25519.Signing.PrivateKey().publicKey.rawRepresentation
+            transport.configurations["alice"] = invalidConfiguration
+
+            do {
+                _ = try await session.refreshIdentities(secretName: "alice", forceRefresh: true)
+                Issue.record("Expected refreshIdentities to throw invalidSignature for tampered configuration")
+            } catch let error as PQSSession.SessionErrors {
+                #expect(error == .invalidSignature)
+            }
+
+            await session.shutdown()
+        } catch {
+            await session.shutdown()
+            throw error
+        }
+    }
+
+    @Test("Force refresh rejects peer account signing key drift from pinned contact")
+    func testForceRefreshRejectsPeerAccountSigningKeyDriftFromPinnedContact() async throws {
+        do {
+            let (store, transport) = try await setupTestSession()
+
+            let trustedBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            let trustedConfiguration = trustedBundle.userConfiguration
+            transport.configurations["alice"] = trustedConfiguration
+
+            let symmetricKey = try await session.getDatabaseSymmetricKey()
+            let pinnedContact = try ContactModel(
+                id: UUID(),
+                props: .init(
+                    secretName: "alice",
+                    configuration: trustedConfiguration,
+                    metadata: [:]
+                ),
+                symmetricKey: symmetricKey
+            )
+            try await store.createContact(pinnedContact)
+
+            let initial = try await session.refreshIdentities(secretName: "alice", forceRefresh: true)
+            #expect(!initial.isEmpty, "The trusted configuration should establish at least one peer identity")
+            let initialIdentityIds = Set(initial.map(\.id))
+            let initialStoredIds = Set(store.identities.map(\.id))
+
+            let foreignBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            #expect(foreignBundle.userConfiguration.signingPublicKey != trustedConfiguration.signingPublicKey)
+            transport.configurations["alice"] = foreignBundle.userConfiguration
+
+            await #expect(throws: PQSSession.SessionErrors.peerSigningKeyOutOfSync) {
+                _ = try await session.refreshIdentities(secretName: "alice", forceRefresh: true)
+            }
+
+            #expect(Set(store.identities.map(\.id)) == initialStoredIds)
+            let after = try await session.getSessionIdentities(with: "alice")
+            #expect(Set(after.map(\.id)) == initialIdentityIds)
+
+            guard let contactProps = await store.contacts.first?.props(symmetricKey: symmetricKey) else {
+                Issue.record("Expected pinned contact to remain decryptable")
+                await session.shutdown()
+                return
+            }
+            #expect(contactProps.configuration.signingPublicKey == trustedConfiguration.signingPublicKey)
+
+            await session.shutdown()
+        } catch {
+            await session.shutdown()
+            throw error
+        }
+    }
     
     // MARK: Identity Management Tests
     
@@ -399,6 +533,80 @@ actor SessionIdentityTests {
             await session.shutdown()
         } catch {
             // Ensure proper cleanup
+            await session.shutdown()
+            throw error
+        }
+    }
+
+    @Test("Should never return current device identity from getSessionIdentities")
+    func testGetSessionIdentitiesExcludesCurrentDeviceIdentity() async throws {
+        do {
+            let (store, _) = try await setupTestSession()
+            guard let context = await session.sessionContext else {
+                Issue.record("Session context should be initialized")
+                await session.shutdown()
+                return
+            }
+
+            // Insert an identity row that points to this same device.
+            let signingPublicKey = try Curve25519.Signing.PublicKey(
+                rawRepresentation: context.activeUserConfiguration.signingPublicKey
+            )
+            guard let signedDevice = context.activeUserConfiguration.signedDevices.first(where: { signed in
+                guard let verified = try? signed.verified(using: signingPublicKey) else { return false }
+                return verified.deviceId == context.sessionUser.deviceId
+            }), let currentDevice = try signedDevice.verified(using: signingPublicKey) else {
+                Issue.record("Expected to resolve current device configuration")
+                await session.shutdown()
+                return
+            }
+            let selfIdentity = try await session.createEncryptableSessionIdentityModel(
+                with: currentDevice,
+                oneTimePublicKey: nil,
+                mlKEMPublicKey: currentDevice.finalMLKEMPublicKey,
+                for: context.sessionUser.secretName,
+                associatedWith: context.sessionUser.deviceId,
+                new: Int.random(in: 1 ..< Int.max)
+            )
+            try await store.createSessionIdentity(selfIdentity)
+
+            let identities = try await session.getSessionIdentities(with: context.sessionUser.secretName)
+            #expect(identities.isEmpty)
+
+            await session.shutdown()
+        } catch {
+            await session.shutdown()
+            throw error
+        }
+    }
+
+    @Test("Should not leak linked self devices into non-self recipient lookups")
+    func testGetSessionIdentitiesDoesNotLeakLinkedSelfDevicesIntoPeerLookup() async throws {
+        do {
+            let (store, transport) = try await setupTestSession()
+
+            let selfSiblingIdentity = try await createTestIdentity(for: "test-user")
+            let bobIdentity = try await createTestIdentity(for: "bob")
+
+            try await store.createSessionIdentity(selfSiblingIdentity)
+            try await store.createSessionIdentity(bobIdentity)
+
+            let bundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            transport.configurations["bob"] = bundle.userConfiguration
+
+            let retrieved = try await session.getSessionIdentities(with: "bob")
+
+            #expect(retrieved.count == 1, "Peer lookup should only return Bob identities")
+            guard let onlyIdentity = retrieved.first,
+                  let props = try? await onlyIdentity.props(symmetricKey: session.getDatabaseSymmetricKey()) else {
+                Issue.record("Expected exactly one decryptable Bob identity")
+                await session.shutdown()
+                return
+            }
+            #expect(props.secretName == "bob")
+
+            await session.shutdown()
+        } catch {
             await session.shutdown()
             throw error
         }
@@ -495,7 +703,166 @@ actor SessionIdentityTests {
             throw error
         }
     }
-    
+
+    @Test("Force refresh replaces rotated active identity instead of mutating it")
+    func testForceRefreshReplacesRotatedActiveIdentity() async throws {
+        do {
+            let (store, transport) = try await setupTestSession()
+
+            let originalBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            let originalSigningPublicKey = try Curve25519.Signing.PublicKey(
+                rawRepresentation: originalBundle.userConfiguration.signingPublicKey
+            )
+            guard let originalSignedDevice = originalBundle.userConfiguration.signedDevices.first,
+                  let originalDevice = try originalSignedDevice.verified(using: originalSigningPublicKey)
+            else {
+                Issue.record("Expected original device to verify")
+                await session.shutdown()
+                return
+            }
+
+            let originalIdentity = try await session.createEncryptableSessionIdentityModel(
+                with: originalDevice,
+                oneTimePublicKey: nil,
+                mlKEMPublicKey: originalDevice.finalMLKEMPublicKey,
+                for: "alice",
+                associatedWith: originalDevice.deviceId,
+                new: 321
+            )
+
+            let rotatedBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            let rotatedSigningKey = try Curve25519.Signing.PrivateKey(
+                rawRepresentation: rotatedBundle.deviceKeys.signingPrivateKey
+            )
+            let rotatedDevice = UserDeviceConfiguration(
+                deviceId: originalDevice.deviceId,
+                signingPublicKey: rotatedSigningKey.publicKey.rawRepresentation,
+                longTermPublicKey: rotatedBundle.deviceConfiguration.longTermPublicKey,
+                finalMLKEMPublicKey: rotatedBundle.deviceConfiguration.finalMLKEMPublicKey,
+                deviceName: originalDevice.deviceName,
+                hmacData: rotatedBundle.deviceConfiguration.hmacData,
+                isMasterDevice: originalDevice.isMasterDevice,
+                lastSeenAt: Date()
+            )
+            let rotatedSignedDevice = try UserConfiguration.SignedDeviceConfiguration(
+                device: rotatedDevice,
+                signingKey: rotatedSigningKey
+            )
+            let rotatedSignedBundle = try UserConfiguration.SignedDeviceKeyBundle(
+                bundle: .init(
+                    deviceId: originalDevice.deviceId,
+                    longTermPublicKey: rotatedDevice.longTermPublicKey,
+                    finalMLKEMPublicKey: rotatedDevice.finalMLKEMPublicKey
+                ),
+                signingKey: rotatedSigningKey
+            )
+            transport.configurations["alice"] = UserConfiguration(
+                signingPublicKey: rotatedSigningKey.publicKey.rawRepresentation,
+                signedDevices: [rotatedSignedDevice],
+                signedOneTimePublicKeys: [],
+                signedMLKEMOneTimePublicKeys: [],
+                signedDeviceKeyBundles: [rotatedSignedBundle]
+            )
+
+            let refreshed = try await session.refreshIdentities(secretName: "alice", forceRefresh: true)
+            let symmetricKey = try await session.getDatabaseSymmetricKey()
+            let activeAliceIdentities = await refreshed.asyncFilter { identity in
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
+                return props.secretName == "alice"
+                    && props.deviceId == originalDevice.deviceId
+                    && !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            }
+
+            #expect(activeAliceIdentities.count == 1)
+            guard let replacement = activeAliceIdentities.first,
+                  let replacementProps = await replacement.props(symmetricKey: symmetricKey)
+            else {
+                Issue.record("Expected one replacement identity")
+                await session.shutdown()
+                return
+            }
+
+            #expect(replacement.id != originalIdentity.id)
+            #expect(replacementProps.longTermPublicKey == rotatedDevice.longTermPublicKey)
+            #expect(replacementProps.signingPublicKey == rotatedDevice.signingPublicKey)
+            #expect(replacementProps.state == nil)
+            #expect(!store.identities.contains(where: { $0.id == originalIdentity.id }))
+
+            await session.shutdown()
+        } catch {
+            await session.shutdown()
+            throw error
+        }
+    }
+
+    @Test("Should assess peer refresh impact for unchanged and rotated peer identity keys")
+    func testRefreshIdentitiesAssessingImpact() async throws {
+        do {
+            let (store, transport) = try await setupTestSession()
+
+            let bundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+            let signingPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: bundle.userConfiguration.signingPublicKey)
+            guard let signedDevice = bundle.userConfiguration.signedDevices.first,
+                  let deviceConfig = try signedDevice.verified(using: signingPublicKey) else {
+                Issue.record("Expected a verified device configuration")
+                await session.shutdown()
+                return
+            }
+
+            let verifiedOneTimeKey = try bundle.userConfiguration.signedOneTimePublicKeys.first?.verified(using: signingPublicKey)
+            let verifiedMLKEMKey = try bundle.userConfiguration.signedMLKEMOneTimePublicKeys.first?.verified(using: signingPublicKey)
+            guard let verifiedMLKEMKey else {
+                Issue.record("Expected a verified MLKEM key")
+                await session.shutdown()
+                return
+            }
+
+            let identity = try await session.createEncryptableSessionIdentityModel(
+                with: deviceConfig,
+                oneTimePublicKey: verifiedOneTimeKey,
+                mlKEMPublicKey: verifiedMLKEMKey,
+                for: "alice",
+                associatedWith: deviceConfig.deviceId,
+                new: 123
+            )
+            try await store.createSessionIdentity(identity)
+            transport.configurations["alice"] = bundle.userConfiguration
+
+            let unchanged = try await session.refreshIdentitiesAssessingImpact(
+                secretName: "alice",
+                deviceId: deviceConfig.deviceId,
+                forceRefresh: false
+            )
+            #expect(unchanged.impact == .noSessionImpact)
+
+            let rotatedSigningKey = Curve25519.Signing.PrivateKey()
+            var rotatedDevice = deviceConfig
+            await rotatedDevice.updateSigningPublicKey(rotatedSigningKey.publicKey.rawRepresentation)
+            let rotatedSignedDevice = try UserConfiguration.SignedDeviceConfiguration(
+                device: rotatedDevice,
+                signingKey: rotatedSigningKey
+            )
+            transport.configurations["alice"] = UserConfiguration(
+                signingPublicKey: rotatedSigningKey.publicKey.rawRepresentation,
+                signedDevices: [rotatedSignedDevice],
+                signedOneTimePublicKeys: [],
+                signedMLKEMOneTimePublicKeys: []
+            )
+
+            let rotated = try await session.refreshIdentitiesAssessingImpact(
+                secretName: "alice",
+                deviceId: deviceConfig.deviceId,
+                forceRefresh: true
+            )
+            #expect(rotated.impact == .freshSessionRecommended)
+
+            await session.shutdown()
+        } catch {
+            await session.shutdown()
+            throw error
+        }
+    }
+
     @Test("Should retrieve existing session identity from storage without refresh")
     func testRetrieveExistingIdentityFromStorage() async throws {
         do {

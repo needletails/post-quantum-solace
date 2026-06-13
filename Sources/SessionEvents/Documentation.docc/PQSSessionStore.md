@@ -396,14 +396,22 @@ func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) asyn
 
 ## Integration with Session
 
-The `PQSSessionStore` is used by the `SessionCache`:
+Pass your conformer through ``SessionConfiguration`` (the SDK
+automatically wraps it in an internal ``SessionCache`` for hot-path
+caching — you do **not** need to construct a `SessionCache` yourself):
 
 ```swift
 let store = DatabaseStore(database: myDatabase)
-let cache = SessionCache(store: store)
 
-await session.setDatabaseDelegate(conformer: cache)
+try await PQSSession.shared.configure(with: SessionConfiguration(
+    transport: transport,
+    store: store,
+    receiver: receiver
+))
 ```
+
+You can swap the store at runtime via
+``PQSSession/setDatabaseDelegate(conformer:)``.
 
 ## Best Practices
 

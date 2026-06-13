@@ -169,6 +169,16 @@ public protocol PQSSessionDelegate: Sendable {
         transportInfo: Data?
     ) -> Bool
 
+    /// Determines whether a non-persistent outbound payload should be retained
+    /// briefly in memory so a peer can request a resend during ratchet repair.
+    ///
+    /// This is intended for hidden SDK control messages that must not create UI
+    /// rows, but are still critical enough that losing the first encrypted copy
+    /// would leave peers out of sync.
+    func shouldReplayNonPersistentOutbound(
+        transportInfo: Data?
+    ) -> Bool
+
     /// Retrieves identifying information about the sender based on the provided transport context.
     ///
     /// This method is useful for resolving session identities or applying custom logic
@@ -278,4 +288,72 @@ public protocol PQSSessionDelegate: Sendable {
         senderSecretName: String,
         senderDeviceId: UUID
     ) async -> Bool
+
+    /// Called when PQS has suppressed/deferred a failed inbound payload and recovery
+    /// will require a resend after session reestablishment.
+    func inboundRecoveryDeferred(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        failedSharedMessageId: String,
+        failureClass: String
+    ) async
+
+    /// When `true`, the session may notify message senders that their message was stored on this device
+    /// (e.g. automatic `.delivered` delivery-state updates). Return `false` when the user has disabled
+    /// read/delivery receipts so peers do not receive that signal.
+    func shouldSendAutomaticDeliveryReceipts() async -> Bool
+
+    /// Called when a linked device on the same account reports a potential compromise
+    /// (e.g. it hit `maxSkippedHeadersExceeded` during decryption).
+    ///
+    /// The master device can use this callback to decide whether to trigger
+    /// `rotateKeysOnPotentialCompromise()`. Child devices may use it for
+    /// informational logging or UI alerts.
+    ///
+    /// - Parameters:
+    ///   - deviceId: The device ID of the linked device that detected the anomaly.
+    ///   - intentId: A stable identifier shared across all delivery attempts of the same
+    ///     compromise episode. The SDK coalesces redundant inbound notifications, but this
+    ///     value lets app code further dedupe user-facing prompts across crashes/restarts
+    ///     by remembering the last `intentId` it surfaced. `nil` for legacy senders that
+    ///     pre-date the envelope wire format.
+    func linkedDeviceReportedPotentialCompromise(deviceId: UUID, intentId: UUID?) async
+
+    /// Called when a remote contact's account-level signing key differs from the
+    /// locally pinned contact identity.
+    ///
+    /// This is not a ratchet repair event. The SDK has rejected the peer's new
+    /// account identity and paused automatic recovery so the application can
+    /// present a safety-number / trust-reset flow to the user.
+    ///
+    /// - Parameters:
+    ///   - secretName: The peer whose pinned account identity changed.
+    ///   - deviceId: The peer device associated with the failed inbound payload.
+    ///   - failedSharedMessageId: The failed inbound message id, when available.
+    func peerAccountIdentityChanged(
+        secretName: String,
+        deviceId: UUID,
+        failedSharedMessageId: String?
+    ) async
+}
+
+public extension PQSSessionDelegate {
+    func shouldReplayNonPersistentOutbound(
+        transportInfo: Data?
+    ) -> Bool { false }
+
+    func inboundRecoveryDeferred(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        failedSharedMessageId: String,
+        failureClass: String
+    ) async {}
+
+    func shouldSendAutomaticDeliveryReceipts() async -> Bool { true }
+    func linkedDeviceReportedPotentialCompromise(deviceId: UUID, intentId: UUID?) async {}
+    func peerAccountIdentityChanged(
+        secretName: String,
+        deviceId: UUID,
+        failedSharedMessageId: String?
+    ) async {}
 }

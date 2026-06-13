@@ -1,22 +1,22 @@
 # Getting Started
 
-Learn how to integrate the Post-Quantum Solace SDK into your application.
+Integrate the Post-Quantum Solace SDK into your Swift application.
 
 ## Overview
 
-The Post-Quantum Solace SDK provides a comprehensive solution for secure messaging with both classical and post-quantum cryptography. This guide will walk you through the essential steps to get started.
+This guide walks through configuring delegates, creating or restoring a
+session, sending and receiving messages, rotating keys, linking new devices,
+and recovering from a verified account-identity change.
 
 ## Prerequisites
 
-- iOS 15.0+ / macOS 12.0+
-- Swift 5.5+
-- Xcode 13.0+
+- iOS 16.0+ / macOS 13.0+ (Swift Concurrency, Sendable)
+- Swift 5.9+
+- Xcode 15+
 
 ## Installation
 
-### Swift Package Manager
-
-Add the Post-Quantum Solace SDK to your project:
+Add Post-Quantum Solace to your `Package.swift`:
 
 ```swift
 dependencies: [
@@ -24,367 +24,312 @@ dependencies: [
 ]
 ```
 
-### Import the SDK
+The library product is `PostQuantumSolace`; the importable module is `PQSSession`:
 
 ```swift
-import PostQuantumSolace
+import PQSSession
 ```
 
-## Basic Setup
+## 1. Configure delegates
 
-### 1. Initialize the Session
-
-The SDK uses a singleton pattern for session management:
-
-```swift
-let session = PQSSession.shared
-```
-
-### 2. Set Up Delegates
-
-**Recommended: Using SessionConfiguration (Simplified Setup)**
-
-The easiest way to configure your session is using `SessionConfiguration`, which allows you to set up all delegates in a single call:
+The recommended path is ``SessionConfiguration`` — it bundles the three
+required delegates and the two optional ones:
 
 ```swift
-// Create a configuration with all required delegates
 let config = SessionConfiguration(
-    transport: myTransport,      // Required: Network communication
-    store: myStore,               // Required: Persistent storage
-    receiver: myReceiver,          // Required: Event handling
-    delegate: mySessionDelegate,        // Optional: Custom session logic
-    eventDelegate: myEventDelegate      // Optional: Override default event handling
+    transport: myTransport,         // any SessionTransport
+    store: myStore,                 // any PQSSessionStore
+    receiver: myReceiver,           // any EventReceiver
+    delegate: mySessionDelegate,    // optional PQSSessionDelegate
+    eventDelegate: myEventDelegate  // optional SessionEvents override
 )
 
-// Configure the session in one call
-try await session.configure(with: config)
+try await PQSSession.shared.configure(with: config)
 ```
 
-**Alternative: Individual Delegate Setup**
-
-You can also set up delegates individually if you prefer more granular control:
+You can still wire delegates individually if you need to swap them at runtime:
 
 ```swift
-// Set up transport delegate for network communication
 await session.setTransportDelegate(conformer: myTransport)
-
-// Set up database delegate for persistent storage
 await session.setDatabaseDelegate(conformer: myStore)
-
-// Set up receiver delegate for event handling
 session.setReceiverDelegate(conformer: myReceiver)
-
-// Optional: Set session delegate for custom behavior
-await session.setPQSSessionDelegate(conformer: mySessionDelegate)
-
-// Optional: Set event delegate to override default event handling
-await session.setSessionEventDelegate(conformer: myEventDelegate)
+await session.setPQSSessionDelegate(conformer: mySessionDelegate)   // optional
+await session.setSessionEventDelegate(conformer: myEventDelegate)   // optional
 ```
 
-### 3. Create a Session
+## 2. Create or start a session
 
-Create a new user session:
+For a brand-new account / device:
 
 ```swift
 try await session.createSession(
     secretName: "alice",
-    appPassword: "securePassword",
+    appPassword: "correct horse battery staple",
     createInitialTransport: {
-        // Set up your transport layer here
-        try await setupNetworkTransport()
+        try await self.bootstrapNetworkConnection()
     }
 )
 ```
 
-### 4. Start the Session
-
-Start the session with the application password:
+For subsequent launches (the local session is persisted):
 
 ```swift
-try await session.startSession(appPassword: "securePassword")
+try await session.startSession(appPassword: "correct horse battery staple")
 ```
 
-## Implementing Required Protocols
+## 3. Implement the delegate protocols
 
 ### SessionTransport
 
-Handle network communication:
-
 ```swift
-class NetworkTransport: SessionTransport {
-    func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
-        // Send message over your network
-        try await networkService.send(message, to: metadata.secretName)
+final class NetworkTransport: SessionTransport {
+    func sendMessage(_ message: SignedRatchetMessage,
+                     metadata: SignedRatchetMessageMetadata) async throws {
+        try await api.send(message, to: metadata.secretName, deviceId: metadata.deviceId)
     }
-    
+
     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
-        // Fetch user configuration from your server
-        return try await apiService.getUserConfiguration(secretName)
+        try await api.fetchConfiguration(for: secretName)
     }
-    
-    // Implement other required methods...
+
+    func publishUserConfiguration(_ configuration: UserConfiguration,
+                                  recipient secretName: String,
+                                  recipient identity: UUID) async throws {
+        try await api.publish(configuration, secretName: secretName, deviceId: identity)
+    }
+
+    // ... fetchOneTimeKeys / updateOneTimeKeys / publishRotatedKeys / etc.
 }
 ```
 
+> Important: `publishUserConfiguration` takes **two** `recipient`-prefixed
+> parameters: the recipient's `secretName` and the recipient device's `UUID`.
+
 ### PQSSessionStore
 
-Handle persistent storage:
-
 ```swift
-class DatabaseStore: PQSSessionStore {
-    func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {
-        // Store encrypted message in your database
-        try await database.insert(message)
+final class DatabaseStore: PQSSessionStore {
+    func createMessage(_ message: EncryptedMessage,
+                       symmetricKey: SymmetricKey) async throws {
+        try await db.insert(message)
     }
-    
+
     func fetchMessage(id: UUID) async throws -> EncryptedMessage {
-        // Retrieve message from your database
-        return try await database.find(id: id)
+        try await db.fetchMessage(id: id)
     }
-    
-    // Implement other required methods...
+    // ... see ``PQSSessionStore`` for the full surface
 }
 ```
 
 ### EventReceiver
 
-Handle application events:
-
 ```swift
-class AppEventReceiver: EventReceiver {
+final class AppEventReceiver: EventReceiver {
     func createdMessage(_ message: EncryptedMessage) async {
-        // Handle new message
-        await updateUI(with: message)
+        let key = try? await PQSSession.shared.getDatabaseSymmetricKey()
+        if let key, let props = await message.props(symmetricKey: key) {
+            await ui.append(text: props.message.text,
+                            from: props.senderSecretName)
+        }
     }
-    
-    func updatedCommunication(_ model: BaseCommunication, members: Set<String>) async {
-        // Handle communication update
-        await refreshChannelList()
+
+    func updatedCommunication(_ model: BaseCommunication,
+                              members: Set<String>) async {
+        await ui.refreshChannel(model.id, members: members)
     }
-    
-    // Implement other required methods...
+
+    func createdChannel(_ model: BaseCommunication) async {
+        await ui.openChannel(model.id)
+    }
+
+    // ... see ``EventReceiver`` for the full surface
 }
 ```
 
-## Sending Messages
+## 4. Send a message
 
-### Text Messages
+`metadata` is a Binary-encoded application blob — the SDK does not interpret
+its contents. Pass `Data()` if you have nothing to attach.
 
 ```swift
 try await session.writeTextMessage(
     recipient: .nickname("bob"),
     text: "Hello, world!",
-    metadata: ["timestamp": Date()],
-    destructionTime: 3600 // Self-destruct after 1 hour
+    metadata: try BinaryEncoder().encode(MyAppMetadata(priority: .high)),
+    destructionTime: 3600 // self-destruct after 1 hour, optional
 )
 ```
 
-### Different Recipient Types
+### Recipient kinds
 
 ```swift
-// Personal message (to your own devices)
-try await session.writeTextMessage(
-    recipient: .personalMessage,
-    text: "Note to self",
-    metadata: [:]
-)
+// Personal note (delivered to your other devices only):
+try await session.writeTextMessage(recipient: .personalMessage, text: "Note to self")
 
-// Private message
-try await session.writeTextMessage(
-    recipient: .nickname("bob"),
-    text: "Private message",
-    metadata: [:]
-)
+// 1:1 conversation:
+try await session.writeTextMessage(recipient: .nickname("bob"),     text: "Hi Bob")
 
-// Channel message
-try await session.writeTextMessage(
-    recipient: .channel("general"),
-    text: "Channel message",
-    metadata: [:]
-)
+// Channel:
+try await session.writeTextMessage(recipient: .channel(channelId),  text: "Hi everyone")
+
+// System broadcast (rare; usually transport-level):
+try await session.writeTextMessage(recipient: .broadcast,           text: "Service notice")
 ```
 
-## Receiving Messages
+## 5. Receive a message
 
-Messages are automatically received and processed through the `EventReceiver`:
+Inbound messages flow from your transport into the SDK via
+``PQSSession/receiveMessage(message:sender:deviceId:messageId:)``, then bubble
+up to ``EventReceiver/createdMessage(_:)``. Decryption uses the database
+symmetric key:
 
 ```swift
-class AppEventReceiver: EventReceiver {
-    func createdMessage(_ message: EncryptedMessage) async {
-        // Decrypt and display the message
-        if let props = await message.props(symmetricKey: sessionKey) {
-            await displayMessage(props.message.text, from: props.senderSecretName)
-        }
-    }
+func createdMessage(_ message: EncryptedMessage) async {
+    guard let key = try? await PQSSession.shared.getDatabaseSymmetricKey(),
+          let props = await message.props(symmetricKey: key) else { return }
+    await ui.show(text: props.message.text, from: props.senderSecretName)
 }
 ```
 
-## Key Management
+## 6. Key management
 
-### Automatic Key Rotation
-
-The SDK automatically manages key rotation:
+The SDK refills one-time keys automatically when their count drops below
+``PQSSessionConstants/oneTimeKeyLowWatermark``. You can also nudge them:
 
 ```swift
-// Keys are rotated automatically, but you can trigger manual rotation
+_ = await session.refreshOneTimeKeysTask()         // Curve OTPKs
+_ = await session.refreshMLKEMOneTimeKeysTask()    // post-quantum OTPKs
+```
+
+For routine, scheduled rotation of this device's long-term keys:
+
+```swift
+try await session.rotateCurrentDeviceKeys()
+```
+
+For a hard reset after a suspected compromise (master-only):
+
+```swift
 try await session.rotateKeysOnPotentialCompromise()
-
-// Check if PQ-KEM keys need rotation
-if try await session.rotateMLKEMKeysIfNeeded() {
-    print("PQ-KEM keys were rotated")
-}
 ```
 
-### One-Time Key Management
+> Important: ``PQSSession/rotateKeysOnPotentialCompromise()`` rotates the
+> account-level signing key. Calling it on a child device throws
+> ``PQSSession/SessionErrors/compromiseRotationRequiresMasterDevice``.
 
-The SDK automatically manages one-time keys, but you can also trigger manual refresh:
+### Useful constants
+
+`PQSSessionConstants` exposes tunable knobs as `Sendable` static lets:
 
 ```swift
-// Refresh one-time keys when needed
-await session.refreshOneTimeKeysTask()
-await session.refreshMLKEMOneTimeKeysTask()
+PQSSessionConstants.oneTimeKeyLowWatermark      // 10
+PQSSessionConstants.oneTimeKeyBatchSize         // 100
+PQSSessionConstants.keyRotationIntervalDays     // 7
+PQSSessionConstants.minimumChannelOperators     // 1
+PQSSessionConstants.minimumChannelMembers       // 2
+PQSSessionConstants.peerRefreshCooldownSeconds  // 30
+PQSSessionConstants.linkedDeviceCompromiseObservedCooldownSeconds // 300
 ```
 
-### Configuration Constants
-
-The SDK provides centralized constants for configuration values via `PQSSessionConstants`:
+## 7. Linking a second device
 
 ```swift
-// Key refresh threshold - keys are automatically refreshed when count drops below this
-let lowWatermark = PQSSessionConstants.oneTimeKeyLowWatermark  // Default: 10
-
-// Batch size for key generation
-let batchSize = PQSSessionConstants.oneTimeKeyBatchSize  // Default: 100
-
-// Key rotation interval in days
-let rotationInterval = PQSSessionConstants.keyRotationIntervalDays  // Default: 7
-
-// Channel requirements
-let minOperators = PQSSessionConstants.minimumChannelOperators  // Default: 1
-let minMembers = PQSSessionConstants.minimumChannelMembers      // Default: 3
-```
-
-These constants are `Sendable` and can be safely accessed from any concurrent context. They're used throughout the SDK to ensure consistent behavior.
-
-## Device Management
-
-### Linking Devices
-
-```swift
-// Create a cryptographic bundle for device linking
 let bundle = try await session.createDeviceCryptographicBundle(isMaster: false)
-
-// Link the device
-try await session.linkDevice(bundle: bundle, password: "devicePassword")
+try await session.linkDevice(bundle: bundle, password: "device-pin-or-otp")
 ```
 
-### Device Configuration
+The new device adopts the same account-level signing key (TOFU-pinned on
+first set), and registers its **own** per-device signing key.
+
+## 8. Account identity verification & recovery
+
+### Compute a safety number
 
 ```swift
-// Update user configuration with new devices
-try await session.updateUserConfiguration([newDeviceConfig])
+guard let me = await session.localSecurityIdentity() else { return }
+let theirConfig = try await myTransport.findConfiguration(for: "bob")
+let them = SecurityIdentity(secretName: "bob", configuration: theirConfig)
 
-// Update one-time keys
-try await session.updateUseroneTimePublicKeys(newKeys)
+let display = SecurityIdentity.safetyNumber(local: me, remote: them)
+print(display) // "12345 67890 12345 67890 ..." 12 groups of 5 digits
 ```
 
-## Error Handling
+### Recover from a TOFU mismatch
 
-The SDK provides comprehensive error handling with `LocalizedError` conformance. All error types include detailed descriptions, failure reasons, and recovery suggestions:
+If a configuration refresh throws
+``PQSSession/SessionErrors/signingKeyOutOfSync``, the **server's account
+signing key has changed** since you last accepted it. Surface a confirmation
+flow to the user (compare safety numbers, scan QR, etc.). After the user
+verifies, commit the new identity:
 
-### Using LocalizedError Features
+```swift
+let serverConfig = try await myTransport.findConfiguration(for: mySecretName)
+try await session.acknowledgeAccountIdentityChange(serverConfig)
+```
+
+This is the **only** path that bypasses TOFU, and it logs the transition at
+`.error` for support triage. Gate it behind a strong, explicit user
+confirmation (passcode, biometrics, or a typed destructive phrase).
+
+## 9. Error handling
+
+All SDK errors conform to `LocalizedError` and surface
+`errorDescription`, `failureReason`, and `recoverySuggestion`:
 
 ```swift
 do {
     try await session.writeTextMessage(
         recipient: .nickname("bob"),
-        text: "Hello, world!"
+        text: "Hello"
     )
 } catch let error as PQSSession.SessionErrors {
-    // Access localized error information
-    if let localizedError = error as? LocalizedError {
-        print("Error: \(localizedError.errorDescription ?? "Unknown error")")
-        
-        if let reason = localizedError.failureReason {
-            print("Reason: \(reason)")
-        }
-        
-        if let suggestion = localizedError.recoverySuggestion {
-            print("Suggestion: \(suggestion)")
-        }
-    }
-    
-    // Pattern matching for specific error handling
     switch error {
-    case .sessionNotInitialized:
-        // Handle session setup issues
-        print("Session not properly initialized")
-        
-    case .databaseNotInitialized:
-        // Handle storage issues
-        print("Database not configured")
-        
-    case .transportNotInitialized:
-        // Handle network issues
-        print("Transport layer not ready")
-        
+    case .sessionNotInitialized:    await prompt("Sign in again.")
+    case .databaseNotInitialized:   await prompt("Storage unavailable.")
+    case .transportNotInitialized:  await prompt("Network unavailable.")
+    case .signingKeyOutOfSync:      await routeToIdentityRecovery()
+    case .deviceIdentityCorrupted:  await routeToReLink()
+    case .compromiseRotationRequiresMasterDevice:
+        await prompt("Use your master device to rotate keys.")
     case .cannotFindOneTimeKey, .drainedKeys:
-        // Keys will be automatically refreshed
-        print("Waiting for automatic key refresh...")
-        
-    case .invalidSignature:
-        // Handle cryptographic verification failures
-        print("Message signature verification failed")
-        
+        // Background refill will run; show a transient banner if needed.
+        break
     default:
-        // Handle other errors
-        print("Unexpected error: \(error)")
+        await prompt(error.recoverySuggestion ?? error.errorDescription ?? "")
     }
+} catch {
+    await prompt(error.localizedDescription)
 }
 ```
 
-### Error Types
+### Error types
 
-The SDK provides several error types, all conforming to `LocalizedError`:
+- ``PQSSession/SessionErrors`` — session lifecycle and operation errors.
+- ``SessionCache/CacheErrors`` — cache and storage errors.
+- `CryptoError` — encryption/decryption failures (in `SessionModels`).
+- `EventErrors`, `SigningErrors`, `JobProcessorErrors` — internal protocol
+  surfaces, surfaced via the public errors above.
 
-- **`PQSSession.SessionErrors`** - Session lifecycle and operation errors
-- **`SessionCache.CacheErrors`** - Cache and storage errors
-- **`CryptoError`** - Cryptographic operation errors (encryption/decryption)
-- **`EventErrors`** - Event handling errors
-- **`SigningErrors`** - Signature verification errors
-- **`JobProcessorErrors`** - Task processing errors
-
-Each error type provides:
-- `errorDescription` - Human-readable error message
-- `failureReason` - Detailed explanation of what went wrong
-- `recoverySuggestion` - Actionable steps to resolve the issue
-
-## Best Practices
+## Best practices
 
 ### Security
-
-- Use strong application passwords
-- Implement proper key rotation
-- Monitor for potential compromises
-- Secure storage of sensitive data
+- Use strong app passwords; back them with biometrics where possible.
+- Treat ``PQSSession/acknowledgeAccountIdentityChange(_:)`` like factory-reset:
+  always require explicit, conscious user consent.
+- Surface ``PQSSession/SessionErrors/signingKeyOutOfSync`` to the user — never
+  swallow it silently.
+- Compare safety numbers out of band before sharing sensitive content.
 
 ### Performance
-
-- Use dedicated queues for cryptographic operations
-- Implement proper caching strategies
-- Handle errors gracefully
-- Monitor memory usage
+- Let the SDK manage one-time key refills — only call the manual entry points
+  when you have a specific reason.
+- Run cryptographic work on the SDK's dedicated executors (it does this for
+  you); avoid wrapping public APIs in extra `Task.detached` calls on the main
+  actor.
 
 ### Integration
-
-- Implement proper error handling
-- Use async/await for all operations
-- Follow the delegate pattern
-- Test thoroughly with different scenarios
-
-## Next Steps
-
-- Explore the [API Reference](doc:APIReference) for detailed documentation
-- Check out [Examples](doc:Examples) for common use cases
-- Read the [Security Guide](doc:SecurityGuide) for best practices
-- Review [Troubleshooting](doc:Troubleshooting) for common issues 
+- Implement all four delegate protocols in dedicated, single-purpose types.
+- Wire them once via ``SessionConfiguration`` rather than scattering setter
+  calls.
+- Persist `EncryptedMessage` and `BaseCommunication` blobs verbatim — the SDK
+  treats them as opaque ciphertext.

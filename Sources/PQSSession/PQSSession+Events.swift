@@ -52,10 +52,13 @@ public extension PQSSession {
     /// try await session.writeTextMessage(
     ///     recipient: .nickname("alice"),
     ///     text: "Hello, how are you?",
-    ///     metadata: ["timestamp": Date(), "priority": "high"],
+    ///     metadata: try BinaryEncoder().encode(MyAppMetadata(priority: .high)),
     ///     destructionTime: 3600 // Message self-destructs in 1 hour
     /// )
     /// ```
+    ///
+    /// `metadata` is an opaque `Data` blob owned by the application; the SDK
+    /// encrypts and forwards it untouched alongside the message envelope.
     ///
     /// - Parameters:
     ///   - recipient: The intended recipient of the message. Can be a nickname, group, or other recipient type.
@@ -81,7 +84,8 @@ public extension PQSSession {
         text: String = "",
         transportInfo: Data? = nil,
         metadata: Data = .init(),
-        destructionTime: TimeInterval? = nil
+        destructionTime: TimeInterval? = nil,
+        sharedIdOverride: String? = nil
     ) async throws {
         do {
             let message = CryptoMessage(
@@ -92,7 +96,11 @@ public extension PQSSession {
                 sentDate: Date(),
                 destructionTime: destructionTime)
 
-            try await processWrite(message: message, session: self)
+            try await processWrite(
+                message: message,
+                session: self,
+                sharedIdOverride: sharedIdOverride
+            )
         } catch {
             logger.log(level: .error, message: "\(error)")
             throw error
@@ -146,13 +154,18 @@ public extension PQSSession {
         deviceId: UUID,
         messageId: String
     ) async throws {
+        if isInboundFailureQuarantined(sender: sender, deviceId: deviceId, messageId: messageId) {
+            logger.log(level: .info, message: "Ignoring quarantined inbound message tuple for sender=\(sender) deviceId=\(deviceId.uuidString)")
+            return
+        }
         do {
-            // We need to make sure that our remote keys are in sync with local keys before proceeding. We do this if we have less than the low watermark.
-            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-                async let _ = await refreshOneTimeKeysTask()
-            }
-            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
-                async let _ = await refreshMLKEMOneTimeKeysTask()
+            if !otkUploadCircuitOpen {
+                if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                    async let _ = await refreshOneTimeKeysTask()
+                }
+                if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                    async let _ = await refreshMLKEMOneTimeKeysTask()
+                }
             }
             
             let message = InboundTaskMessage(
@@ -160,33 +173,82 @@ public extension PQSSession {
                 senderSecretName: sender,
                 senderDeviceId: deviceId,
                 sharedMessageId: messageId)
-
+            
             try await taskProcessor.inboundTask(
                 message,
                 session: self)
-
-        } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-            logger.log(level: .warning, message: "MaxSkippedHeadersExceeded - rotation disabled, using resend recovery flow.")
-
-            let now = Date()
-            if let cooldownUntil = maxSkippedRotationCooldownUntil, now < cooldownUntil {
-                // Rotation already attempted recently; rethrow so SDK consumer can request resend.
-                throw ratchetError
-            }
-
-            // Gate rotations to prevent storms under offline backlog delivery.
-            // Set gate BEFORE awaiting rotation to prevent re-entrant calls from racing.
-            maxSkippedRotationCooldownUntil = now.addingTimeInterval(60)
-            hasRotatedForMaxSkipped = true
             
-            // Rethrow the original error so the consumer can delete offline backlog and request resend.
-            throw ratchetError
         } catch {
             logger.log(level: .error, message: "Error during message processing: \(error)")
             throw error
         }
     }
+  
+    func requestMessageResend(sharedMessageId: String, senderName: String, senderDeviceId: UUID) async throws {
+        try await requestMessageResend(
+            sharedMessageIds: [sharedMessageId],
+            senderName: senderName,
+            senderDeviceId: senderDeviceId)
+    }
 
+    func requestMessageResend(sharedMessageIds: [String], senderName: String, senderDeviceId: UUID) async throws {
+        let sharedMessageIds = sharedMessageIds.filter { !$0.isEmpty }
+        guard !sharedMessageIds.isEmpty else { return }
+
+        guard let context = await sessionContext else {
+            throw SessionErrors.sessionNotInitialized
+        }
+
+        let packet = FailedMessageResendRequest(
+            failedSharedMessageIds: sharedMessageIds,
+            requestingDeviceId: context.sessionUser.deviceId)
+        let info = TransportEvent.requestMessageResend(packet)
+        let encoded = try BinaryEncoder().encode(info)
+        let isSelf = senderName == context.sessionUser.secretName
+        let message = CryptoMessage(
+            text: "",
+            metadata: .init(),
+            recipient: isSelf ? .personalMessage : .nickname(senderName),
+            transportInfo: encoded,
+            sentDate: Date(),
+            destructionTime: nil)
+        
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        var selected: (identity: SessionIdentity, sessionContextId: Int)?
+        for identity in try await cache?.fetchSessionIdentities() ?? [] {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard props.secretName == senderName,
+                  props.deviceId == senderDeviceId,
+                  !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            else { continue }
+            if selected == nil || props.sessionContextId > selected!.sessionContextId {
+                selected = (identity, props.sessionContextId)
+            }
+        }
+
+        guard let identity = selected?.identity else {
+            logger.log(
+                level: .warning,
+                message: "pqs.recovery.resendRequestFailed reason=missingIdentity sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(sharedMessageIds.count)")
+            throw SessionErrors.invalidDeviceIdentity
+        }
+        
+        let task = EncryptableTask(
+            task: .writeMessage(OutboundTaskMessage(
+                message: message,
+                recipientIdentity: identity,
+                localId: UUID(),
+                sharedId: UUID().uuidString,
+                isPersistedOutbound: false
+            ))
+        )
+    
+        try await taskProcessor.feedTask(task, session: self)
+        logger.log(
+            level: .info,
+            message: "pqs.recovery.resendRequestSubmitted sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(sharedMessageIds.count) ids=\(sharedMessageIds.joined(separator: ","))")
+    }
+    
     // MARK: Outbound
 
     /// Processes an outbound message by encrypting and sending it to all target devices.
@@ -218,14 +280,17 @@ public extension PQSSession {
     ///   to all devices associated with the recipient.
     internal func processWrite(
         message: CryptoMessage,
-        session: PQSSession
+        session: PQSSession,
+        sharedIdOverride: String? = nil
     ) async throws {
+        
         guard let sessionContext = await session.sessionContext else {
             throw SessionErrors.sessionNotInitialized
         }
         guard let cache = await session.cache else {
             throw SessionErrors.databaseNotInitialized
         }
+        
         let symmetricKey = try await getDatabaseSymmetricKey()
         let mySecretName = sessionContext.sessionUser.secretName
 
@@ -237,7 +302,13 @@ public extension PQSSession {
                 switch event {
                 case .sessionReestablishment:
                     shouldPersist = false
+                case .linkedDeviceReprovisioning:
+                    shouldPersist = false
                 case .synchronizeOneTimeKeys(_):
+                    shouldPersist = false
+                case .refreshOneTimeKeys:
+                    shouldPersist = false
+                case .requestMessageResend(_):
                     shouldPersist = false
                 }
             } catch {}
@@ -250,6 +321,7 @@ public extension PQSSession {
             session: session,
             sender: mySecretName,
             type: message.recipient,
+            sharedIdOverride: sharedIdOverride,
             shouldPersist: shouldPersist,
             logger: logger)
     }
@@ -324,6 +396,27 @@ public extension PQSSession {
             session: self,
             cache: cache,
             metadata: metadata)
+    }
+
+    func updateChannelMembership(
+        channelName: String,
+        administrator: String,
+        members: Set<String>,
+        operators: Set<String>,
+        shouldSynchronize: Bool
+    ) async throws {
+        guard let cache else {
+            throw SessionErrors.databaseNotInitialized
+        }
+        try await taskProcessor.updateChannelMembership(
+            channelName: channelName,
+            administrator: administrator,
+            members: members,
+            operators: operators,
+            symmetricKey: getDatabaseSymmetricKey(),
+            session: self,
+            cache: cache,
+            shouldSynchronize: shouldSynchronize)
     }
 }
 
@@ -431,7 +524,8 @@ extension PQSSession: SessionEvents {
         secretName: String,
         metadata: Data = .init(),
         friendshipMetadata: FriendshipMetadata? = nil,
-        requestFriendship: Bool
+        requestFriendship: Bool,
+        friendshipMetadataConflictPolicy: FriendshipMetadataConflictPolicy = .preferSettled
     ) async throws -> ContactModel {
         let params = try await requireAllSessionParameters()
         if let eventDelegate {
@@ -445,7 +539,8 @@ extension PQSSession: SessionEvents {
                 transport: params.transportDelegate,
                 receiver: params.receiverDelegate,
                 symmetricKey: params.symmetricKey,
-                logger: logger
+                logger: logger,
+                friendshipMetadataConflictPolicy: friendshipMetadataConflictPolicy
             )
         } else {
             return try await createContact(
@@ -458,7 +553,8 @@ extension PQSSession: SessionEvents {
                 transport: params.transportDelegate,
                 receiver: params.receiverDelegate,
                 symmetricKey: params.symmetricKey,
-                logger: logger
+                logger: logger,
+                friendshipMetadataConflictPolicy: friendshipMetadataConflictPolicy
             )
         }
     }
