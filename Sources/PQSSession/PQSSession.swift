@@ -265,6 +265,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         now: Date = Date()
     ) {
         let key = reconciliationPeerKey(sender: sender, deviceId: deviceId, flow: flow)
+        pruneRecoveryTimestamps(&lastReconciliationAtByPeer, ttl: reconciliationPeerCooldown, now: now)
         lastReconciliationAtByPeer[key] = now
     }
 
@@ -560,7 +561,28 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     func markAutomaticRotationAttempt(sender: String, deviceId: UUID, now: Date = Date()) {
         let peerKey = automaticRotationPeerKey(sender: sender, deviceId: deviceId)
         lastAutomaticRotationAt = now
+        pruneRecoveryTimestamps(&lastAutomaticRotationAtByPeer, ttl: automaticRotationPeerCooldown, now: now)
         lastAutomaticRotationAtByPeer[peerKey] = now
+    }
+
+    /// Bounds an in-memory recovery bookkeeping map: drops entries whose cooldown/TTL
+    /// has already lapsed (they can no longer influence gating decisions) and evicts
+    /// oldest entries beyond `PQSSessionConstants.recoveryTrackingMaxEntries`.
+    private func pruneRecoveryTimestamps(
+        _ map: inout [String: Date],
+        ttl: TimeInterval,
+        now: Date
+    ) {
+        map = map.filter { now.timeIntervalSince($0.value) < ttl }
+        let cap = PQSSessionConstants.recoveryTrackingMaxEntries
+        guard map.count >= cap else { return }
+        let overflowKeys = map
+            .sorted { $0.value < $1.value }
+            .prefix(map.count - cap + 1)
+            .map(\.key)
+        for key in overflowKeys {
+            map.removeValue(forKey: key)
+        }
     }
     
     /// Returns whether a resend/refresh control request can be sent for this failed message.
@@ -576,6 +598,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Marks a resend/refresh control request as sent for this failed message.
     func markPeerResendRequestSent(sender: String, deviceId: UUID, failedMessageId: String, now: Date = Date()) {
         let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        pruneRecoveryTimestamps(&lastResendRequestAtByPeer, ttl: peerResendRequestCooldown, now: now)
         lastResendRequestAtByPeer[requestKey] = now
     }
 
@@ -637,6 +660,15 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let cutoff = now.addingTimeInterval(-inboundFailurePolicyTTL)
         pendingResendAfterReestablishment = pendingResendAfterReestablishment.filter { _, pending in
             pending.createdAt > cutoff
+        }
+        let cap = PQSSessionConstants.recoveryTrackingMaxEntries
+        guard pendingResendAfterReestablishment.count >= cap else { return }
+        let overflowKeys = pendingResendAfterReestablishment
+            .sorted { $0.value.createdAt < $1.value.createdAt }
+            .prefix(pendingResendAfterReestablishment.count - cap + 1)
+            .map(\.key)
+        for key in overflowKeys {
+            pendingResendAfterReestablishment.removeValue(forKey: key)
         }
     }
 

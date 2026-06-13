@@ -57,8 +57,10 @@ dependencies: [
 
 ### Import the SDK
 
+The library product is `PostQuantumSolace`; the importable module is `PQSSession`:
+
 ```swift
-import PostQuantumSolace
+import PQSSession
 ```
 
 ## 🆕 What's New in 3.0.0

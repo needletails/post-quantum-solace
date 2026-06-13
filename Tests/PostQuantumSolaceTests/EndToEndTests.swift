@@ -257,6 +257,7 @@ actor EndToEndTests {
     func linkSenderChildSession2(store: MockIdentityStore, transport: _MockTransportDelegate) async throws {
         await store.setLocalSalt("testChildSalt2")
         await _senderChildSession2.setLogLevel(.trace)
+        _senderChildSession2.isViable = true
         await self.store.setPublishableName(sMockUserData.ssn)
         _senderChildSession2.linkDelegate = senderChild2LinkDelegate
         let bundle = try await _senderChildSession2.createDeviceCryptographicBundle(isMaster: false)
@@ -2273,8 +2274,7 @@ actor EndToEndTests {
             }
         }
         
-        aliceTask?.cancel()
-        try? await Task.sleep(nanoseconds: 50_000_000) // Give time to cancel
+        _ = await aliceTask?.value
         await shutdownSessions()
     }
     
@@ -9474,8 +9474,22 @@ actor TransportStore {
                 else {
                     throw TestError.invalidRecoverySignature
                 }
+                guard let rotatedDevice = try keys.signedDevice.verified(using: newSigningKey) else {
+                    throw TestError.invalidRotatedDeviceSignature
+                }
                 userConfig.config.signingPublicKey = keys.pskData
                 userConfig.config.signedDevices = [keys.signedDevice]
+                userConfig.config.signedDeviceKeyBundles.removeAll()
+                if let signedDeviceKeyBundle = keys.deviceKeyBundle {
+                    let deviceSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: rotatedDevice.signingPublicKey)
+                    guard signedDeviceKeyBundle.id == rotatedDevice.deviceId,
+                          let bundle = try signedDeviceKeyBundle.verified(using: deviceSigningKey),
+                          bundle.deviceId == rotatedDevice.deviceId
+                    else {
+                        throw TestError.invalidRotatedDeviceSignature
+                    }
+                    userConfig.config.signedDeviceKeyBundles.append(signedDeviceKeyBundle)
+                }
                 userConfigurations[index] = userConfig
                 return
             }

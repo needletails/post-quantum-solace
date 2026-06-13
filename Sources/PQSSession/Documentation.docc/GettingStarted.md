@@ -24,8 +24,10 @@ dependencies: [
 ]
 ```
 
+The library product is `PostQuantumSolace`; the importable module is `PQSSession`:
+
 ```swift
-import PostQuantumSolace
+import PQSSession
 ```
 
 ## 1. Configure delegates

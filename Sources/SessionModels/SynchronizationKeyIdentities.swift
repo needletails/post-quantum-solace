@@ -241,6 +241,11 @@ public enum TransportEvent: Sendable, Codable {
 }
 
 public struct FailedMessageResendRequest: Sendable, Codable {
+    /// Maximum number of failed message ids carried in a single resend request.
+    /// Enforced on both encode (init) and decode so a hostile peer cannot amplify
+    /// replay work on the receiver with an oversized batch.
+    public static let maxBatchedIds = 64
+
     public let failedSharedMessageId: String
     public let failedSharedMessageIds: [String]
     public let requestingDeviceId: UUID
@@ -301,6 +306,9 @@ public struct FailedMessageResendRequest: Sendable, Codable {
         for id in ids where !id.isEmpty && !seen.contains(id) {
             seen.insert(id)
             normalized.append(id)
+            if normalized.count == Self.maxBatchedIds {
+                break
+            }
         }
         return normalized
     }

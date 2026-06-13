@@ -809,6 +809,16 @@ public actor TaskProcessor {
         logger: NeedleTailLogger
     ) async throws {
 
+        guard !sessionIdentities.isEmpty else {
+            logger.log(
+                level: .warning,
+                message: "No recipient session identities resolved for outbound message recipient \(message.recipient)")
+            if !shouldPersist, message.recipient == .personalMessage {
+                return
+            }
+            throw PQSSession.SessionErrors.missingSessionIdentity
+        }
+
         var task: EncryptableTask
         var encryptableMessage: EncryptedMessage?
 

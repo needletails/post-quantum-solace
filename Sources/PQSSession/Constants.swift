@@ -138,6 +138,12 @@ public enum PQSSessionConstants: Sendable {
     /// once per inbound control message when a backlog drains.
     public static let forcedIdentityRefreshCoalesceWindowSeconds: TimeInterval = 30
 
+    /// Maximum number of in-memory entries retained per recovery bookkeeping map
+    /// (resend-request cooldowns, reconciliation cooldowns, rotation cooldowns,
+    /// pending resend-after-reestablishment). Oldest entries are evicted first.
+    /// Bounds memory growth under floods of unique failed-message identifiers.
+    public static let recoveryTrackingMaxEntries = 512
+
     // MARK: - Schema versioning
 
     /// Current schema version for persisted session state.

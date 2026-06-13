@@ -153,7 +153,7 @@ and the device should be re-linked.
 ## Quick start
 
 ```swift
-import PostQuantumSolace
+import PQSSession
 
 let session = PQSSession.shared
 

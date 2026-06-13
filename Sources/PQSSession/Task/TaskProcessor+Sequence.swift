@@ -106,6 +106,10 @@ extension TaskProcessor {
             }
         }.value
 
+        guard session.isViable else {
+            return
+        }
+
         if let cache = await session.cache,
            let hasJobs = try? await !cache.fetchJobs().isEmpty,
            hasJobs {
@@ -117,6 +121,11 @@ extension TaskProcessor {
     private func processingLoop(_ session: PQSSession) async throws {
         guard let cache = await session.cache else {
             throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+
+        guard session.isViable else {
+            await jobConsumer.gracefulShutdown()
+            return
         }
         
         let symmetricKey = try await session.getDatabaseSymmetricKey()
@@ -275,16 +284,96 @@ extension TaskProcessor {
                     symmetricKey: symmetricKey)
             }
 
+        } catch let ratchetError as RatchetError where ratchetError == .decryptionFailed {
+            switch props.task.task {
+            case .streamMessage(let message):
+                let failureClass = "ratchet.decryptionFailed"
+                if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
+                    return try await handleFreshSessionRepair(
+                        message: message,
+                        failureClass: "ratchet.decryptionFailed.repeated",
+                        job: job,
+                        cache: cache,
+                        session: session,
+                        diagnostic: "repeatFailureClass=\(failureClass)",
+                        retryOriginalAfterReset: false)
+                }
+
+                let didRequestResend = await requestPeerResendIfAllowed(
+                    message: message,
+                    failureClass: failureClass,
+                    session: session)
+                auditInboundDecryptFailure(
+                    message: message,
+                    failureClass: failureClass,
+                    action: didRequestResend ? "resendRequested" : "resendSkipped")
+                await session.markInboundFailure(message, failureClass: failureClass)
+                try await cache.deleteJob(job)
+                return .deleted
+            case .writeMessage(let message):
+                logger.log(level: .error, message: "decryptionFailed for writeMessage to recipient: \(message.message.recipient)")
+                try await cache.deleteJob(job)
+            }
+
+        } catch let ratchetError as RatchetError where isInboundSessionDesyncError(ratchetError) {
+            switch props.task.task {
+            case .streamMessage(let message):
+                return try await handleFreshSessionRepair(
+                    message: message,
+                    failureClass: inboundSessionDesyncFailureClass(ratchetError),
+                    job: job,
+                    cache: cache,
+                    session: session,
+                    retryOriginalAfterReset: false)
+            case .writeMessage(let message):
+                logger.log(level: .error, message: "\(ratchetError) for writeMessage to recipient: \(message.message.recipient)")
+                try await cache.deleteJob(job)
+            }
+
+        } catch let ratchetError as RatchetError where ratchetError == .expiredKey {
+            switch props.task.task {
+            case .streamMessage(let message):
+                let failureClass = "ratchet.expiredKey"
+                if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
+                    auditInboundDecryptFailure(
+                        message: message,
+                        failureClass: failureClass,
+                        action: "dropExpiredSkippedKey",
+                        suppressed: true)
+                    try await cache.deleteJob(job)
+                    return .deleted
+                }
+
+                auditInboundDecryptFailure(
+                    message: message,
+                    failureClass: failureClass,
+                    action: "dropExpiredSkippedKey")
+                await session.markInboundFailure(message, failureClass: failureClass)
+                try await cache.deleteJob(job)
+                return .deleted
+            case .writeMessage(let message):
+                logger.log(level: .error, message: "expiredKey for writeMessage to recipient: \(message.message.recipient)")
+                try await cache.deleteJob(job)
+            }
+
         } catch let ratchetError as RatchetError where ratchetError == .missingOneTimeKey {
             switch props.task.task {
             case .streamMessage(let message):
                 let failureClass = "ratchet.missingOneTimeKey"
                 if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
+                    auditInboundDecryptFailure(
+                        message: message,
+                        failureClass: failureClass,
+                        suppressed: true)
                     logger.log(level: .info, message: "Suppressing repeated \(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
                     try await cache.deleteJob(job)
                     return .deleted
                 }
 
+                auditInboundDecryptFailure(
+                    message: message,
+                    failureClass: failureClass,
+                    action: "replaceOTKBatchThenPeerRefresh")
                 logger.log(
                     level: .warning,
                     message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=replaceOTKBatchThenPeerRefresh")
@@ -323,6 +412,10 @@ extension TaskProcessor {
                         message: "pqs.recovery.reestablishmentFailed kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) error=\(error)")
                 }
 
+                // Record the accepted recovery so redelivery of the same frame is
+                // suppressed instead of repeating the OTK batch replacement and the
+                // cooldown-bypassing peerRefresh re-emit.
+                await session.markInboundFailure(message, failureClass: failureClass)
                 try await cache.deleteJob(job)
                 return .deleted
             case .writeMessage(let message):
@@ -348,6 +441,10 @@ extension TaskProcessor {
             case .streamMessage(let message):
                 let failureClass = "payload.sessionDecryptionError"
                 if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
+                    auditInboundDecryptFailure(
+                        message: message,
+                        failureClass: failureClass,
+                        suppressed: true)
                     logger.log(level: .info, message: "Suppressing repeated \(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
                     try await cache.deleteJob(job)
                     return .deleted
@@ -357,6 +454,10 @@ extension TaskProcessor {
                     message: message,
                     failureClass: failureClass,
                     session: session)
+                auditInboundDecryptFailure(
+                    message: message,
+                    failureClass: failureClass,
+                    action: didRequestResend ? "resendRequested" : "resendSkipped")
                 if didRequestResend {
                     await session.markInboundFailure(message, failureClass: failureClass)
                 }
@@ -572,6 +673,14 @@ extension TaskProcessor {
         ].contains(error)
     }
 
+    private func isInboundSessionDesyncError(_ error: RatchetError) -> Bool {
+        [
+            .headerDecryptFailed,
+            .receivingKeyIsNil,
+            .receivingHeaderKeyIsNil
+        ].contains(error)
+    }
+
     private func freshSessionFailureClass(_ error: RatchetError) -> String {
         switch error {
         case .initialMessageNotReceived:
@@ -586,6 +695,19 @@ extension TaskProcessor {
             return "ratchet.stateUninitialized"
         default:
             return "ratchet.freshSessionRepair"
+        }
+    }
+
+    private func inboundSessionDesyncFailureClass(_ error: RatchetError) -> String {
+        switch error {
+        case .headerDecryptFailed:
+            return "ratchet.headerDecryptFailed"
+        case .receivingKeyIsNil:
+            return "ratchet.receivingKeyIsNil"
+        case .receivingHeaderKeyIsNil:
+            return "ratchet.receivingHeaderKeyIsNil"
+        default:
+            return "ratchet.sessionDesync"
         }
     }
 
@@ -634,11 +756,20 @@ extension TaskProcessor {
     ) async throws -> JobProcessingOutcome {
         let failureClass = "signature.invalidSignature"
         if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
+            auditInboundDecryptFailure(
+                message: message,
+                failureClass: failureClass,
+                action: "invalidSignatureRecovery",
+                suppressed: true)
             logger.log(level: .info, message: "Suppressing repeated \(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
             try await cache.deleteJob(job)
             return .deleted
         }
 
+        auditInboundDecryptFailure(
+            message: message,
+            failureClass: failureClass,
+            action: "invalidSignatureRecovery")
         await session.markInboundFailure(message, failureClass: failureClass)
 
         guard let context = await session.sessionContext else {
@@ -715,12 +846,25 @@ extension TaskProcessor {
         retryOriginalAfterReset: Bool = true
     ) async throws -> JobProcessingOutcome {
         if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
+            auditInboundDecryptFailure(
+                message: message,
+                failureClass: failureClass,
+                error: diagnostic,
+                action: "freshSessionRepairThenDeferredResend",
+                suppressed: true,
+                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
             logger.log(level: .info, message: "Suppressing repeated \(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
             try await cache.deleteJob(job)
             return .deleted
         }
 
         let diagnosticSuffix = diagnostic.map { " \($0)" } ?? ""
+        auditInboundDecryptFailure(
+            message: message,
+            failureClass: failureClass,
+            error: diagnostic,
+            action: "freshSessionRepairThenDeferredResend",
+            metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
         logger.log(
             level: .warning,
             message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=freshSessionRepairThenDeferredResend\(diagnosticSuffix)")
@@ -822,6 +966,10 @@ extension TaskProcessor {
         session: PQSSession
     ) async throws -> JobProcessingOutcome {
         let failureClass = "identity.peerSigningKeyOutOfSync"
+        auditInboundDecryptFailure(
+            message: message,
+            failureClass: failureClass,
+            action: "notifyPeerAccountIdentityChanged")
         logger.log(
             level: .error,
             message: "pqs.recovery.blocked.trust failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=notifyPeerAccountIdentityChanged")
