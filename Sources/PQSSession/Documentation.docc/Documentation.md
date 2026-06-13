@@ -145,10 +145,13 @@ device and re-link from the master).
 
 Every device owns a stable per-device signing key for the lifetime of its
 `DeviceID`. Master rotations distribute a new account-level signing key, but
-they never replace a child's per-device key. The per-device invariant is
-checked at startup (``PQSSession/startSession(appPassword:)``); on detected
-corruption the SDK emits ``PQSSession/SessionErrors/deviceIdentityCorrupted``
-and the device should be re-linked.
+they never replace a child's per-device key. Startup
+(``PQSSession/startSession(appPassword:)``) performs a non-fatal diagnostic
+check for cached divergence so fresh re-link flows can finish. Reprovisioning
+and key-rotation paths enforce the invariant and emit
+``PQSSession/SessionErrors/deviceIdentityCorrupted`` if a bundle tries to
+re-attest a child device with a foreign per-device key; that device should be
+re-linked.
 
 ## Quick start
 

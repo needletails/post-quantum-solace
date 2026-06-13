@@ -9,6 +9,20 @@
 
 A secure, post-quantum cryptographic messaging SDK with end-to-end encryption, built for the quantum-resistant future.
 
+## 🎉 Version 3.0.0
+
+Post-Quantum Solace 3.0.0 is a major release for production-grade
+secure messaging: hardened trust and identity invariants, coalesced session
+recovery, archived-state decrypt fallback, and flood-safe inbound failure
+handling. It requires **DoubleRatchetKit 3.0.0**.
+
+> **Upgrading from 2.x?** See the
+> [3.0.0 Migration Guide](#-300-migration-guide). For the 1.x → 2.0 API break,
+> see the [2.0.0 Migration Guide](#-200-migration-guide).
+
+> **Import note:** The Swift package product is `PostQuantumSolace`; the
+> importable module is `PQSSession` (`import PQSSession`).
+
 ## 🌟 Features
 
 - **🔐 Post-Quantum Security**: MLKEM1024 for long-term security against quantum attacks
@@ -66,10 +80,12 @@ import PQSSession
 ## 🆕 What's New in 3.0.0
 
 Version 3.0.0 hardens the trust model, formalizes the per-device identity
-invariant, and exposes the building blocks needed to ship a production-grade
-verification experience.
+invariant, and ships recovery and multi-device behavior for production
+deployments.
 
 ### ✨ New Features
+
+#### Trust, identity, and verification
 
 - **Trust On First Use (TOFU) pinning**: The account-level signing key is pinned
   on first observation and any drift on a subsequent server refresh is rejected
@@ -80,16 +96,36 @@ verification experience.
   to a server-advertised identity after explicit user confirmation. See
   [`AccountIdentityRecovery`](Sources/PQSSession/Documentation.docc/AccountIdentityRecovery.md).
 - **Per-device signing key invariant**: Master rotations only update the
-  account-level key; child devices keep their own per-device signing key. New
-  errors `compromiseRotationRequiresMasterDevice` and `deviceIdentityCorrupted`
-  surface this contract to callers.
+  account-level key; child devices keep their own per-device signing key.
+  Reprovisioning and key-rotation paths throw `deviceIdentityCorrupted` if a
+  bundle tries to replace that key, while startup logs any cached divergence as
+  a diagnostic so fresh re-link flows can complete.
 - **`SecurityIdentity`** (in `SessionModels`): First-class type for safety
   numbers and out-of-band fingerprint comparison.
   See [`SecurityIdentity`](Sources/SessionModels/Documentation.docc/SecurityIdentity.md).
+
+#### Session recovery and control events
+
 - **Control event coalescing**: Sender-side episodes and receiver-side
   deduplication prevent storms of compromise / refresh / repair notifications.
   Tunables live on `PQSSessionConstants`. See
   [`ControlEventCoalescing`](Sources/PQSSession/Documentation.docc/ControlEventCoalescing.md).
+- **`SessionReestablishmentEnvelope` wire format**: Control messages carry
+  `intentId` and `epoch` for deduplication across multi-device delivery.
+- **Archived session identity fallback**: Inactive ratchet snapshots (bounded
+  per device) are tried when the active identity cannot decrypt — supporting
+  delayed and out-of-order delivery after reestablishment.
+- **Graceful inbound decrypt recovery**: `missingOneTimeKey` and `CryptoKitError`
+  paths replace OTK batches and emit `peerRefresh` instead of looping resend
+  requests; failure-class suppression prevents repeated recovery on the same frame.
+- **`PQSSessionDelegate.inboundRecoveryDeferred`**: Optional hook when resend is
+  deferred until the peer completes reestablishment (default no-op).
+
+#### Multi-device and messaging
+
+- **Sibling device fan-out**: Persistable `.nickname` outbound messages are also
+  encrypted to the sender's linked devices so delivery receipts and conversation
+  state stay consistent across master/child devices.
 - **Broadcast recipient (`MessageRecipient.broadcast`)**: First-class broadcast
   fan-out for one-to-many announcements.
 - **`OneTimeKeyRefreshPolicy`**: Explicit policies (`.automatic`,
@@ -97,19 +133,95 @@ verification experience.
 - **Linked-device compromise hook**: Optional
   `PQSSessionDelegate.linkedDeviceReportedPotentialCompromise(deviceId:intentId:)`
   ships with a no-op default so existing delegates keep compiling.
+
+#### Wire format and hardening
+
 - **Binary-codable wire / persistence**: `metadata`, transport blobs and
   stored channel/contact metadata are now plain `Data` produced by
   `BinaryCodable` instead of BSON `Document` values.
+- **Recovery flood bounds**: In-memory recovery bookkeeping maps are pruned and
+  capped (`PQSSessionConstants.recoveryTrackingMaxEntries`); batched resend
+  requests are capped at `FailedMessageResendRequest.maxBatchedIds`.
+- **`DecryptFailureAuditLog`**: Optional file-backed audit trail for inbound
+  decrypt failures (enabled by default; disable via `DecryptFailureAuditLog.configure(isEnabled: false)`).
+- **DoubleRatchetKit 3.0.0**: Depends on deferred-persistence semantics in the
+  underlying ratchet layer.
 
-### 🔄 Migration from 2.x to 3.0.0
+## 🧭 3.0.0 Migration Guide
 
-#### 1. Handle the new TOFU error path
+Version 3.0.0 introduces **source-breaking** changes for integrators on 2.x.
+Plan a coordinated upgrade with **DoubleRatchetKit 3.0.0** and retest trust,
+metadata, and decrypt-recovery flows before shipping.
 
-`startSession`, `refreshUserConfiguration`, and any code path that adopts a
-fresh `UserConfiguration` from the network can now throw
-`PQSSession.SessionErrors.signingKeyOutOfSync`. Treat it as a security event
-and route the user through your "verify identity" UX instead of retrying
-silently.
+### ⚠️ Breaking Changes
+
+1. **TOFU account-identity pinning**
+   - **2.x**: A refreshed `UserConfiguration` from the network could be adopted
+     even when the account signing key changed.
+   - **3.0.0**: Drift throws `PQSSession.SessionErrors.signingKeyOutOfSync` until
+     the user explicitly confirms via `acknowledgeAccountIdentityChange(_:)`.
+
+2. **Master-only compromise rotation**
+   - **2.x**: Linked devices could call `rotateKeysOnPotentialCompromise()`.
+   - **3.0.0**: Only the master device may rotate; linked devices get
+     `compromiseRotationRequiresMasterDevice`.
+
+3. **Metadata is `Data`, not BSON `Document`**
+   - **2.x**: `metadata` parameters accepted BSON `Document` values.
+   - **3.0.0**: All metadata is `Data` from `BinaryEncoder` / `BinaryDecoder`.
+
+4. **OTK refresh policy enum**
+   - **2.x**: `refreshOneTimeKeysTask(forceRefresh: Bool)`.
+   - **3.0.0**: `refreshOneTimeKeysTask(policy: OneTimeKeyRefreshPolicy)`.
+
+5. **New `MessageRecipient.broadcast` case**
+   - **2.x**: `.nickname` and `.channel` only.
+   - **3.0.0**: Exhaustive `switch`es over `MessageRecipient` must handle
+     `.broadcast` (or use `default`).
+
+6. **New `SessionErrors` cases**
+   - `signingKeyOutOfSync`, `compromiseRotationRequiresMasterDevice`,
+     `deviceIdentityCorrupted`, `longTermKeyRotationFailed`.
+
+7. **Wire-format control events**
+   - `TransportEvent.sessionReestablishment` carries a `SessionReestablishmentEnvelope`
+     (`intentId`, `epoch`) instead of a bare kind enum.
+   - `FailedMessageResendRequest` may batch `failedSharedMessageIds` (capped at
+     `FailedMessageResendRequest.maxBatchedIds` on inbound handling).
+
+8. **DoubleRatchetKit 3.0.0 required**
+   - Do not pair PQS 3.x with DRK 2.x. Ratchet state no longer advances on
+     failed decrypt attempts in the underlying layer.
+
+### 🎯 Why These Changes?
+
+- **Trust**: Account-level signing keys must not change silently after first use.
+- **Device identity**: Child devices keep their own signing keys; only the master
+  rotates the account key on compromise.
+- **Recovery**: Archived identities, coalesced control events, and failure-class
+  suppression prevent decrypt storms and bricking active sessions.
+- **Interop**: Binary-codable `Data` metadata is consistent across platforms and
+  storage backends.
+
+### 📝 Migration Steps
+
+#### Step 1: Pin both SDKs to 3.0.0
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "3.0.0"),
+    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "3.0.0")
+]
+```
+
+Upgrade **DoubleRatchetKit first**, then Post-Quantum Solace. Rebuild and fix
+any compile errors from new `SessionErrors` cases or `MessageRecipient.broadcast`.
+
+#### Step 2: Handle the TOFU error path
+
+`startSession`, `refreshUserConfiguration`, and any path that adopts a fresh
+`UserConfiguration` can throw `signingKeyOutOfSync`. Route to identity
+verification UI — do not retry silently.
 
 ```swift
 do {
@@ -122,13 +234,10 @@ do {
 }
 ```
 
-#### 2. Don't trigger compromise rotation from a child device
+#### Step 3: Restrict compromise rotation to the master device
 
-`rotateKeysOnPotentialCompromise()` is now master-only and throws
-`compromiseRotationRequiresMasterDevice` if a linked device calls it. Forward
-the signal to the master via the new
-`PQSSessionDelegate.linkedDeviceReportedPotentialCompromise` callback (or your
-existing transport) and let the master rotate.
+Forward linked-device compromise signals to the master via
+`PQSSessionDelegate.linkedDeviceReportedPotentialCompromise` (or your transport).
 
 ```swift
 func linkedDeviceReportedPotentialCompromise(deviceId: UUID, intentId: UUID?) async {
@@ -137,28 +246,25 @@ func linkedDeviceReportedPotentialCompromise(deviceId: UUID, intentId: UUID?) as
 }
 ```
 
-#### 3. Treat `deviceIdentityCorrupted` as "auto-unlink"
+On linked devices, `rotateKeysOnPotentialCompromise()` now throws
+`compromiseRotationRequiresMasterDevice`.
 
-If a child device's stored per-device signing key no longer matches the
-master-published bundle (for example after a partial restore), the SDK fails
-fast with `PQSSession.SessionErrors.deviceIdentityCorrupted`. The recovery
-path is to unlink and re-link from the master — there is no in-place repair.
+#### Step 4: Handle `deviceIdentityCorrupted`
+
+If reprovisioning or key rotation sees a child device re-attested with a foreign
+per-device signing key, the SDK throws `deviceIdentityCorrupted`. Treat that as
+"unlink and re-link" — there is no in-place repair.
 
 ```swift
 do {
-    try await session.startSession(appPassword: password)
+    try await session.installLinkedDeviceReprovisioningBundle(bundle)
 } catch PQSSession.SessionErrors.deviceIdentityCorrupted {
-    try await session.deleteSession() // wipe local state
+    try await session.deleteSession()
     presentReLinkFlow()
 }
 ```
 
-#### 4. Switch metadata blobs from `Document` to `Data`
-
-All `metadata` parameters (`writeTextMessage`, `BaseCommunication`,
-`MessageMetadata`, `requestFriendshipStateChange`, etc.) are now plain `Data`
-produced via `BinaryEncoder` / `BinaryDecoder`. BSON `Document` values are no
-longer accepted on the wire or in storage.
+#### Step 5: Re-encode metadata blobs
 
 **Before (2.x):**
 ```swift
@@ -180,42 +286,92 @@ try await session.writeTextMessage(
 )
 ```
 
-#### 5. Adopt the new `OneTimeKeyRefreshPolicy`
+Re-encode any metadata you persisted yourself outside the SDK.
 
-`refreshOneTimeKeysTask` and `refreshMLKEMOneTimeKeysTask` no longer take a
-boolean. Pick the policy that matches the call site:
+#### Step 6: Adopt `OneTimeKeyRefreshPolicy`
 
 ```swift
-// Background refresh — let the SDK decide based on remaining OTK count.
-try await session.refreshOneTimeKeysTask(policy: .automatic)
-
-// Top-up after explicit batch consumption.
-try await session.refreshOneTimeKeysTask(policy: .replenishBatch)
-
-// During device-key rotation — replace the current device's batch on server.
-try await session.refreshOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
+try await session.refreshOneTimeKeysTask(policy: .automatic)           // background
+try await session.refreshOneTimeKeysTask(policy: .replenishBatch)      // after consumption
+try await session.refreshOneTimeKeysTask(policy: .replaceCurrentDeviceBatch) // during rotation
 ```
 
-#### 6. Render safety numbers from `SecurityIdentity`
+Same for `refreshMLKEMOneTimeKeysTask(policy:)`.
 
-The new `SecurityIdentity` value type exposes the canonical safety-number and
-short-fingerprint helpers. Use it for any "Verify Safety Number" UX so the
-fingerprint logic stays consistent across platforms.
+#### Step 7: Use `SecurityIdentity` for safety numbers
 
 ```swift
 let local  = await session.localSecurityIdentity()!
 let remote = SecurityIdentity(secretName: contact.secretName,
                               configuration: contact.configuration)
 
-let safetyNumber  = SecurityIdentity.safetyNumber(local: local, remote: remote)
-let shortFprintHex = remote.shortFingerprintHex(byteCount: 8)
+let safetyNumber     = SecurityIdentity.safetyNumber(local: local, remote: remote)
+let shortFprintHex   = remote.shortFingerprintHex(byteCount: 8)
 ```
 
-### 🔄 Migration from 1.x to 2.0.0
+#### Step 8: Optional recovery UI hook
 
-> Already on 2.x? You can skip this section.
+Implement `PQSSessionDelegate.inboundRecoveryDeferred` to surface deferred resend
+while the peer completes reestablishment (default extension is a no-op).
 
-#### Recommended: Use SessionConfiguration
+```swift
+func inboundRecoveryDeferred(
+    senderSecretName: String,
+    senderDeviceId: UUID,
+    failedSharedMessageId: String,
+    failureClass: String
+) async {
+    // e.g. show a subtle "syncing with peer…" state for this conversation
+}
+```
+
+### ✅ Post-upgrade checklist
+
+- [ ] `Package.swift` pins DRK and PQS to `from: "3.0.0"`
+- [ ] `SessionErrors` switches updated for new cases
+- [ ] `MessageRecipient` switches handle `.broadcast`
+- [ ] App metadata read/write uses `BinaryEncoder` / `BinaryDecoder`
+- [ ] Identity-change UX wired to `signingKeyOutOfSync` → `acknowledgeAccountIdentityChange`
+- [ ] Compromise flow is master-only; linked devices forward via delegate
+- [ ] Active sessions retested: decrypt failure → resend, out-of-order delivery, reestablishment
+- [ ] Multi-device: nickname messages and delivery receipts across linked devices
+
+### 📌 Migration Notes
+
+- `PQSSessionDelegate.linkedDeviceReportedPotentialCompromise` and
+  `inboundRecoveryDeferred` ship with no-op defaults — existing delegates compile.
+- `SessionConfiguration`, `LocalizedError`, and `PQSSessionConstants` from 2.0 are unchanged.
+- `startSession(appPassword:)` performs a non-fatal diagnostic check for cached
+  per-device signing-key divergence. Enforcement happens on reprovisioning and
+  key-rotation paths, where the SDK can distinguish corruption from transient
+  fresh-link state.
+- Custom transports that bypass `adoptVerifiedUserConfiguration(_:)` will have
+  inbound refreshes rejected under TOFU.
+- On-disk ratchet snapshots from sessions mid-recovery during upgrade may need
+  reestablishment — retest active conversations after deploying.
+
+### 🔗 See Also (3.0.0)
+
+- [Account Identity Recovery Guide](Sources/PQSSession/Documentation.docc/AccountIdentityRecovery.md)
+- [Control Event Coalescing](Sources/PQSSession/Documentation.docc/ControlEventCoalescing.md)
+- [SecurityIdentity Reference](Sources/SessionModels/Documentation.docc/SecurityIdentity.md)
+
+## 🧭 2.0.0 Migration Guide
+
+Version 2.0.0 introduced `SessionConfiguration`, `LocalizedError` on session errors,
+and `PQSSessionConstants`. These are **source-breaking** changes from 1.x.
+
+### ⚠️ Breaking Changes
+
+1. **Delegate wiring** — individual `set*Delegate` calls replaced by
+   `configure(with: SessionConfiguration)` (individual setters still work).
+2. **Error handling** — `SessionErrors` conforms to `LocalizedError`; prefer
+   `errorDescription` over `rawValue`.
+3. **Constants** — magic numbers replaced by `PQSSessionConstants`.
+
+### 📝 Migration Steps
+
+#### Step 1: Use SessionConfiguration
 
 **Before (1.x):**
 ```swift
@@ -238,7 +394,7 @@ let config = SessionConfiguration(
 try await session.configure(with: config)
 ```
 
-#### Error Handling Updates
+#### Step 2: Update error handling
 
 **Before (1.x):**
 ```swift
@@ -260,11 +416,11 @@ catch let error as PQSSession.SessionErrors {
 }
 ```
 
-#### Using Constants
+#### Step 3: Replace magic numbers with constants
 
 **Before (1.x):**
 ```swift
-if keyCount < 10 {  // Magic number
+if keyCount < 10 {
     await refreshKeys()
 }
 ```
@@ -276,39 +432,10 @@ if keyCount < PQSSessionConstants.oneTimeKeyLowWatermark {
 }
 ```
 
-### ⚠️ Breaking Changes Summary (2.x → 3.0.0)
+### 📌 Migration Notes
 
-- `PQSSession.SessionErrors` adds new cases (`signingKeyOutOfSync`,
-  `compromiseRotationRequiresMasterDevice`, `deviceIdentityCorrupted`,
-  `longTermKeyRotationFailed`). Exhaustive `switch` statements over
-  `SessionErrors` must add cases or a `default`.
-- `rotateKeysOnPotentialCompromise()` is now master-only and will throw on
-  linked devices.
-- `metadata` is `Data` everywhere it was previously `Document`. Re-encode any
-  on-disk blobs you persisted yourself.
-- `refreshOneTimeKeysTask(forceRefresh:)` is replaced by
-  `refreshOneTimeKeysTask(policy:)`. Same for the ML-KEM variant.
-- `MessageRecipient.broadcast` is added — `switch` statements over
-  `MessageRecipient` need to handle it (or use `default`).
-- Inbound `UserConfiguration` from the network now flows through
-  `adoptVerifiedUserConfiguration(_:)` which enforces the TOFU pin. Custom
-  transport implementations that bypass this path will have their refresh
-  rejected.
-
-### 📝 Backward Compatibility
-
-- `PQSSessionDelegate.linkedDeviceReportedPotentialCompromise(deviceId:intentId:)`
-  ships with a no-op default extension; existing delegates compile unchanged.
-- `SessionConfiguration`-style setup, `LocalizedError` conformance, and
-  `PQSSessionConstants` from 2.0 remain unchanged.
-
-### 🔗 See Also
-
-- [Account Identity Recovery Guide](Sources/PQSSession/Documentation.docc/AccountIdentityRecovery.md)
-- [Control Event Coalescing](Sources/PQSSession/Documentation.docc/ControlEventCoalescing.md)
-- [SecurityIdentity Reference](Sources/SessionModels/Documentation.docc/SecurityIdentity.md)
-- [Migration Guide (1.x → 2.x)](Sources/PQSSession/Documentation.docc/GettingStarted.md#migration-from-1x)
-- [API Reference](Sources/PQSSession/Documentation.docc/)
+- Already on 3.x? Skip this section unless you maintain a 1.x → 2.x upgrade path.
+- See [Getting Started](Sources/PQSSession/Documentation.docc/GettingStarted.md) for current setup patterns.
 
 ## 🌐 Cross-Platform Support
 
@@ -515,7 +642,7 @@ try await session.writeTextMessage(
 **Channel Structure**:
 - **Administrator**: The user who created the channel (typically one)
 - **Operators**: Users with elevated permissions (minimum 1 required)
-- **Members**: Regular participants who can send/receive messages (minimum 3 required)
+- **Members**: Regular participants who can send/receive messages (minimum 2 required)
 - **Blocked Members**: Users who have been blocked from the channel
 
 **Channel Requirements** (configurable via `PQSSessionConstants`):
@@ -677,7 +804,7 @@ PQSSessionConstants.keyRotationIntervalDays
 
 // Channel requirements
 PQSSessionConstants.minimumChannelOperators  // Default: 1
-PQSSessionConstants.minimumChannelMembers     // Default: 3
+PQSSessionConstants.minimumChannelMembers     // Default: 2
 ```
 
 These constants are `Sendable` and can be safely accessed from any concurrent context.
@@ -766,7 +893,13 @@ For detailed documentation, see:
 
 ### Version History
 
-- **3.0.0** (Current): TOFU account-identity pinning with user-mediated recovery (`acknowledgeAccountIdentityChange`), per-device signing key invariant with master-only compromise rotation, `SecurityIdentity` and safety-number support, control-event coalescing, broadcast recipient fan-out, `OneTimeKeyRefreshPolicy`, and `Data`/BinaryCodable metadata blobs.
+- **3.0.0** (Current): TOFU account-identity pinning with user-mediated recovery
+  (`acknowledgeAccountIdentityChange`), per-device signing key invariant with
+  master-only compromise rotation, `SecurityIdentity` and safety-number support,
+  control-event coalescing with `SessionReestablishmentEnvelope`, archived
+  identity decrypt fallback, graceful inbound failure recovery, multi-device
+  sibling fan-out, recovery flood bounds, and **DoubleRatchetKit 3.0.0**
+  dependency. Metadata blobs are `Data`/BinaryCodable (not BSON `Document`).
 - **2.0.0**: Enhanced error handling with `LocalizedError`, `SessionConfiguration` for simplified setup, `PQSSessionConstants` for centralized configuration, `CryptoError` for cryptographic operations, and comprehensive documentation updates.
 - **1.x**: Initial release with core post-quantum cryptographic messaging functionality.
 
@@ -781,7 +914,7 @@ This project is licensed under the AGPL-3.0 License - see the [LICENSE](LICENSE)
 ## 🔗 Dependencies
 
 - [swift-crypto](https://github.com/apple/swift-crypto) - Apple's cryptographic library
-- [double-ratchet-kit](https://github.com/needletails/double-ratchet-kit) - Double Ratchet protocol implementation
+- [double-ratchet-kit](https://github.com/needletails/double-ratchet-kit) - Double Ratchet protocol implementation (**3.0.0+** required for PQS 3.0.0)
 - [needletail-crypto](https://github.com/needletails/needletail-crypto) - Cryptographic utilities
 - [needletail-logger](https://github.com/needletails/needletail-logger) - Logging framework
 - [needletail-algorithms](https://github.com/needletails/needletail-algorithms) - Algorithm implementations

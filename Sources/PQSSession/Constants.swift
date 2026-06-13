@@ -80,7 +80,7 @@ public enum PQSSessionConstants: Sendable {
     /// Channels must have at least this many members to be considered valid.
     /// This ensures channels have sufficient participants for meaningful communication.
     ///
-    /// - Default: `3`
+    /// - Default: `2`
     /// - See also: `PQSSessionConstants.minimumChannelOperators`
     public static let minimumChannelMembers = 2
 

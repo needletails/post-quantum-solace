@@ -150,9 +150,10 @@ after the user verifies and accepts the new safety number.
 - Linked (child) devices each own a **per-device** signing key for the
   lifetime of their `DeviceID`. They consume server-published bundles via
   ``adoptVerifiedUserConfiguration(_:)``.
-- A startup invariant verifies the per-device signing key matches what the
-  server records; on mismatch the SDK throws
-  ``SessionErrors/deviceIdentityCorrupted`` and the device should be
+- Startup performs a non-fatal diagnostic check for cached per-device key
+  divergence. Reprovisioning and key-rotation paths enforce the invariant and
+  throw ``SessionErrors/deviceIdentityCorrupted`` if a bundle tries to
+  re-attest a child device with a foreign per-device key; that device should be
   re-linked.
 
 ## Quick start

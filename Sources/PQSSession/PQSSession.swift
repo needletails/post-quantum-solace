@@ -1007,7 +1007,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         case peerSigningKeyOutOfSync = "Peer account signing key is out of sync with the locally pinned contact identity."
         case compromiseRotationRequiresMasterDevice = "Compromise key rotation is restricted to the master device."
         case invalidOperatorCount = "The number of operators must be greater than 0."
-        case invalidMemberCount = "The number of members must be greater than 2."
+        case invalidMemberCount = "The number of members must be at least 2."
         case signingKeyMismatchWithServer = "Local signing key does not match server's stored device signing key."
         case deviceIdentityCorrupted = "This device's identity is unrecoverable; re-link from your master device."
         
@@ -1388,6 +1388,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             }
         } catch {
             logger.log(level: .error, message: "Error Creating Session, \(error)")
+            throw error
         }
         return self
     }
@@ -2107,7 +2108,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             // Decode the session context from the decrypted data
             let sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
 
-            // Diagnostic-only Sesame per-device identity check. Logs (does not throw) when the
+            // Diagnostic-only per-device identity check. Logs (does not throw) when the
             // local `signingPrivateKey` does not match this device's `signingPublicKey` entry in
             // the cached `activeUserConfiguration.signedDevices`. The original write-master-key-
             // onto-child overwrite bug is prevented at the source by:
