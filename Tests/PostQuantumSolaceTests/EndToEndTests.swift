@@ -3384,34 +3384,29 @@ actor EndToEndTests {
         var authenticationFailures = 0
         var successfulMessages = 0
         
-        // Create multiple concurrent tasks to send messages simultaneously
-        let concurrentTasks = (1...10).map { i in
-            Task {
-                do {
-                    // Minimal delay to ensure they start almost simultaneously
-                    try await Task.sleep(until: .now + .milliseconds(UInt64.random(in: 0...5)))
-                    
-                    try await _senderSession.writeTextMessage(
-                        recipient: .nickname("bob"),
-                        text: "Race condition test \(i)")
-                    return MessageResult.success
-                } catch {
-                    if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
-                        error.localizedDescription.contains("authenticationFailure") ||
-                        error.localizedDescription.contains("invalidKeyId") {
-                        return MessageResult.authenticationFailure
-                    } else {
-                        return MessageResult.otherError(error)
-                    }
-                }
-            }
-        }
+        let senderSession = _senderSession
         
-        // Wait for all concurrent tasks to complete
+        // Create multiple structured child tasks to send messages simultaneously.
         let results = await withTaskGroup(of: MessageResult.self) { group in
-            for task in concurrentTasks {
+            for i in 1...10 {
                 group.addTask {
-                    await task.value
+                    do {
+                        // Minimal delay to ensure they start almost simultaneously
+                        try await Task.sleep(until: .now + .milliseconds(UInt64(i % 6)))
+                        
+                        try await senderSession.writeTextMessage(
+                            recipient: .nickname("bob"),
+                            text: "Race condition test \(i)")
+                        return MessageResult.success
+                    } catch {
+                        if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
+                            error.localizedDescription.contains("authenticationFailure") ||
+                            error.localizedDescription.contains("invalidKeyId") {
+                            return MessageResult.authenticationFailure
+                        } else {
+                            return MessageResult.otherError(error)
+                        }
+                    }
                 }
             }
             
