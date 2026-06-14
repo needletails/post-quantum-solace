@@ -545,88 +545,98 @@ actor EndToEndTests {
     func testManualKeyRotationThenImmediateSend() async throws {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-        
-        defer {
-            Task {
-                aliceTask?.cancel()
-                bobTask?.cancel()
-                await shutdownSessions()
-            }
-        }
-        
+
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
-			bobTransport.continuation = continuation
+            bobTransport.continuation = continuation
         }
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
 
-        let senderStore = createSenderStore()
-        let recipientStore = createRecipientStore()
+        func cleanup() async {
+            aliceTransport.continuation?.finish()
+            bobTransport.continuation?.finish()
+            aliceTask?.cancel()
+            bobTask?.cancel()
+            if let aliceTask {
+                await aliceTask.value
+            }
+            if let bobTask {
+                await bobTask.value
+            }
+            await shutdownSessions()
+        }
+
+        do {
+            let senderStore = createSenderStore()
+            let recipientStore = createRecipientStore()
         
 
-        let sd = SessionDelegate(session: _senderSession)
-        let rsd = SessionDelegate(session: _recipientSession)
+            let sd = SessionDelegate(session: _senderSession)
+            let rsd = SessionDelegate(session: _recipientSession)
         
-        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+            try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+            try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         
-        try await createFriendship(
-            aliceSession: _senderSession,
-            sd: sd,
-            bobSession: _recipientSession,
-            rsd: rsd)
+            try await createFriendship(
+                aliceSession: _senderSession,
+                sd: sd,
+                bobSession: _recipientSession,
+                rsd: rsd)
         
-        // Alice receive loop
-        aliceTask = Task {
-            await #expect(throws: Never.self, "Alice should process Bob's replies after rotation") {
-                var count = 0
-                for await received in aliceStream {
-                    count += 1
+            // Alice receive loop
+            aliceTask = Task {
+                await #expect(throws: Never.self, "Alice should process Bob's replies after rotation") {
+                    var count = 0
+                    for await received in aliceStream {
+                        count += 1
 
-                    if count == 3 {
-                        _ = try await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
-                        aliceTransport.continuation?.finish()
-                        bobTransport.continuation?.finish()
+                        if count == 3 {
+                            _ = try await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
+                            aliceTransport.continuation?.finish()
+                            bobTransport.continuation?.finish()
+                        }
                     }
                 }
             }
-        }
         
-        // Bob receive loop
-        bobTask = Task {
-            await #expect(throws: Never.self, "Bob should process Alice's post-rotation send and reply") {
-                var processed = 0
-                for await received in bobStream {
-                    guard try await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received) else {
-                        continue
-                    }
-                    processed += 1
-                    if processed == 1 {
-                        // After first warmup delivery, rotate on Alice and immediately send
-                        try await self._senderSession.rotateKeysOnPotentialCompromise()
-                        try await self._senderSession.writeTextMessage(
-                            recipient: .nickname("bob"),
-                            text: "post-rotate")
-                    } else if processed == 2 {
-                        // Reply from Bob after receiving Alice's post-rotation message
-                        try await self._recipientSession.writeTextMessage(
-                            recipient: .nickname("alice"),
-                            text: "ack post-rotate")
+            // Bob receive loop
+            bobTask = Task {
+                await #expect(throws: Never.self, "Bob should process Alice's post-rotation send and reply") {
+                    var processed = 0
+                    for await received in bobStream {
+                        guard try await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received) else {
+                            continue
+                        }
+                        processed += 1
+                        if processed == 1 {
+                            // After first warmup delivery, rotate on Alice and immediately send
+                            try await self._senderSession.rotateKeysOnPotentialCompromise()
+                            try await self._senderSession.writeTextMessage(
+                                recipient: .nickname("bob"),
+                                text: "post-rotate")
+                        } else if processed == 2 {
+                            // Reply from Bob after receiving Alice's post-rotation message
+                            try await self._recipientSession.writeTextMessage(
+                                recipient: .nickname("alice"),
+                                text: "ack post-rotate")
+                        }
                     }
                 }
             }
+        
+            // Warm-up to establish identity/ratchet
+            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+
+            // Let the receive loops finish the rotation flow before deterministic teardown.
+            try await Task.sleep(until: .now + .seconds(5))
+            await cleanup()
+        } catch {
+            await cleanup()
+            throw error
         }
-        
-        // Warm-up to establish identity/ratchet
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
-        
-        // Give tasks time to run
-        try await Task.sleep(until: .now + .seconds(1))
-        aliceTransport.continuation?.finish()
-        bobTransport.continuation?.finish()
     }
     
     @Test("Auto Sync After Rotation - No Manual Send")
@@ -7064,8 +7074,12 @@ actor EndToEndTests {
             bobTransport.continuation?.finish()
             bobTask?.cancel()
             aliceTask?.cancel()
-            await bobTask?.value
-            await aliceTask?.value
+            if let bobTask {
+                await bobTask.value
+            }
+            if let aliceTask {
+                await aliceTask.value
+            }
             await shutdownSessions()
         }
 
@@ -7189,128 +7203,134 @@ actor EndToEndTests {
 
     @Test("Missing MLKEM OTK recovery archives state without crashing")
     func testMissingMLKEMOTKRecoveryArchivesStateWithoutCrashing() async throws {
-        defer { Task { await shutdownSessions() } }
-
-        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
-        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-
-        actor Capture {
-            var msg: ReceivedMessage?
-            func set(_ message: ReceivedMessage) { msg = message }
-            func get() -> ReceivedMessage? { msg }
+        func cleanup() async {
+            await shutdownSessions()
         }
 
-        let brokenCapture = Capture()
-        let senderStore = createSenderStore()
-        let recipientStore = createRecipientStore()
-        let sd = SessionDelegate(session: _senderSession)
-        let rsd = SessionDelegate(session: _recipientSession)
+        do {
+            let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+            let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
 
-        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-
-        _ = try await _senderSession.refreshIdentities(
-            secretName: rMockUserData.ssn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true
-        )
-        _ = try await _recipientSession.refreshIdentities(
-            secretName: sMockUserData.ssn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true
-        )
-
-        guard let senderContext = await _recipientSession.sessionContext else {
-            Issue.record("Recipient session context should be initialized")
-            return
-        }
-
-        bobTransport.shouldDeliver = { _ in false }
-        bobTransport.transformOutgoing = { received in
-            guard let signed = received.message.signed else { return received }
-            let ratchetMessage = try BinaryDecoder().decode(RatchetMessage.self, from: signed.data)
-            guard let encryptedData = Mirror(reflecting: ratchetMessage)
-                .children
-                .first(where: { $0.label == "encryptedData" })?
-                .value as? Data
-            else {
-                throw TestError.invalidRatchetHeader
+            actor Capture {
+                var msg: ReceivedMessage?
+                func set(_ message: ReceivedMessage) { msg = message }
+                func get() -> ReceivedMessage? { msg }
             }
 
-            let forgedHeader = EncryptedHeader(
-                remoteLongTermPublicKey: ratchetMessage.header.remoteLongTermPublicKey,
-                remoteOneTimePublicKey: ratchetMessage.header.remoteOneTimePublicKey,
-                remoteMLKEMPublicKey: ratchetMessage.header.remoteMLKEMPublicKey,
-                headerCiphertext: ratchetMessage.header.headerCiphertext,
-                messageCiphertext: ratchetMessage.header.messageCiphertext,
-                oneTimeKeyId: ratchetMessage.header.oneTimeKeyId,
-                mlKEMOneTimeKeyId: UUID(),
-                encrypted: ratchetMessage.header.encrypted
-            )
-            let forgedRatchetMessage = RatchetMessage(
-                header: forgedHeader,
-                encryptedData: encryptedData
-            )
-            let forged = try SignedRatchetMessage(
-                message: forgedRatchetMessage,
-                signingPrivateKey: senderContext.sessionUser.deviceKeys.signingPrivateKey
-            )
-            let forgedReceived = ReceivedMessage(
-                message: forged,
-                sender: received.sender,
-                recipient: received.recipient,
-                deviceId: received.deviceId,
-                messageId: received.messageId,
-                transportEvent: received.transportEvent
-            )
-            await brokenCapture.set(forgedReceived)
-            return forgedReceived
-        }
+            let brokenCapture = Capture()
+            let senderStore = createSenderStore()
+            let recipientStore = createRecipientStore()
+            let sd = SessionDelegate(session: _senderSession)
+            let rsd = SessionDelegate(session: _recipientSession)
 
-        let receiverMessageCountBefore = await senderStore.createdMessages.count
-        let receiverIdentityCountBefore = await senderStore.identities.count
+            try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+            try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
 
-        try await _recipientSession.writeTextMessage(
-            recipient: .nickname(sMockUserData.ssn),
-            text: "broken"
-        )
+            _ = try await _senderSession.refreshIdentities(
+                secretName: rMockUserData.ssn,
+                forceRefresh: true,
+                sendOneTimeIdentities: true
+            )
+            _ = try await _recipientSession.refreshIdentities(
+                secretName: sMockUserData.ssn,
+                forceRefresh: true,
+                sendOneTimeIdentities: true
+            )
 
-        guard let brokenMessage = await brokenCapture.get() else {
-            Issue.record("Broken outbound message should be captured")
-            return
-        }
+            let senderContext = try #require(
+                await _recipientSession.sessionContext,
+                "Recipient session context should be initialized")
 
-        await #expect(throws: Never.self) {
-            try await self._senderSession.receiveMessage(
-                message: brokenMessage.message,
+            bobTransport.shouldDeliver = { _ in false }
+            bobTransport.transformOutgoing = { received in
+                guard let signed = received.message.signed else { return received }
+                let ratchetMessage = try BinaryDecoder().decode(RatchetMessage.self, from: signed.data)
+                guard let encryptedData = Mirror(reflecting: ratchetMessage)
+                    .children
+                    .first(where: { $0.label == "encryptedData" })?
+                    .value as? Data
+                else {
+                    throw TestError.invalidRatchetHeader
+                }
+
+                let forgedHeader = EncryptedHeader(
+                    remoteLongTermPublicKey: ratchetMessage.header.remoteLongTermPublicKey,
+                    remoteOneTimePublicKey: ratchetMessage.header.remoteOneTimePublicKey,
+                    remoteMLKEMPublicKey: ratchetMessage.header.remoteMLKEMPublicKey,
+                    headerCiphertext: ratchetMessage.header.headerCiphertext,
+                    messageCiphertext: ratchetMessage.header.messageCiphertext,
+                    oneTimeKeyId: ratchetMessage.header.oneTimeKeyId,
+                    mlKEMOneTimeKeyId: UUID(),
+                    encrypted: ratchetMessage.header.encrypted
+                )
+                let forgedRatchetMessage = RatchetMessage(
+                    header: forgedHeader,
+                    encryptedData: encryptedData
+                )
+                let forged = try SignedRatchetMessage(
+                    message: forgedRatchetMessage,
+                    signingPrivateKey: senderContext.sessionUser.deviceKeys.signingPrivateKey
+                )
+                let forgedReceived = ReceivedMessage(
+                    message: forged,
+                    sender: received.sender,
+                    recipient: received.recipient,
+                    deviceId: received.deviceId,
+                    messageId: received.messageId,
+                    transportEvent: received.transportEvent
+                )
+                await brokenCapture.set(forgedReceived)
+                return forgedReceived
+            }
+
+            let receiverMessageCountBefore = await senderStore.createdMessages.count
+            let receiverIdentityCountBefore = await senderStore.identities.count
+
+            try await _recipientSession.writeTextMessage(
+                recipient: .nickname(sMockUserData.ssn),
+                text: "broken"
+            )
+
+            let brokenMessage = try #require(
+                await brokenCapture.get(),
+                "Broken outbound message should be captured")
+
+            await #expect(throws: Never.self) {
+                try await self._senderSession.receiveMessage(
+                    message: brokenMessage.message,
+                    sender: brokenMessage.sender,
+                    deviceId: brokenMessage.deviceId,
+                    messageId: brokenMessage.messageId
+                )
+            }
+
+            let pendingResends = await _senderSession.takePendingResendsAfterReestablishment(
                 sender: brokenMessage.sender,
-                deviceId: brokenMessage.deviceId,
-                messageId: brokenMessage.messageId
+                deviceId: brokenMessage.deviceId)
+            #expect(
+                pendingResends.contains(where: { $0.failedSharedMessageId == brokenMessage.messageId }),
+                "missingOneTimeKey should defer a resend request for the failed message until peerRefresh completes")
+            for pending in pendingResends {
+                await _senderSession.deferPeerResendUntilReestablished(
+                    sender: pending.senderName,
+                    deviceId: pending.senderDeviceId,
+                    failedMessageId: pending.failedSharedMessageId,
+                    failureClass: pending.failureClass)
+            }
+
+            #expect(
+                await senderStore.createdMessages.count == receiverMessageCountBefore,
+                "Failed missing-OTK payload should not be persisted"
             )
+            #expect(
+                await senderStore.identities.count >= receiverIdentityCountBefore,
+                "Missing OTK recovery should not regress identity tracking"
+            )
+            await cleanup()
+        } catch {
+            await cleanup()
+            throw error
         }
-
-        let pendingResends = await _senderSession.takePendingResendsAfterReestablishment(
-            sender: brokenMessage.sender,
-            deviceId: brokenMessage.deviceId)
-        #expect(
-            pendingResends.contains(where: { $0.failedSharedMessageId == brokenMessage.messageId }),
-            "missingOneTimeKey should defer a resend request for the failed message until peerRefresh completes")
-        for pending in pendingResends {
-            await _senderSession.deferPeerResendUntilReestablished(
-                sender: pending.senderName,
-                deviceId: pending.senderDeviceId,
-                failedMessageId: pending.failedSharedMessageId,
-                failureClass: pending.failureClass)
-        }
-
-        #expect(
-            await senderStore.createdMessages.count == receiverMessageCountBefore,
-            "Failed missing-OTK payload should not be persisted"
-        )
-        #expect(
-            await senderStore.identities.count >= receiverIdentityCountBefore,
-            "Missing OTK recovery should not regress identity tracking"
-        )
     }
 
     @Test("CryptoKitError reconciliation recovery enables subsequent message decryption")
@@ -8324,62 +8344,69 @@ actor EndToEndTests {
 
     @Test("refreshOneTimeKeys control message is non-persistent and triggers refresh")
     func testRefreshOneTimeKeysControlMessageIsNonPersistentAndTriggersRefresh() async throws {
-        defer { Task { await shutdownSessions() } }
-
-        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
-        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-
-        actor Capture {
-            var msg: ReceivedMessage?
-            func set(_ message: ReceivedMessage) { msg = message }
-            func get() -> ReceivedMessage? { msg }
+        func cleanup() async {
+            await shutdownSessions()
         }
 
-        let controlCapture = Capture()
-        let senderStore = createSenderStore()
-        let recipientStore = createRecipientStore()
-        let sd = SessionDelegate(session: _senderSession)
-        let rsd = SessionDelegate(session: _recipientSession)
+        do {
+            let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+            let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
 
-        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+            actor Capture {
+                var msg: ReceivedMessage?
+                func set(_ message: ReceivedMessage) { msg = message }
+                func get() -> ReceivedMessage? { msg }
+            }
 
-        _ = try await _senderSession.refreshIdentities(
-            secretName: rMockUserData.ssn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true
-        )
-        _ = try await _recipientSession.refreshIdentities(
-            secretName: sMockUserData.ssn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true
-        )
+            let controlCapture = Capture()
+            let senderStore = createSenderStore()
+            let recipientStore = createRecipientStore()
+            let sd = SessionDelegate(session: _senderSession)
+            let rsd = SessionDelegate(session: _recipientSession)
 
-        bobTransport.shouldDeliver = { received in
-            await controlCapture.set(received)
-            return false
-        }
+            try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+            try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
 
-        let metadata = try BinaryEncoder().encode(TransportEvent.refreshOneTimeKeys)
-        let senderMessageCountBefore = await recipientStore.createdMessages.count
-        try await _recipientSession.writeTextMessage(
-            recipient: .nickname(sMockUserData.ssn),
-            transportInfo: metadata
-        )
+            _ = try await _senderSession.refreshIdentities(
+                secretName: rMockUserData.ssn,
+                forceRefresh: true,
+                sendOneTimeIdentities: true
+            )
+            _ = try await _recipientSession.refreshIdentities(
+                secretName: sMockUserData.ssn,
+                forceRefresh: true,
+                sendOneTimeIdentities: true
+            )
 
-        guard let controlMessage = await controlCapture.get() else {
-            Issue.record("refreshOneTimeKeys control message should be captured")
-            return
-        }
+            bobTransport.shouldDeliver = { received in
+                await controlCapture.set(received)
+                return false
+            }
 
-        #expect(
-            await recipientStore.createdMessages.count == senderMessageCountBefore,
-            "refreshOneTimeKeys control frames should not be persisted"
-        )
-        if case .refreshOneTimeKeys = controlMessage.transportEvent {
-            #expect(Bool(true))
-        } else {
-            Issue.record("Expected refreshOneTimeKeys transport event")
+            let metadata = try BinaryEncoder().encode(TransportEvent.refreshOneTimeKeys)
+            let senderMessageCountBefore = await recipientStore.createdMessages.count
+            try await _recipientSession.writeTextMessage(
+                recipient: .nickname(sMockUserData.ssn),
+                transportInfo: metadata
+            )
+
+            let controlMessage = try #require(
+                await controlCapture.get(),
+                "refreshOneTimeKeys control message should be captured")
+
+            #expect(
+                await recipientStore.createdMessages.count == senderMessageCountBefore,
+                "refreshOneTimeKeys control frames should not be persisted"
+            )
+            if case .refreshOneTimeKeys = controlMessage.transportEvent {
+                #expect(Bool(true))
+            } else {
+                Issue.record("Expected refreshOneTimeKeys transport event")
+            }
+            await cleanup()
+        } catch {
+            await cleanup()
+            throw error
         }
     }
 
@@ -8387,71 +8414,51 @@ actor EndToEndTests {
 
     @Test("OTK upload retries after transient failure")
     func testOTKUploadRetryAfterFailure() async throws {
-        defer { Task { await shutdownSessions() } }
+        func cleanup() async {
+            await shutdownSessions()
+        }
 
-        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
-        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        do {
+            let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+            let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
 
-        let senderStore = createSenderStore()
-        let recipientStore = createRecipientStore()
-        let sd = SessionDelegate(session: _senderSession)
-        let rsd = SessionDelegate(session: _recipientSession)
+            let senderStore = createSenderStore()
+            let recipientStore = createRecipientStore()
+            let sd = SessionDelegate(session: _senderSession)
+            let rsd = SessionDelegate(session: _recipientSession)
 
-        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+            try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+            try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
 
-        _ = try await _senderSession.refreshIdentities(
-            secretName: rMockUserData.rsn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true)
+            _ = try await _senderSession.refreshIdentities(
+                secretName: rMockUserData.rsn,
+                forceRefresh: true,
+                sendOneTimeIdentities: true)
 
-        // Drain Alice's OTKs so the next refresh MUST generate + upload.
-        await self.store.drainOTKs(for: sMockUserData.ssn)
+            // Drain Alice's OTKs so the next refresh MUST generate + upload.
+            await self.store.drainOTKs(for: sMockUserData.ssn)
 
-        // Inject: first OTK upload attempt will throw, subsequent ones succeed.
-        await aliceTransport.setOTKUploadFailCount(1)
+            // Inject: first OTK upload attempt will throw, subsequent ones succeed.
+            await aliceTransport.setOTKUploadFailCount(1)
 
-        let result = await _senderSession.refreshOneTimeKeysTask(policy: .replenishBatch)
+            let result = await _senderSession.refreshOneTimeKeysTask(policy: .replenishBatch)
 
-        let attemptCount = await aliceTransport.otkUploadAttemptCount
-        #expect(result == true,
-                "refreshOneTimeKeysTask should succeed after retrying the failed upload (attemptCount=\(attemptCount))")
-        #expect(attemptCount >= 2,
-                "Should have attempted upload at least twice (first fail + retry), got \(attemptCount)")
+            let attemptCount = await aliceTransport.otkUploadAttemptCount
+            #expect(result == true,
+                    "refreshOneTimeKeysTask should succeed after retrying the failed upload (attemptCount=\(attemptCount))")
+            #expect(attemptCount >= 2,
+                    "Should have attempted upload at least twice (first fail + retry), got \(attemptCount)")
+            await cleanup()
+        } catch {
+            await cleanup()
+            throw error
+        }
     }
 
     @Test("missingOneTimeKey recovers from archived snapshot before reconciliation")
     func testMissingOneTimeKeyArchiveRecovery() async throws {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-        defer {
-            Task {
-                aliceTask?.cancel()
-                bobTask?.cancel()
-                await shutdownSessions()
-            }
-        }
-
-        actor MissingOTKProbe {
-            var captured: ReceivedMessage?
-            var messageDecrypted = false
-            var hitMissingOTK = false
-            var reconciliationTriggered = false
-            private var msgCount = 0
-
-            func capture(_ msg: ReceivedMessage) { captured = msg }
-            func getCaptured() -> ReceivedMessage? { captured }
-            func isCaptured(_ msg: ReceivedMessage) -> Bool { captured?.messageId == msg.messageId }
-            func markDecrypted() { messageDecrypted = true }
-            func markMissingOTK() { hitMissingOTK = true }
-            func markReconciliation() { reconciliationTriggered = true }
-            func nextMessageIndex() -> Int {
-                msgCount += 1
-                return msgCount
-            }
-        }
-
-        let probe = MissingOTKProbe()
 
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
@@ -8462,145 +8469,186 @@ actor EndToEndTests {
             aliceTransport.continuation = continuation
         }
 
-        let senderStore = createSenderStore()
-        let recipientStore = createRecipientStore()
-        let sd = SessionDelegate(session: _senderSession)
-        let rsd = SessionDelegate(session: _recipientSession)
-
-        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-        try await createFriendship(
-            aliceSession: _senderSession,
-            sd: sd,
-            bobSession: _recipientSession,
-            rsd: rsd)
-
-        aliceTask = Task {
-            for await received in aliceStream {
-                _ = try? await self.receiveIgnoringRecoverableErrors(
-                    self._senderSession,
-                    received: received)
+        func cleanup() async {
+            aliceTransport.continuation?.finish()
+            bobTransport.continuation?.finish()
+            aliceTask?.cancel()
+            bobTask?.cancel()
+            if let aliceTask {
+                await aliceTask.value
             }
+            if let bobTask {
+                await bobTask.value
+            }
+            await shutdownSessions()
         }
 
-        let bobRotationCountBefore = await bobTransport.publishRotatedKeysCallCount
+        do {
+            actor MissingOTKProbe {
+                var captured: ReceivedMessage?
+                var messageDecrypted = false
+                var hitMissingOTK = false
+                var reconciliationTriggered = false
+                private var msgCount = 0
 
-        bobTask = Task {
-            for await received in bobStream {
-                do {
-                    try await self._recipientSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId)
-                    if received.transportEvent == nil, await probe.isCaptured(received) {
-                        await probe.markDecrypted()
-                    }
-                } catch let ratchetError as RatchetError where ratchetError == .missingOneTimeKey {
-                    await probe.markMissingOTK()
-                } catch {
-                    // Tolerate transient errors
+                func capture(_ msg: ReceivedMessage) { captured = msg }
+                func getCaptured() -> ReceivedMessage? { captured }
+                func isCaptured(_ msg: ReceivedMessage) -> Bool { captured?.messageId == msg.messageId }
+                func markDecrypted() { messageDecrypted = true }
+                func markMissingOTK() { hitMissingOTK = true }
+                func markReconciliation() { reconciliationTriggered = true }
+                func nextMessageIndex() -> Int {
+                    msgCount += 1
+                    return msgCount
                 }
             }
+
+            let probe = MissingOTKProbe()
+
+            let senderStore = createSenderStore()
+            let recipientStore = createRecipientStore()
+            let sd = SessionDelegate(session: _senderSession)
+            let rsd = SessionDelegate(session: _recipientSession)
+
+            try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+            try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+            try await createFriendship(
+                aliceSession: _senderSession,
+                sd: sd,
+                bobSession: _recipientSession,
+                rsd: rsd)
+
+            aliceTask = Task {
+                for await received in aliceStream {
+                    _ = try? await self.receiveIgnoringRecoverableErrors(
+                        self._senderSession,
+                        received: received)
+                }
+            }
+
+            let bobRotationCountBefore = await bobTransport.publishRotatedKeysCallCount
+
+            bobTask = Task {
+                for await received in bobStream {
+                    do {
+                        try await self._recipientSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId)
+                        if received.transportEvent == nil, await probe.isCaptured(received) {
+                            await probe.markDecrypted()
+                        }
+                    } catch let ratchetError as RatchetError where ratchetError == .missingOneTimeKey {
+                        await probe.markMissingOTK()
+                    } catch {
+                        // Tolerate transient errors
+                    }
+                }
+            }
+
+            _ = try await _senderSession.refreshIdentities(
+                secretName: rMockUserData.rsn,
+                forceRefresh: true,
+                sendOneTimeIdentities: true)
+            _ = try await _recipientSession.refreshIdentities(
+                secretName: sMockUserData.ssn,
+                forceRefresh: true,
+                sendOneTimeIdentities: true)
+
+            // Baseline: establish ratchet state with a delivered message.
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "baseline")
+            try await Task.sleep(for: .milliseconds(500))
+
+            // Capture a message (not delivered to Bob).
+            aliceTransport.shouldDeliver = { received in
+                guard received.sender == "alice", received.recipient == "bob" else { return true }
+                guard received.transportEvent == nil else { return true }
+                await probe.capture(received)
+                return false
+            }
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "in-flight message before OTK drain")
+            for _ in 0..<40 {
+                if await probe.getCaptured() != nil { break }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+
+            #expect(await probe.getCaptured() != nil,
+                    "Message should have been captured by shouldDeliver")
+
+            // Simulate post-reconciliation state on Bob's side:
+            // 1. Archive current ratchet state for alice
+            try await _recipientSession.createInactiveSessionSnapshot(
+                for: sMockUserData.ssn,
+                policy: .archive)
+
+            // 2. Clear the active ratchet state for alice's identity
+            let bobCache = await _recipientSession.cache!
+            let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
+            for identity in try await bobCache.fetchSessionIdentities() {
+                guard var props = await identity.props(symmetricKey: bobSymKey) else { continue }
+                guard props.secretName == sMockUserData.ssn else { continue }
+                guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+                guard props.state != nil else { continue }
+                props.state = nil
+                try await identity.updateIdentityProps(symmetricKey: bobSymKey, props: props)
+                try await bobCache.updateSessionIdentity(identity)
+            }
+            await _recipientSession.removeIdentity(with: sMockUserData.ssn)
+
+            // 3. Drain Alice's OTKs so replay triggers missingOneTimeKey (not just CryptoKitError)
+            await self.store.drainOTKs(for: sMockUserData.ssn)
+
+            // Replay the captured message into Bob's receive stream.
+            let oldMessage = try #require(
+                await probe.getCaptured(),
+                "Captured message should exist")
+            aliceTransport.continuation?.yield(oldMessage)
+
+            for _ in 0..<60 {
+                if await probe.messageDecrypted { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+
+            let bobRotationCountAfter = await bobTransport.publishRotatedKeysCallCount
+
+            #expect(
+                await probe.messageDecrypted,
+                "Message should be decrypted from the archived snapshot even when missingOneTimeKey is the error path")
+            #expect(
+                bobRotationCountAfter == bobRotationCountBefore,
+                "Archive recovery should NOT trigger full reconciliation (rotation count should not change)")
+
+            let aliceConfiguration = try await bobTransport.findConfiguration(for: sMockUserData.ssn)
+            let currentAliceDevices = try aliceConfiguration.getVerifiedDevices().map {
+                try aliceConfiguration.deviceWithCurrentKeyBundle($0)
+            }
+            let currentAliceDevice = try #require(
+                currentAliceDevices.first(where: { $0.deviceId == oldMessage.deviceId }),
+                "Expected Alice's current server device bundle to exist")
+
+            var activeAliceProps = [SessionIdentity.UnwrappedProps]()
+            for identity in try await bobCache.fetchSessionIdentities() {
+                guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
+                guard props.secretName == sMockUserData.ssn else { continue }
+                guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+                activeAliceProps.append(props)
+            }
+            #expect(activeAliceProps.count == 1)
+            let activeAlice = try #require(
+                activeAliceProps.first,
+                "Expected exactly one active Alice SessionIdentity")
+            #expect(activeAlice.longTermPublicKey == currentAliceDevice.longTermPublicKey)
+            #expect(activeAlice.signingPublicKey == currentAliceDevice.signingPublicKey)
+            await cleanup()
+        } catch {
+            await cleanup()
+            throw error
         }
-
-        _ = try await _senderSession.refreshIdentities(
-            secretName: rMockUserData.rsn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true)
-        _ = try await _recipientSession.refreshIdentities(
-            secretName: sMockUserData.ssn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true)
-
-        // Baseline: establish ratchet state with a delivered message.
-        try await _senderSession.writeTextMessage(
-            recipient: .nickname("bob"),
-            text: "baseline")
-        try await Task.sleep(for: .milliseconds(500))
-
-        // Capture a message (not delivered to Bob).
-        aliceTransport.shouldDeliver = { received in
-            guard received.sender == "alice", received.recipient == "bob" else { return true }
-            guard received.transportEvent == nil else { return true }
-            await probe.capture(received)
-            return false
-        }
-        try await _senderSession.writeTextMessage(
-            recipient: .nickname("bob"),
-            text: "in-flight message before OTK drain")
-        for _ in 0..<40 {
-            if await probe.getCaptured() != nil { break }
-            try await Task.sleep(for: .milliseconds(50))
-        }
-
-        #expect(await probe.getCaptured() != nil,
-                "Message should have been captured by shouldDeliver")
-
-        // Simulate post-reconciliation state on Bob's side:
-        // 1. Archive current ratchet state for alice
-        try await _recipientSession.createInactiveSessionSnapshot(
-            for: sMockUserData.ssn,
-            policy: .archive)
-
-        // 2. Clear the active ratchet state for alice's identity
-        let bobCache = await _recipientSession.cache!
-        let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
-        for identity in try await bobCache.fetchSessionIdentities() {
-            guard var props = await identity.props(symmetricKey: bobSymKey) else { continue }
-            guard props.secretName == sMockUserData.ssn else { continue }
-            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
-            guard props.state != nil else { continue }
-            props.state = nil
-            try await identity.updateIdentityProps(symmetricKey: bobSymKey, props: props)
-            try await bobCache.updateSessionIdentity(identity)
-        }
-        await _recipientSession.removeIdentity(with: sMockUserData.ssn)
-
-        // 3. Drain Alice's OTKs so replay triggers missingOneTimeKey (not just CryptoKitError)
-        await self.store.drainOTKs(for: sMockUserData.ssn)
-
-        // Replay the captured message into Bob's receive stream.
-        guard let oldMessage = await probe.getCaptured() else {
-            Issue.record("Captured message should exist")
-            return
-        }
-        aliceTransport.continuation?.yield(oldMessage)
-
-        for _ in 0..<60 {
-            if await probe.messageDecrypted { break }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-
-        let bobRotationCountAfter = await bobTransport.publishRotatedKeysCallCount
-
-        #expect(
-            await probe.messageDecrypted,
-            "Message should be decrypted from the archived snapshot even when missingOneTimeKey is the error path")
-        #expect(
-            bobRotationCountAfter == bobRotationCountBefore,
-            "Archive recovery should NOT trigger full reconciliation (rotation count should not change)")
-
-        let aliceConfiguration = try await bobTransport.findConfiguration(for: sMockUserData.ssn)
-        let currentAliceDevices = try aliceConfiguration.getVerifiedDevices().map {
-            try aliceConfiguration.deviceWithCurrentKeyBundle($0)
-        }
-        guard let currentAliceDevice = currentAliceDevices.first(where: { $0.deviceId == oldMessage.deviceId }) else {
-            Issue.record("Expected Alice's current server device bundle to exist")
-            return
-        }
-
-        var activeAliceProps = [SessionIdentity.UnwrappedProps]()
-        for identity in try await bobCache.fetchSessionIdentities() {
-            guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
-            guard props.secretName == sMockUserData.ssn else { continue }
-            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
-            activeAliceProps.append(props)
-        }
-        #expect(activeAliceProps.count == 1)
-        guard let activeAlice = activeAliceProps.first else { return }
-        #expect(activeAlice.longTermPublicKey == currentAliceDevice.longTermPublicKey)
-        #expect(activeAlice.signingPublicKey == currentAliceDevice.signingPublicKey)
     }
 
     @Test("Job survives identity deletion during reconciliation")
