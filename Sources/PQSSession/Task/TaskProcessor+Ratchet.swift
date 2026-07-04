@@ -1374,6 +1374,83 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         }
     }
 
+    func handleOutOfBandResendRequest(
+        from senderName: String,
+        deviceId senderDeviceId: UUID,
+        failedSharedMessageIds: [String],
+        session: PQSSession
+    ) async throws -> [String] {
+        let requestedIds = failedSharedMessageIds
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !requestedIds.isEmpty else { return [] }
+
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        var replayableMessages: [(sharedId: String, message: CryptoMessage)] = []
+        var missingCount = 0
+
+        for sharedId in requestedIds {
+            if let replay = recentOutboundReplayMessage(sharedId: sharedId) {
+                replayableMessages.append((sharedId, replay.message))
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.outOfBandResendUsingRecentControl sharedId=\(sharedId) replayCount=\(replay.replayCount)")
+                continue
+            }
+
+            do {
+                guard let foundMessage = try await session.cache?.fetchMessage(sharedId: sharedId),
+                      let cryptoMessage = await foundMessage.props(symmetricKey: symmetricKey)?.message
+                else {
+                    missingCount += 1
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.outOfBandResendSkipped reason=unreadableLocalMessage sharedId=\(sharedId)")
+                    continue
+                }
+                replayableMessages.append((sharedId, cryptoMessage))
+            } catch {
+                missingCount += 1
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.outOfBandResendSkipped reason=missingLocalMessage sharedId=\(sharedId) error=\(error)")
+            }
+        }
+
+        guard !replayableMessages.isEmpty else {
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.outOfBandResendUnavailable sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(requestedIds.count) missingCount=\(missingCount)")
+            return []
+        }
+
+        let identity = try await session.resetSessionIdentityForFreshSession(
+            secretName: senderName,
+            deviceId: senderDeviceId,
+            sendOneTimeIdentities: true)
+
+        var queuedIds: [String] = []
+        for replayable in replayableMessages {
+            let task = EncryptableTask(
+                task: .writeMessage(OutboundTaskMessage(
+                    message: replayable.message,
+                    recipientIdentity: identity,
+                    localId: UUID(),
+                    sharedId: replayable.sharedId,
+                    isPersistedOutbound: false
+                )),
+                priority: .urgent
+            )
+            try await feedTask(task, session: session)
+            queuedIds.append(replayable.sharedId)
+        }
+
+        logger.log(
+            level: .info,
+            message: "pqs.recovery.outOfBandResendQueued sender=\(senderName) deviceId=\(senderDeviceId) queuedCount=\(queuedIds.count) missingCount=\(missingCount) requestedCount=\(requestedIds.count)")
+        return queuedIds
+    }
+
     private func isReplayableNonPersistentControl(
         _ message: CryptoMessage,
         session: PQSSession
@@ -1500,6 +1577,14 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 logger.log(
                     level: .info,
                     message: "pqs.recovery.resendDrainStarted reason=\(reason) count=\(sharedIds.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) ids=\(sharedIds.joined(separator: ","))")
+                for pending in ready {
+                    await session.deferPeerResendUntilReestablished(
+                        sender: pending.senderName,
+                        deviceId: pending.senderDeviceId,
+                        failedMessageId: pending.failedSharedMessageId,
+                        failureClass: pending.failureClass,
+                        notifyDelegate: false)
+                }
                 try await session.requestMessageResend(
                     sharedMessageIds: sharedIds,
                     senderName: key.senderName,

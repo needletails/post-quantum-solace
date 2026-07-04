@@ -497,6 +497,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         guard let expiry = inboundFailurePolicyUntil[key] else {
             return false
         }
+        if hasPendingResendAfterReestablishment(
+            sender: inbound.senderSecretName,
+            deviceId: inbound.senderDeviceId,
+            failedMessageId: inbound.sharedMessageId,
+            now: now
+        ) {
+            return false
+        }
         return expiry > now
     }
     
@@ -607,7 +615,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         deviceId: UUID,
         failedMessageId: String,
         failureClass: String,
-        now: Date = Date()
+        now: Date = Date(),
+        notifyDelegate: Bool = true
     ) {
         cleanupPendingResendAfterReestablishment(now: now)
         let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
@@ -617,6 +626,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             failedSharedMessageId: failedMessageId,
             failureClass: failureClass,
             createdAt: now)
+        guard notifyDelegate else { return }
         let delegate = sessionDelegate
         Task {
             await delegate?.inboundRecoveryDeferred(
@@ -636,6 +646,17 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         return pendingResendAfterReestablishment.values.contains { pending in
             pending.senderName == sender && pending.senderDeviceId == deviceId
         }
+    }
+
+    func hasPendingResendAfterReestablishment(
+        sender: String,
+        deviceId: UUID,
+        failedMessageId: String,
+        now: Date = Date()
+    ) -> Bool {
+        cleanupPendingResendAfterReestablishment(now: now)
+        let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        return pendingResendAfterReestablishment[requestKey] != nil
     }
 
     func takePendingResendsAfterReestablishment(

@@ -92,7 +92,7 @@ Always force a deliberate user choice. Common policy:
 
 ## Ergonomics for app integrations
 
-Higher-level SDKs (NeedleTailKit) typically expose this as a
+Higher-level SDKs (NudgeKit) typically expose this as a
 publishable signal so a SwiftUI/Compose layer can react automatically.
 The pattern is:
 

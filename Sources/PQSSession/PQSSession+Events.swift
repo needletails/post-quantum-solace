@@ -85,7 +85,8 @@ public extension PQSSession {
         transportInfo: Data? = nil,
         metadata: Data = .init(),
         destructionTime: TimeInterval? = nil,
-        sharedIdOverride: String? = nil
+        sharedIdOverride: String? = nil,
+        shouldPersistOverride: Bool? = nil
     ) async throws {
         do {
             let message = CryptoMessage(
@@ -99,7 +100,8 @@ public extension PQSSession {
             try await processWrite(
                 message: message,
                 session: self,
-                sharedIdOverride: sharedIdOverride
+                sharedIdOverride: sharedIdOverride,
+                shouldPersistOverride: shouldPersistOverride
             )
         } catch {
             logger.log(level: .error, message: "\(error)")
@@ -248,6 +250,19 @@ public extension PQSSession {
             level: .info,
             message: "pqs.recovery.resendRequestSubmitted sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(sharedMessageIds.count) ids=\(sharedMessageIds.joined(separator: ","))")
     }
+
+    @discardableResult
+    func handleOutOfBandResendRequest(
+        from senderName: String,
+        deviceId senderDeviceId: UUID,
+        failedSharedMessageIds: [String]
+    ) async throws -> [String] {
+        try await taskProcessor.handleOutOfBandResendRequest(
+            from: senderName,
+            deviceId: senderDeviceId,
+            failedSharedMessageIds: failedSharedMessageIds,
+            session: self)
+    }
     
     // MARK: Outbound
 
@@ -281,7 +296,8 @@ public extension PQSSession {
     internal func processWrite(
         message: CryptoMessage,
         session: PQSSession,
-        sharedIdOverride: String? = nil
+        sharedIdOverride: String? = nil,
+        shouldPersistOverride: Bool? = nil
     ) async throws {
         
         guard let sessionContext = await session.sessionContext else {
@@ -294,7 +310,7 @@ public extension PQSSession {
         let symmetricKey = try await getDatabaseSymmetricKey()
         let mySecretName = sessionContext.sessionUser.secretName
 
-        var shouldPersist = sessionDelegate?.shouldPersist(transportInfo: message.transportInfo) == false ? false : true
+        var shouldPersist = shouldPersistOverride ?? (sessionDelegate?.shouldPersist(transportInfo: message.transportInfo) == false ? false : true)
 
         if let data = message.transportInfo {
             do {

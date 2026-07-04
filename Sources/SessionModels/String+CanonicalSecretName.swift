@@ -21,7 +21,7 @@ extension String {
     /// stored or looked up inside Post-Quantum Solace.
     ///
     /// This intentionally mirrors the IRC nickname normalization used by the
-    /// `needle-tail-kit` transport layer (`String.ircLowercased`):
+    /// `nudge-kit` transport layer (`String.ircLowercased`):
     ///
     /// - Lowercases the string.
     /// - Substitutes the IRC-equivalent of the four "wall" characters that

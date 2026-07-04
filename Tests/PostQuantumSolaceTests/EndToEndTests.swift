@@ -1415,6 +1415,12 @@ actor EndToEndTests {
             failedInbound,
             failureClass: "ratchet.missingOneTimeKey"
         )
+        await _recipientSession.deferPeerResendUntilReestablished(
+            sender: original.sender,
+            deviceId: original.deviceId,
+            failedMessageId: original.messageId,
+            failureClass: "ratchet.missingOneTimeKey"
+        )
 
         #expect(
             !(await _recipientSession.isInboundFailureQuarantined(
@@ -1424,6 +1430,14 @@ actor EndToEndTests {
             )),
             "Failure policy must not quarantine the tuple that replay recovery reuses"
         )
+        #expect(
+            !(await _recipientSession.shouldSuppressInboundFailure(
+                failedInbound,
+                failureClass: "ratchet.missingOneTimeKey"
+            )),
+            "Pending replay recovery must admit the same shared id before decryption"
+        )
+
     }
     
     @Test("maxSkipped resend side effect failure stays internal and retryable")
@@ -7625,7 +7639,13 @@ actor EndToEndTests {
 
         #expect(
             await waitUntil { await probe.contains(responseDrainedSharedId) },
-            "peerRefresh response should release the deferred resend request")
+            "peerRefresh response should submit the deferred resend request")
+        #expect(
+            await _recipientSession.hasPendingResendAfterReestablishment(
+                sender: "alice",
+                deviceId: aliceDeviceId,
+                failedMessageId: responseDrainedSharedId),
+            "Deferred resend marker should remain until the requested replay succeeds")
 
         let successfulInboundDrainedSharedId = UUID().uuidString
         await _recipientSession.deferPeerResendUntilReestablished(
@@ -9598,6 +9618,9 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     /// Useful for forging signatures or mutating payloads deterministically.
     var transformOutgoing: (@Sendable (ReceivedMessage) async throws -> ReceivedMessage)?
 
+    /// Optional hook to pause or observe OTK uploads in recovery tests.
+    var beforeUpdateOneTimeKeys: (@Sendable () async -> Void)?
+
     /// If set, publishing rotated keys will throw this error (test-only).
     /// Used to simulate rotation publish failures.
     var publishRotatedKeysError: Error?
@@ -9703,6 +9726,9 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
         for secretName: String, deviceId: String,
         keys: [SessionModels.UserConfiguration.SignedOneTimePublicKey]
     ) async throws {
+        if let beforeUpdateOneTimeKeys {
+            await beforeUpdateOneTimeKeys()
+        }
         // Track calls for testing (thread-safe)
         await callTracker.record(secretName: secretName, deviceId: deviceId, keyCount: keys.count)
         try await otkErrorInjector.checkAndThrow()

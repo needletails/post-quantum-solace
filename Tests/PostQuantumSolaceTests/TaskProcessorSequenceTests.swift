@@ -882,8 +882,8 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
-    @Test("missingOneTimeKey marks failure so redelivery is suppressed")
-    func testMissingOneTimeKeySuppressesRedelivery() async throws {
+    @Test("missingOneTimeKey pending redelivery does not repeat OTK replacement")
+    func testMissingOneTimeKeyPendingRedeliveryDoesNotRepeatOTKReplacement() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         await session.taskProcessor.setTaskDelegate(
@@ -906,14 +906,14 @@ actor TaskProcessorSequenceTests {
             deviceId: peerDeviceId)
         #expect(hasPendingRepair, "missingOneTimeKey should defer resend until peerRefresh")
 
-        // The accepted recovery (OTK batch replacement + forced peerRefresh) must be
-        // recorded, otherwise every redelivery of the same frame repeats the full
-        // recovery: two OTK batch replacements and a cooldown-bypassing re-emit.
+        // Pending deferred messages must be admitted for a real replay/decrypt attempt.
+        // The peer-level pending recovery still coalesces failures, so this does not
+        // reopen the full OTK-replacement storm.
         #expect(
-            await session.shouldSuppressInboundFailure(
+            !(await session.shouldSuppressInboundFailure(
                 inbound,
-                failureClass: "ratchet.missingOneTimeKey"),
-            "First missingOneTimeKey failure must be marked so the redelivered frame is suppressed")
+                failureClass: "ratchet.missingOneTimeKey")),
+            "Pending missingOneTimeKey replay should not be dropped before decryption")
 
         // Redelivery of the identical frame must not trigger another OTK batch replacement.
         let otkCallsAfterFirst = await transport.updateOneTimeKeysCallCount
@@ -926,6 +926,122 @@ actor TaskProcessorSequenceTests {
         #expect(
             otkCallsAfterSecond == otkCallsAfterFirst,
             "Redelivered missingOneTimeKey frame must not replace the OTK batch again")
+
+        await session.shutdown()
+    }
+
+    @Test("missingOneTimeKey burst coalesces recovery for distinct messages from same peer")
+    func testMissingOneTimeKeyBurstCoalescesRecoveryForDistinctMessages() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+
+        let peerDeviceId = UUID()
+        let first = try makeTestInboundTaskMessage(
+            senderSecretName: "bob_missing_otk_burst",
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "missing_otk_burst_1")
+        let second = try makeTestInboundTaskMessage(
+            senderSecretName: "bob_missing_otk_burst",
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "missing_otk_burst_2")
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(first)),
+            session: session
+        )
+        let hasPendingRepair = try await waitForPendingRepair(
+            sender: "bob_missing_otk_burst",
+            deviceId: peerDeviceId)
+        #expect(hasPendingRepair, "First missingOneTimeKey should start a recovery episode")
+
+        let otkCallsAfterFirst = await transport.updateOneTimeKeysCallCount
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(second)),
+            session: session
+        )
+        #expect(
+            await session.hasPendingResendAfterReestablishment(
+                sender: "bob_missing_otk_burst",
+                deviceId: peerDeviceId,
+                failedMessageId: "missing_otk_burst_2"),
+            "Distinct failed message should still be recorded for replay")
+
+        let otkCallsAfterSecond = await transport.updateOneTimeKeysCallCount
+        #expect(
+            otkCallsAfterSecond == otkCallsAfterFirst,
+            "Distinct missingOneTimeKey messages from an in-flight peer recovery must not replace the OTK batch again")
+
+        let pendingIds = await Set(session.pendingResendAfterReestablishment.values.map(\.failedSharedMessageId))
+        #expect(pendingIds.contains("missing_otk_burst_1"))
+        #expect(pendingIds.contains("missing_otk_burst_2"))
+
+        await session.shutdown()
+    }
+
+    @Test("missingOneTimeKey marks recovery pending before OTK replacement completes")
+    func testMissingOneTimeKeyMarksRecoveryPendingBeforeOTKReplacementCompletes() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+
+        let uploadPause = OTKUploadPause()
+        transport.beforeUpdateOneTimeKeys = {
+            await uploadPause.beforeFirstUpload()
+        }
+        defer {
+            transport.beforeUpdateOneTimeKeys = nil
+        }
+
+        let peerDeviceId = UUID()
+        let first = try makeTestInboundTaskMessage(
+            senderSecretName: "bob_missing_otk_inflight",
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "missing_otk_inflight_1")
+        let second = try makeTestInboundTaskMessage(
+            senderSecretName: "bob_missing_otk_inflight",
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "missing_otk_inflight_2")
+
+        async let firstFeed: Void = session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(first)),
+            session: session
+        )
+
+        let uploadPaused = try await waitUntil {
+            await uploadPause.isPaused()
+        }
+        #expect(uploadPaused, "Expected first recovery to pause inside OTK upload")
+        #expect(
+            await session.hasPendingResendAfterReestablishment(
+                sender: "bob_missing_otk_inflight",
+                deviceId: peerDeviceId),
+            "Recovery episode must be visible before OTK replacement completes")
+
+        async let secondFeed: Void = session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(second)),
+            session: session
+        )
+
+        await uploadPause.release()
+        try await firstFeed
+        try await secondFeed
+
+        #expect(
+            await session.hasPendingResendAfterReestablishment(
+                sender: "bob_missing_otk_inflight",
+                deviceId: peerDeviceId,
+                failedMessageId: "missing_otk_inflight_2"),
+            "Second missingOneTimeKey should be recorded inside the in-flight recovery episode")
+
+        let sawSingleCurveUpload = try await waitUntil {
+            await self.transport.updateOneTimeKeysCallCount == 1
+        }
+        #expect(sawSingleCurveUpload, "Only the first in-flight recovery should upload a replacement curve OTK batch")
 
         await session.shutdown()
     }
@@ -1643,6 +1759,35 @@ actor TaskProcessorSequenceTests {
             sender: sender,
             deviceId: deviceId)
     }
+
+    private func waitForSuppressedInboundFailure(
+        _ inbound: InboundTaskMessage,
+        failureClass: String,
+        timeout: TimeInterval = 3
+    ) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await session.shouldSuppressInboundFailure(inbound, failureClass: failureClass) {
+                return true
+            }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        return await session.shouldSuppressInboundFailure(inbound, failureClass: failureClass)
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 3,
+        _ condition: @escaping @Sendable () async -> Bool
+    ) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() {
+                return true
+            }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        return await condition()
+    }
     
     
     @Test("Edge Cases - Feed While Processing")
@@ -1861,6 +2006,31 @@ final class MockTaskDelegateWithOneShotError: TaskSequenceDelegate, @unchecked S
 
     func getErrorCount() async -> Int {
         await errorTracker.getErrorCount()
+    }
+}
+
+private actor OTKUploadPause {
+    private var didPause = false
+    private var isReleased = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func beforeFirstUpload() async {
+        guard !didPause else { return }
+        didPause = true
+        guard !isReleased else { return }
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func isPaused() -> Bool {
+        didPause && !isReleased
+    }
+
+    func release() {
+        isReleased = true
+        continuation?.resume()
+        continuation = nil
     }
 }
 

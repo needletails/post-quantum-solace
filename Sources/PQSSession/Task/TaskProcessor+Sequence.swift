@@ -370,6 +370,26 @@ extension TaskProcessor {
                     return .deleted
                 }
 
+                if await session.hasPendingResendAfterReestablishment(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId) {
+                    auditInboundDecryptFailure(
+                        message: message,
+                        failureClass: failureClass,
+                        action: "coalescedPendingPeerRecovery")
+                    await session.deferPeerResendUntilReestablished(
+                        sender: message.senderSecretName,
+                        deviceId: message.senderDeviceId,
+                        failedMessageId: message.sharedMessageId,
+                        failureClass: failureClass)
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=pendingPeerRefresh")
+                    await session.markInboundFailure(message, failureClass: failureClass)
+                    try await cache.deleteJob(job)
+                    return .deleted
+                }
+
                 auditInboundDecryptFailure(
                     message: message,
                     failureClass: failureClass,
@@ -377,6 +397,16 @@ extension TaskProcessor {
                 logger.log(
                     level: .warning,
                     message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=replaceOTKBatchThenPeerRefresh")
+
+                await session.deferPeerResendUntilReestablished(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId,
+                    failedMessageId: message.sharedMessageId,
+                    failureClass: failureClass)
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.deferred failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) waitingFor=peerRefresh")
+
                 let curveReplaced = await session.refreshOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
                 let mlKEMReplaced = await session.refreshMLKEMOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
                 if !curveReplaced || !mlKEMReplaced {
@@ -387,15 +417,6 @@ extension TaskProcessor {
 
                 let mySecretName = await session.sessionContext?.sessionUser.secretName
                 let isSelf = message.senderSecretName == mySecretName
-
-                await session.deferPeerResendUntilReestablished(
-                    sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId,
-                    failedMessageId: message.sharedMessageId,
-                    failureClass: failureClass)
-                logger.log(
-                    level: .info,
-                    message: "pqs.recovery.deferred failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) waitingFor=peerRefresh")
 
                 do {
                     _ = try await session.emitSessionReestablishment(
