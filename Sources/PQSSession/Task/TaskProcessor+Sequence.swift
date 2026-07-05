@@ -128,6 +128,7 @@ extension TaskProcessor {
             return
         }
         
+        deferredDelayedJobIds.removeAll()
         let symmetricKey = try await session.getDatabaseSymmetricKey()
         // If `loadTasks(...)` already seeded the consumer, don't immediately re-load from cache,
         // otherwise the same JobModel can be enqueued twice and processed twice.
@@ -214,6 +215,17 @@ extension TaskProcessor {
 #endif
         
         if let delayedUntil = props.delayedUntil, delayedUntil > Date() {
+            // A not-yet-due retry must not head-of-line block ready jobs queued
+            // behind it (e.g. new outbound sends during an inbound recovery
+            // flood). Skip ahead once by re-queueing it at the back; if it
+            // cycles back to the front still not due, every remaining job is
+            // waiting on a future due date, so wait this one out.
+            if !deferredDelayedJobIds.contains(job.id), await !jobConsumer.deque.isEmpty {
+                deferredDelayedJobIds.insert(job.id)
+                await jobConsumer.feedConsumer(job, priority: .background)
+                return .deferredToBack
+            }
+            deferredDelayedJobIds.remove(job.id)
             let sleep = delayedUntil.timeIntervalSinceNow
             do {
                 try await Task.sleep(nanoseconds: UInt64(sleep * 1_000_000_000))
@@ -221,6 +233,8 @@ extension TaskProcessor {
                 // If the task was cancelled while sleeping, just pause and let a future resume reload from cache.
                 return .paused
             }
+        } else {
+            deferredDelayedJobIds.remove(job.id)
         }
         
         guard session.isViable else {
@@ -407,36 +421,47 @@ extension TaskProcessor {
                     level: .info,
                     message: "pqs.recovery.deferred failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) waitingFor=peerRefresh")
 
-                let curveReplaced = await session.refreshOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
-                let mlKEMReplaced = await session.refreshMLKEMOneTimeKeysTask(policy: .replaceCurrentDeviceBatch)
-                if !curveReplaced || !mlKEMReplaced {
-                    logger.log(
-                        level: .error,
-                        message: "pqs.recovery.failed failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=otkBatchReplacementFailed")
-                }
-
-                let mySecretName = await session.sessionContext?.sessionUser.secretName
-                let isSelf = message.senderSecretName == mySecretName
-
-                do {
-                    _ = try await session.emitSessionReestablishment(
-                        kind: .peerRefresh,
-                        recipient: isSelf ? .personalMessage : .nickname(message.senderSecretName),
-                        scope: isSelf ? .personal : .peer(secretName: message.senderSecretName),
-                        forceReemit: true)
-                    logger.log(
-                        level: .info,
-                        message: "pqs.recovery.reestablishmentQueued kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
-                } catch {
-                    logger.log(
-                        level: .warning,
-                        message: "pqs.recovery.reestablishmentFailed kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) error=\(error)")
-                }
-
-                // Record the accepted recovery so redelivery of the same frame is
-                // suppressed instead of repeating the OTK batch replacement and the
-                // cooldown-bypassing peerRefresh re-emit.
+                // Record the accepted recovery *before* the network-bound side effects so
+                // redelivery of the same frame is suppressed instead of repeating the OTK
+                // batch replacement and the cooldown-bypassing peerRefresh re-emit.
                 await session.markInboundFailure(message, failureClass: failureClass)
+
+                // The published-batch replacement (key generation + two uploads with
+                // retry backoff) and the subsequent peerRefresh emit must not block the
+                // job queue: an offline-backlog flood would otherwise stall every queued
+                // outbound send behind this recovery. The recovery episode state above
+                // is already recorded, so subsequent failures coalesce against it while
+                // this continuation runs. Ordering inside the continuation is preserved:
+                // peerRefresh is only emitted once fresh keys are on the server.
+                let logger = logger
+                Task {
+                    let curveReplaced = await session.refreshOneTimeKeysTask(policy: .replacePublishedBatch)
+                    let mlKEMReplaced = await session.refreshMLKEMOneTimeKeysTask(policy: .replacePublishedBatch)
+                    if !curveReplaced || !mlKEMReplaced {
+                        logger.log(
+                            level: .error,
+                            message: "pqs.recovery.failed failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=otkBatchReplacementFailed")
+                    }
+
+                    let mySecretName = await session.sessionContext?.sessionUser.secretName
+                    let isSelf = message.senderSecretName == mySecretName
+
+                    do {
+                        _ = try await session.emitSessionReestablishment(
+                            kind: .peerRefresh,
+                            recipient: isSelf ? .personalMessage : .nickname(message.senderSecretName),
+                            scope: isSelf ? .personal : .peer(secretName: message.senderSecretName),
+                            forceReemit: true)
+                        logger.log(
+                            level: .info,
+                            message: "pqs.recovery.reestablishmentQueued kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
+                    } catch {
+                        logger.log(
+                            level: .warning,
+                            message: "pqs.recovery.reestablishmentFailed kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) error=\(error)")
+                    }
+                }
+
                 try await cache.deleteJob(job)
                 return .deleted
             case .writeMessage(let message):
@@ -559,6 +584,9 @@ extension TaskProcessor {
         case paused
         /// Job failed but was not deleted (best-effort retry semantics).
         case failed
+        /// Job is delayed and not yet due; it was re-queued at the back of the deque
+        /// so ready jobs behind it can run first. It remains in cache.
+        case deferredToBack
     }
     
     // MARK: - Errors

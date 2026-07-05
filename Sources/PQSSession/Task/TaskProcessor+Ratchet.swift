@@ -1083,14 +1083,33 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
 
                         var replayQueuedCount = 0
                         var replayMissingCount = 0
+                        var replayCoalescedCount = 0
                         for failedSharedMessageId in request.failedSharedMessageIds {
                             let cryptoMessage: CryptoMessage
+                            // Recent non-persistent recovery controls are intentionally replayable
+                            // multiple times while a peer repairs; they are already bounded by
+                            // `recentOutboundReplayMaxReplays`, so they bypass the servicing cooldown.
+                            var servicedFromPersistedStore = false
                             if let replay = recentOutboundReplayMessage(sharedId: failedSharedMessageId) {
                                 cryptoMessage = replay.message
                                 logger.log(
                                     level: .info,
                                     message: "pqs.recovery.resendReplayUsingRecentControl sharedId=\(failedSharedMessageId) replayCount=\(replay.replayCount)")
                             } else {
+                                // Persisted-message replays are otherwise unbounded: a peer stuck in a
+                                // decrypt-failure loop could force us to re-ratchet and re-consume OTKs
+                                // for the same message on every request. Coalesce repeats per requester.
+                                guard await session.canServicePeerResendRequest(
+                                    requestingDeviceId: request.requestingDeviceId,
+                                    sharedId: failedSharedMessageId)
+                                else {
+                                    replayCoalescedCount += 1
+                                    logger.log(
+                                        level: .info,
+                                        message: "pqs.recovery.resendReplayCoalesced reason=servicingCooldown sharedId=\(failedSharedMessageId) requestingDeviceId=\(request.requestingDeviceId)")
+                                    continue
+                                }
+
                                 let foundMessage: EncryptedMessage?
                                 do {
                                     foundMessage = try await session.cache?.fetchMessage(sharedId: failedSharedMessageId)
@@ -1110,6 +1129,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                     continue
                                 }
                                 cryptoMessage = fetchedCryptoMessage
+                                servicedFromPersistedStore = true
                             }
 
                             let task = EncryptableTask(
@@ -1123,12 +1143,21 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                             )
 
                             try await feedTask(task, session: session)
+                            if servicedFromPersistedStore {
+                                await session.markPeerResendRequestServiced(
+                                    requestingDeviceId: request.requestingDeviceId,
+                                    sharedId: failedSharedMessageId)
+                            }
                             replayQueuedCount += 1
                         }
                         if replayQueuedCount > 0 {
                             logger.log(
                                 level: .info,
-                                message: "pqs.recovery.resendReplayQueued sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) queuedCount=\(replayQueuedCount) skippedCount=\(replayMissingCount) requestedCount=\(request.failedSharedMessageIds.count)")
+                                message: "pqs.recovery.resendReplayQueued sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) queuedCount=\(replayQueuedCount) skippedCount=\(replayMissingCount) coalescedCount=\(replayCoalescedCount) requestedCount=\(request.failedSharedMessageIds.count)")
+                        } else if replayCoalescedCount > 0 {
+                            logger.log(
+                                level: .info,
+                                message: "pqs.recovery.resendReplayCoalescedAll sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) coalescedCount=\(replayCoalescedCount) skippedCount=\(replayMissingCount) requestedCount=\(request.failedSharedMessageIds.count)")
                         } else {
                             logger.log(
                                 level: .warning,
@@ -1386,15 +1415,31 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         guard !requestedIds.isEmpty else { return [] }
 
         let symmetricKey = try await session.getDatabaseSymmetricKey()
-        var replayableMessages: [(sharedId: String, message: CryptoMessage)] = []
+        var replayableMessages: [(sharedId: String, message: CryptoMessage, servicedFromPersistedStore: Bool)] = []
         var missingCount = 0
+        var coalescedCount = 0
 
         for sharedId in requestedIds {
+            // Recent non-persistent recovery controls are already bounded by
+            // `recentOutboundReplayMaxReplays`; let them replay while a peer repairs.
             if let replay = recentOutboundReplayMessage(sharedId: sharedId) {
-                replayableMessages.append((sharedId, replay.message))
+                replayableMessages.append((sharedId, replay.message, false))
                 logger.log(
                     level: .info,
                     message: "pqs.recovery.outOfBandResendUsingRecentControl sharedId=\(sharedId) replayCount=\(replay.replayCount)")
+                continue
+            }
+
+            // Persisted-message replays are otherwise unbounded; coalesce repeated
+            // requests for the same message from the same requester.
+            guard await session.canServicePeerResendRequest(
+                requestingDeviceId: senderDeviceId,
+                sharedId: sharedId)
+            else {
+                coalescedCount += 1
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.outOfBandResendCoalesced reason=servicingCooldown sharedId=\(sharedId) requestingDeviceId=\(senderDeviceId)")
                 continue
             }
 
@@ -1408,7 +1453,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         message: "pqs.recovery.outOfBandResendSkipped reason=unreadableLocalMessage sharedId=\(sharedId)")
                     continue
                 }
-                replayableMessages.append((sharedId, cryptoMessage))
+                replayableMessages.append((sharedId, cryptoMessage, true))
             } catch {
                 missingCount += 1
                 logger.log(
@@ -1420,7 +1465,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         guard !replayableMessages.isEmpty else {
             logger.log(
                 level: .info,
-                message: "pqs.recovery.outOfBandResendUnavailable sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(requestedIds.count) missingCount=\(missingCount)")
+                message: "pqs.recovery.outOfBandResendUnavailable sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(requestedIds.count) missingCount=\(missingCount) coalescedCount=\(coalescedCount)")
             return []
         }
 
@@ -1442,12 +1487,17 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 priority: .urgent
             )
             try await feedTask(task, session: session)
+            if replayable.servicedFromPersistedStore {
+                await session.markPeerResendRequestServiced(
+                    requestingDeviceId: senderDeviceId,
+                    sharedId: replayable.sharedId)
+            }
             queuedIds.append(replayable.sharedId)
         }
 
         logger.log(
             level: .info,
-            message: "pqs.recovery.outOfBandResendQueued sender=\(senderName) deviceId=\(senderDeviceId) queuedCount=\(queuedIds.count) missingCount=\(missingCount) requestedCount=\(requestedIds.count)")
+            message: "pqs.recovery.outOfBandResendQueued sender=\(senderName) deviceId=\(senderDeviceId) queuedCount=\(queuedIds.count) missingCount=\(missingCount) coalescedCount=\(coalescedCount) requestedCount=\(requestedIds.count)")
         return queuedIds
     }
 

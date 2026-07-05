@@ -57,6 +57,18 @@ public enum PQSSessionConstants: Sendable {
     /// - See also: `PQSSessionConstants.oneTimeKeyLowWatermark`
     public static let oneTimeKeyBatchSize = 100
     
+    /// Maximum number of local one-time *private* keys retained per key type when
+    /// the published batch is replaced with `OneTimeKeyRefreshPolicy.replacePublishedBatch`.
+    ///
+    /// Private keys must outlive the server-side publics they correspond to: a
+    /// consumed-on-server key means an in-flight message still needs the private
+    /// counterpart to decrypt. This cap bounds the retained pool; the oldest keys
+    /// are evicted first. Keys are also removed individually once consumed.
+    ///
+    /// - Default: `200` (two full batches)
+    /// - See also: `PQSSessionConstants.oneTimeKeyBatchSize`
+    public static let retainedOneTimePrivateKeyCap = oneTimeKeyBatchSize * 2
+
     /// The interval (in days) after which MLKEM keys are automatically rotated
     ///
     /// This provides automatic key freshness without manual intervention,

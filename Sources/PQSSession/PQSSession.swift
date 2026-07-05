@@ -286,6 +286,13 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Key format: "<secretName>|<deviceUUID>|<failedSharedMessageId>".
     var lastResendRequestAtByPeer: [String: Date] = [:]
 
+    /// Last time we *serviced* (replayed a frame for) an inbound resend request, keyed by the
+    /// requesting device and the failed shared message id. Bounds responder-side amplification:
+    /// a peer stuck in a decrypt-failure loop cannot force us to re-ratchet and re-consume
+    /// one-time keys for the same message on every repeated request.
+    /// Key format: "<requestingDeviceUUID>|<sharedId>".
+    var lastServicedResendAtByRequest: [String: Date] = [:]
+
     struct PendingResendAfterReestablishment: Sendable, Equatable {
         let senderName: String
         let senderDeviceId: UUID
@@ -300,6 +307,12 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     
     /// Cooldown for peer resend/refresh requests triggered by inbound failures.
     let peerResendRequestCooldown: TimeInterval = 15
+
+    /// Cooldown for *servicing* a repeated inbound resend request for the same failed message
+    /// from the same requesting device. Matches ``peerResendRequestCooldown`` so a legitimate
+    /// re-request (which the requester itself rate-limits to this interval) is honored, while
+    /// bursts/loops of identical requests are coalesced to a single replay.
+    let peerResendServiceCooldown: TimeInterval = 15
 
     // MARK: - Inactive session support (backward compatible)
 
@@ -331,6 +344,13 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         /// on the server, deleting the previous batch first. Used during
         /// device-key rotation flows.
         case replaceCurrentDeviceBatch
+        /// Replace the batch *advertised on the server* with fresh keys while
+        /// retaining existing local private keys, so in-flight messages that
+        /// were encrypted against the previous batch can still be decrypted.
+        /// The retained private pool is capped at
+        /// ``PQSSessionConstants/retainedOneTimePrivateKeyCap``; the oldest
+        /// keys are evicted first. Used by `missingOneTimeKey` recovery.
+        case replacePublishedBatch
     }
     
     enum KeyLoadingState: Sendable {
@@ -608,6 +628,31 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
         pruneRecoveryTimestamps(&lastResendRequestAtByPeer, ttl: peerResendRequestCooldown, now: now)
         lastResendRequestAtByPeer[requestKey] = now
+    }
+
+    /// Builds a stable key for responder-side resend servicing, scoped to the requesting device
+    /// and the specific failed message being replayed.
+    func peerResendServiceKey(requestingDeviceId: UUID, sharedId: String) -> String {
+        "\(requestingDeviceId.uuidString)|\(sharedId)"
+    }
+
+    /// Returns whether we may service (replay a frame for) an inbound resend request for this
+    /// `(requestingDeviceId, sharedId)`. Repeated identical requests inside the cooldown are
+    /// refused so a looping peer cannot amplify replay work or drain our one-time keys.
+    func canServicePeerResendRequest(requestingDeviceId: UUID, sharedId: String, now: Date = Date()) -> Bool {
+        let requestKey = peerResendServiceKey(requestingDeviceId: requestingDeviceId, sharedId: sharedId)
+        if let lastServicedAt = lastServicedResendAtByRequest[requestKey],
+           now.timeIntervalSince(lastServicedAt) < peerResendServiceCooldown {
+            return false
+        }
+        return true
+    }
+
+    /// Records that we serviced an inbound resend request for this `(requestingDeviceId, sharedId)`.
+    func markPeerResendRequestServiced(requestingDeviceId: UUID, sharedId: String, now: Date = Date()) {
+        let requestKey = peerResendServiceKey(requestingDeviceId: requestingDeviceId, sharedId: sharedId)
+        pruneRecoveryTimestamps(&lastServicedResendAtByRequest, ttl: peerResendServiceCooldown, now: now)
+        lastServicedResendAtByRequest[requestKey] = now
     }
 
     func deferPeerResendUntilReestablished(
@@ -2346,8 +2391,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     func refreshOneTimeKeys(refreshType: KeysType, policy: OneTimeKeyRefreshPolicy = .automatic) async throws {
         guard await sessionContext != nil else { return }
         guard let cache else { return }
-        if policy == .replaceCurrentDeviceBatch {
-            try await replaceCurrentDeviceOneTimeKeys(cache: cache, refreshType: refreshType)
+        if policy == .replaceCurrentDeviceBatch || policy == .replacePublishedBatch {
+            try await replaceCurrentDeviceOneTimeKeys(
+                cache: cache,
+                refreshType: refreshType,
+                retainLocalPrivateKeys: policy == .replacePublishedBatch)
             return
         }
         var keys = [UUID]()
@@ -2372,7 +2420,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             shouldReplenish = publicKeysCount <= PQSSessionConstants.oneTimeKeyLowWatermark
         case .replenishBatch:
             shouldReplenish = true
-        case .replaceCurrentDeviceBatch:
+        case .replaceCurrentDeviceBatch, .replacePublishedBatch:
             shouldReplenish = false
         }
         if shouldReplenish {
@@ -2457,9 +2505,18 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
 
+    /// Replaces this device's one-time-key batch on the server.
+    ///
+    /// - Parameter retainLocalPrivateKeys: When `true` (recovery paths), existing local
+    ///   private keys are kept so in-flight messages encrypted against the previous
+    ///   batch can still decrypt; the retained pool is capped at
+    ///   `PQSSessionConstants.retainedOneTimePrivateKeyCap` with oldest-first eviction.
+    ///   When `false` (compromise rotation), the local private pool is wiped with the
+    ///   published batch.
     private func replaceCurrentDeviceOneTimeKeys(
         cache: SessionCache,
-        refreshType: KeysType
+        refreshType: KeysType,
+        retainLocalPrivateKeys: Bool = false
     ) async throws {
         guard let transportDelegate else {
             throw SessionErrors.transportNotInitialized
@@ -2485,7 +2542,9 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
         switch refreshType {
         case .curve:
-            sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
+            if !retainLocalPrivateKeys {
+                sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
+            }
             sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
 
             let privateOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
@@ -2512,10 +2571,19 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             )
 
             sessionContext.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
-            logger.log(level: .debug, message: "Replaced local curve OTK batch; count=\(signedOneTimePublicKeys.count)")
+            if retainLocalPrivateKeys {
+                let overflow = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.count
+                    - PQSSessionConstants.retainedOneTimePrivateKeyCap
+                if overflow > 0 {
+                    sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeFirst(overflow)
+                }
+            }
+            logger.log(level: .debug, message: "Replaced published curve OTK batch; count=\(signedOneTimePublicKeys.count) retainedPrivates=\(retainLocalPrivateKeys ? sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.count : 0)")
 
         case .mlKEM:
-            sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
+            if !retainLocalPrivateKeys {
+                sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
+            }
             sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
 
             let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
@@ -2542,7 +2610,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             )
 
             sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
-            logger.log(level: .debug, message: "Replaced local MLKEM OTK batch; count=\(signedMLKEMOneTimeKeys.count)")
+            if retainLocalPrivateKeys {
+                let overflow = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count
+                    - PQSSessionConstants.retainedOneTimePrivateKeyCap
+                if overflow > 0 {
+                    sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeFirst(overflow)
+                }
+            }
+            logger.log(level: .debug, message: "Replaced published MLKEM OTK batch; count=\(signedMLKEMOneTimeKeys.count) retainedPrivates=\(retainLocalPrivateKeys ? sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count : 0)")
         }
 
         sessionContext.updateSessionUser(sessionContext.sessionUser)

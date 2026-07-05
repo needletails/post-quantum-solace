@@ -915,6 +915,13 @@ actor TaskProcessorSequenceTests {
                 failureClass: "ratchet.missingOneTimeKey")),
             "Pending missingOneTimeKey replay should not be dropped before decryption")
 
+        // The batch replacement now runs off the job loop; wait for the first
+        // upload to land before capturing the baseline.
+        let sawFirstUpload = try await waitUntil {
+            await self.transport.updateOneTimeKeysCallCount >= 1
+        }
+        #expect(sawFirstUpload, "First missingOneTimeKey recovery should upload a replacement batch")
+
         // Redelivery of the identical frame must not trigger another OTK batch replacement.
         let otkCallsAfterFirst = await transport.updateOneTimeKeysCallCount
         try await session.taskProcessor.feedTask(
@@ -956,6 +963,13 @@ actor TaskProcessorSequenceTests {
             sender: "bob_missing_otk_burst",
             deviceId: peerDeviceId)
         #expect(hasPendingRepair, "First missingOneTimeKey should start a recovery episode")
+
+        // The batch replacement now runs off the job loop; wait for the first
+        // upload to land before capturing the baseline.
+        let sawFirstUpload = try await waitUntil {
+            await self.transport.updateOneTimeKeysCallCount >= 1
+        }
+        #expect(sawFirstUpload, "First missingOneTimeKey recovery should upload a replacement batch")
 
         let otkCallsAfterFirst = await transport.updateOneTimeKeysCallCount
         try await session.taskProcessor.feedTask(
@@ -1046,6 +1060,249 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    @Test("missingOneTimeKey recovery retains local one-time private keys for in-flight messages")
+    func testMissingOneTimeKeyRecoveryRetainsLocalPrivateKeys() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+
+        guard let contextBefore = await session.sessionContext else {
+            Issue.record("Session context should be available")
+            await session.shutdown()
+            return
+        }
+        let curveIdsBefore = Set(contextBefore.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        let mlKEMIdsBefore = Set(contextBefore.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.map(\.id))
+        #expect(!curveIdsBefore.isEmpty, "Session should start with local curve one-time private keys")
+        #expect(!mlKEMIdsBefore.isEmpty, "Session should start with local MLKEM one-time private keys")
+
+        let peerDeviceId = UUID()
+        let inbound = try makeTestInboundTaskMessage(
+            senderSecretName: "bob_retain_privates",
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "retain_privates_1")
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+
+        // Recovery replaces the *published* batch: fresh keys are appended while
+        // the pre-existing private counterparts stay available for the rest of
+        // the in-flight backlog that was encrypted against them.
+        let sawFreshBatches = try await waitUntil(timeout: 10) {
+            guard let context = await self.session.sessionContext else { return false }
+            return context.sessionUser.deviceKeys.oneTimePrivateKeys.count > curveIdsBefore.count
+                && context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count > mlKEMIdsBefore.count
+        }
+        #expect(sawFreshBatches, "Recovery should append fresh one-time keys without wiping the existing pool")
+
+        guard let contextAfter = await session.sessionContext else {
+            Issue.record("Session context should be available after recovery")
+            await session.shutdown()
+            return
+        }
+        let curveIdsAfter = Set(contextAfter.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        let mlKEMIdsAfter = Set(contextAfter.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.map(\.id))
+        #expect(
+            curveIdsBefore.isSubset(of: curveIdsAfter),
+            "missingOneTimeKey recovery must not delete curve private keys that in-flight messages still reference")
+        #expect(
+            mlKEMIdsBefore.isSubset(of: mlKEMIdsAfter),
+            "missingOneTimeKey recovery must not delete MLKEM private keys that in-flight messages still reference")
+
+        await session.shutdown()
+    }
+
+    @Test("replacePublishedBatch policy retains private keys and caps the retained pool")
+    func testReplacePublishedBatchRetainsAndCapsPrivateKeys() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        guard let contextBefore = await session.sessionContext else {
+            Issue.record("Session context should be available")
+            await session.shutdown()
+            return
+        }
+        let deviceId = contextBefore.sessionUser.deviceId
+        let originalCurveIds = Set(contextBefore.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        let originalPublicIds = Set(
+            contextBefore.activeUserConfiguration.signedOneTimePublicKeys
+                .filter { $0.deviceId == deviceId }
+                .map(\.id))
+        #expect(!originalCurveIds.isEmpty)
+
+        let firstReplace = await session.refreshOneTimeKeysTask(policy: .replacePublishedBatch)
+        #expect(firstReplace, "Published-batch replacement should succeed")
+
+        guard let contextAfterFirst = await session.sessionContext else {
+            Issue.record("Session context should be available after first replacement")
+            await session.shutdown()
+            return
+        }
+        let curveIdsAfterFirst = Set(contextAfterFirst.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        let publicIdsAfterFirst = Set(
+            contextAfterFirst.activeUserConfiguration.signedOneTimePublicKeys
+                .filter { $0.deviceId == deviceId }
+                .map(\.id))
+        #expect(
+            originalCurveIds.isSubset(of: curveIdsAfterFirst),
+            "Private keys must be retained across a published-batch replacement")
+        #expect(
+            curveIdsAfterFirst.count > originalCurveIds.count,
+            "A fresh batch of private keys must be appended")
+        #expect(
+            publicIdsAfterFirst.isDisjoint(with: originalPublicIds),
+            "The advertised public batch must be fully replaced")
+
+        // Repeated replacements must not grow the retained private pool unboundedly.
+        let secondReplace = await session.refreshOneTimeKeysTask(policy: .replacePublishedBatch)
+        #expect(secondReplace, "Second published-batch replacement should succeed")
+
+        guard let contextAfterSecond = await session.sessionContext else {
+            Issue.record("Session context should be available after second replacement")
+            await session.shutdown()
+            return
+        }
+        #expect(
+            contextAfterSecond.sessionUser.deviceKeys.oneTimePrivateKeys.count
+                <= PQSSessionConstants.retainedOneTimePrivateKeyCap,
+            "Retained private key pool must be capped")
+
+        await session.shutdown()
+    }
+
+    @Test("missingOneTimeKey recovery does not block the job queue while OTK upload is in flight")
+    func testMissingOneTimeKeyRecoveryDoesNotBlockJobQueue() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+
+        let uploadPause = OTKUploadPause()
+        transport.beforeUpdateOneTimeKeys = {
+            await uploadPause.beforeFirstUpload()
+        }
+        defer {
+            transport.beforeUpdateOneTimeKeys = nil
+        }
+
+        let firstPeerDeviceId = UUID()
+        let secondPeerDeviceId = UUID()
+        let first = try makeTestInboundTaskMessage(
+            senderSecretName: "bob_nonblocking_1",
+            senderDeviceId: firstPeerDeviceId,
+            sharedMessageId: "nonblocking_1")
+        let second = try makeTestInboundTaskMessage(
+            senderSecretName: "bob_nonblocking_2",
+            senderDeviceId: secondPeerDeviceId,
+            sharedMessageId: "nonblocking_2")
+
+        async let firstFeed: Void = session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(first)),
+            session: session
+        )
+
+        let uploadPaused = try await waitUntil {
+            await uploadPause.isPaused()
+        }
+        #expect(uploadPaused, "Expected first recovery to pause inside OTK upload")
+
+        // While the first peer's OTK upload is still in flight the job queue must
+        // keep draining: a failure from a *different* peer has to be recorded
+        // without waiting for the network round-trip to finish.
+        async let secondFeed: Void = session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(second)),
+            session: session
+        )
+
+        let secondRecordedWhilePaused = try await waitUntil {
+            await self.session.hasPendingResendAfterReestablishment(
+                sender: "bob_nonblocking_2",
+                deviceId: secondPeerDeviceId)
+        }
+        #expect(
+            secondRecordedWhilePaused,
+            "The job queue must not be blocked behind an in-flight OTK batch upload")
+
+        await uploadPause.release()
+        try await firstFeed
+        try await secondFeed
+
+        await session.shutdown()
+    }
+
+    @Test("Delayed job does not block ready jobs behind it")
+    func testDelayedJobDoesNotBlockReadyJobs() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let mockDelegate = MockTaskDelegate()
+        await session.taskProcessor.setTaskDelegate(mockDelegate)
+
+        guard let cache = await session.cache else {
+            Issue.record("Cache should be available")
+            await session.shutdown()
+            return
+        }
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        let recipientIdentity = createTestRecipientIdentity()
+
+        // Seed a not-yet-due retry ahead of a ready job in the same queue.
+        let delayedJob = try JobModel(
+            id: UUID(),
+            props: .init(
+                sequenceId: 1,
+                task: .init(task: .writeMessage(.init(
+                    message: createTestMessage("delayed"),
+                    recipientIdentity: recipientIdentity,
+                    localId: UUID(),
+                    sharedId: "delayed_shared"))),
+                isBackgroundTask: false,
+                delayedUntil: Date().addingTimeInterval(1.5),
+                scheduledAt: Date(),
+                attempts: 0),
+            symmetricKey: symmetricKey)
+        let readyJob = try JobModel(
+            id: UUID(),
+            props: .init(
+                sequenceId: 2,
+                task: .init(task: .writeMessage(.init(
+                    message: createTestMessage("ready"),
+                    recipientIdentity: recipientIdentity,
+                    localId: UUID(),
+                    sharedId: "ready_shared"))),
+                isBackgroundTask: false,
+                scheduledAt: Date(),
+                attempts: 0),
+            symmetricKey: symmetricKey)
+        try await cache.createJob(delayedJob)
+        try await cache.createJob(readyJob)
+
+        async let load: Void = session.taskProcessor.loadTasks(
+            cache: cache,
+            symmetricKey: symmetricKey,
+            session: session)
+
+        let readyProcessedQuickly = try await waitUntil(timeout: 1.0) {
+            await mockDelegate.getProcessedMessages().contains("ready")
+        }
+        #expect(
+            readyProcessedQuickly,
+            "A ready job must not wait for a not-yet-due delayed job that sits ahead of it")
+
+        let delayedProcessedEventually = try await waitUntil(timeout: 5.0) {
+            await mockDelegate.getProcessedMessages().contains("delayed")
+        }
+        #expect(delayedProcessedEventually, "The delayed job must still run once it becomes due")
+
+        try await load
+        await session.shutdown()
+    }
+
     @Test("Peer resend request tracking is pruned and capped")
     func testPeerResendRequestTrackingIsBounded() async {
         let deviceId = UUID()
@@ -1079,6 +1336,85 @@ actor TaskProcessorSequenceTests {
         #expect(
             await session.lastResendRequestAtByPeer.count <= PQSSessionConstants.recoveryTrackingMaxEntries,
             "Resend-request tracking must be capped")
+        await session.shutdown()
+    }
+
+    @Test("Peer resend servicing coalesces duplicate requests within cooldown")
+    func testPeerResendServicingCoalescesDuplicateRequests() async {
+        let requestingDeviceId = UUID()
+        let now = Date()
+
+        #expect(
+            await session.canServicePeerResendRequest(
+                requestingDeviceId: requestingDeviceId,
+                sharedId: "m1",
+                now: now),
+            "First service of a resend request must be allowed")
+
+        await session.markPeerResendRequestServiced(
+            requestingDeviceId: requestingDeviceId,
+            sharedId: "m1",
+            now: now)
+
+        #expect(
+            !(await session.canServicePeerResendRequest(
+                requestingDeviceId: requestingDeviceId,
+                sharedId: "m1",
+                now: now.addingTimeInterval(1))),
+            "Re-servicing the same (requesting device, sharedId) within cooldown must be refused")
+
+        #expect(
+            await session.canServicePeerResendRequest(
+                requestingDeviceId: requestingDeviceId,
+                sharedId: "m2",
+                now: now.addingTimeInterval(1)),
+            "A different failed message id must still be serviceable")
+
+        #expect(
+            await session.canServicePeerResendRequest(
+                requestingDeviceId: UUID(),
+                sharedId: "m1",
+                now: now.addingTimeInterval(1)),
+            "A different requesting device must still be serviceable")
+
+        #expect(
+            await session.canServicePeerResendRequest(
+                requestingDeviceId: requestingDeviceId,
+                sharedId: "m1",
+                now: now.addingTimeInterval(session.peerResendServiceCooldown + 1)),
+            "After the cooldown elapses the same request may be serviced again")
+
+        await session.shutdown()
+    }
+
+    @Test("Peer resend servicing tracking is pruned and capped")
+    func testPeerResendServicingTrackingIsBounded() async {
+        let requestingDeviceId = UUID()
+        let now = Date()
+
+        for index in 0..<10 {
+            await session.markPeerResendRequestServiced(
+                requestingDeviceId: requestingDeviceId,
+                sharedId: "stale\(index)",
+                now: now.addingTimeInterval(-3600))
+        }
+        await session.markPeerResendRequestServiced(
+            requestingDeviceId: requestingDeviceId,
+            sharedId: "fresh",
+            now: now)
+        #expect(
+            await session.lastServicedResendAtByRequest.count == 1,
+            "Stale resend-servicing entries must be pruned on insert")
+
+        for index in 0..<(PQSSessionConstants.recoveryTrackingMaxEntries + 100) {
+            await session.markPeerResendRequestServiced(
+                requestingDeviceId: requestingDeviceId,
+                sharedId: "m\(index)",
+                now: now)
+        }
+        #expect(
+            await session.lastServicedResendAtByRequest.count <= PQSSessionConstants.recoveryTrackingMaxEntries,
+            "Resend-servicing tracking must be capped")
         await session.shutdown()
     }
 

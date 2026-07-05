@@ -118,6 +118,13 @@ public actor TaskProcessor {
     /// Used to prevent multiple concurrent job processing loops.
     var isRunning = false
 
+    /// Delayed (not-yet-due) jobs that were skipped ahead of once in the current
+    /// processing pass so ready work behind them is not head-of-line blocked.
+    /// When a job id is already recorded here and is popped again while still
+    /// not due, the queue has cycled back to it and the loop waits it out
+    /// instead of busy-spinning. Cleared as jobs become due or the loop restarts.
+    var deferredDelayedJobIds: Set<UUID> = []
+
     /// Delegate responsible for transport-level session communication.
     /// Handles the actual sending and receiving of encrypted messages over the network.
     var delegate: (any SessionTransport)?
