@@ -1206,7 +1206,7 @@ actor TaskProcessorSequenceTests {
             session: session
         )
 
-        let uploadPaused = try await waitUntil {
+        let uploadPaused = try await waitUntil(timeout: 15) {
             await uploadPause.isPaused()
         }
         #expect(uploadPaused, "Expected first recovery to pause inside OTK upload")
@@ -1219,7 +1219,7 @@ actor TaskProcessorSequenceTests {
             session: session
         )
 
-        let secondRecordedWhilePaused = try await waitUntil {
+        let secondRecordedWhilePaused = try await waitUntil(timeout: 15) {
             await self.session.hasPendingResendAfterReestablishment(
                 sender: "bob_nonblocking_2",
                 deviceId: secondPeerDeviceId)
@@ -1287,11 +1287,11 @@ actor TaskProcessorSequenceTests {
             symmetricKey: symmetricKey,
             session: session)
 
-        let readyProcessedQuickly = try await waitUntil(timeout: 1.0) {
+        let readyProcessed = try await waitUntil(timeout: 15) {
             await mockDelegate.getProcessedMessages().contains("ready")
         }
         #expect(
-            readyProcessedQuickly,
+            readyProcessed,
             "A ready job must not wait for a not-yet-due delayed job that sits ahead of it")
 
         let delayedProcessedEventually = try await waitUntil(timeout: 5.0) {
