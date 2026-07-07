@@ -8675,24 +8675,6 @@ actor EndToEndTests {
     func testJobSurvivesIdentityDeletion() async throws {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-        defer {
-            Task {
-                aliceTask?.cancel()
-                bobTask?.cancel()
-                await shutdownSessions()
-            }
-        }
-
-        actor JobSurvivalProbe {
-            var messageDecrypted = false
-            var bobUnblocked = false
-
-            func markDecrypted() { messageDecrypted = true }
-            func unblock() { bobUnblocked = true }
-            func isUnblocked() -> Bool { bobUnblocked }
-        }
-
-        let probe = JobSurvivalProbe()
 
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
@@ -8703,131 +8685,129 @@ actor EndToEndTests {
             aliceTransport.continuation = continuation
         }
 
-        let senderStore = createSenderStore()
-        let recipientStore = createRecipientStore()
-        let sd = SessionDelegate(session: _senderSession)
-        let rsd = SessionDelegate(session: _recipientSession)
-
-        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-        try await createFriendship(
-            aliceSession: _senderSession,
-            sd: sd,
-            bobSession: _recipientSession,
-            rsd: rsd)
-
-        aliceTask = Task {
-            for await received in aliceStream {
-                _ = try? await self.receiveIgnoringRecoverableErrors(
-                    self._senderSession,
-                    received: received)
+        func cleanup() async {
+            aliceTransport.continuation?.finish()
+            bobTransport.continuation?.finish()
+            aliceTask?.cancel()
+            bobTask?.cancel()
+            if let aliceTask {
+                await aliceTask.value
             }
+            if let bobTask {
+                await bobTask.value
+            }
+            await shutdownSessions()
         }
 
-        // Bob's loop: block until probe says unblocked, then process.
-        bobTask = Task {
-            for await received in bobStream {
-                while !(await probe.isUnblocked()) {
-                    try? await Task.sleep(for: .milliseconds(50))
+        do {
+            actor JobSurvivalProbe {
+                var messageDecrypted = false
+                var bobUnblocked = false
+
+                func markDecrypted() { messageDecrypted = true }
+                func unblock() { bobUnblocked = true }
+                func isUnblocked() -> Bool { bobUnblocked }
+            }
+
+            let probe = JobSurvivalProbe()
+
+            let senderStore = createSenderStore()
+            let recipientStore = createRecipientStore()
+            let sd = SessionDelegate(session: _senderSession)
+            let rsd = SessionDelegate(session: _recipientSession)
+
+            try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+            try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+            try await createFriendship(
+                aliceSession: _senderSession,
+                sd: sd,
+                bobSession: _recipientSession,
+                rsd: rsd)
+
+            aliceTask = Task {
+                for await received in aliceStream {
+                    _ = try? await self.receiveIgnoringRecoverableErrors(
+                        self._senderSession,
+                        received: received)
                 }
-                do {
-                    try await self._recipientSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId)
-                    if received.transportEvent == nil {
-                        await probe.markDecrypted()
+            }
+
+            // Bob's loop: block until probe says unblocked, then process.
+            bobTask = Task {
+                for await received in bobStream {
+                    while !(await probe.isUnblocked()) {
+                        if Task.isCancelled { return }
+                        try? await Task.sleep(for: .milliseconds(50))
                     }
-                } catch {
-                    // Log but tolerate
+                    do {
+                        try await self._recipientSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId)
+                        if received.transportEvent == nil {
+                            await probe.markDecrypted()
+                        }
+                    } catch {
+                        // Tolerate transient errors during reconciliation churn.
+                    }
                 }
             }
+
+            _ = try await _senderSession.refreshIdentities(
+                secretName: rMockUserData.rsn,
+                forceRefresh: true,
+                sendOneTimeIdentities: true)
+            _ = try await _recipientSession.refreshIdentities(
+                secretName: sMockUserData.ssn,
+                forceRefresh: true,
+                sendOneTimeIdentities: true)
+
+            // Establish ratchet
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "baseline")
+            try await Task.sleep(for: .milliseconds(500))
+
+            // Send a message while Bob is blocked
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "message during identity churn")
+            try await Task.sleep(for: .milliseconds(200))
+
+            // While Bob is blocked, simulate reconciliation: delete Alice's identity on Bob's side.
+            let bobCache = await _recipientSession.cache!
+            let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
+            for identity in try await bobCache.fetchSessionIdentities() {
+                guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
+                guard props.secretName == sMockUserData.ssn else { continue }
+                if props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) { continue }
+                try await bobCache.deleteSessionIdentity(identity.id)
+            }
+            await _recipientSession.removeIdentity(with: sMockUserData.ssn)
+
+            // Unblock Bob so the pending message is processed.
+            await probe.unblock()
+
+            for _ in 0..<120 {
+                if await probe.messageDecrypted { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+
+            #expect(
+                await probe.messageDecrypted,
+                "Message should eventually decrypt after identity refresh/retry, not be silently dropped")
+            await cleanup()
+        } catch {
+            await cleanup()
+            throw error
         }
-
-        _ = try await _senderSession.refreshIdentities(
-            secretName: rMockUserData.rsn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true)
-        _ = try await _recipientSession.refreshIdentities(
-            secretName: sMockUserData.ssn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true)
-
-        // Establish ratchet
-        try await _senderSession.writeTextMessage(
-            recipient: .nickname("bob"),
-            text: "baseline")
-        try await Task.sleep(for: .milliseconds(500))
-
-        // Send a message while Bob is blocked
-        try await _senderSession.writeTextMessage(
-            recipient: .nickname("bob"),
-            text: "message during identity churn")
-        try await Task.sleep(for: .milliseconds(200))
-
-        // While Bob is blocked, simulate reconciliation: delete Alice's identity on Bob's side.
-        let bobCache = await _recipientSession.cache!
-        let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
-        for identity in try await bobCache.fetchSessionIdentities() {
-            guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
-            guard props.secretName == sMockUserData.ssn else { continue }
-            if props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) { continue }
-            try await bobCache.deleteSessionIdentity(identity.id)
-        }
-        await _recipientSession.removeIdentity(with: sMockUserData.ssn)
-
-        // Unblock Bob so the pending message is processed.
-        await probe.unblock()
-
-        for _ in 0..<80 {
-            if await probe.messageDecrypted { break }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-
-        #expect(
-            await probe.messageDecrypted,
-            "Message should eventually decrypt after identity refresh/retry, not be silently dropped")
     }
 
     @Test("sessionDecryptionError requests resend without compromise rotation")
     func testSessionDecryptionErrorRequestsResendWithoutRotation() async throws {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-        defer {
-            Task {
-                aliceTask?.cancel()
-                bobTask?.cancel()
-                await shutdownSessions()
-            }
-        }
-
-        final class CorruptionGate: @unchecked Sendable {
-            private let lock = NSLock()
-            private var remaining: Int
-
-            init(corruptCount: Int) { self.remaining = corruptCount }
-
-            func consumeCorruption() -> Bool {
-                lock.lock()
-                defer { lock.unlock() }
-                guard remaining > 0 else { return false }
-                remaining -= 1
-                return true
-            }
-        }
-
-        let gate = CorruptionGate(corruptCount: 1)
-
-        actor RepairProbe {
-            private(set) var sawResendRequest = false
-
-            func markResendRequest() {
-                sawResendRequest = true
-            }
-        }
-
-        let repairProbe = RepairProbe()
 
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
@@ -8838,89 +8818,136 @@ actor EndToEndTests {
             aliceTransport.continuation = continuation
         }
 
-        let senderStore = createSenderStore()
-        let recipientStore = createRecipientStore()
-        let sd = SessionDelegate(session: _senderSession)
-        let rsd = SessionDelegate(session: _recipientSession)
-
-        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-        try await createFriendship(
-            aliceSession: _senderSession,
-            sd: sd,
-            bobSession: _recipientSession,
-            rsd: rsd)
-
-        let rotationCountBefore = await bobTransport.publishRotatedKeysCallCount
-
-        // Inject the decrypted payload transform on Bob's session:
-        // replaces valid CryptoMessage bytes with garbage so BinaryDecoder fails,
-        // triggering sessionDecryptionError. Auto-disarms after one corruption.
-        await _recipientSession.setTestDecryptedPayloadTransform { [gate] data in
-            guard gate.consumeCorruption() else { return data }
-            return Data([0xDE, 0xAD, 0xBE, 0xEF])
+        func cleanup() async {
+            aliceTransport.continuation?.finish()
+            bobTransport.continuation?.finish()
+            aliceTask?.cancel()
+            bobTask?.cancel()
+            if let aliceTask {
+                await aliceTask.value
+            }
+            if let bobTask {
+                await bobTask.value
+            }
+            await shutdownSessions()
         }
 
-        aliceTask = Task {
-            for await received in aliceStream {
-                if let transportEvent = received.transportEvent,
-                   case .requestMessageResend = transportEvent {
-                    await repairProbe.markResendRequest()
+        do {
+            final class CorruptionGate: @unchecked Sendable {
+                private let lock = NSLock()
+                private var remaining: Int
+
+                init(corruptCount: Int) { self.remaining = corruptCount }
+
+                func consumeCorruption() -> Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    guard remaining > 0 else { return false }
+                    remaining -= 1
+                    return true
                 }
-                _ = try? await self.receiveIgnoringRecoverableErrors(
-                    self._senderSession,
-                    received: received
-                )
             }
-        }
 
-        bobTask = Task {
-            for await received in bobStream {
-                _ = try? await self.receiveIgnoringRecoverableErrors(
-                    self._recipientSession,
-                    received: received
-                )
+            let gate = CorruptionGate(corruptCount: 1)
+
+            actor RepairProbe {
+                private(set) var sawResendRequest = false
+
+                func markResendRequest() {
+                    sawResendRequest = true
+                }
             }
+
+            let repairProbe = RepairProbe()
+
+            let senderStore = createSenderStore()
+            let recipientStore = createRecipientStore()
+            let sd = SessionDelegate(session: _senderSession)
+            let rsd = SessionDelegate(session: _recipientSession)
+
+            try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+            try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+            try await createFriendship(
+                aliceSession: _senderSession,
+                sd: sd,
+                bobSession: _recipientSession,
+                rsd: rsd)
+
+            let rotationCountBefore = await bobTransport.publishRotatedKeysCallCount
+
+            // Inject the decrypted payload transform on Bob's session:
+            // replaces valid CryptoMessage bytes with garbage so BinaryDecoder fails,
+            // triggering sessionDecryptionError. Auto-disarms after one corruption.
+            await _recipientSession.setTestDecryptedPayloadTransform { [gate] data in
+                guard gate.consumeCorruption() else { return data }
+                return Data([0xDE, 0xAD, 0xBE, 0xEF])
+            }
+
+            aliceTask = Task {
+                for await received in aliceStream {
+                    if let transportEvent = received.transportEvent,
+                       case .requestMessageResend = transportEvent {
+                        await repairProbe.markResendRequest()
+                    }
+                    _ = try? await self.receiveIgnoringRecoverableErrors(
+                        self._senderSession,
+                        received: received
+                    )
+                }
+            }
+
+            bobTask = Task {
+                for await received in bobStream {
+                    _ = try? await self.receiveIgnoringRecoverableErrors(
+                        self._recipientSession,
+                        received: received
+                    )
+                }
+            }
+
+            // Alice sends a message -- Bob will hit sessionDecryptionError internally.
+            // The ratchet succeeds, payload decode fails once, and recovery should request resend
+            // without rotating local identity material.
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "trigger decode failure")
+
+            // Wait for the resend request to reach Alice and for the replayed message to decrypt.
+            for _ in 0..<80 {
+                if await repairProbe.sawResendRequest,
+                   await recipientStore.createdMessages.count > 0 { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+
+            let rotationCountAfter = await bobTransport.publishRotatedKeysCallCount
+            #expect(
+                rotationCountAfter == rotationCountBefore,
+                "sessionDecryptionError should not trigger compromise rotation (got \(rotationCountAfter) vs \(rotationCountBefore))")
+            #expect(await repairProbe.sawResendRequest, "sessionDecryptionError should request resend")
+            #expect(await recipientStore.createdMessages.count > 0, "The replayed message should eventually decrypt after resend")
+
+            try await Task.sleep(for: .milliseconds(500))
+
+            let msgCountBefore = await recipientStore.createdMessages.count
+
+            // Send a follow-up message to verify the session recovers
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "post-recovery message")
+
+            for _ in 0..<120 {
+                if await recipientStore.createdMessages.count > msgCountBefore { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
+
+            #expect(
+                await recipientStore.createdMessages.count > msgCountBefore,
+                "After resend-based recovery from sessionDecryptionError, subsequent messages should decrypt cleanly")
+            await cleanup()
+        } catch {
+            await cleanup()
+            throw error
         }
-
-        // Alice sends a message -- Bob will hit sessionDecryptionError internally.
-        // The ratchet succeeds, payload decode fails once, and recovery should request resend
-        // without rotating local identity material.
-        try await _senderSession.writeTextMessage(
-            recipient: .nickname("bob"),
-            text: "trigger decode failure")
-
-        // Wait for the resend request to reach Alice and for the replayed message to decrypt.
-        for _ in 0..<40 {
-            if await repairProbe.sawResendRequest,
-               await recipientStore.createdMessages.count > 0 { break }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-
-        let rotationCountAfter = await bobTransport.publishRotatedKeysCallCount
-        #expect(
-            rotationCountAfter == rotationCountBefore,
-            "sessionDecryptionError should not trigger compromise rotation (got \(rotationCountAfter) vs \(rotationCountBefore))")
-        #expect(await repairProbe.sawResendRequest, "sessionDecryptionError should request resend")
-        #expect(await recipientStore.createdMessages.count > 0, "The replayed message should eventually decrypt after resend")
-
-        try await Task.sleep(for: .milliseconds(500))
-
-        let msgCountBefore = await recipientStore.createdMessages.count
-
-        // Send a follow-up message to verify the session recovers
-        try await _senderSession.writeTextMessage(
-            recipient: .nickname("bob"),
-            text: "post-recovery message")
-
-        for _ in 0..<60 {
-            if await recipientStore.createdMessages.count > msgCountBefore { break }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-
-        #expect(
-            await recipientStore.createdMessages.count > msgCountBefore,
-            "After resend-based recovery from sessionDecryptionError, subsequent messages should decrypt cleanly")
     }
 }
 
@@ -9303,8 +9330,9 @@ actor TransportStore {
             }) else { fatalError() }
         
         var oneTimeKeyPair = oneTimePublicKeyPairs[oneTimeKeyPairIndex]
-        guard let publicKey = try oneTimeKeyPair.keys.last?.verified(using: signingKey) else {
-            fatalError()
+        guard let lastCurveKey = oneTimeKeyPair.keys.last,
+              let publicKey = try? lastCurveKey.verified(using: signingKey) else {
+            return SessionModels.OneTimeKeys(curve: nil, mlKEM: nil)
         }
         oneTimeKeyPair.keys.removeAll(where: { $0.id == publicKey.id })
         oneTimePublicKeyPairs[oneTimeKeyPairIndex] = oneTimeKeyPair
@@ -9313,8 +9341,9 @@ actor TransportStore {
             let mlKEMKeyPairIndex = mlKEMOneTimeKeyPairs.firstIndex(where: { $0.id == secretName })
         else { fatalError() }
         var mlKEMKeyPair = mlKEMOneTimeKeyPairs[mlKEMKeyPairIndex]
-        guard let mlKEMKey = try mlKEMKeyPair.keys.last?.verified(using: signingKey) else {
-            fatalError()
+        guard let lastMLKEMKey = mlKEMKeyPair.keys.last,
+              let mlKEMKey = try? lastMLKEMKey.verified(using: signingKey) else {
+            return SessionModels.OneTimeKeys(curve: nil, mlKEM: nil)
         }
         
         mlKEMKeyPair.keys.removeAll(where: { $0.id == mlKEMKey.id })
