@@ -113,4 +113,60 @@ actor OutboundIdentityResolutionTests {
 
         await session.shutdown()
     }
+
+    @Test("Persisted personal message with no sibling identities is stored locally as delivered")
+    func persistedPersonalMessageWithoutSiblingIdentitiesPersistsLocallyAsDelivered() async throws {
+        var session = PQSSession()
+        let transportStore = TransportStore()
+        let transport = _MockTransportDelegate(session: session, store: transportStore)
+        let receiver = ReceiverDelegate(session: session)
+        let store = MockIdentityStore(
+            mockUserData: .init(session: session),
+            session: session,
+            isSender: true)
+
+        await store.setLocalSalt("single-device-personal-note-salt")
+        await session.setDatabaseDelegate(conformer: store)
+        await session.setTransportDelegate(conformer: transport)
+        await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
+        await session.setReceiverDelegate(conformer: receiver)
+        session.isViable = true
+        await transportStore.setPublishableName("alice")
+
+        session = try await session.createSession(secretName: "alice", appPassword: "123") {}
+        await session.setAppPassword("123")
+        session = try await session.startSession(appPassword: "123")
+        try await receiver.setKey(session.getDatabaseSymmetricKey())
+
+        let cache = try #require(await session.cache)
+        let sharedId = "single-device-personal-note-shared-id"
+        let message = CryptoMessage(
+            text: "note to self on a single-device account",
+            metadata: Data(),
+            recipient: .personalMessage,
+            sentDate: Date(),
+            destructionTime: nil)
+
+        try await session.taskProcessor.outboundTask(
+            message: message,
+            cache: cache,
+            symmetricKey: session.getDatabaseSymmetricKey(),
+            session: session,
+            sender: "alice",
+            type: .personalMessage,
+            sharedIdOverride: sharedId,
+            shouldPersist: true,
+            logger: NeedleTailLogger("[ outbound-identity-resolution-test ]"))
+
+        // No outbound crypto jobs should be scheduled: there is no sibling device.
+        #expect(try await cache.fetchJobs().isEmpty)
+
+        let persisted = try await cache.fetchCachedMessages(sharedId: sharedId)
+        #expect(persisted.count == 1)
+        let savedMessage = try #require(persisted.first)
+        let props = try #require(await savedMessage.props(symmetricKey: session.getDatabaseSymmetricKey()))
+        #expect(props.deliveryState == .delivered)
+
+        await session.shutdown()
+    }
 }

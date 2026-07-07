@@ -816,14 +816,19 @@ public actor TaskProcessor {
         logger: NeedleTailLogger
     ) async throws {
 
-        guard !sessionIdentities.isEmpty else {
+        let hasRecipientIdentities = !sessionIdentities.isEmpty
+        if !hasRecipientIdentities {
             logger.log(
                 level: .warning,
                 message: "No recipient session identities resolved for outbound message recipient \(message.recipient)")
-            if !shouldPersist, message.recipient == .personalMessage {
-                return
+            // Personal messages are encrypted only for the account's *other* devices.
+            // A single-device account legitimately resolves zero identities here:
+            // control events (non-persisted) are a no-op, and persisted notes-to-self
+            // fall through below so they are stored locally and marked delivered.
+            guard message.recipient == .personalMessage else {
+                throw PQSSession.SessionErrors.missingSessionIdentity
             }
-            throw PQSSession.SessionErrors.missingSessionIdentity
+            guard shouldPersist else { return }
         }
 
         var task: EncryptableTask
@@ -864,6 +869,18 @@ public actor TaskProcessor {
                 shouldUpdateCommunication: shouldUpdateCommunication)
             await session.receiverDelegate?.createdMessage(savedMessage)
             encryptableMessage = savedMessage
+        }
+
+        if !hasRecipientIdentities {
+            // Single-device personal message: nothing to encrypt or transmit. The
+            // note already lives on the only device, so it is delivered by definition.
+            if let savedMessage = encryptableMessage {
+                try await session.updateMessageDeliveryState(
+                    savedMessage,
+                    deliveryState: .delivered,
+                    messageRecipient: message.recipient)
+            }
+            return
         }
 
         // When persisting, fetch message props once and reuse for all identities to avoid per-identity
