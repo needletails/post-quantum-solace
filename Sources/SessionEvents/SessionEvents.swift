@@ -100,35 +100,100 @@ enum EventErrors: Error, LocalizedError {
 ///
 /// When both sides are at the same settlement tier we keep `passed`, preserving the
 /// caller's explicit intent for inbound `friendshipStateRequest` packets.
-fileprivate func preferSettledFriendshipMetadata(
+/// `pending`/`requested` are transient handshake states; everything else
+/// (accept/reject/block variants) is a settled relationship outcome.
+func isTransientFriendshipState(_ state: FriendshipMetadata.State) -> Bool {
+    switch state {
+    case .pending, .requested:
+        return true
+    case .accepted, .rejected, .rejectedByOther, .mutuallyRejected,
+         .blocked, .blockedByOther, .unblocked:
+        return false
+    }
+}
+
+func preferSettledFriendshipMetadata(
     passed: FriendshipMetadata,
     stored: FriendshipMetadata
 ) -> FriendshipMetadata {
-    func isTransient(_ state: FriendshipMetadata.State) -> Bool {
-        switch state {
-        case .pending, .requested:
-            return true
-        case .accepted, .rejected, .rejectedByOther, .mutuallyRejected,
-             .blocked, .blockedByOther, .unblocked:
-            return false
-        }
+    // Sync packets are gossip, not intent: a stale snapshot carrying blank
+    // `pending` must not cancel an outstanding request (requester side) or
+    // dismiss an accept prompt (recipient side). Intentional resets travel as
+    // explicit `friendshipStateRequest` packets and merge via
+    // `preferInboundFriendshipMetadata`, which does honor them.
+    if stored.myState == .requested && passed.myState == .pending {
+        return stored
     }
-    if isTransient(passed.myState) && !isTransient(stored.myState) {
+    if stored.theirState == .requested && passed.theirState == .pending {
+        return stored
+    }
+    // A transient snapshot never downgrades a settled outcome (accepted,
+    // blocked, rejected). Settled-to-settled transitions (e.g. a sibling
+    // device syncing a block over an accepted friendship) pass through.
+    if isTransientFriendshipState(passed.myState) && !isTransientFriendshipState(stored.myState) {
         return stored
     }
     return passed
 }
 
+/// Merges an inbound peer `friendshipStateRequest` with local disk truth.
+///
+/// Explicit friendship packets carry user intent, so peer-driven transitions
+/// (request, accept, block, reject, symmetric reset) apply — but replayed
+/// transient packets must not downgrade a settled relationship, and nothing
+/// a peer sends can override a block that this user initiated.
+func preferInboundFriendshipMetadata(
+    passed: FriendshipMetadata,
+    stored: FriendshipMetadata
+) -> FriendshipMetadata {
+    // Only this user's own unblock action may lift a block they initiated.
+    if stored.myState == .blocked {
+        return stored
+    }
+    // Server-reported block sync (or peer block packet) must surface
+    // `blockedByOther` even when local state still looks pending/requested.
+    if passed.myState == .blockedByOther || passed.theirState == .blocked {
+        return passed
+    }
+    // A symmetric pending/pending packet is only ever produced by an intentional
+    // `resetToPendingState` (cancel request / unfriend); replays of the original
+    // request arrive as (pending, requested) after the perspective swap.
+    if passed.myState == .pending && passed.theirState == .pending {
+        return passed
+    }
+    // Peer accepted us (including accept-after-delete and unblock-restore).
+    if passed.ourState == .accepted && stored.ourState != .accepted {
+        return passed
+    }
+    // Peer (re-)requested us; idempotent when the prompt is already showing.
+    if passed.theirState == .requested && stored.ourState != .accepted {
+        return passed
+    }
+    if stored.ourState == .accepted {
+        // A fully transient packet reaching an accepted relationship is the
+        // server's offline spool replaying the original request — drop it.
+        // Settled peer actions (block, reject) still carry intent and apply.
+        if isTransientFriendshipState(passed.myState) && isTransientFriendshipState(passed.theirState) {
+            return stored
+        }
+        return passed
+    }
+    return preferSettledFriendshipMetadata(passed: passed, stored: stored)
+}
+
 public enum FriendshipMetadataConflictPolicy: Sendable {
     case preferSettled
     case incoming
+    case inboundFriendship
 
-    fileprivate func resolve(passed: FriendshipMetadata, stored: FriendshipMetadata) -> FriendshipMetadata {
+    func resolve(passed: FriendshipMetadata, stored: FriendshipMetadata) -> FriendshipMetadata {
         switch self {
         case .preferSettled:
             return preferSettledFriendshipMetadata(passed: passed, stored: stored)
         case .incoming:
             return passed
+        case .inboundFriendship:
+            return preferInboundFriendshipMetadata(passed: passed, stored: stored)
         }
     }
 }
@@ -787,10 +852,10 @@ public extension SessionEvents {
                 cache: cache,
                 communicationType: recipient,
                 symmetricKey: symmetricKey)
-            logger.log(level: .debug, message: "Found Communication Model")
+            logger.log(level: .info, message: "Found Communication Model")
             shouldUpdateCommunication = true
         } catch {
-            logger.log(level: .debug, message: "Creating Communication Model")
+            logger.log(level: .info, message: "Creating Communication Model")
             // Create communication model
             communicationModel = try await createCommunicationModel(
                 recipients: members,
@@ -818,15 +883,15 @@ public extension SessionEvents {
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
                 await receiver.updatedCommunication(communicationModel, members: membersToUpdate)
-                logger.log(level: .debug, message: "Updated Communication Model")
+                logger.log(level: .info, message: "Updated Communication Model")
             } else {
                 try await cache.createCommunication(communicationModel)
                 await receiver.updatedCommunication(communicationModel, members: membersToUpdate)
-                logger.log(level: .debug, message: "Created Communication Model")
+                logger.log(level: .info, message: "Created Communication Model")
             }
             return sharedIdentifier.uuidString
         } else {
-            logger.log(level: .debug, message: "Shared Id already exists")
+            logger.log(level: .info, message: "Shared Id already exists")
             return nil
         }
     }
@@ -1011,11 +1076,13 @@ public extension SessionEvents {
             metadata: metadata,
             with: "friendshipMetadata")
         
-        try await cache.updateContact(foundContact)
-        
-        guard let updatedProps = updatedProps else {
+        guard let updatedProps else {
             throw EventErrors.propsError
         }
+
+        // `updatePropsMetadata` mutated `foundContact` in place (reference type),
+        // so persisting the same instance writes the new friendship state through.
+        try await cache.updateContact(foundContact)
         
         // Use cache-truth identity/config so downstream bundle matching and metadata
         // refresh listeners compare against the canonical contact record.
@@ -1038,6 +1105,13 @@ public extension SessionEvents {
         // Derive the server block/unblock flag from the requested transition rather
         // than from the resulting metadata so unblock still produces an
         // explicit `false` packet for the server to act on.
+        //
+        // `senderCanDeliver` consults the *recipient's* `blockedUsers`, so a stale
+        // server block left after delete/re-add must be cleared by the party that
+        // owns the list. Friendship re-establishment packets always carry
+        // `blockData=false` so the sender drops any lingering block entry for the
+        // peer before the relationship packet is routed (e.g. nudge `.requested`
+        // clears `nudge.blockedUsers[echo]` so echo's later `.accepted` can deliver).
         var blockUnblockData: Data?
         switch state {
         case .blocked:
@@ -1046,6 +1120,8 @@ public extension SessionEvents {
             if wasBlocked {
                 blockUnblockData = convertBoolToData(false)
             }
+        case .requested, .accepted, .pending:
+            blockUnblockData = convertBoolToData(false)
         default:
             break
         }

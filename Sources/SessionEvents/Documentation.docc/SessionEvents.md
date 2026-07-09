@@ -31,6 +31,12 @@ The protocol is `Sendable`. Every method is `async`.
 
 - ``SessionEvents/requestFriendshipStateChange(state:contact:cache:receiver:sessionDelegate:symmetricKey:logger:)``
 
+For `.requested`, `.accepted`, and `.pending`, the default implementation
+sends `blockData=false` so the server can clear a stale `blockedUsers`
+entry before routing. Pair friendship sends with
+``PQSSession/bootstrapPeerContactSession(secretName:purpose:)`` when the
+peer outbound ratchet is not ready. See <doc:FriendshipContactBootstrap>.
+
 ### Message lifecycle
 
 - ``SessionEvents/updateMessageDeliveryState(_:deliveryState:messageRecipient:allowExternalUpdate:sessionDelegate:cache:receiver:symmetricKey:)``
@@ -86,3 +92,4 @@ hooks and ``EventReceiver`` for UI-side notifications.
 - ``PQSSessionDelegate``
 - ``EventReceiver``
 - ``SessionTransport``
+- <doc:FriendshipContactBootstrap>

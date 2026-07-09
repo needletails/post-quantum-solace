@@ -9061,6 +9061,8 @@ struct SessionDelegate: PQSSessionDelegate {
                     break
                 case .refreshOneTimeKeys:
                     break
+                case .publishedOneTimeKeysReplenished:
+                    break
                 case .requestMessageResend(_):
                     break
                 case .linkedDeviceReprovisioning(_):

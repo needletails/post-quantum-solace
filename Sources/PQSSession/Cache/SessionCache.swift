@@ -200,8 +200,17 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter id: The session identity to be removed.
     /// - Throws: An error if the removal fails.
     public func deleteSessionIdentity(_ id: UUID) async throws {
-        try await store.deleteSessionIdentity(id)
-        sessionIdentities.removeAll(where: { $0.id == id })
+        do {
+            try await store.deleteSessionIdentity(id)
+            sessionIdentities.removeAll(where: { $0.id == id })
+        } catch {
+            let identities = try await store.fetchSessionIdentities()
+            guard identities.contains(where: { $0.id == id }) else {
+                sessionIdentities.removeAll(where: { $0.id == id })
+                return
+            }
+            throw error
+        }
     }
 
     // MARK: - Message Methods
@@ -354,7 +363,15 @@ public actor SessionCache: PQSSessionStore {
             contacts[index] = contact
             try await store.updateContact(contact)
         } else {
-            throw CacheErrors.contactNotFound
+            // Memory can lag the store (e.g. a contact re-created around a
+            // delete while the array was already populated). Persist first:
+            // stores throw for a missing row (GRDB `RecordError.recordNotFound`),
+            // so on a genuinely nonexistent contact we still fail loudly and
+            // never append a phantom record to memory. On success, repopulating
+            // the array heals the staleness instead of aborting the caller's
+            // state transition with `contactNotFound`.
+            try await store.updateContact(contact)
+            contacts.append(contact)
         }
     }
 

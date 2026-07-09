@@ -678,6 +678,8 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     outboundTask.message.transportInfo = encodedData
                 case .refreshOneTimeKeys:
                     logger.log(level: .info, message: "Prepared to send one-time-key refresh request")
+                case .publishedOneTimeKeysReplenished:
+                    logger.log(level: .info, message: "Prepared to send one-time-key replenish acknowledgement")
                 case .requestMessageResend(let request):
                     logger.log(level: .info, message: "Prepared to request resend for sharedMessageId=\(request.failedSharedMessageId)")
                 }
@@ -1044,6 +1046,26 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         canSaveMessage = false
                     case .refreshOneTimeKeys:
                         canSaveMessage = false
+                        logger.log(
+                            level: .info,
+                            message: "Received refreshOneTimeKeys from \(inboundTask.senderSecretName); replenishing local published OTK batch")
+                        async let curveRefresh = session.refreshOneTimeKeysTask(policy: .replenishBatch)
+                        async let mlKEMRefresh = session.refreshMLKEMOneTimeKeysTask(policy: .replenishBatch)
+                        let (curveReplaced, mlKEMReplaced) = await (curveRefresh, mlKEMRefresh)
+                        if !curveReplaced || !mlKEMReplaced {
+                            logger.log(
+                                level: .warning,
+                                message: "refreshOneTimeKeys inbound replenish incomplete for \(inboundTask.senderSecretName) curve=\(curveReplaced) mlkem=\(mlKEMReplaced)")
+                        } else {
+                            try await session.ackPublishedOneTimeKeysReplenished(to: inboundTask.senderSecretName)
+                        }
+                    case .publishedOneTimeKeysReplenished:
+                        canSaveMessage = false
+                        logger.log(
+                            level: .info,
+                            message: "Received publishedOneTimeKeysReplenished from \(inboundTask.senderSecretName)")
+                        await session.completePeerPublishedOneTimeKeysReplenishmentWait(
+                            secretName: inboundTask.senderSecretName)
                     case .requestMessageResend(let request):
                         canSaveMessage = false
 
@@ -1268,7 +1290,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             logger.log(
                 level: .info,
                 message: "pqs.recovery.linkedDeviceReprovisioningSent sharedId=\(sharedId) targetDeviceId=\(bundle.targetDeviceId)")
-        case .synchronizeOneTimeKeys, .refreshOneTimeKeys:
+        case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished:
             break
         }
     }
@@ -1285,7 +1307,8 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
              .sessionReestablishment,
              .linkedDeviceReprovisioning,
              .synchronizeOneTimeKeys,
-             .refreshOneTimeKeys:
+             .refreshOneTimeKeys,
+             .publishedOneTimeKeysReplenished:
             return true
         }
     }
@@ -1403,26 +1426,42 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         }
     }
 
+    /// Friendship packets must never be replayed from the recovery ring; peers
+    /// converge via fresh `friendshipStateRequest` or sibling `synchronizeContacts`.
+    private func isFriendshipStateControlMessage(_ message: CryptoMessage) -> Bool {
+        (try? BinaryDecoder().decode(FriendshipMetadata.self, from: message.metadata)) != nil
+    }
+
     func handleOutOfBandResendRequest(
         from senderName: String,
         deviceId senderDeviceId: UUID,
         failedSharedMessageIds: [String],
         session: PQSSession
-    ) async throws -> [String] {
+    ) async throws -> PQSSession.OutOfBandResendResult {
         let requestedIds = failedSharedMessageIds
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        guard !requestedIds.isEmpty else { return [] }
+        guard !requestedIds.isEmpty else {
+            return PQSSession.OutOfBandResendResult(queuedIds: [], permanentlyUnavailableIds: [])
+        }
 
         let symmetricKey = try await session.getDatabaseSymmetricKey()
         var replayableMessages: [(sharedId: String, message: CryptoMessage, servicedFromPersistedStore: Bool)] = []
         var missingCount = 0
         var coalescedCount = 0
+        var permanentlyUnavailableIds: [String] = []
 
         for sharedId in requestedIds {
             // Recent non-persistent recovery controls are already bounded by
             // `recentOutboundReplayMaxReplays`; let them replay while a peer repairs.
             if let replay = recentOutboundReplayMessage(sharedId: sharedId) {
+                if isFriendshipStateControlMessage(replay.message) {
+                    permanentlyUnavailableIds.append(sharedId)
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.outOfBandResendSkipped reason=staleFriendshipControl sharedId=\(sharedId)")
+                    continue
+                }
                 replayableMessages.append((sharedId, replay.message, false))
                 logger.log(
                     level: .info,
@@ -1448,14 +1487,23 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                       let cryptoMessage = await foundMessage.props(symmetricKey: symmetricKey)?.message
                 else {
                     missingCount += 1
+                    permanentlyUnavailableIds.append(sharedId)
                     logger.log(
                         level: .info,
                         message: "pqs.recovery.outOfBandResendSkipped reason=unreadableLocalMessage sharedId=\(sharedId)")
                     continue
                 }
+                if isFriendshipStateControlMessage(cryptoMessage) {
+                    permanentlyUnavailableIds.append(sharedId)
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.outOfBandResendSkipped reason=staleFriendshipControl sharedId=\(sharedId)")
+                    continue
+                }
                 replayableMessages.append((sharedId, cryptoMessage, true))
             } catch {
                 missingCount += 1
+                permanentlyUnavailableIds.append(sharedId)
                 logger.log(
                     level: .info,
                     message: "pqs.recovery.outOfBandResendSkipped reason=missingLocalMessage sharedId=\(sharedId) error=\(error)")
@@ -1466,13 +1514,43 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             logger.log(
                 level: .info,
                 message: "pqs.recovery.outOfBandResendUnavailable sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(requestedIds.count) missingCount=\(missingCount) coalescedCount=\(coalescedCount)")
-            return []
+            return PQSSession.OutOfBandResendResult(
+                queuedIds: [],
+                permanentlyUnavailableIds: permanentlyUnavailableIds)
         }
 
-        let identity = try await session.resetSessionIdentityForFreshSession(
-            secretName: senderName,
-            deviceId: senderDeviceId,
-            sendOneTimeIdentities: true)
+        let onlyRecentControls = replayableMessages.allSatisfy { !$0.servicedFromPersistedStore }
+        let needsRatchetReset = replayableMessages.contains(where: { $0.servicedFromPersistedStore })
+        let identity: SessionIdentity
+        if onlyRecentControls {
+            identity = try await session.activeSessionIdentityForPeer(
+                secretName: senderName,
+                deviceId: senderDeviceId)
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.outOfBandResendReusingIdentity sender=\(senderName) deviceId=\(senderDeviceId) replayCount=\(replayableMessages.count)")
+        } else if needsRatchetReset,
+                  await session.canAttemptReconciliation(
+                    sender: senderName,
+                    deviceId: senderDeviceId,
+                    flow: .outbound) {
+            identity = try await session.resetSessionIdentityForFreshSession(
+                secretName: senderName,
+                deviceId: senderDeviceId,
+                sendOneTimeIdentities: true)
+            await session.markReconciliationAttempt(
+                sender: senderName,
+                deviceId: senderDeviceId,
+                flow: .outbound)
+        } else {
+            identity = try await session.activeSessionIdentityForPeer(
+                secretName: senderName,
+                deviceId: senderDeviceId,
+                sendOneTimeIdentities: needsRatchetReset)
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.outOfBandResendReusingIdentity sender=\(senderName) deviceId=\(senderDeviceId) reason=reconciliationCooldown replayCount=\(replayableMessages.count)")
+        }
 
         var queuedIds: [String] = []
         for replayable in replayableMessages {
@@ -1498,7 +1576,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         logger.log(
             level: .info,
             message: "pqs.recovery.outOfBandResendQueued sender=\(senderName) deviceId=\(senderDeviceId) queuedCount=\(queuedIds.count) missingCount=\(missingCount) coalescedCount=\(coalescedCount) requestedCount=\(requestedIds.count)")
-        return queuedIds
+        return PQSSession.OutOfBandResendResult(
+            queuedIds: queuedIds,
+            permanentlyUnavailableIds: permanentlyUnavailableIds)
     }
 
     private func isReplayableNonPersistentControl(
@@ -1517,7 +1597,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             return envelope.isResponse
         case .linkedDeviceReprovisioning:
             return true
-        case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .requestMessageResend:
+        case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished, .requestMessageResend:
             return false
         }
     }

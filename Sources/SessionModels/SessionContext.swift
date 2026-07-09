@@ -37,6 +37,8 @@ public struct SessionContext: Codable & Sendable, Equatable {
         case sessionContextId = "c" // Key for the session context identity
         case activeUserConfiguration = "d" // Key for the last user configuration
         case registrationState = "e" // Key for the registration state
+        /// Opaque host-local policy blob (e.g. NudgeKit tombstones). Optional for back-compat.
+        case hostLocalPolicyData = "f"
     }
 
     /// The session user associated with this context.
@@ -70,6 +72,14 @@ public struct SessionContext: Codable & Sendable, Equatable {
     /// in an unregistered state.
     public var registrationState: RegistrationState
 
+    /// Optional host-encoded local policy blob persisted with the session context.
+    ///
+    /// Encrypted at rest with the app-password–derived key (same as this
+    /// `SessionContext` row). Hosts use this for small durable policy that must
+    /// survive contact/channel row deletion (e.g. delete tombstones). Missing on
+    /// older contexts; treat as empty.
+    public var hostLocalPolicyData: Data?
+
     /// Initializes a new instance of `SessionContext`.
     ///
     /// - Parameters:
@@ -78,6 +88,7 @@ public struct SessionContext: Codable & Sendable, Equatable {
     ///   - sessionContextId: Unique identifier for the device associated with the session.
     ///   - activeUserConfiguration: The last user configuration associated with the session.
     ///   - registrationState: The current registration state of the user.
+    ///   - hostLocalPolicyData: Optional host-local policy blob (default `nil`).
     ///
     /// - Important: The `databaseEncryptionKey` should be securely generated and
     ///              should not be shared or exposed in logs or error messages.
@@ -86,13 +97,15 @@ public struct SessionContext: Codable & Sendable, Equatable {
         databaseEncryptionKey data: Data,
         sessionContextId: Int,
         activeUserConfiguration: UserConfiguration,
-        registrationState: RegistrationState
+        registrationState: RegistrationState,
+        hostLocalPolicyData: Data? = nil
     ) {
         self.sessionUser = sessionUser
         databaseEncryptionKey = data
         self.sessionContextId = sessionContextId
         self.activeUserConfiguration = activeUserConfiguration
         self.registrationState = registrationState
+        self.hostLocalPolicyData = hostLocalPolicyData
     }
 
     /// Updates the session user with a new value.

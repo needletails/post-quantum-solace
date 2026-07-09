@@ -32,12 +32,24 @@ public enum FriendshipRequestError: Error, LocalizedError, Equatable, Sendable {
     /// (block / unblock / cancel) are still allowed and will not throw this.
     case previouslyRejectedByContact
 
+    /// The peer must publish fresh one-time keys and/or the inbound friend request
+    /// must be decrypted before accept can bootstrap an outbound reply lane.
+    case peerSessionNotReady
+
+    /// The server rejected delivery because this account is on the peer's
+    /// `blockedUsers` list (client friendship state may still look unblocked).
+    case blockedByPeer
+
     public var errorDescription: String? {
         switch self {
         case .alreadyAccepted:
             return "You're already friends with this contact."
         case .previouslyRejectedByContact:
             return "This contact previously declined your friend request."
+        case .peerSessionNotReady:
+            return "Can't accept yet. Wait for the friend request to arrive, then try again."
+        case .blockedByPeer:
+            return "This contact has blocked you, so the friendship update couldn't be delivered."
         }
     }
 
@@ -47,6 +59,10 @@ public enum FriendshipRequestError: Error, LocalizedError, Equatable, Sendable {
             return "There's nothing to do — you can already message each other."
         case .previouslyRejectedByContact:
             return "Wait for them to add you, or block this contact if you don't want them to reach you again."
+        case .peerSessionNotReady:
+            return "Ask them to send the request again while you're both online."
+        case .blockedByPeer:
+            return "They'll need to unblock you before you can become friends again."
         }
     }
 }

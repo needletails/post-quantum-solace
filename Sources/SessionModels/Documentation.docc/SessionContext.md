@@ -2,8 +2,9 @@
 
 The central container for all session-level state: the local
 ``SessionUser``, the database encryption key, the active
-``UserConfiguration``, the device-scoped session id, and the user's
-``SessionContext/RegistrationState``.
+``UserConfiguration``, the device-scoped session id, the user's
+``SessionContext/RegistrationState``, and an optional host-local
+policy blob.
 
 ## Overview
 
@@ -15,11 +16,18 @@ operations such as identity recovery or device management.
 
 Coding keys are intentionally single-letter for on-disk obfuscation.
 
+``SessionContext/hostLocalPolicyData`` is an opaque optional blob for
+host SDKs (e.g. NudgeKit delete tombstones). It is encrypted with the
+same app-password–derived key as the rest of this row. Older contexts
+omit the field; treat missing data as empty.
+
 ## Topics
 
 ### Initialization
 
-- ``SessionContext/init(sessionUser:databaseEncryptionKey:sessionContextId:activeUserConfiguration:registrationState:)``
+- ``SessionContext/init(sessionUser:databaseEncryptionKey:sessionContextId:activeUserConfiguration:registrationState:hostLocalPolicyData:)``
+
+`hostLocalPolicyData` defaults to `nil`.
 
 ### State
 
@@ -28,6 +36,7 @@ Coding keys are intentionally single-letter for on-disk obfuscation.
 - ``SessionContext/sessionContextId``
 - ``SessionContext/activeUserConfiguration``
 - ``SessionContext/registrationState``
+- ``SessionContext/hostLocalPolicyData``
 
 ### Mutation
 

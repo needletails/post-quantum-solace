@@ -11,10 +11,8 @@ should a transport message be persisted, what is the sender's identity,
 should automatic delivery receipts be emitted — and react to compromise
 signals from linked devices.
 
-Default implementations are provided for the optional methods
-``shouldSendAutomaticDeliveryReceipts()`` and
-``linkedDeviceReportedPotentialCompromise(deviceId:intentId:)``; the
-remaining methods are required.
+Default implementations are provided for the optional methods listed under
+**Optional hooks** below; the remaining methods are required.
 
 The protocol is `Sendable`. All methods are invoked on the session actor
 and should be implemented to return quickly.
@@ -45,10 +43,49 @@ and should be implemented to return quickly.
 - ``PQSSessionDelegate/updateCryptoMessageMetadata(_:sharedMessageId:)``
 - ``PQSSessionDelegate/updateEncryptableMessageMetadata(_:transportInfo:identity:recipient:)``
 
-### Receipts & compromise
+### Receipts, compromise & identity
 
 - ``PQSSessionDelegate/shouldSendAutomaticDeliveryReceipts()``
 - ``PQSSessionDelegate/linkedDeviceReportedPotentialCompromise(deviceId:intentId:)``
+- ``PQSSessionDelegate/peerAccountIdentityChanged(secretName:deviceId:failedSharedMessageId:)``
+
+### Friendship bootstrap & inbound recovery (optional)
+
+- ``PQSSessionDelegate/preferredOnlinePeerDeviceId(for:)``
+- ``PQSSessionDelegate/shouldSuppressInboundRecoveryFromSender(_:)``
+- ``PQSSessionDelegate/inboundRecoveryDeferred(senderSecretName:senderDeviceId:failedSharedMessageId:failureClass:)``
+- ``PQSSessionDelegate/shouldReplayNonPersistentOutbound(transportInfo:)``
+
+## Optional hooks
+
+These methods have default implementations in a protocol extension:
+
+| Method | Default |
+| ------ | ------- |
+| ``shouldSendAutomaticDeliveryReceipts()`` | `true` |
+| ``linkedDeviceReportedPotentialCompromise(deviceId:intentId:)`` | no-op |
+| ``peerAccountIdentityChanged(secretName:deviceId:failedSharedMessageId:)`` | no-op |
+| ``preferredOnlinePeerDeviceId(for:)`` | `nil` |
+| ``shouldSuppressInboundRecoveryFromSender(_:)`` | `false` |
+| ``inboundRecoveryDeferred(senderSecretName:senderDeviceId:failedSharedMessageId:failureClass:)`` | no-op |
+| ``shouldReplayNonPersistentOutbound(transportInfo:)`` | `false` |
+
+### Live-device preference for OTK bootstrap
+
+Published account configs can still list ghost devices after reinstall.
+Override ``preferredOnlinePeerDeviceId(for:)`` with the currently online
+(ISON / presence) device id so
+``PQSSession/bootstrapPeerContactSession(secretName:purpose:)`` does not
+route handshake notify to an offline ghost that still looks like master.
+See <doc:FriendshipContactBootstrap>.
+
+### Friendship `blockData`
+
+``requestFriendshipStateChange(recipient:blockData:metadata:currentState:)``
+receives optional `blockData`. For `.requested`, `.accepted`, and `.pending`,
+the SDK sends `blockData=false` so the server can clear a stale
+`blockedUsers` entry **before** routing. Hosts must apply that unblock before
+delivery checks.
 
 ## Example
 
@@ -150,6 +187,14 @@ final class AppSessionDelegate: PQSSessionDelegate {
             deviceId: deviceId,
             failedMessageId: failedSharedMessageId)
     }
+
+    func preferredOnlinePeerDeviceId(for secretName: String) async -> UUID? {
+        await Presence.onlineDeviceId(for: secretName)
+    }
+
+    func shouldSuppressInboundRecoveryFromSender(_ senderSecretName: String) async -> Bool {
+        await ContactStore.isLocallyDeleted(senderSecretName)
+    }
 }
 ```
 
@@ -175,3 +220,4 @@ You can swap the delegate at runtime via
 - ``SessionConfiguration``
 - ``SessionEvents``
 - ``EventReceiver``
+- <doc:FriendshipContactBootstrap>

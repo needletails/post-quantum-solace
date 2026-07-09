@@ -28,11 +28,16 @@ obfuscate on-disk layout.
 ### Session state
 
 - ``SessionContext``
+- ``SessionContext/hostLocalPolicyData``
 - ``SessionContext/RegistrationState``
 - ``SessionUser``
 - ``LinkDeviceInfo``
 - ``LinkedDeviceReprovisioningBundle``
 - ``DeviceLinkingDelegate``
+
+``SessionContext/hostLocalPolicyData`` is an optional opaque host blob inside
+the app-key–encrypted session context row (no SQLite migration). See
+<doc:FriendshipContactBootstrap> for host tombstone guidance.
 
 ### Messages
 
@@ -59,6 +64,9 @@ obfuscate on-disk layout.
 - ``SharedContactInfo``
 - ``FriendshipMetadata``
 - ``FriendshipMetadata/State``
+
+Peer OTK bootstrap before friendship request/accept (including delete → re-add)
+is covered in <doc:FriendshipContactBootstrap>.
 
 ### Jobs & data packets
 

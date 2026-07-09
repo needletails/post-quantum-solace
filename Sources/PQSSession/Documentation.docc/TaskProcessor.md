@@ -17,6 +17,22 @@ in-flight cryptographic work proceeds on a dedicated executor.
 - Restarts itself across `start`/`shutdown` cycles via
   ``PQSSession/resumeJobQueue()``.
 
+## Friendship / OTK bootstrap (3.2.0)
+
+When encrypting ``TransportEvent/synchronizeOneTimeKeys`` (OTK handshake
+notify) for a peer nickname:
+
+- Identities are filtered to the **bootstrap-target** device from
+  `peerMasterDevice(for:)` (online / OTK-capable), not every master-flagged
+  or preserved ghost row in the published account config.
+- That control event is treated as **recovery-critical** so a single failed
+  encrypt does not burn the outbound repair cooldown and leave
+  delete → re-add stranded.
+
+Friendship identity gather also forces prune against published devices so
+ghost rows do not receive friendship fan-out. Host integration details:
+<doc:FriendshipContactBootstrap>.
+
 ## Topics
 
 ### Related coalescing constants
@@ -30,5 +46,6 @@ in-flight cryptographic work proceeds on a dedicated executor.
 ## See also
 
 - <doc:ControlEventCoalescing>
+- <doc:FriendshipContactBootstrap>
 - ``PQSSession``
 - ``SessionCache``

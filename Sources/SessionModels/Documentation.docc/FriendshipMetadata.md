@@ -52,6 +52,23 @@ publish a friendship state change to the remote party. The SDK
 serializes the new `FriendshipMetadata` and routes it through the
 configured ``SessionTransport``.
 
+Before the first friendship packet after add or crypto wipe, hosts should
+call ``PQSSession/bootstrapPeerContactSession(secretName:purpose:)`` so the
+peer OTK handshake and outbound ratchet are ready. See
+<doc:FriendshipContactBootstrap>.
+
+### Server `blockData` on re-establish
+
+When publishing a transition, the SDK attaches optional `blockData` for the
+host/server:
+
+- `.blocked` → block (`true`)
+- `.unblocked` (when previously blocked) → unblock (`false`)
+- `.requested`, `.accepted`, `.pending` → always unblock (`false`)
+
+That clears a stale server `blockedUsers` entry **before** the relationship
+packet is routed. Hosts must apply unblock before delivery checks.
+
 ## State priority
 
 `updateOurState()` resolves contradictory perspectives by collapsing
@@ -73,3 +90,4 @@ them to a single canonical state. The full priority list is:
 - ``ContactModel``
 - ``PQSSession``
 - ``SessionEvents``
+- <doc:FriendshipContactBootstrap>

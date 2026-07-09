@@ -74,4 +74,14 @@ struct TransportEventCodingTests {
         #expect(decodedRequest.failedSharedMessageIds == ["single"])
         #expect(decodedRequest.requestingDeviceId == deviceId)
     }
+
+    @Test("publishedOneTimeKeysReplenished encodes and decodes")
+    func publishedOneTimeKeysReplenishedEncodesAndDecodes() throws {
+        let encoded = try BinaryEncoder().encode(TransportEvent.publishedOneTimeKeysReplenished)
+        let decoded = try BinaryDecoder().decode(TransportEvent.self, from: encoded)
+        guard case .publishedOneTimeKeysReplenished = decoded else {
+            Issue.record("Expected publishedOneTimeKeysReplenished transport event")
+            return
+        }
+    }
 }

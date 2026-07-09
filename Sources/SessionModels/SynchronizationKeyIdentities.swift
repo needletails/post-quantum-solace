@@ -230,6 +230,8 @@ public enum TransportEvent: Sendable, Codable {
     case synchronizeOneTimeKeys(SynchronizationKeyIdentities)
     case refreshOneTimeKeys
     case requestMessageResend(FailedMessageResendRequest)
+    /// Peer acknowledges that a published OTK replenish batch is on the server.
+    case publishedOneTimeKeysReplenished
     
     enum CodingKeys: String, CodingKey {
         case sessionReestablishment = "a"
@@ -237,6 +239,7 @@ public enum TransportEvent: Sendable, Codable {
         case synchronizeOneTimeKeys = "c"
         case refreshOneTimeKeys = "d"
         case requestMessageResend = "e"
+        case publishedOneTimeKeysReplenished = "f"
     }
 }
 

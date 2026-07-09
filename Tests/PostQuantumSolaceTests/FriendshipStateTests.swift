@@ -322,6 +322,8 @@ struct FriendshipMetadataTests {
         let errors: [FriendshipRequestError] = [
             .alreadyAccepted,
             .previouslyRejectedByContact,
+            .peerSessionNotReady,
+            .blockedByPeer,
         ]
 
         for error in errors {

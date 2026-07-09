@@ -335,6 +335,18 @@ public protocol PQSSessionDelegate: Sendable {
         deviceId: UUID,
         failedSharedMessageId: String?
     ) async
+
+    /// When `true`, inbound decrypt recovery (OTK replacement, fresh-session repair,
+    /// deferred resend) should be dropped for this sender. Used when the local user
+    /// deleted the relationship and no contact row remains — late packets are expected.
+    func shouldSuppressInboundRecoveryFromSender(_ senderSecretName: String) async -> Bool
+
+    /// Preferred live peer device for OTK / friendship bootstrap when presence is known.
+    ///
+    /// Published account configs can still list ghost devices after reinstall. Hosts that
+    /// track ISON / online presence should return the currently online device id so
+    /// handshake notify is not routed to an offline ghost that still looks like master.
+    func preferredOnlinePeerDeviceId(for secretName: String) async -> UUID?
 }
 
 public extension PQSSessionDelegate {
@@ -356,4 +368,8 @@ public extension PQSSessionDelegate {
         deviceId: UUID,
         failedSharedMessageId: String?
     ) async {}
+
+    func shouldSuppressInboundRecoveryFromSender(_ senderSecretName: String) async -> Bool { false }
+
+    func preferredOnlinePeerDeviceId(for secretName: String) async -> UUID? { nil }
 }

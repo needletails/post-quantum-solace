@@ -36,6 +36,7 @@ The SDK is designed around three jobs:
 
 - <doc:AccountIdentityRecovery>
 - <doc:ControlEventCoalescing>
+- <doc:FriendshipContactBootstrap>
 
 ### Core entry point
 
@@ -53,6 +54,8 @@ The SDK is designed around three jobs:
 - ``PQSSession/shutdown()``
 - ``PQSSession/resumeJobQueue()``
 - ``PQSSession/isViable``
+- ``SessionContext``
+- ``SessionContext/hostLocalPolicyData``
 
 ### Account identity & TOFU trust
 
@@ -73,6 +76,9 @@ The SDK is designed around three jobs:
 - ``PQSSession/createContact(secretName:metadata:friendshipMetadata:requestFriendship:)``
 - ``PQSSession/sendCommunicationSynchronization(contact:)``
 - ``PQSSession/requestFriendshipStateChange(state:contact:)``
+- ``PQSSession/bootstrapPeerContactSession(secretName:purpose:)``
+- ``PQSSession/peerNeedsOutboundBootstrap(_:)``
+- ``PeerContactBootstrapPurpose``
 - ``PQSSession/updateMessageDeliveryState(_:deliveryState:messageRecipient:allowExternalUpdate:)``
 - ``PQSSession/editCurrentMessage(_:newText:)``
 
@@ -236,4 +242,7 @@ do {
 - **Receiver** — implement ``EventReceiver`` to react to message and
   contact lifecycle changes in your UI.
 - **Optional delegate** — implement ``PQSSessionDelegate`` to participate
-  in metadata redaction, transport routing, and compromise notifications.
+  in metadata redaction, transport routing, compromise notifications, and
+  (for multi-device hosts) ``PQSSessionDelegate/preferredOnlinePeerDeviceId(for:)``
+  so friendship OTK bootstrap targets a live peer device. See
+  <doc:FriendshipContactBootstrap>.

@@ -301,6 +301,16 @@ extension TaskProcessor {
         } catch let ratchetError as RatchetError where ratchetError == .decryptionFailed {
             switch props.task.task {
             case .streamMessage(let message):
+                if let deferred = try await tryDeferInboundDuringContactBootstrap(
+                    message: message,
+                    error: ratchetError,
+                    job: job,
+                    props: props,
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey) {
+                    return deferred
+                }
                 let failureClass = "ratchet.decryptionFailed"
                 if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
                     return try await handleFreshSessionRepair(
@@ -374,6 +384,18 @@ extension TaskProcessor {
             switch props.task.task {
             case .streamMessage(let message):
                 let failureClass = "ratchet.missingOneTimeKey"
+                if await session.shouldSuppressInboundRecoveryFromSender(message.senderSecretName) {
+                    auditInboundDecryptFailure(
+                        message: message,
+                        failureClass: failureClass,
+                        action: "dropDeletedPeer",
+                        suppressed: true)
+                    logger.log(
+                        level: .info,
+                        message: "Dropping \(failureClass) for deleted peer \(message.senderSecretName); skipping recovery")
+                    try await cache.deleteJob(job)
+                    return .deleted
+                }
                 if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
                     auditInboundDecryptFailure(
                         message: message,
@@ -471,6 +493,16 @@ extension TaskProcessor {
         } catch let cryptoError as CryptoKitError {
             switch props.task.task {
             case .streamMessage(let message):
+                if let deferred = try await tryDeferInboundUntilPeerRatchetReady(
+                    message: message,
+                    job: job,
+                    props: props,
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey,
+                    failureClass: "crypto.bodyDecryptionFailed") {
+                    return deferred
+                }
                 return try await handleFreshSessionRepair(
                     message: message,
                     failureClass: "crypto.bodyDecryptionFailed",
@@ -608,9 +640,43 @@ extension TaskProcessor {
         return inbound
     }
 
-    /// When OTK bootstrap is in flight (`addingContactData` set), friendship packets can
-    /// arrive before the handshake ratchet message finishes decrypting. Briefly defer instead
-    /// of entering full SessionIdentity repair; fall through to existing repair after timeout.
+    /// When the peer OTK handshake is still in flight, encrypted payloads (often a
+    /// friendship request sent immediately after bootstrap) can arrive before the
+    /// ratchet is ready. Re-queue at the back of the job deque so earlier handshake
+    /// jobs can run first; fall through to full repair only after bounded passes.
+    private func tryDeferInboundUntilPeerRatchetReady(
+        message: InboundTaskMessage,
+        job: JobModel,
+        props: JobModel.UnwrappedProps,
+        cache: SessionCache,
+        session: PQSSession,
+        symmetricKey: SymmetricKey,
+        failureClass: String
+    ) async throws -> JobProcessingOutcome? {
+        guard await session.isAwaitingInboundPeerRatchetHandshake(
+            secretName: message.senderSecretName,
+            deviceId: message.senderDeviceId) else {
+            return nil
+        }
+
+        let maxAttempts = 24
+        guard props.attempts < maxAttempts else { return nil }
+
+        logger.log(
+            level: .info,
+            message: "Re-queueing inbound message until peer OTK handshake completes for \(message.senderSecretName) deviceId=\(message.senderDeviceId) failureClass=\(failureClass) pass=\(props.attempts + 1)/\(maxAttempts)")
+
+        var updatedProps = props
+        updatedProps.attempts += 1
+        _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
+        try await cache.updateJob(job)
+        if await !jobConsumer.deque.isEmpty {
+            await jobConsumer.feedConsumer(job, priority: .background)
+            return .deferredToBack
+        }
+        return .paused
+    }
+
     private func tryDeferInboundDuringContactBootstrap(
         message: InboundTaskMessage,
         error: RatchetError,
@@ -620,25 +686,15 @@ extension TaskProcessor {
         session: PQSSession,
         symmetricKey: SymmetricKey
     ) async throws -> JobProcessingOutcome? {
-        guard error == .initialMessageNotReceived else { return nil }
-        guard await session.addingContactData != nil else { return nil }
-
-        let maxAttempts = 24
-        guard props.attempts < maxAttempts else { return nil }
-
-        logger.log(
-            level: .info,
-            message: "Deferring inbound message during contact OTK bootstrap for \(message.senderSecretName) deviceId=\(message.senderDeviceId) attempt=\(props.attempts + 1)/\(maxAttempts)")
-
-        var updatedProps = props
-        updatedProps.attempts += 1
-        updatedProps.delayedUntil = Date().addingTimeInterval(0.25)
-        _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
-        try await cache.updateJob(job)
-        Task {
-            try? await session.resumeJobQueue()
-        }
-        return .paused
+        guard isFreshSessionRepairError(error) || error == .decryptionFailed else { return nil }
+        return try await tryDeferInboundUntilPeerRatchetReady(
+            message: message,
+            job: job,
+            props: props,
+            cache: cache,
+            session: session,
+            symmetricKey: symmetricKey,
+            failureClass: freshSessionFailureClass(error))
     }
 
     private func deferPendingOutboundTransportRetry(
@@ -686,7 +742,7 @@ extension TaskProcessor {
             return "pqs.recovery.resendRequestSendFailed sharedId=\(outboundTask.sharedId) requestingDeviceId=\(request.requestingDeviceId) requestedCount=\(request.failedSharedMessageIds.count) ids=\(request.failedSharedMessageIds.joined(separator: ",")) retryAttempt=\(attempt) error=\(error)"
         case .linkedDeviceReprovisioning(let bundle):
             return "pqs.recovery.linkedDeviceReprovisioningSendFailed sharedId=\(outboundTask.sharedId) targetDeviceId=\(bundle.targetDeviceId) retryAttempt=\(attempt) error=\(error)"
-        case .synchronizeOneTimeKeys, .refreshOneTimeKeys:
+        case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished:
             return nil
         }
     }
@@ -894,6 +950,20 @@ extension TaskProcessor {
         diagnostic: String? = nil,
         retryOriginalAfterReset: Bool = true
     ) async throws -> JobProcessingOutcome {
+        if await session.shouldSuppressInboundRecoveryFromSender(message.senderSecretName) {
+            auditInboundDecryptFailure(
+                message: message,
+                failureClass: failureClass,
+                error: diagnostic,
+                action: "dropDeletedPeer",
+                suppressed: true,
+                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
+            logger.log(
+                level: .info,
+                message: "Dropping \(failureClass) for deleted peer \(message.senderSecretName); skipping fresh-session repair")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
         if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
             auditInboundDecryptFailure(
                 message: message,
@@ -1114,7 +1184,11 @@ extension TaskProcessor {
         switch event {
         case .sessionReestablishment, .requestMessageResend:
             return true
-        case .linkedDeviceReprovisioning, .synchronizeOneTimeKeys, .refreshOneTimeKeys:
+        // OTK handshake is the gate for delete→re-add. A single failed encrypt must
+        // not burn the outbound repair cooldown and leave bootstrap stranded.
+        case .synchronizeOneTimeKeys:
+            return true
+        case .linkedDeviceReprovisioning, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished:
             return false
         }
     }

@@ -315,17 +315,24 @@ public actor TaskProcessor {
             var sendOneTimeIdentities = false
             var createIdentity = true
             
+            var forceIdentityRefresh = false
             if let state = try? BinaryDecoder().decode(FriendshipMetadata.self, from: message.metadata) {
                 if state.myState == .requested {
-                    // Only bootstrap fresh OTK identities when none exist yet. Callers that
-                    // pre-bootstrap (e.g. MessageReceiverManager.synchronize) already sent
-                    // notifyIdentityCreation and must not burn another OTK on friendship.
-                    let existingPeerIdentities = try await session.getSessionIdentities(with: nickname)
-                    sendOneTimeIdentities = existingPeerIdentities.isEmpty
+                    // Bootstrap OTK when the master peer identity has no initialized ratchet
+                    // yet. Callers that pre-bootstrap via `bootstrapPeerContactSession`
+                    // must not burn another OTK on friendship.
+                    sendOneTimeIdentities = try await session.peerNeedsOutboundBootstrap(nickname)
                 }
                 if state.myState == .pending && state.theirState == .pending {
                     createIdentity = false
                 }
+                // Friendship controls must not fan out to ghost device rows left after
+                // peer reinstall / device rotation; force a prune against published devices.
+                forceIdentityRefresh = true
+            }
+            // OTK handshake fan-out has the same ghost-device risk as friendship.
+            if sendOneTimeIdentities {
+                forceIdentityRefresh = true
             }
 
             identities = try await gatherPrivateMessageIdentities(
@@ -333,7 +340,31 @@ public actor TaskProcessor {
                 target: nickname,
                 logger: logger,
                 createIdentity: createIdentity,
-                sendOneTimeIdentities: sendOneTimeIdentities)
+                sendOneTimeIdentities: sendOneTimeIdentities,
+                forceRefresh: forceIdentityRefresh)
+
+            // OTK handshake notify must encrypt to the bootstrap-target device
+            // (online / OTK-capable), not every master-flagged row. Ghost devices
+            // left in published configs after reinstall are often still marked master.
+            if let transportInfo = message.transportInfo,
+               let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo),
+               case .synchronizeOneTimeKeys = event,
+               let targetDevice = try? await session.peerMasterDevice(for: nickname) {
+                let beforeCount = identities.count
+                await identities.asyncRemoveAll { identity in
+                    guard let props = await identity.props(symmetricKey: symmetricKey) else { return true }
+                    return props.deviceId != targetDevice.deviceId
+                }
+                if identities.isEmpty {
+                    logger.log(
+                        level: .warning,
+                        message: "OTK handshake: no SessionIdentity for bootstrap target \(nickname) deviceId=\(targetDevice.deviceId); gathered=\(beforeCount)")
+                } else {
+                    logger.log(
+                        level: .info,
+                        message: "OTK handshake: scoped to bootstrap target \(nickname) deviceId=\(targetDevice.deviceId)")
+                }
+            }
             
             let isPersistable = await session.sessionDelegate?.shouldPersist(transportInfo: message.transportInfo) != false
             if isPersistable && !sendOneTimeIdentities {
@@ -416,14 +447,21 @@ public actor TaskProcessor {
             }
         }
         
+        // Multi-device fan-out is required for linked-device / replenish control.
+        // `synchronizeOneTimeKeys` (OTK handshake notify) must NOT preserve ghosts:
+        // after delete/re-add, published account configs can still list stale device
+        // rows; sending the handshake only to a ghost leaves the live master with
+        // `ratchet.stateUninitialized` and blocks contact re-add.
         let shouldPreserveAllDevicesForControlEvent: Bool = {
             guard let transportInfo = message.transportInfo else { return false }
             guard let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo) else { return false }
             switch event {
-            case .sessionReestablishment, .linkedDeviceReprovisioning, .refreshOneTimeKeys, .synchronizeOneTimeKeys:
+            case .sessionReestablishment, .linkedDeviceReprovisioning, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished:
                 return true
             case .requestMessageResend:
                 return true
+            case .synchronizeOneTimeKeys:
+                return false
             }
         }()
 
@@ -448,35 +486,47 @@ public actor TaskProcessor {
 
         // Filter identities based on delegate-supplied info
         if let sessionDelegate = await session.sessionDelegate {
-            if let (secretName, deviceId) = await sessionDelegate.retrieveUserInfo(message.transportInfo) {
-                if !deviceId.isEmpty {
-                    let lookupSecretName: String?
-                    if secretName.isEmpty {
-                        switch type {
-                        case let .nickname(name), let .channel(name):
-                            lookupSecretName = name
-                        case .personalMessage:
-                            lookupSecretName = sender
-                        case .broadcast:
-                            lookupSecretName = nil
-                        }
+            var targetedSpecificDevice = false
+            if let (secretName, deviceId) = await sessionDelegate.retrieveUserInfo(message.transportInfo),
+               !deviceId.isEmpty {
+                targetedSpecificDevice = true
+                let lookupSecretName: String?
+                if secretName.isEmpty {
+                    switch type {
+                    case let .nickname(name), let .channel(name):
+                        lookupSecretName = name
+                    case .personalMessage:
+                        lookupSecretName = sender
+                    case .broadcast:
+                        lookupSecretName = nil
+                    }
+                } else {
+                    lookupSecretName = secretName
+                }
+                if let lookupSecretName {
+                    let resolvedIdentity = await getIdentity(secretName: lookupSecretName, deviceId: deviceId)
+                    if let offerIdentity = resolvedIdentity {
+                        identities = [offerIdentity]
                     } else {
-                        lookupSecretName = secretName
-                    }
-                    if let lookupSecretName {
-                        let resolvedIdentity = await getIdentity(secretName: lookupSecretName, deviceId: deviceId)
-                        if let offerIdentity = resolvedIdentity {
-                            identities = [offerIdentity]
-                        } else {
-                            logger.log(level: .error, message: "Missing Offer Identity: \(lookupSecretName)")
-                            return
-                        }
+                        logger.log(level: .error, message: "Missing Offer Identity: \(lookupSecretName)")
+                        return
                     }
                 }
-            } else if type != .broadcast && !shouldPreserveAllDevicesForControlEvent {
-                await identities.asyncRemoveAll {
-                    await ($0.props(symmetricKey: symmetricKey)?.isMasterDevice == false)
+            }
+            if !targetedSpecificDevice,
+               type != .broadcast,
+               !shouldPreserveAllDevicesForControlEvent {
+                let hadMaster = await identities.asyncContains {
+                    await ($0.props(symmetricKey: symmetricKey)?.isMasterDevice == true)
                 }
+                if hadMaster {
+                    await identities.asyncRemoveAll {
+                        await ($0.props(symmetricKey: symmetricKey)?.isMasterDevice == false)
+                    }
+                }
+                // If the published config has no master flag (or only ghosts are
+                // flagged), keep the gathered identities rather than dropping all
+                // recipients and silently no-op'ing OTK / friendship delivery.
             }
         }
 
@@ -678,11 +728,13 @@ public actor TaskProcessor {
         target: String,
         logger: NeedleTailLogger,
         createIdentity: Bool = true,
-        sendOneTimeIdentities: Bool
+        sendOneTimeIdentities: Bool,
+        forceRefresh: Bool = false
     ) async throws -> [SessionIdentity] {
         let identities = try await session.refreshIdentities(
             secretName: target,
             createIdentity: createIdentity,
+            forceRefresh: forceRefresh,
             sendOneTimeIdentities: sendOneTimeIdentities)
         logger.log(level: .info, message: "Gathered \(identities.count) Private Message Session Identities")
         return identities

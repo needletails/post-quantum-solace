@@ -135,6 +135,16 @@ import SessionModels
 ///
 /// - Important: This actor is designed as a singleton. Always use `PQSSession.shared`
 ///   rather than creating new instances.
+
+/// Why `bootstrapPeerContactSession` is being invoked for a peer.
+public enum PeerContactBootstrapPurpose: Sendable {
+    /// Requester sending the first friendship packet to a peer.
+    case newOutbound
+    /// Acceptor replying to a peer-initiated request. Opens a fresh OTK lane so the
+    /// accept packet encrypts on the same session the requester learns from OTK notify.
+    case friendshipReply
+}
+
 public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Unique identifier for the session instance.
     /// This ID is generated once and remains constant for the lifetime of the session.
@@ -212,6 +222,18 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     let crypto = NeedleTailCrypto()
     var logger = NeedleTailLogger("[PQSSession]")
     var sessionIdentities = Set<String>()
+    /// Peers whose OTK notify finished and outbound jobs drained this session.
+    /// Prevents skipping bootstrap when DB rows show initialized outbound state but
+    /// the peer never received the handshake (intermittent friendship decrypt failures).
+    var deliveredOneTimeNotifyPeers = Set<String>()
+    /// Peers whose inbound `friendshipStateRequest` was decrypted and applied this session.
+    /// Accept bootstrap requires this flag or an established inbound ratchet in the cache.
+    var peerInboundFriendshipConfirmedPeers = Set<String>()
+    var lastPeerOneTimeRefreshRequestAt: [String: Date] = [:]
+    let peerOneTimeRefreshRequestCooldown: TimeInterval = 15
+    var peerOneTimeReplenishWaiters: [String: CheckedContinuation<Void, Never>] = [:]
+    var peerOneTimeReplenishAcknowledgedPeers = Set<String>()
+    let peerOneTimeReplenishWaitTimeout: TimeInterval = 4
     var addingContactData: Data?
     /// Last successful automatic key-rotation attempt by inbound peer key.
     /// Key format: "<secretName>|<deviceUUID>".
@@ -267,6 +289,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let key = reconciliationPeerKey(sender: sender, deviceId: deviceId, flow: flow)
         pruneRecoveryTimestamps(&lastReconciliationAtByPeer, ttl: reconciliationPeerCooldown, now: now)
         lastReconciliationAtByPeer[key] = now
+    }
+
+    func clearOutboundReconciliationCooldown(secretName: String, deviceId: UUID) {
+        let key = reconciliationPeerKey(sender: secretName, deviceId: deviceId, flow: .outbound)
+        lastReconciliationAtByPeer.removeValue(forKey: key)
     }
 
     private func reconciliationPeerKey(sender: String, deviceId: UUID, flow: ReconciliationFlow) -> String {
@@ -527,7 +554,12 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         return expiry > now
     }
-    
+
+    /// True when the app delegate wants decrypt recovery dropped for a deleted peer.
+    func shouldSuppressInboundRecoveryFromSender(_ senderSecretName: String) async -> Bool {
+        await sessionDelegate?.shouldSuppressInboundRecoveryFromSender(senderSecretName) ?? false
+    }
+
     /// Records failure-class suppression for a final inbound failure.
     /// Intentionally does not quarantine the whole message tuple: resend recovery reuses the same
     /// `sharedMessageId`, so tuple-wide quarantine would drop the replay before decryption.
@@ -760,7 +792,18 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     ///
     /// - Parameter secretName: The secret name of the user whose identity should be removed
     public func removeIdentity(with secretName: String) {
+        clearPeerTransientState(secretName: secretName)
+    }
+
+    internal func clearPeerTransientState(secretName: String) {
         sessionIdentities.remove(secretName)
+        deliveredOneTimeNotifyPeers.remove(secretName)
+        peerInboundFriendshipConfirmedPeers.remove(secretName)
+        lastPeerOneTimeRefreshRequestAt.removeValue(forKey: secretName)
+        peerOneTimeReplenishAcknowledgedPeers.remove(secretName)
+        if let waiter = peerOneTimeReplenishWaiters.removeValue(forKey: secretName) {
+            waiter.resume()
+        }
     }
 
     // MARK: - Inactive snapshot helpers
@@ -1032,6 +1075,17 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// Enum representing various session-related errors
+    public struct OutOfBandResendResult: Sendable, Equatable {
+        public let queuedIds: [String]
+        /// Requested ids with no local replay source; the requester should stop retrying these.
+        public let permanentlyUnavailableIds: [String]
+
+        public init(queuedIds: [String], permanentlyUnavailableIds: [String]) {
+            self.queuedIds = queuedIds
+            self.permanentlyUnavailableIds = permanentlyUnavailableIds
+        }
+    }
+
     public enum SessionErrors: String, Error, LocalizedError {
         case saltError = "Salt error occurred."
         case databaseNotInitialized = "Database is not initialized."
@@ -2857,12 +2911,153 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
     /// Sends OTK notify for a new peer session and waits for outbound encrypt jobs to drain.
     /// Call before the first friendship request so the receiver ratchet is ready.
-    public func bootstrapPeerContactSession(secretName: String) async throws {
-        _ = try await refreshIdentities(
-            secretName: secretName,
-            createIdentity: true,
-            sendOneTimeIdentities: true)
-        await waitForOutboundJobDrain()
+    /// No-ops when the peer's master device already has initialized outbound ratchet state.
+    public func bootstrapPeerContactSession(
+        secretName: String,
+        purpose: PeerContactBootstrapPurpose = .newOutbound
+    ) async throws {
+        switch purpose {
+        case .newOutbound:
+            let needsOutboundBootstrap = try await peerNeedsOutboundBootstrap(secretName)
+            let needsHandshakeNotify = !deliveredOneTimeNotifyPeers.contains(secretName)
+
+            guard needsOutboundBootstrap || needsHandshakeNotify else {
+                logger.log(
+                    level: .info,
+                    message: "bootstrapPeerContactSession: outbound ratchet already ready for \(secretName) and OTK notify already delivered this session; skipping")
+                return
+            }
+
+            if !needsOutboundBootstrap, needsHandshakeNotify {
+                logger.log(
+                    level: .warning,
+                    message: "bootstrapPeerContactSession: local outbound state exists for \(secretName) but OTK notify was not confirmed this session; sending OTK handshake")
+            } else {
+                logger.log(
+                    level: .info,
+                    message: "bootstrapPeerContactSession: sending OTK bootstrap for \(secretName)")
+            }
+
+            // Master-targeted handshake only. A blanket refresh that notifies every
+            // published peer device — including ghost rows left after reinstall —
+            // leaves the live master without a usable outbound ratchet (delete→re-add).
+            try await preparePeerIdentitiesForOutboundBootstrap(
+                secretName: secretName,
+                forceHandshakeReplay: !needsOutboundBootstrap && needsHandshakeNotify)
+
+            guard let peerDevice = try await peerMasterDevice(for: secretName) else {
+                throw PQSSession.SessionErrors.missingSessionIdentity
+            }
+
+            if try await !peerCanSupplyCurveOneTimeKey(
+                secretName: secretName,
+                deviceId: peerDevice.deviceId) {
+                try await repairPeerPublishedOneTimeKeysIfPossible(
+                    secretName: secretName,
+                    deviceId: peerDevice.deviceId)
+            }
+
+            guard try await peerCanSupplyCurveOneTimeKey(
+                secretName: secretName,
+                deviceId: peerDevice.deviceId) else {
+                logger.log(
+                    level: .warning,
+                    message: "bootstrapPeerContactSession: peer \(secretName) has no published curve OTK for outbound bootstrap")
+                throw PQSSession.SessionErrors.cannotFindOneTimeKey
+            }
+
+            guard try await deliverPeerHandshakeNotifyBeforeOutboundSenderInit(secretName: secretName) else {
+                throw PQSSession.SessionErrors.missingSessionIdentity
+            }
+            await waitForOutboundJobDrain()
+            // Do not force-refresh after the handshake: a second refresh can recreate
+            // ghost device rows and race the just-initialized master outbound ratchet.
+            if try await peerNeedsOutboundBootstrap(secretName) {
+                _ = try await refreshIdentities(
+                    secretName: secretName,
+                    createIdentity: true,
+                    forceRefresh: true,
+                    sendOneTimeIdentities: false)
+                await waitForOutboundJobDrain()
+            }
+
+        case .friendshipReply:
+            guard try await peerCanAcceptFriendship(secretName) else {
+                logger.log(
+                    level: .warning,
+                    message: "bootstrapPeerContactSession: refusing accept bootstrap for \(secretName); inbound friendship not confirmed and no live inbound ratchet")
+                throw PQSSession.SessionErrors.cannotFindOneTimeKey
+            }
+
+            // After a live inbound request decrypt, this device often already has an
+            // outbound ratchet (e.g. contactCreated / sibling sync). Resetting and
+            // sending a fresh OTK here races the peer's existing inbound state and
+            // surfaces as `maxSkippedHeadersExceeded` on the accept packet — the
+            // peer never applies `.accepted`. Reuse the live lane when present.
+            if try await !peerNeedsOutboundBootstrap(secretName) {
+                logger.log(
+                    level: .info,
+                    message: "bootstrapPeerContactSession: outbound ratchet already ready for \(secretName); skipping fresh OTK reply lane before friendship accept")
+                return
+            }
+
+            logger.log(
+                level: .info,
+                message: "bootstrapPeerContactSession: establishing fresh OTK reply lane for \(secretName) before friendship accept")
+            deliveredOneTimeNotifyPeers.remove(secretName)
+
+            guard let peerDevice = try await peerMasterDevice(for: secretName) else {
+                throw PQSSession.SessionErrors.missingSessionIdentity
+            }
+
+            if try await !peerCanSupplyCurveOneTimeKey(
+                secretName: secretName,
+                deviceId: peerDevice.deviceId) {
+                try await repairPeerPublishedOneTimeKeysIfPossible(
+                    secretName: secretName,
+                    deviceId: peerDevice.deviceId)
+            }
+
+            guard try await peerCanSupplyCurveOneTimeKey(
+                secretName: secretName,
+                deviceId: peerDevice.deviceId) else {
+                logger.log(
+                    level: .warning,
+                    message: "bootstrapPeerContactSession: peer \(secretName) has no published curve OTK for accept bootstrap")
+                throw PQSSession.SessionErrors.cannotFindOneTimeKey
+            }
+
+            try await preparePeerIdentitiesForFriendshipReply(secretName: secretName)
+            guard try await deliverPeerHandshakeNotifyBeforeOutboundSenderInit(secretName: secretName) else {
+                throw PQSSession.SessionErrors.missingSessionIdentity
+            }
+            await waitForOutboundJobDrain()
+            _ = try await refreshIdentities(
+                secretName: secretName,
+                createIdentity: true,
+                forceRefresh: true,
+                sendOneTimeIdentities: false)
+            await waitForOutboundJobDrain()
+        }
+
+        guard try await hasInitializedOutboundRatchetForPeer(secretName) else {
+            deliveredOneTimeNotifyPeers.remove(secretName)
+            logger.log(
+                level: .warning,
+                message: "bootstrapPeerContactSession: outbound ratchet still not ready for \(secretName) after OTK drain")
+            if let peerDevice = try await peerMasterDevice(for: secretName),
+               try await !peerCanSupplyCurveOneTimeKey(
+                secretName: secretName,
+                deviceId: peerDevice.deviceId) {
+                throw PQSSession.SessionErrors.cannotFindOneTimeKey
+            }
+            throw PQSSession.SessionErrors.missingSessionIdentity
+        }
+
+        deliveredOneTimeNotifyPeers.insert(secretName)
+        logger.log(
+            level: .info,
+            message: "bootstrapPeerContactSession: OTK notify delivered and outbound job drain finished for \(secretName)")
     }
 
     /// Shuts down the session, clearing sensitive state.
@@ -2899,6 +3094,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         await setPQSSessionDelegate(conformer: nil)
         await setSessionEventDelegate(conformer: nil)
         sessionIdentities.removeAll()
+        deliveredOneTimeNotifyPeers.removeAll()
+        peerInboundFriendshipConfirmedPeers.removeAll()
+        lastPeerOneTimeRefreshRequestAt.removeAll()
+        for (_, waiter) in peerOneTimeReplenishWaiters {
+            waiter.resume()
+        }
+        peerOneTimeReplenishWaiters.removeAll()
+        peerOneTimeReplenishAcknowledgedPeers.removeAll()
 
     }
 

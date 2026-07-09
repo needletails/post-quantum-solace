@@ -10,9 +10,10 @@ and recovering from a verified account-identity change.
 
 ## Prerequisites
 
-- iOS 16.0+ / macOS 13.0+ (Swift Concurrency, Sendable)
-- Swift 5.9+
+- iOS 18.0+ / macOS 15.0+ (also Linux and Android via the supported package platforms)
+- Swift 6.1+
 - Xcode 15+
+- DoubleRatchetKit 3.0.0+
 
 ## Installation
 
@@ -20,7 +21,7 @@ Add Post-Quantum Solace to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "1.0.0")
+    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "3.2.0")
 ]
 ```
 
@@ -333,3 +334,7 @@ do {
   calls.
 - Persist `EncryptedMessage` and `BaseCommunication` blobs verbatim — the SDK
   treats them as opaque ciphertext.
+- For multi-device friendship add / delete → re-add, implement
+  ``PQSSessionDelegate/preferredOnlinePeerDeviceId(for:)`` and call
+  ``PQSSession/bootstrapPeerContactSession(secretName:purpose:)`` before the
+  first friendship packet. See <doc:FriendshipContactBootstrap>.

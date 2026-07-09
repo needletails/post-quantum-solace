@@ -45,6 +45,7 @@ an existing one with ``startSession(appPassword:)``.
 - ``setSessionContext(_:)``
 - ``cache``
 - ``appPassword``
+- ``SessionContext/hostLocalPolicyData``
 
 ### Account identity & TOFU trust
 
@@ -73,9 +74,25 @@ an existing one with ``startSession(appPassword:)``.
 - ``sendCommunicationSynchronization(contact:)``
 - ``sendContactCreatedAcknowledgment(recipient:)``
 - ``requestFriendshipStateChange(state:contact:)``
+- ``bootstrapPeerContactSession(secretName:purpose:)``
+- ``peerNeedsOutboundBootstrap(_:)``
+- ``PeerContactBootstrapPurpose``
 - ``requestMetadata(from:)``
 - ``requestMyMetadata()``
 - ``setAddingContact(_:)``
+
+### Friendship bootstrap (delete → re-add)
+
+Before the first friendship packet after add or crypto wipe, call
+``bootstrapPeerContactSession(secretName:purpose:)`` with
+``PeerContactBootstrapPurpose/newOutbound`` (requester) or
+``PeerContactBootstrapPurpose/friendshipReply`` (acceptor). Use
+``peerNeedsOutboundBootstrap(_:)`` to decide whether bootstrap is still
+required. Multi-device hosts should implement
+``PQSSessionDelegate/preferredOnlinePeerDeviceId(for:)`` so OTK notify
+targets a live peer device rather than a ghost still listed in the published
+account config. Full host checklist:
+<doc:FriendshipContactBootstrap>.
 
 ### Key rotation
 
@@ -195,3 +212,6 @@ contend with regular API calls.
 - ``PQSSessionConstants``
 - ``SecurityIdentity``
 - ``SessionErrors``
+- <doc:FriendshipContactBootstrap>
+- <doc:AccountIdentityRecovery>
+- <doc:ControlEventCoalescing>

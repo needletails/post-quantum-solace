@@ -40,4 +40,36 @@ struct SessionIdentitySourceTests {
         #expect(source.contains("Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)"))
         #expect(source.contains("Curve25519.KeyAgreement.PublicKey(rawRepresentation: currentDevice.longTermPublicKey)"))
     }
+
+    @Test("full identity refresh prunes ghost devices via shared helper")
+    func fullIdentityRefreshPrunesGhostDevicesViaSharedHelper() throws {
+        let source = try PQSSessionIdentitySource.read("Sources/PQSSession/PQSSession+SessionIdentity.swift")
+        #expect(source.contains("pruneStaleSessionIdentities"))
+        #expect(source.contains("Will remove stale session identity for recipient"))
+
+        let refreshBody = try {
+            guard let range = source.range(of: "internal func refreshSessionIdentities(") else {
+                throw NSError(domain: "SessionIdentitySourceTests", code: 1)
+            }
+            guard let open = source[range.upperBound...].firstIndex(of: "{") else {
+                throw NSError(domain: "SessionIdentitySourceTests", code: 2)
+            }
+            var depth = 0
+            var index = open
+            while index < source.endIndex {
+                switch source[index] {
+                case "{": depth += 1
+                case "}":
+                    depth -= 1
+                    if depth == 0 {
+                        return String(source[open...index])
+                    }
+                default: break
+                }
+                index = source.index(after: index)
+            }
+            throw NSError(domain: "SessionIdentitySourceTests", code: 3)
+        }()
+        #expect(refreshBody.contains("pruneStaleSessionIdentities"))
+    }
 }

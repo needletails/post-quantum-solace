@@ -4,17 +4,19 @@
 
 [![Swift](https://img.shields.io/badge/Swift-6.1+-orange.svg)](https://swift.org)
 [![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20macOS%2015%2B%20%7C%20Linux%20%7C%20Android-blue.svg)](https://developer.apple.com)
-[![Version](https://img.shields.io/badge/Version-3.0.0-blue.svg)](https://github.com/needletails/post-quantum-solace)
+[![Version](https://img.shields.io/badge/Version-3.2.0-blue.svg)](https://github.com/needletails/post-quantum-solace)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-green.svg)](LICENSE)
 
 A secure, post-quantum cryptographic messaging SDK with end-to-end encryption, built for the quantum-resistant future.
 
-## 🎉 Version 3.0.0
+## 🎉 Version 3.2.0
 
-Post-Quantum Solace 3.0.0 is a major release for production-grade
-secure messaging: hardened trust and identity invariants, coalesced session
-recovery, archived-state decrypt fallback, and flood-safe inbound failure
-handling. It requires **DoubleRatchetKit 3.0.0**.
+**3.2.0** improves multi-device friendship delete → re-add (live-device OTK
+bootstrap, friendship `blockData` unblock, host-local policy on
+`SessionContext`). Requires **DoubleRatchetKit 3.0.0**.
+
+Details:
+[`FriendshipContactBootstrap`](Sources/PQSSession/Documentation.docc/FriendshipContactBootstrap.md).
 
 > **Upgrading from 2.x?** See the
 > [3.0.0 Migration Guide](#-300-migration-guide). For the 1.x → 2.0 API break,
@@ -51,7 +53,14 @@ Add the Post-Quantum Solace SDK to your project:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "3.0.0")
+    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "3.2.0")
+]
+```
+
+For the 3.0 / 3.1 line (before friendship bootstrap targeting):
+```swift
+dependencies: [
+    .package(url: "https://github.com/needletails/post-quantum-solace.git", "3.0.0"..<"3.2.0")
 ]
 ```
 
@@ -890,18 +899,18 @@ For detailed documentation, see:
 - [API Reference](Sources/PQSSession/Documentation.docc/)
 - [Getting Started Guide](Sources/PQSSession/Documentation.docc/GettingStarted.md)
 - [Architecture Overview](Sources/PQSSession/Documentation.docc/Documentation.md)
+- [Friendship contact bootstrap (3.2.0)](Sources/PQSSession/Documentation.docc/FriendshipContactBootstrap.md)
 
 ### Version History
 
-- **3.0.0** (Current): TOFU account-identity pinning with user-mediated recovery
-  (`acknowledgeAccountIdentityChange`), per-device signing key invariant with
-  master-only compromise rotation, `SecurityIdentity` and safety-number support,
-  control-event coalescing with `SessionReestablishmentEnvelope`, archived
-  identity decrypt fallback, graceful inbound failure recovery, multi-device
-  sibling fan-out, recovery flood bounds, and **DoubleRatchetKit 3.0.0**
-  dependency. Metadata blobs are `Data`/BinaryCodable (not BSON `Document`).
-- **2.0.0**: Enhanced error handling with `LocalizedError`, `SessionConfiguration` for simplified setup, `PQSSessionConstants` for centralized configuration, `CryptoError` for cryptographic operations, and comprehensive documentation updates.
-- **1.x**: Initial release with core post-quantum cryptographic messaging functionality.
+- **3.2.0** (Current): Multi-device friendship delete → re-add reliability;
+  `SessionContext.hostLocalPolicyData`. Details in
+  [`FriendshipContactBootstrap`](Sources/PQSSession/Documentation.docc/FriendshipContactBootstrap.md).
+- **3.1.x**: Session recovery and multi-device hardening on 3.0.0.
+- **3.0.0**: TOFU pinning, per-device identity, control-event coalescing,
+  inbound recovery, BinaryCodable metadata; requires **DoubleRatchetKit 3.0.0**.
+- **2.0.0**: `SessionConfiguration`, `LocalizedError`, `PQSSessionConstants`.
+- **1.x**: Initial release.
 
 ## 🤝 Contributing
 
@@ -914,7 +923,7 @@ This project is licensed under the AGPL-3.0 License - see the [LICENSE](LICENSE)
 ## 🔗 Dependencies
 
 - [swift-crypto](https://github.com/apple/swift-crypto) - Apple's cryptographic library
-- [double-ratchet-kit](https://github.com/needletails/double-ratchet-kit) - Double Ratchet protocol implementation (**3.0.0+** required for PQS 3.0.0)
+- [double-ratchet-kit](https://github.com/needletails/double-ratchet-kit) - Double Ratchet protocol implementation (**3.0.0+** required for PQS 3.x)
 - [needletail-crypto](https://github.com/needletails/needletail-crypto) - Cryptographic utilities
 - [needletail-logger](https://github.com/needletails/needletail-logger) - Logging framework
 - [needletail-algorithms](https://github.com/needletails/needletail-algorithms) - Algorithm implementations

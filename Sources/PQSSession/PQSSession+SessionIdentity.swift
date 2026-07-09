@@ -279,6 +279,44 @@ public extension PQSSession {
         }
     }
 
+    /// Removes local `SessionIdentity` rows whose device IDs are absent from `verifiedDeviceIds`.
+    private func pruneStaleSessionIdentities(
+        secretName: String,
+        identities: inout [SessionIdentity],
+        verifiedDeviceIds: Set<UUID>,
+        symmetricKey: SymmetricKey
+    ) async {
+        let cachedIdentities: [SessionIdentity]
+        if let fromCache = try? await getSessionIdentities(with: secretName) {
+            cachedIdentities = fromCache
+        } else {
+            cachedIdentities = identities
+        }
+
+        let deviceIds = await Set(cachedIdentities.asyncCompactMap {
+            await $0.props(symmetricKey: symmetricKey)?.deviceId
+        })
+
+        for deviceId in deviceIds where !verifiedDeviceIds.contains(deviceId) {
+            logger.log(level: .info, message: "Will remove stale session identity for recipient: \(secretName)")
+            let candidates = await cachedIdentities.asyncFilter { element in
+                guard let props = await element.props(symmetricKey: symmetricKey) else { return false }
+                return props.deviceId == deviceId
+            }
+            for identityToRemove in candidates {
+                do {
+                    try await cache?.deleteSessionIdentity(identityToRemove.id)
+                    logger.log(level: .info, message: "Did remove stale session identity for recipient: \(secretName)")
+                    identities.removeAll { $0.id == identityToRemove.id }
+                } catch {
+                    logger.log(
+                        level: .warning,
+                        message: "Failed to delete stale session identity for recipient \(secretName): \(error)")
+                }
+            }
+        }
+    }
+
     internal func refreshIdentitiesAssessingImpact(
         secretName: String,
         deviceId: UUID,
@@ -364,18 +402,704 @@ public extension PQSSession {
         }
         return false
     }
-    
+
     /// Extracts synchronization keys from adding contact data if available
     /// - Returns: Optional tuple containing curve and mlKEM key IDs
     private func extractSynchronizationKeys() async throws -> (curveId: String?, mlKEMId: String?)? {
         guard let addingContactData else { return nil }
-        
+
         let keys = try BinaryDecoder().decode(SynchronizationKeyIdentities.self, from: addingContactData)
         await setAddingContact(nil)
-        
+
         return (curveId: keys.senderCurveId, mlKEMId: keys.senderMLKEMId)
     }
-    
+
+    /// Whether an established inbound ratchet exists for traffic from the given peer
+    /// device (`props.state != nil`). A session-identity row alone is not enough: the
+    /// OTK handshake packet must complete before friendship payloads can decrypt.
+    func hasActiveInboundSessionIdentity(
+        secretName: String,
+        deviceId: UUID
+    ) async -> Bool {
+        guard let cache else { return false }
+        do {
+            let symmetricKey = try await getDatabaseSymmetricKey()
+            let identities = try await cache.fetchSessionIdentities()
+            for identity in identities {
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+                if props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) {
+                    continue
+                }
+                if props.secretName == secretName,
+                   props.deviceId == deviceId,
+                   props.state != nil {
+                    return true
+                }
+            }
+            return false
+        } catch {
+            return false
+        }
+    }
+
+    /// True while the local side is still completing the first inbound ratchet with a peer
+    /// (outbound OTK notify in flight, or no established inbound state yet).
+    func isAwaitingInboundPeerRatchetHandshake(
+        secretName: String,
+        deviceId: UUID
+    ) async -> Bool {
+        if addingContactData != nil {
+            return true
+        }
+        return !(await hasActiveInboundSessionIdentity(
+            secretName: secretName,
+            deviceId: deviceId))
+    }
+
+    /// Whether outbound traffic to this peer can encrypt without a fresh OTK bootstrap.
+    ///
+    /// True when the bootstrap-target peer device (online / OTK-capable / master)
+    /// has initialized outbound ratchet state. A session-identity row alone is not
+    /// enough. Ghost master rows must not veto a live device that already has state.
+    internal func hasInitializedOutboundRatchetForPeer(_ secretName: String) async throws -> Bool {
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let identities = try await getSessionIdentities(with: secretName)
+        let preferredDeviceId = try await peerMasterDevice(for: secretName)?.deviceId
+
+        if let preferredDeviceId {
+            for identity in identities {
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+                guard props.secretName == secretName else { continue }
+                guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+                if props.deviceId == preferredDeviceId {
+                    return props.state != nil
+                }
+            }
+            return false
+        }
+
+        var sawMasterRow = false
+        var masterHasState = false
+        var sawAnyActiveRow = false
+
+        for identity in identities {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard props.secretName == secretName else { continue }
+            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+
+            sawAnyActiveRow = true
+            if props.isMasterDevice {
+                sawMasterRow = true
+                if props.state != nil {
+                    masterHasState = true
+                }
+            }
+        }
+
+        if sawMasterRow {
+            return masterHasState
+        }
+
+        guard sawAnyActiveRow else { return false }
+
+        for identity in identities {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard props.secretName == secretName else { continue }
+            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+            if props.state != nil {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// True when OTK bootstrap and first outbound sender init are still required for this peer.
+    func peerNeedsOutboundBootstrap(_ secretName: String) async throws -> Bool {
+        !(try await hasInitializedOutboundRatchetForPeer(secretName))
+    }
+
+    /// Clears stale peer identity rows and reconciliation cooldown before OTK bootstrap.
+    ///
+    /// Failed friendship attempts can leave state-less `SessionIdentity` rows in the DB.
+    /// Encrypting on those rows hits `ratchet.stateUninitialized`, consumes the outbound
+    /// repair cooldown, and suppresses the friendship packet — the same outcome as
+    /// delete-contact + re-add, but without requiring user action.
+    internal func preparePeerIdentitiesForOutboundBootstrap(
+        secretName: String,
+        forceHandshakeReplay: Bool = false
+    ) async throws {
+        guard let targetDevice = try await peerMasterDevice(for: secretName) else {
+            return
+        }
+
+        clearOutboundReconciliationCooldown(
+            secretName: secretName,
+            deviceId: targetDevice.deviceId)
+
+        let needsBootstrap = try await peerNeedsOutboundBootstrap(secretName)
+        guard needsBootstrap || forceHandshakeReplay else { return }
+
+        _ = try await resetSessionIdentityForFreshSession(
+            secretName: secretName,
+            deviceId: targetDevice.deviceId,
+            sendOneTimeIdentities: false)
+
+        logger.log(
+            level: .info,
+            message: forceHandshakeReplay
+                ? "preparePeerIdentitiesForOutboundBootstrap: reset identity for \(secretName) deviceId=\(targetDevice.deviceId) to replay OTK notify on existing outbound row"
+                : "preparePeerIdentitiesForOutboundBootstrap: reset state-less identity for \(secretName) deviceId=\(targetDevice.deviceId) before OTK notify")
+    }
+
+    /// Resets the peer master identity before an accept/reply OTK so the subsequent
+    /// friendship packet does not encrypt on a stale inbound-only ratchet row.
+    internal func preparePeerIdentitiesForFriendshipReply(secretName: String) async throws {
+        guard let targetDevice = try await peerMasterDevice(for: secretName) else {
+            return
+        }
+
+        clearOutboundReconciliationCooldown(
+            secretName: secretName,
+            deviceId: targetDevice.deviceId)
+
+        _ = try await resetSessionIdentityForFreshSession(
+            secretName: secretName,
+            deviceId: targetDevice.deviceId,
+            sendOneTimeIdentities: false)
+
+        logger.log(
+            level: .info,
+            message: "preparePeerIdentitiesForFriendshipReply: reset peer identity for \(secretName) deviceId=\(targetDevice.deviceId) before accept OTK")
+    }
+
+    /// Sends OTK handshake notify while the peer row is still state-less so the peer can
+    /// establish inbound decrypt before this device initializes its outbound sender ratchet.
+    @discardableResult
+    internal func deliverPeerHandshakeNotifyBeforeOutboundSenderInit(secretName: String) async throws -> Bool {
+        guard let transportDelegate else {
+            throw PQSSession.SessionErrors.transportNotInitialized
+        }
+        guard let targetDevice = try await peerMasterDevice(for: secretName) else {
+            return false
+        }
+
+        let configuration = try await transportDelegate.findConfiguration(for: secretName)
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let identities = try await getSessionIdentities(with: secretName)
+        guard let identity = await identities.asyncFirst(where: { candidate in
+            guard let props = await candidate.props(symmetricKey: symmetricKey) else { return false }
+            guard props.secretName == secretName, props.deviceId == targetDevice.deviceId else { return false }
+            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { return false }
+            return props.state == nil
+        }) else {
+            logger.log(
+                level: .warning,
+                message: "deliverPeerHandshakeNotifyBeforeOutboundSenderInit: no state-less identity for \(secretName) deviceId=\(targetDevice.deviceId)")
+            return false
+        }
+
+        guard var props = await identity.props(symmetricKey: symmetricKey) else { return false }
+        if props.oneTimePublicKey == nil {
+            try await attachPublishedPeerOneTimeKeys(
+                to: &props,
+                secretName: secretName,
+                device: targetDevice,
+                configuration: configuration)
+            try await identity.updateIdentityProps(symmetricKey: symmetricKey, props: props)
+            try await cache?.updateSessionIdentity(identity)
+        }
+
+        guard let recipientCurveId = props.oneTimePublicKey?.id.uuidString else {
+            logger.log(
+                level: .warning,
+                message: "deliverPeerHandshakeNotifyBeforeOutboundSenderInit: no peer curve OTK for \(secretName) deviceId=\(targetDevice.deviceId)")
+            throw PQSSession.SessionErrors.cannotFindOneTimeKey
+        }
+
+        let recipientMLKEMId = props.mlKEMPublicKey.id.uuidString
+        try await notifyIdentityCreation(
+            for: secretName,
+            curveId: recipientCurveId,
+            mlKEMId: recipientMLKEMId)
+        logger.log(
+            level: .info,
+            message: "deliverPeerHandshakeNotifyBeforeOutboundSenderInit: sent OTK notify outbound to \(secretName) deviceId=\(targetDevice.deviceId)")
+        return true
+    }
+
+    /// Returns the peer device that should own OTK / friendship bootstrap.
+    ///
+    /// Order of preference:
+    /// 1. Host-reported online device (ISON) that can supply a curve OTK
+    /// 2. Master-flagged device that can supply a curve OTK
+    /// 3. Any peer device that can supply a curve OTK
+    /// 4. Online device / master / first peer as a last resort
+    ///
+    /// Ghost devices left in published account configs after reinstall must not win
+    /// over a live online peer — that is what broke delete→re-add.
+    internal func peerMasterDevice(for secretName: String) async throws -> UserDeviceConfiguration? {
+        guard let transportDelegate else {
+            throw PQSSession.SessionErrors.transportNotInitialized
+        }
+        guard let sessionUser = await sessionContext?.sessionUser else {
+            throw PQSSession.SessionErrors.sessionNotInitialized
+        }
+
+        let configuration = try await transportDelegate.findConfiguration(for: secretName)
+        let devices = try configuration.getVerifiedDevices().map {
+            try configuration.deviceWithCurrentKeyBundle($0)
+        }
+        let peerDevices = devices.filter { $0.deviceId != sessionUser.deviceId }
+        guard !peerDevices.isEmpty else { return nil }
+
+        let preferredOnlineId = await sessionDelegate?.preferredOnlinePeerDeviceId(for: secretName)
+        if let preferredOnlineId,
+           let online = peerDevices.first(where: { $0.deviceId == preferredOnlineId }),
+           try await peerCanSupplyCurveOneTimeKey(
+            secretName: secretName,
+            deviceId: online.deviceId) {
+            return online
+        }
+
+        let masters = peerDevices.filter(\.isMasterDevice)
+        let masterCandidates = masters.isEmpty ? peerDevices : masters
+        for device in masterCandidates {
+            if try await peerCanSupplyCurveOneTimeKey(
+                secretName: secretName,
+                deviceId: device.deviceId) {
+                return device
+            }
+        }
+
+        for device in peerDevices {
+            if try await peerCanSupplyCurveOneTimeKey(
+                secretName: secretName,
+                deviceId: device.deviceId) {
+                return device
+            }
+        }
+
+        if let preferredOnlineId,
+           let online = peerDevices.first(where: { $0.deviceId == preferredOnlineId }) {
+            return online
+        }
+
+        return masterCandidates.first
+    }
+
+    /// True when the peer still has at least one published curve OTK id on the server.
+    internal func peerHasPublishedCurveOneTimeKey(
+        secretName: String,
+        deviceId: UUID
+    ) async throws -> Bool {
+        guard let transportDelegate else { return false }
+        let curveIds = try await transportDelegate.fetchOneTimeKeyIdentities(
+            for: secretName,
+            deviceId: deviceId.uuidString,
+            type: .curve)
+        return !curveIds.isEmpty
+    }
+
+    /// True when the peer has a published curve OTK that can be verified from live configuration.
+    internal func peerCanSupplyCurveOneTimeKey(
+        secretName: String,
+        deviceId: UUID
+    ) async throws -> Bool {
+        guard let transportDelegate else { return false }
+        let configuration = try await transportDelegate.findConfiguration(for: secretName)
+        let accountSigningPublicKey = try Curve25519.Signing.PublicKey(
+            rawRepresentation: configuration.signingPublicKey)
+        guard let accountSignedDevice = configuration.signedDevices.first(where: {
+            (try? $0.verified(using: accountSigningPublicKey))?.deviceId == deviceId
+        }),
+              let verifiedDevice = try accountSignedDevice.verified(using: accountSigningPublicKey)
+        else {
+            return false
+        }
+        let device = try configuration.deviceWithCurrentKeyBundle(verifiedDevice)
+        let curveIds = try await transportDelegate.fetchOneTimeKeyIdentities(
+            for: secretName,
+            deviceId: deviceId.uuidString,
+            type: .curve)
+        return try resolvePublishedCurveOneTimeKey(
+            curveIds: curveIds,
+            configuration: configuration,
+            device: device) != nil
+    }
+
+    /// Creates a peer session-identity row when a contact exists but no encryptable row was cached yet.
+    internal func ensurePeerSessionIdentityRow(for secretName: String) async throws {
+        let identities = try await getSessionIdentities(with: secretName)
+        guard identities.isEmpty else { return }
+        logger.log(
+            level: .info,
+            message: "ensurePeerSessionIdentityRow: creating missing peer identity row for \(secretName)")
+        _ = try await refreshIdentities(
+            secretName: secretName,
+            createIdentity: true,
+            forceRefresh: false,
+            sendOneTimeIdentities: false)
+    }
+
+    /// True when an active peer identity row can encrypt outbound control traffic.
+    internal func peerHasEncryptableSessionForControl(
+        secretName: String,
+        deviceId: UUID
+    ) async throws -> Bool {
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let identities = try await getSessionIdentities(with: secretName)
+        for identity in identities {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard props.deviceId == deviceId, props.state != nil else { continue }
+            return true
+        }
+        return false
+    }
+
+    /// Deletes every active and archived session-identity row for a peer and clears handshake state.
+    ///
+    /// Call from contact removal so re-adding the same peer starts from a clean cryptographic slate.
+    func wipePeerRelationshipState(secretName: String) async throws {
+        guard let cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let identities = try await cache.fetchSessionIdentities()
+        var deletedCount = 0
+        for identity in identities {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard props.secretName == secretName else { continue }
+            try await cache.deleteSessionIdentity(identity.id)
+            deletedCount += 1
+        }
+        clearPeerTransientState(secretName: secretName)
+        logger.log(
+            level: .info,
+            message: "wipePeerRelationshipState: removed \(deletedCount) session identity row(s) and transient handshake state for \(secretName)")
+    }
+
+    /// Re-promotes the newest archived peer ratchet when accept bootstrap left only a state-less row.
+    internal func restoreEncryptablePeerSessionFromArchiveIfNeeded(
+        secretName: String,
+        deviceId: UUID
+    ) async throws {
+        if try await peerHasEncryptableSessionForControl(secretName: secretName, deviceId: deviceId) {
+            return
+        }
+
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let archived = try await fetchArchivedSessionIdentities(secretName: secretName, deviceId: deviceId)
+        guard let source = await archived.asyncFirst(where: { identity in
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
+            return props.state != nil
+        }),
+              let archivedProps = await source.props(symmetricKey: symmetricKey) else {
+            logger.log(
+                level: .warning,
+                message: "restoreEncryptablePeerSessionFromArchiveIfNeeded: no archived encryptable peer session for \(secretName) deviceId=\(deviceId)")
+            return
+        }
+
+        guard let cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+
+        let inactivePrefix = PQSSessionConstants.inactiveSessionDeviceNamePrefix
+        let restoredDeviceName = archivedProps.deviceName.hasPrefix(inactivePrefix)
+            ? String(archivedProps.deviceName.dropFirst(inactivePrefix.count))
+            : archivedProps.deviceName
+
+        let allIdentities = try await cache.fetchSessionIdentities()
+        for identity in allIdentities {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard props.secretName == secretName,
+                  props.deviceId == deviceId,
+                  !props.deviceName.hasPrefix(inactivePrefix) else { continue }
+            try await cache.deleteSessionIdentity(identity.id)
+        }
+
+        var generatedSessionContextIds = Set<Int>()
+        for identity in allIdentities {
+            if let props = await identity.props(symmetricKey: symmetricKey) {
+                generatedSessionContextIds.insert(props.sessionContextId)
+            }
+        }
+        var sessionContextId: Int
+        repeat {
+            sessionContextId = Int.random(in: 1 ..< Int.max)
+        } while generatedSessionContextIds.contains(sessionContextId)
+
+        let restored = try SessionIdentity(
+            id: UUID(),
+            props: .init(
+                secretName: archivedProps.secretName,
+                deviceId: archivedProps.deviceId,
+                sessionContextId: sessionContextId,
+                longTermPublicKey: archivedProps.longTermPublicKey,
+                signingPublicKey: archivedProps.signingPublicKey,
+                mlKEMPublicKey: archivedProps.mlKEMPublicKey,
+                oneTimePublicKey: archivedProps.oneTimePublicKey,
+                state: archivedProps.state,
+                deviceName: restoredDeviceName,
+                serverTrusted: archivedProps.serverTrusted,
+                previousRekey: archivedProps.previousRekey,
+                isMasterDevice: archivedProps.isMasterDevice,
+                verifiedIdentity: archivedProps.verifiedIdentity,
+                verificationCode: archivedProps.verificationCode),
+            symmetricKey: symmetricKey)
+        try await cache.createSessionIdentity(restored)
+        removeIdentity(with: secretName)
+        logger.log(
+            level: .info,
+            message: "restoreEncryptablePeerSessionFromArchiveIfNeeded: restored active peer session from archive for \(secretName) deviceId=\(deviceId)")
+    }
+
+    /// Waits briefly for the peer to replenish published OTKs. Returns whether keys are available.
+    internal func awaitPeerReplenishCompletion(
+        secretName: String,
+        deviceId: UUID,
+        maxWait: TimeInterval? = nil
+    ) async -> Bool {
+        let waitBudget = maxWait ?? peerOneTimeReplenishWaitTimeout
+        if (try? await peerCanSupplyCurveOneTimeKey(secretName: secretName, deviceId: deviceId)) == true {
+            return true
+        }
+        if peerOneTimeReplenishAcknowledgedPeers.remove(secretName) != nil {
+            if (try? await peerCanSupplyCurveOneTimeKey(secretName: secretName, deviceId: deviceId)) == true {
+                return true
+            }
+        }
+
+        let timeoutTask = Task { [secretName, deviceId, waitBudget] in
+            try await Task.sleep(nanoseconds: UInt64(waitBudget * 1_000_000_000))
+            await self.cancelPeerOneTimeReplenishWait(secretName: secretName, deviceId: deviceId)
+        }
+        defer { timeoutTask.cancel() }
+
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            peerOneTimeReplenishWaiters[secretName] = continuation
+        }
+
+        return (try? await peerCanSupplyCurveOneTimeKey(secretName: secretName, deviceId: deviceId)) == true
+    }
+
+    internal func cancelPeerOneTimeReplenishWait(secretName: String, deviceId: UUID) async {
+        guard let waiter = peerOneTimeReplenishWaiters.removeValue(forKey: secretName) else { return }
+        waiter.resume()
+    }
+
+    internal func completePeerPublishedOneTimeKeysReplenishmentWait(secretName: String) {
+        if let waiter = peerOneTimeReplenishWaiters.removeValue(forKey: secretName) {
+            waiter.resume()
+        } else {
+            peerOneTimeReplenishAcknowledgedPeers.insert(secretName)
+        }
+    }
+
+    /// Ensures this device has published curve and ML-KEM one-time keys on the server.
+    /// Call after the transport/API path is viable (e.g. IRC `registered("true")`).
+    func ensurePublishedOneTimeKeysOnServerIfNeeded() async {
+        guard isViable else {
+            logger.log(
+                level: .info,
+                message: "ensurePublishedOneTimeKeysOnServerIfNeeded: deferring until session transport is viable")
+            return
+        }
+        guard let transportDelegate, let sessionContext = await sessionContext else { return }
+        let secretName = sessionContext.sessionUser.secretName
+        let deviceId = sessionContext.sessionUser.deviceId.uuidString
+        do {
+            let curveIds = try await transportDelegate.fetchOneTimeKeyIdentities(
+                for: secretName,
+                deviceId: deviceId,
+                type: .curve)
+            let mlKEMIds = try await transportDelegate.fetchOneTimeKeyIdentities(
+                for: secretName,
+                deviceId: deviceId,
+                type: .mlKEM)
+            if curveIds.isEmpty || mlKEMIds.isEmpty {
+                logger.log(
+                    level: .info,
+                    message: "ensurePublishedOneTimeKeysOnServerIfNeeded: server pool empty; replenishing for \(secretName)")
+                async let curveRefresh = refreshOneTimeKeysTask(policy: .replenishBatch)
+                async let mlKEMRefresh = refreshMLKEMOneTimeKeysTask(policy: .replenishBatch)
+                _ = await (curveRefresh, mlKEMRefresh)
+            }
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "ensurePublishedOneTimeKeysOnServerIfNeeded failed for \(secretName): \(error)")
+        }
+    }
+
+    /// Acknowledges that this device finished uploading a published OTK replenish batch.
+    internal func ackPublishedOneTimeKeysReplenished(to secretName: String) async throws {
+        let metadata = try BinaryEncoder().encode(TransportEvent.publishedOneTimeKeysReplenished)
+        logger.log(
+            level: .info,
+            message: "ackPublishedOneTimeKeysReplenished: notifying \(secretName) that published one-time keys were replenished")
+        try await writeTextMessage(
+            recipient: .nickname(secretName),
+            transportInfo: metadata)
+        await waitForOutboundJobDrain()
+    }
+
+    /// Repair-only: asks the peer to replenish when accept bootstrap needs a published OTK.
+    internal func repairPeerPublishedOneTimeKeysIfPossible(
+        secretName: String,
+        deviceId: UUID
+    ) async throws {
+        guard try await !peerCanSupplyCurveOneTimeKey(secretName: secretName, deviceId: deviceId) else {
+            return
+        }
+        guard try await peerHasEncryptableSessionForControl(
+            secretName: secretName,
+            deviceId: deviceId) else {
+            logger.log(
+                level: .warning,
+                message: "repairPeerPublishedOneTimeKeysIfPossible: cannot request OTK replenish for \(secretName); no encryptable peer session row")
+            return
+        }
+        try await requestPeerToReplenishPublishedOneTimeKeys(secretName: secretName)
+        _ = await awaitPeerReplenishCompletion(secretName: secretName, deviceId: deviceId)
+    }
+
+    /// Asks the peer to upload a fresh published OTK batch before accept bootstrap retries.
+    /// Uses the current session row so the control packet can encrypt before identity reset.
+    internal func requestPeerToReplenishPublishedOneTimeKeys(secretName: String) async throws {
+        let now = Date()
+        if let last = lastPeerOneTimeRefreshRequestAt[secretName],
+           now.timeIntervalSince(last) < peerOneTimeRefreshRequestCooldown {
+            logger.log(
+                level: .info,
+                message: "requestPeerToReplenishPublishedOneTimeKeys: skipping duplicate refresh request for \(secretName)")
+            return
+        }
+        lastPeerOneTimeRefreshRequestAt[secretName] = now
+
+        let metadata = try BinaryEncoder().encode(TransportEvent.refreshOneTimeKeys)
+        logger.log(
+            level: .info,
+            message: "requestPeerToReplenishPublishedOneTimeKeys: asking \(secretName) to replenish published one-time keys")
+        try await writeTextMessage(
+            recipient: .nickname(secretName),
+            transportInfo: metadata)
+        await waitForOutboundJobDrain()
+        logger.log(
+            level: .info,
+            message: "requestPeerToReplenishPublishedOneTimeKeys: refresh control queued for \(secretName)")
+    }
+
+    /// Resolves peer OTK material from the published pool without consuming server keys.
+    internal func attachPublishedPeerOneTimeKeys(
+        to props: inout SessionIdentity.UnwrappedProps,
+        secretName: String,
+        device: UserDeviceConfiguration,
+        configuration: UserConfiguration
+    ) async throws {
+        guard let transportDelegate else {
+            throw PQSSession.SessionErrors.transportNotInitialized
+        }
+
+        let curveIds = try await transportDelegate.fetchOneTimeKeyIdentities(
+            for: secretName,
+            deviceId: device.deviceId.uuidString,
+            type: .curve)
+        if let signedCurve = try resolvePublishedCurveOneTimeKey(
+            curveIds: curveIds,
+            configuration: configuration,
+            device: device) {
+            props.oneTimePublicKey = signedCurve
+        } else {
+            props.oneTimePublicKey = nil
+        }
+
+        let mlKEMIds = try await transportDelegate.fetchOneTimeKeyIdentities(
+            for: secretName,
+            deviceId: device.deviceId.uuidString,
+            type: .mlKEM)
+        let deviceSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
+        if let signedMLKEM = try resolvePublishedMLKEMOneTimeKey(
+            mlKEMIds: mlKEMIds,
+            configuration: configuration,
+            deviceSigningPublicKey: deviceSigningPublicKey) {
+            props.mlKEMPublicKey = signedMLKEM
+        } else {
+            props.mlKEMPublicKey = device.finalMLKEMPublicKey
+        }
+    }
+
+    private func resolvePublishedCurveOneTimeKey(
+        curveIds: [UUID],
+        configuration: UserConfiguration,
+        device: UserDeviceConfiguration
+    ) throws -> CurvePublicKey? {
+        let deviceSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
+        for curveId in curveIds.reversed() {
+            if let signedCurve = try configuration.signedOneTimePublicKeys
+                .first(where: { $0.id == curveId })?
+                .verified(using: deviceSigningPublicKey) {
+                return signedCurve
+            }
+        }
+        return nil
+    }
+
+    private func resolvePublishedMLKEMOneTimeKey(
+        mlKEMIds: [UUID],
+        configuration: UserConfiguration,
+        deviceSigningPublicKey: Curve25519.Signing.PublicKey
+    ) throws -> MLKEMPublicKey? {
+        for mlKEMId in mlKEMIds.reversed() {
+            if let signedMLKEM = try configuration.signedMLKEMOneTimePublicKeys
+                .first(where: { $0.id == mlKEMId })?
+                .verified(using: deviceSigningPublicKey) {
+                return signedMLKEM
+            }
+        }
+        return nil
+    }
+
+    /// Returns the active (non-archived) session identity used for outbound traffic
+    /// to one peer device, refreshing identities when none is cached yet.
+    internal func activeSessionIdentityForPeer(
+        secretName: String,
+        deviceId: UUID,
+        sendOneTimeIdentities: Bool = false
+    ) async throws -> SessionIdentity {
+        let symmetricKey = try await getDatabaseSymmetricKey()
+
+        func matchingIdentity(in identities: [SessionIdentity]) async -> SessionIdentity? {
+            for identity in identities {
+                guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+                if props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) {
+                    continue
+                }
+                if props.secretName == secretName, props.deviceId == deviceId {
+                    return identity
+                }
+            }
+            return nil
+        }
+
+        var identities = try await getSessionIdentities(with: secretName)
+        if let identity = await matchingIdentity(in: identities) {
+            return identity
+        }
+
+        _ = try await refreshIdentities(
+            secretName: secretName,
+            forceRefresh: true,
+            sendOneTimeIdentities: sendOneTimeIdentities)
+        identities = try await getSessionIdentities(with: secretName)
+        guard let identity = await matchingIdentity(in: identities) else {
+            throw PQSSession.SessionErrors.missingSessionIdentity
+        }
+        return identity
+    }
+
+
+
     /// Retrieves session identities associated with a specified recipient name.
     /// This method filters out identities that do not match the recipient name or are the current user's identities.
     /// - Parameter recipientName: The name of the recipient for which to retrieve identities.
@@ -636,6 +1360,7 @@ public extension PQSSession {
                 secretName: secretName,
                 source: "remote")
             var collected = [UserDeviceConfiguration]()
+            var oneTimeNotifiedDeviceIds = Set<UUID>()
             // Create a set of existing device IDs from the existing identities for quick lookup
             let existingDeviceIds = await Set(identities.asyncCompactMap {
                 await $0.props(symmetricKey: symmetricKey)?.deviceId
@@ -677,20 +1402,20 @@ public extension PQSSession {
                     logger.log(level: .info, message: "Created Session Identity: \(identity)")
                     identities.append(identity)
 
-                    if let curveId = curve?.id {
+                    // OTK handshake must target the peer master only. Ghost / non-master
+                    // rows in a published account config must not consume the notify lane.
+                    if sendOneTimeIdentities,
+                       !isSelfSecretName,
+                       device.isMasterDevice,
+                       let curveId = curve?.id {
                         try await notifyIdentityCreation(
                             for: secretName,
                             curveId: curveId.uuidString,
                             mlKEMId: mlKEM.id.uuidString)
+                        oneTimeNotifiedDeviceIds.insert(device.deviceId)
                     }
                 }
             }
-
-            // This will get all identities that are the recipient name and a child device.
-            let newfilter = try await getSessionIdentities(with: secretName)
-            let newDeviceIds = await Set(newfilter.asyncCompactMap {
-                await $0.props(symmetricKey: symmetricKey)?.deviceId
-            })
 
             guard let localConfiguration = await sessionContext?.activeUserConfiguration else { return [] }
             let myDevices = try verifiedDevicesWithUsableKeyMaterial(
@@ -699,38 +1424,11 @@ public extension PQSSession {
                 source: "local")
             verifiedDevices.append(contentsOf: myDevices)
 
-            for deviceId in newDeviceIds {
-                let isVerified = verifiedDevices.contains { verifiedDevice in
-                    verifiedDevice.deviceId == deviceId
-                }
-
-                if !isVerified {
-                    logger.log(level: .info, message: "Will remove stale session identity for recipient: \(secretName)")
-                    // If our current list in the DB contains a session identity that is not in the master list, we need to remove it.
-                    if let identityToRemove = await identities.asyncFirst(where: { element in
-                        // Try to get the properties for each element.
-                        guard let props = await element.props(symmetricKey: symmetricKey) else {
-                            return false
-                        }
-                        // Compare the deviceIds; make sure deviceId is available in this scope.
-                        return props.deviceId == deviceId
-                    }) {
-                        do {
-                            try await cache?.deleteSessionIdentity(identityToRemove.id)
-                            logger.log(level: .info, message: "Did remove stale session identity for recipient: \(secretName)")
-
-                            // Remove the identity from the identities array.
-                            if let index = identities.firstIndex(where: { identity in
-                                identity.id == identityToRemove.id
-                            }) {
-                                identities.remove(at: index)
-                            }
-                        } catch {
-                            logger.log(level: .warning, message: "Failed to delete stale session identity for recipient \(secretName): \(error)")
-                        }
-                    }
-                }
-            }
+            await pruneStaleSessionIdentities(
+                secretName: secretName,
+                identities: &identities,
+                verifiedDeviceIds: Set(verifiedDevices.map(\.deviceId)),
+                symmetricKey: symmetricKey)
 
             
             for foundIdentity in await identities.asyncFilter( { await $0.props(symmetricKey: symmetricKey)?.secretName == secretName }) {
@@ -756,6 +1454,15 @@ public extension PQSSession {
                                 identity.id == foundIdentity.id
                             })
                             identities.append(replacement)
+                            if sendOneTimeIdentities {
+                                try await deliverOneTimeIdentityNotifyIfNeeded(
+                                    secretName: secretName,
+                                    device: device,
+                                    configuration: configuration,
+                                    identity: replacement,
+                                    symmetricKey: symmetricKey,
+                                    alreadyNotified: &oneTimeNotifiedDeviceIds)
+                            }
                             break
                         }
 
@@ -764,36 +1471,11 @@ public extension PQSSession {
                         
                         if forceRefresh, currentProps.state == nil {
                             do {
-                                let deviceSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
-                                // Curve one-time keys are optional.
-                                let curveIds = try await transportDelegate.fetchOneTimeKeyIdentities(
-                                    for: secretName,
-                                    deviceId: device.deviceId.uuidString,
-                                    type: .curve)
-                                
-                                if let curveId = curveIds.last,
-                                   let signedCurve = try configuration.signedOneTimePublicKeys
-                                       .first(where: { $0.id == curveId })?
-                                       .verified(using: deviceSigningPublicKey) {
-                                    currentProps.oneTimePublicKey = signedCurve
-                                } else {
-                                    currentProps.oneTimePublicKey = nil
-                                }
-
-                                // MLKEM key is required; prefer one-time, fall back to final.
-                                let mlKEMIds = try await transportDelegate.fetchOneTimeKeyIdentities(
-                                    for: secretName,
-                                    deviceId: device.deviceId.uuidString,
-                                    type: .mlKEM)
-                                
-                                if let mlKEMId = mlKEMIds.last,
-                                   let signedMLKEM = try configuration.signedMLKEMOneTimePublicKeys
-                                       .first(where: { $0.id == mlKEMId })?
-                                       .verified(using: deviceSigningPublicKey) {
-                                    currentProps.mlKEMPublicKey = signedMLKEM
-                                } else {
-                                    currentProps.mlKEMPublicKey = device.finalMLKEMPublicKey
-                                }
+                                try await attachPublishedPeerOneTimeKeys(
+                                    to: &currentProps,
+                                    secretName: secretName,
+                                    device: device,
+                                    configuration: configuration)
                             } catch {
                                 logger.log(level: .warning, message: "Failed to refresh one-time keys for \(secretName) (\(device.deviceId)): \(error)")
                             }
@@ -806,6 +1488,17 @@ public extension PQSSession {
                         try await cache?.updateSessionIdentity(foundIdentity)
                         if let index = identities.firstIndex(where: { $0.id == foundIdentity.id }) {
                             identities[index] = foundIdentity
+                        }
+                        if sendOneTimeIdentities,
+                           !isSelfSecretName,
+                           device.deviceId != sessionUser.deviceId {
+                            try await deliverOneTimeIdentityNotifyIfNeeded(
+                                secretName: secretName,
+                                device: device,
+                                configuration: configuration,
+                                identity: foundIdentity,
+                                symmetricKey: symmetricKey,
+                                alreadyNotified: &oneTimeNotifiedDeviceIds)
                         }
                         break
                     }
@@ -988,6 +1681,57 @@ public extension PQSSession {
     /// cryptographic keys. This allows other users to discover and establish
     /// communication with the new identity.
     ///
+    /// Sends OTK notify for a peer identity row that already exists but has no outbound ratchet
+    /// state yet. `sendOneTimeIdentities` previously only notified on brand-new device rows;
+    /// bootstrap paths that reset a stale row first need this follow-up notify.
+    private func deliverOneTimeIdentityNotifyIfNeeded(
+        secretName: String,
+        device: UserDeviceConfiguration,
+        configuration: UserConfiguration,
+        identity: SessionIdentity,
+        symmetricKey: SymmetricKey,
+        alreadyNotified: inout Set<UUID>
+    ) async throws {
+        guard !alreadyNotified.contains(device.deviceId) else { return }
+        // Peer OTK handshake is master-scoped; ghost devices stay in the account
+        // config after reinstall and must not receive (or burn) the notify.
+        guard device.isMasterDevice else {
+            logger.log(
+                level: .debug,
+                message: "refreshSessionIdentities: skipping OTK notify for non-master \(secretName) deviceId=\(device.deviceId)")
+            return
+        }
+        guard var props = await identity.props(symmetricKey: symmetricKey) else { return }
+        guard props.state == nil else { return }
+
+        if props.oneTimePublicKey == nil {
+            try await attachPublishedPeerOneTimeKeys(
+                to: &props,
+                secretName: secretName,
+                device: device,
+                configuration: configuration)
+            try await identity.updateIdentityProps(symmetricKey: symmetricKey, props: props)
+            try await cache?.updateSessionIdentity(identity)
+        }
+
+        guard let recipientCurveId = props.oneTimePublicKey?.id.uuidString else {
+            logger.log(
+                level: .warning,
+                message: "refreshSessionIdentities: skipping OTK notify for \(secretName) deviceId=\(device.deviceId); no peer curve OTK available")
+            return
+        }
+
+        let recipientMLKEMId = props.mlKEMPublicKey.id.uuidString
+        try await notifyIdentityCreation(
+            for: secretName,
+            curveId: recipientCurveId,
+            mlKEMId: recipientMLKEMId)
+        alreadyNotified.insert(device.deviceId)
+        logger.log(
+            level: .info,
+            message: "refreshSessionIdentities: delivered OTK notify for existing state-less identity \(secretName) deviceId=\(device.deviceId)")
+    }
+
     /// - Parameters:
     ///   - secretName: The secret name of the newly created identity
     ///   - curveId: The initial one-time Curve Key Id associated with the new identity
@@ -1009,6 +1753,9 @@ public extension PQSSession {
             text: "",
             transportInfo: metadata,
             metadata: metadata)
+        logger.log(
+            level: .info,
+            message: "Sent notifyIdentityCreation outbound to nickname(\"\(secretName)\") curveId=\(curveId)")
     }
     
     private func synchronizeActiveUserConfiguration(_ configuration: UserConfiguration) async throws {

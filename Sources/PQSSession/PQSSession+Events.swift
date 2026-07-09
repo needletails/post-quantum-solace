@@ -256,7 +256,7 @@ public extension PQSSession {
         from senderName: String,
         deviceId senderDeviceId: UUID,
         failedSharedMessageIds: [String]
-    ) async throws -> [String] {
+    ) async throws -> PQSSession.OutOfBandResendResult {
         try await taskProcessor.handleOutOfBandResendRequest(
             from: senderName,
             deviceId: senderDeviceId,
@@ -323,6 +323,8 @@ public extension PQSSession {
                 case .synchronizeOneTimeKeys(_):
                     shouldPersist = false
                 case .refreshOneTimeKeys:
+                    shouldPersist = false
+                case .publishedOneTimeKeysReplenished:
                     shouldPersist = false
                 case .requestMessageResend(_):
                     shouldPersist = false
