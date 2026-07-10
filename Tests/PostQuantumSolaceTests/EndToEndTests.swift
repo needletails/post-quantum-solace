@@ -780,13 +780,9 @@ actor EndToEndTests {
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
-        try await createFriendship(
-            aliceSession: _senderMaxSkipSession,
-            sd: sd,
-            bobSession: _recipientMaxSkipSession,
-            rsd: rsd)
-        
-        // Receive loops
+
+        // Receive loops must run before friendship bootstrap so OTK notify and the
+        // friendship packet are processed as they arrive (Linux CI is slower here).
         aliceTask = Task {
             await #expect(throws: Never.self) {
                 for await received in aliceStream {
@@ -839,6 +835,31 @@ actor EndToEndTests {
                 }
             }
         }
+
+        try await createFriendship(
+            aliceSession: _senderMaxSkipSession,
+            sd: sd,
+            bobSession: _recipientMaxSkipSession,
+            rsd: rsd)
+
+        let aliceDeviceId = try #require(await _senderMaxSkipSession.sessionContext?.sessionUser.deviceId)
+        let friendshipReadyDeadline = Date().addingTimeInterval(15)
+        while Date() < friendshipReadyDeadline {
+            let outboundReady = try await _senderMaxSkipSession.hasInitializedOutboundRatchetForPeer("bob")
+            let inboundReady = await _recipientMaxSkipSession.hasActiveInboundSessionIdentity(
+                secretName: "alice",
+                deviceId: aliceDeviceId)
+            if outboundReady, inboundReady { break }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        #expect(
+            try await _senderMaxSkipSession.hasInitializedOutboundRatchetForPeer("bob"),
+            "Alice outbound ratchet should be ready before post-rotation send")
+        #expect(
+            await _recipientMaxSkipSession.hasActiveInboundSessionIdentity(
+                secretName: "alice",
+                deviceId: aliceDeviceId),
+            "Bob inbound ratchet should be ready before post-rotation send")
         
         // Rotate both sides with 2s sleep after each so reestablishment is processed before sending
         // (longer delay when run in batch after other tests that share session state)
@@ -8141,12 +8162,9 @@ actor EndToEndTests {
 
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-        try await createFriendship(
-            aliceSession: _senderSession,
-            sd: sd,
-            bobSession: _recipientSession,
-            rsd: rsd)
 
+        // Receive loops must be live before friendship bootstrap so OTK notify is processed
+        // as it arrives. Fixed sleeps are not enough on slower Linux runners.
         aliceTask = Task {
             for await received in aliceStream {
                 _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -8172,6 +8190,23 @@ actor EndToEndTests {
             }
         }
 
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        let aliceDeviceId = try #require(await _senderSession.sessionContext?.sessionUser.deviceId)
+        let friendshipReadyDeadline = Date().addingTimeInterval(15)
+        while Date() < friendshipReadyDeadline {
+            let outboundReady = try await _senderSession.hasInitializedOutboundRatchetForPeer("bob")
+            let inboundReady = await _recipientSession.hasActiveInboundSessionIdentity(
+                secretName: "alice",
+                deviceId: aliceDeviceId)
+            if outboundReady, inboundReady { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
         _ = try await _senderSession.refreshIdentities(
             secretName: rMockUserData.rsn,
             forceRefresh: true,
@@ -8188,7 +8223,10 @@ actor EndToEndTests {
             recipient: .nickname("bob"),
             text: "baseline"
         )
-        try await Task.sleep(for: .milliseconds(500))
+        for _ in 0..<40 {
+            if try await _recipientSession.hasInitializedOutboundRatchetForPeer("alice") { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
 
         // Old message: sent clean but captured by shouldDeliver (not delivered to Bob).
         // Arm capture after the baseline has established state so control/repair timing
@@ -8211,6 +8249,14 @@ actor EndToEndTests {
         #expect(await probe.getCaptured() != nil,
                 "Old message should have been captured by shouldDeliver")
 
+        // Stop Alice's receive loop before reconciliation so concurrent recovery controls
+        // cannot re-initialize Bob's active identity while we assert archive-fallback
+        // invariants. That race is timing-sensitive and fails on slower Linux runners
+        // even when archive fallback itself is correct. Keep aliceTransport.continuation
+        // open so the captured old message can still be yielded into Bob's stream.
+        aliceTask?.cancel()
+        aliceTask = nil
+
         // Simulate what reconciliation does on Bob's side:
         // 1. Archive current ratchet state for alice
         try await _recipientSession.createInactiveSessionSnapshot(
@@ -8220,6 +8266,7 @@ actor EndToEndTests {
         // 2. Clear the active ratchet state (set state=nil) for alice's identity
         let bobCache = await _recipientSession.cache!
         let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
+        var clearedActiveIdentityIds = Set<UUID>()
         for identity in try await bobCache.fetchSessionIdentities() {
             guard var props = await identity.props(symmetricKey: bobSymKey) else { continue }
             guard props.secretName == sMockUserData.ssn else { continue }
@@ -8228,6 +8275,7 @@ actor EndToEndTests {
             props.state = nil
             try await identity.updateIdentityProps(symmetricKey: bobSymKey, props: props)
             try await bobCache.updateSessionIdentity(identity)
+            clearedActiveIdentityIds.insert(identity.id)
         }
         // Clear memoization so next access re-reads from cache.
         await _recipientSession.removeIdentity(with: sMockUserData.ssn)
@@ -8252,11 +8300,12 @@ actor EndToEndTests {
             "Old message encrypted with previous keys should be decrypted from the archived snapshot"
         )
 
+        // Assert only against the active rows we cleared. Archive fallback may replace the
+        // object identity; any later recovery-created row is outside this invariant.
         var activeStateWasMutated = false
         for identity in try await bobCache.fetchSessionIdentities() {
+            guard clearedActiveIdentityIds.contains(identity.id) else { continue }
             guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
-            guard props.secretName == sMockUserData.ssn else { continue }
-            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
             if props.state != nil {
                 activeStateWasMutated = true
             }
