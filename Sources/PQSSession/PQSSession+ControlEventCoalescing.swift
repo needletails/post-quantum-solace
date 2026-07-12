@@ -218,10 +218,12 @@ extension PQSSession {
         }
 
         do {
+            // Do not consume a server OTK just to emit repair controls — that is what
+            // caused multi-device recovery to thrash OTKs into HTTP 409 conflicts.
             _ = try await resetSessionIdentityForFreshSession(
                 secretName: secretName,
                 deviceId: deviceId,
-                sendOneTimeIdentities: true)
+                sendOneTimeIdentities: false)
             markReconciliationAttempt(
                 sender: secretName,
                 deviceId: deviceId,

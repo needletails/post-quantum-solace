@@ -1552,10 +1552,12 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     sender: senderName,
                     deviceId: senderDeviceId,
                     flow: .outbound) {
+            // Resend repair must not consume a fresh OTK per request; reuse/repair
+            // with published keys and let outbound bootstrap consume at most once.
             identity = try await session.resetSessionIdentityForFreshSession(
                 secretName: senderName,
                 deviceId: senderDeviceId,
-                sendOneTimeIdentities: true)
+                sendOneTimeIdentities: false)
             await session.markReconciliationAttempt(
                 sender: senderName,
                 deviceId: senderDeviceId,

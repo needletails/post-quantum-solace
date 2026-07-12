@@ -1173,6 +1173,13 @@ public extension PQSSession {
     /// This is the PostQuantumSolace-side session reestablishment primitive. A
     /// rotated peer key bundle must never be grafted onto an existing ratchet
     /// state; doing so leaves the ratchet with old state and new identity keys.
+    ///
+    /// - Important: One-time prekeys are used at most once, and only via the atomic
+    ///   server consume (`sendOneTimeIdentities: true`). Recovery / repair callers pass
+    ///   `false` and get a **nil** curve OTK — X3DH permits a bundle without a one-time
+    ///   prekey, with the final MLKEM key playing the signed-prekey role. Binding a
+    ///   published, un-consumed OTK is forbidden: two initiators can race onto the same
+    ///   key and the losing handshake fails with `ratchet.missingOneTimeKey` at the peer.
     @discardableResult
     internal func resetSessionIdentityForFreshSession(
         secretName: String,
@@ -1215,8 +1222,7 @@ public extension PQSSession {
 
         let allIdentities = try await cache.fetchSessionIdentities()
         var generatedSessionContextIds = Set<Int>()
-        var deletedActiveCount = 0
-        var archivedActiveCount = 0
+        var activeMatches: [(identity: SessionIdentity, props: SessionIdentity.UnwrappedProps)] = []
 
         for identity in allIdentities {
             guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
@@ -1225,24 +1231,34 @@ public extension PQSSession {
                   props.deviceId == deviceId,
                   !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
             else { continue }
-
-            if props.state != nil {
-                try await archiveActiveSessionIdentitySnapshot(
-                    props: props,
-                    symmetricKey: symmetricKey,
-                    cache: cache)
-                archivedActiveCount += 1
-            }
-
-            try await cache.deleteSessionIdentity(identity.id)
-            deletedActiveCount += 1
+            activeMatches.append((identity, props))
         }
 
-        var sessionContextId: Int
-        repeat {
-            sessionContextId = Int.random(in: 1 ..< Int.max)
-        } while generatedSessionContextIds.contains(sessionContextId)
+        // Repair-lane reuse: a prior repair may already have left a state-less row.
+        // Reuse it instead of tearing the row down again under concurrent recovery.
+        // Consume-lane callers (`sendOneTimeIdentities == true`) must fall through to
+        // the atomic OTK consume below so bootstrap semantics stay exact.
+        if !sendOneTimeIdentities,
+           let reusable = activeMatches.last(where: { $0.props.state == nil }),
+           activeMatches.allSatisfy({ $0.props.state == nil }) {
+            let keysMatchDevice =
+                reusable.props.longTermPublicKey == device.longTermPublicKey
+                && reusable.props.signingPublicKey == device.signingPublicKey
+            if keysMatchDevice {
+                // If the row already carries an OTK it was atomically consumed by an
+                // earlier bootstrap; keep it. Never attach published (non-consumed)
+                // OTKs here — that breaks the at-most-once one-time-prekey contract.
+                logger.log(
+                    level: .info,
+                    message: "Reusing existing state-less SessionIdentity for \(secretName) (\(device.deviceId)); repair lane does not consume OTKs")
+                return reusable.identity
+            }
+        }
 
+        // Acquire replacement key material BEFORE tearing down the active row.
+        // A failed OTK fetch must not leave the peer with no SessionIdentity.
+        // Repair lane (`sendOneTimeIdentities == false`) intentionally yields a nil
+        // curve OTK; the ratchet handshake proceeds on long-term + final MLKEM keys.
         let (curve, mlKEM) = try await createOneTimeKeys(
             secretName: secretName,
             deviceId: device.deviceId,
@@ -1250,6 +1266,27 @@ public extension PQSSession {
             mlKEMId: nil,
             configuration: configuration,
             fetchOneTimeKeys: sendOneTimeIdentities)
+
+        var deletedActiveCount = 0
+        var archivedActiveCount = 0
+
+        for match in activeMatches {
+            if match.props.state != nil {
+                try await archiveActiveSessionIdentitySnapshot(
+                    props: match.props,
+                    symmetricKey: symmetricKey,
+                    cache: cache)
+                archivedActiveCount += 1
+            }
+
+            try await cache.deleteSessionIdentity(match.identity.id)
+            deletedActiveCount += 1
+        }
+
+        var sessionContextId: Int
+        repeat {
+            sessionContextId = Int.random(in: 1 ..< Int.max)
+        } while generatedSessionContextIds.contains(sessionContextId)
 
         let identity = try await createEncryptableSessionIdentityModel(
             with: device,
@@ -1268,7 +1305,7 @@ public extension PQSSession {
 
         logger.log(
             level: .info,
-            message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); archived=\(archivedActiveCount) deletedActive=\(deletedActiveCount)")
+            message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); archived=\(archivedActiveCount) deletedActive=\(deletedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
 
         return identity
     }
@@ -1639,9 +1676,6 @@ public extension PQSSession {
         fetchOneTimeKeys: Bool
     ) async throws -> (curve: CurvePublicKey?, mlKEM: MLKEMPublicKey){
         
-        var curveId = curveId
-        var mlKEMId = mlKEMId
-        
         let accountSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: configuration.signingPublicKey)
         guard let accountSignedDevice = configuration.signedDevices.first(where: {
             (try? $0.verified(using: accountSigningPublicKey))?.deviceId == deviceId
@@ -1660,8 +1694,19 @@ public extension PQSSession {
             // On Contact Creation this will be false for the requester. The recipient will contained the passed identities, thus containing values.
         if fetchOneTimeKeys {
             let keys = try await transportDelegate.fetchOneTimeKeys(for: secretName, deviceId: deviceId.uuidString)
-            curveId = keys.curve?.id.uuidString
-            mlKEMId = keys.mlKEM?.id.uuidString
+            // Prefer the consumed key material itself. Looking up only by id against a
+            // stale findConfiguration snapshot can miss keys that were just consumed.
+            let consumedCurveId = keys.curve?.id.uuidString ?? curveId
+            let consumedMLKEMId = keys.mlKEM?.id.uuidString ?? mlKEMId
+            let fallbackCurve = try configuration.signedOneTimePublicKeys
+                .first(where: { $0.id.uuidString == consumedCurveId })?
+                .verified(using: deviceSigningPublicKey)
+            let fallbackMLKEM = try configuration.signedMLKEMOneTimePublicKeys
+                .first(where: { $0.id.uuidString == consumedMLKEMId })?
+                .verified(using: deviceSigningPublicKey)
+            let curvePublicKey = keys.curve ?? fallbackCurve
+            let mlKEMPublicKey = keys.mlKEM ?? fallbackMLKEM ?? currentDevice.finalMLKEMPublicKey
+            return (curvePublicKey, mlKEMPublicKey)
         }
         
         let curvePublicKey = try configuration.signedOneTimePublicKeys.first(where: { $0.id.uuidString == curveId })?.verified(using: deviceSigningPublicKey)

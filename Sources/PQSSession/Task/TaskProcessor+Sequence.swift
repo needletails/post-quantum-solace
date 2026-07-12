@@ -1015,15 +1015,18 @@ extension TaskProcessor {
             flow: .inbound)
         var resetSucceeded = false
         if canReset {
-            await session.markReconciliationAttempt(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId,
-                flow: .inbound)
             do {
+                // Repair must not consume a server OTK per decrypt failure. Attach
+                // published keys locally; the coalesced peerRefresh / first outbound
+                // bootstrap is the only place that should burn an OTK.
                 _ = try await session.resetSessionIdentityForFreshSession(
                     secretName: message.senderSecretName,
                     deviceId: message.senderDeviceId,
-                    sendOneTimeIdentities: true)
+                    sendOneTimeIdentities: false)
+                await session.markReconciliationAttempt(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId,
+                    flow: .inbound)
                 resetSucceeded = true
             } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
                 return try await handlePeerSigningKeyOutOfSync(
@@ -1167,10 +1170,12 @@ extension TaskProcessor {
         }
 
         do {
+            // Outbound repair only needs a fresh state-less row. Consuming an OTK
+            // here races with inbound recovery and depletes the peer's pool.
             let replacement = try await session.resetSessionIdentityForFreshSession(
                 secretName: props.secretName,
                 deviceId: props.deviceId,
-                sendOneTimeIdentities: true)
+                sendOneTimeIdentities: false)
             await session.markReconciliationAttempt(
                 sender: props.secretName,
                 deviceId: props.deviceId,

@@ -162,14 +162,13 @@ struct FriendshipFlowSourceTests {
         #expect(taskSource.contains("forceIdentityRefresh = true"))
         #expect(taskSource.contains("forceRefresh: forceIdentityRefresh"))
         #expect(taskSource.contains("if sendOneTimeIdentities"))
-        #expect(taskSource.contains("targetedSpecificDevice"))
-        #expect(taskSource.contains("!targetedSpecificDevice"))
+        #expect(taskSource.contains("restrictPeerFanoutToMasterDevices"))
         #expect(taskSource.contains("isMasterDevice == false"))
-        #expect(taskSource.contains("case .synchronizeOneTimeKeys:"))
-        #expect(taskSource.contains("return false"))
-        #expect(taskSource.contains("hadMaster"))
+        #expect(taskSource.contains("case .synchronizeOneTimeKeys = event"))
         #expect(taskSource.contains("OTK handshake: scoped to bootstrap target"))
         #expect(taskSource.contains("peerMasterDevice(for: nickname)"))
+        // Normal DM / channel / sibling fan-out must not strip linked child devices.
+        #expect(taskSource.contains("Prune peer ghosts before appending sibling identities"))
 
         let refreshBody = try PQSFriendshipSource.functionBody(
             named: "internal func refreshSessionIdentities",
@@ -238,6 +237,37 @@ struct FriendshipFlowSourceTests {
         #expect(inboundMerge.contains("passed.myState == .blockedByOther || passed.theirState == .blocked"))
     }
 
+    @Test("inbound decrypt recovery resets without consuming server OTKs")
+    func inboundDecryptRecoveryResetsWithoutConsumingServerOTKs() throws {
+        let source = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
+        #expect(source.contains("action=freshSessionRepairThenDeferredResend"))
+        #expect(source.contains("Repair must not consume a server OTK per decrypt failure"))
+        #expect(source.contains("sendOneTimeIdentities: false"))
+        // Cooldown is recorded only after a successful reset so a failed OTK/repair
+        // attempt can retry instead of being silenced for 15s.
+        #expect(source.contains("markReconciliationAttempt(\n                    sender: message.senderSecretName,\n                    deviceId: message.senderDeviceId,\n                    flow: .inbound)"))
+    }
+
+    @Test("fresh session reset preserves at-most-once one-time prekeys")
+    func freshSessionResetPreservesAtMostOnceOneTimePrekeys() throws {
+        let identitySource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession+SessionIdentity.swift")
+        let resetBody = try PQSFriendshipSource.functionBody(
+            named: "internal func resetSessionIdentityForFreshSession",
+            in: identitySource)
+        // Repair lane (`sendOneTimeIdentities == false`) gets a nil curve OTK; it must
+        // never bind a published, un-consumed OTK to the fresh row (two initiators can
+        // race onto the same key -> ratchet.missingOneTimeKey at the peer).
+        #expect(!resetBody.contains("attachPublishedPeerOneTimeKeys"))
+        #expect(resetBody.contains("at-most-once"))
+        // Reuse of an existing state-less row is repair-lane only; consume-lane callers
+        // must always reach the atomic server consume.
+        #expect(resetBody.contains("if !sendOneTimeIdentities,"))
+        // Key material is acquired before the active row is torn down.
+        let consumeIndex = try #require(resetBody.range(of: "createOneTimeKeys"))
+        let deleteIndex = try #require(resetBody.range(of: "deleteSessionIdentity"))
+        #expect(consumeIndex.lowerBound < deleteIndex.lowerBound)
+    }
+
     @Test("out-of-band resend reuses identity for recent control replay")
     func outOfBandResendReusesIdentityForRecentControlReplay() throws {
         let source = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
@@ -249,7 +279,8 @@ struct FriendshipFlowSourceTests {
         #expect(body.contains("flow: .outbound"))
         #expect(body.contains("isFriendshipStateControlMessage"))
         #expect(body.contains("staleFriendshipControl"))
-        #expect(!body.contains("let identity = try await session.resetSessionIdentityForFreshSession(\n            secretName: senderName,\n            deviceId: senderDeviceId,\n            sendOneTimeIdentities: true)"))
+        #expect(body.contains("sendOneTimeIdentities: false"))
+        #expect(!body.contains("sendOneTimeIdentities: true)"))
     }
 
     @Test("session cache delete is idempotent when row is already absent")
