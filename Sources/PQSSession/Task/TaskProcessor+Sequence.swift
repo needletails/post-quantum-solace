@@ -406,9 +406,13 @@ extension TaskProcessor {
                     return .deleted
                 }
 
-                if await session.hasPendingResendAfterReestablishment(
+                let hasPendingOTKRecovery = await session.hasPendingResendAfterReestablishment(
                     sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId) {
+                    deviceId: message.senderDeviceId)
+                let hasOpenOTKEpisode = await session.hasOpenReestablishmentEpisode(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId)
+                if hasPendingOTKRecovery || hasOpenOTKEpisode {
                     auditInboundDecryptFailure(
                         message: message,
                         failureClass: failureClass,
@@ -964,9 +968,13 @@ extension TaskProcessor {
             try await cache.deleteJob(job)
             return .deleted
         }
-        if await session.hasPendingResendAfterReestablishment(
+        let hasPendingRecovery = await session.hasPendingResendAfterReestablishment(
             sender: message.senderSecretName,
-            deviceId: message.senderDeviceId) {
+            deviceId: message.senderDeviceId)
+        let hasOpenEpisode = await session.hasOpenReestablishmentEpisode(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId)
+        if hasPendingRecovery || hasOpenEpisode {
             auditInboundDecryptFailure(
                 message: message,
                 failureClass: failureClass,
@@ -1009,16 +1017,21 @@ extension TaskProcessor {
             level: .warning,
             message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=freshSessionRepairThenDeferredResend\(diagnosticSuffix)")
 
-        let canReset = await session.canAttemptReconciliation(
+        // Single-flight: only one reset+peerRefresh leader per peer device episode.
+        let isEpisodeLeader = await session.tryBeginReestablishmentEpisode(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId)
+        let canAttempt = await session.canAttemptReconciliation(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId,
             flow: .inbound)
+        let canReset = isEpisodeLeader && canAttempt
         var resetSucceeded = false
         if canReset {
             do {
-                // Repair must not consume a server OTK per decrypt failure. Attach
-                // published keys locally; the coalesced peerRefresh / first outbound
-                // bootstrap is the only place that should burn an OTK.
+                // Repair must not consume a server OTK per decrypt failure. Nil curve
+                // OTK (X3DH without one-time prekey); coalesced peerRefresh / first
+                // outbound bootstrap is the only place that should burn an OTK.
                 _ = try await session.resetSessionIdentityForFreshSession(
                     secretName: message.senderSecretName,
                     deviceId: message.senderDeviceId,
@@ -1029,6 +1042,9 @@ extension TaskProcessor {
                     flow: .inbound)
                 resetSucceeded = true
             } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
+                await session.endReestablishmentEpisode(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId)
                 return try await handlePeerSigningKeyOutOfSync(
                     message: message,
                     job: job,
@@ -1037,6 +1053,10 @@ extension TaskProcessor {
             } catch {
                 logger.log(level: .warning, message: "Fresh session reset failed for \(message.senderSecretName) (\(message.senderDeviceId)): \(error)")
             }
+        } else if !isEpisodeLeader {
+            logger.log(
+                level: .info,
+                message: "Skipping inbound SessionIdentity reset for \(message.senderSecretName) (\(message.senderDeviceId)); reestablishment episode already open")
         } else {
             logger.log(level: .info, message: "Skipping inbound SessionIdentity reset for \(message.senderSecretName) (\(message.senderDeviceId)); reconciliation cooldown is active")
         }

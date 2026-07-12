@@ -243,9 +243,23 @@ struct FriendshipFlowSourceTests {
         #expect(source.contains("action=freshSessionRepairThenDeferredResend"))
         #expect(source.contains("Repair must not consume a server OTK per decrypt failure"))
         #expect(source.contains("sendOneTimeIdentities: false"))
+        #expect(source.contains("tryBeginReestablishmentEpisode"))
+        #expect(source.contains("hasOpenReestablishmentEpisode"))
         // Cooldown is recorded only after a successful reset so a failed OTK/repair
         // attempt can retry instead of being silenced for 15s.
         #expect(source.contains("markReconciliationAttempt(\n                    sender: message.senderSecretName,\n                    deviceId: message.senderDeviceId,\n                    flow: .inbound)"))
+    }
+
+    @Test("outbound user ciphertext is prioritized over control frames")
+    func outboundUserCiphertextIsPrioritizedOverControlFrames() throws {
+        let taskSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor.swift")
+        #expect(taskSource.contains("return isSelfRecipient ? .standard : .urgent"))
+        #expect(taskSource.contains("return .background"))
+        #expect(taskSource.contains("Sibling identity gather failed"))
+        let consumerSource = try PQSFriendshipSource.read(
+            "Sources/PQSSession/Utilities/NeedleTailAsyncConsumer+Extension.swift")
+        #expect(consumerSource.contains("feedConsumer(typedJob, priority: props.task.priority)"))
+        #expect(!consumerSource.contains("priority: .standard)"))
     }
 
     @Test("fresh session reset preserves at-most-once one-time prekeys")

@@ -67,57 +67,10 @@ extension NeedleTailAsyncConsumer {
         guard let typedJob = job as? T else {
             throw PQSSession.SessionErrors.propsError
         }
-        
-        let taskJob = TaskJob(item: typedJob, priority: .standard)
-        
-        // Always use sequence-based insertion to ensure FIFO ordering and prevent race conditions
-        await insertSequence(
-            taskJob,
-            sequenceId: props.sequenceId,
-            symmetricKey: symmetricKey
-        )
-    }
 
-    /// Inserts a task job into the deque at the appropriate position based on sequence ordering.
-    ///
-    /// This private method maintains the integrity of the task sequence by inserting new jobs
-    /// at the correct position based on their sequence ID. Jobs are ordered from lowest to
-    /// highest sequence ID to ensure proper processing order.
-    ///
-    /// - Parameters:
-    ///   - taskJob: The `TaskJob<T>` to be inserted into the deque.
-    ///   - sequenceId: The sequence identifier used to determine the insertion position.
-    ///     Lower sequence IDs are processed before higher ones.
-    ///   - symmetricKey: The `SymmetricKey` used for decrypting existing job properties
-    ///     to determine their sequence IDs for comparison.
-    ///
-    /// - Note: This method is asynchronous and performs cryptographic operations to
-    ///   decrypt job properties for sequence comparison. The insertion maintains the
-    ///   deque's ordered state based on sequence IDs.
-    ///
-    /// - Implementation Details:
-    ///   - Searches for the first job with a sequence ID greater than or equal to the new job
-    ///   - If no such job is found, the new job is inserted at the end of the deque
-    ///   - Uses `firstAsyncIndex(where:)` for efficient async searching
-    ///   - Maintains the deque's internal consistency during insertion
-    ///   - The entire operation is atomic to prevent race conditions
-    private func insertSequence(_ taskJob: TaskJob<T>, sequenceId: Int, symmetricKey: SymmetricKey) async {
-        // Since NeedleTailAsyncConsumer is an actor, all operations are atomic
-        // Find the index where the new job should be inserted
-        // `await` in the predicate lets other `NeedleTailAsyncConsumer` work run (actor reentrancy),
-        // e.g. `next()` popping the deque. The index from `firstAsyncIndex` can then be stale vs
-        // `deque.count`; `Deque.insert` preconditions on a valid offset — clamp before insert.
-        let rawIndex = await deque.firstAsyncIndex(where: {
-            guard let jobModel = $0.item as? JobModel,
-                  let props = await jobModel.props(symmetricKey: symmetricKey) else {
-                return false
-            }
-            let currentJobSequenceId = props.sequenceId
-            return currentJobSequenceId >= sequenceId // Find the first job with a sequence ID greater than or equal to the new job
-        }) ?? deque.count // If no such index is found, use the end of the deque
-
-        let insertIndex = min(max(0, rawIndex), deque.count)
-        deque.insert(taskJob, at: insertIndex)
+        // Honor EncryptableTask.priority so user ciphertext (.urgent) is not
+        // head-of-line blocked behind repair/control (.background) work.
+        await feedConsumer(typedJob, priority: props.task.priority)
     }
     
     /// Gracefully shuts down the consumer by clearing the deque and stopping processing.

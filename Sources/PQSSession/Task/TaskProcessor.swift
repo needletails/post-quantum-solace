@@ -390,8 +390,17 @@ public actor TaskProcessor {
             
             let isPersistable = await session.sessionDelegate?.shouldPersist(transportInfo: message.transportInfo) != false
             if isPersistable && !sendOneTimeIdentities {
-                let personalIdentities = try await gatherPersonalIdentities(session: session, sender: sender, logger: logger)
-                identities.append(contentsOf: personalIdentities)
+                // Sibling sync must not block or fail the peer DM fan-out. A missing
+                // personal SessionIdentity (SESSIONIDENTITYNOTFOUND) is recovered
+                // best-effort after the peer ciphertext jobs are already queued.
+                do {
+                    let personalIdentities = try await gatherPersonalIdentities(session: session, sender: sender, logger: logger)
+                    identities.append(contentsOf: personalIdentities)
+                } catch {
+                    logger.log(
+                        level: .warning,
+                        message: "Sibling identity gather failed for \(sender); continuing peer fan-out without linked-device sync: \(error)")
+                }
             }
             
             recipients.formUnion([sender, nickname])
@@ -848,7 +857,7 @@ public actor TaskProcessor {
         cache: SessionCache,
         session: PQSSession,
         symmetricKey: SymmetricKey,
-        sender _: String,
+        sender: String,
         recipients: Set<String>,
         sharedIdOverride: String? = nil,
         shouldPersist: Bool,
@@ -943,6 +952,22 @@ public actor TaskProcessor {
                     )
                 }
 
+                guard let identityProps = await identity.props(symmetricKey: symmetricKey) else {
+                    logger.log(level: .warning, message: "Skipping outbound task for unreadable recipient identity \(identity.id)")
+                    continue
+                }
+
+                // User-visible ciphertext to peers is urgent. Sibling sync and
+                // non-persisted control/repair frames stay lower so they cannot
+                // starve the conversation path (see production multi-device delay).
+                let isSelfRecipient = identityProps.secretName == sender
+                let taskPriority: Priority = {
+                    if shouldPersist {
+                        return isSelfRecipient ? .standard : .urgent
+                    }
+                    return .background
+                }()
+
                 if shouldPersist {
                     guard let encryptableMessage else { return }
                     guard let messageProps = persistedMessageProps else {
@@ -956,7 +981,8 @@ public actor TaskProcessor {
                             recipientIdentity: identity,
                             localId: encryptableMessage.id,
                             sharedId: encryptableMessage.sharedId
-                        )))
+                        )),
+                        priority: taskPriority)
                 } else {
                     if await session.sessionDelegate?.shouldFinishCommunicationSynchronization(message.transportInfo) == true {
                         guard !message.text.isEmpty else { return }
@@ -982,12 +1008,9 @@ public actor TaskProcessor {
                             localId: UUID(),
                             sharedId: sharedIdOverride ?? UUID().uuidString,
                             isPersistedOutbound: false
-                        ))
+                        )),
+                        priority: taskPriority
                     )
-                }
-                guard await identity.props(symmetricKey: symmetricKey) != nil else {
-                    logger.log(level: .warning, message: "Skipping outbound task for unreadable recipient identity \(identity.id)")
-                    continue
                 }
                 try await feedTask(task, session: session)
             } catch {

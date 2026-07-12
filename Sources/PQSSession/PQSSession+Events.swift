@@ -242,7 +242,8 @@ public extension PQSSession {
                 localId: UUID(),
                 sharedId: UUID().uuidString,
                 isPersistedOutbound: false
-            ))
+            )),
+            priority: .urgent
         )
     
         try await taskProcessor.feedTask(task, session: self)

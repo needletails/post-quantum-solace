@@ -331,6 +331,15 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Failed inbound messages whose replay should be requested only after the
     /// peer/device has completed the reestablishment round.
     var pendingResendAfterReestablishment: [String: PendingResendAfterReestablishment] = [:]
+
+    /// Open single-flight reestablishment episodes keyed by `"secretName|deviceUUID"`.
+    /// While an episode is open, additional decrypt failures for that peer device
+    /// coalesce into deferred resend instead of starting another identity reset.
+    var openReestablishmentEpisodes: [String: Date] = [:]
+
+    /// Maximum lifetime of a single-flight reestablishment episode before a new
+    /// leader is allowed. Bounds stuck recovery without timer-based retry loops.
+    let reestablishmentEpisodeTTL: TimeInterval = 90
     
     /// Cooldown for peer resend/refresh requests triggered by inbound failures.
     let peerResendRequestCooldown: TimeInterval = 15
@@ -734,6 +743,50 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         cleanupPendingResendAfterReestablishment(now: now)
         let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
         return pendingResendAfterReestablishment[requestKey] != nil
+    }
+
+    func reestablishmentEpisodeKey(sender: String, deviceId: UUID) -> String {
+        "\(sender)|\(deviceId.uuidString)"
+    }
+
+    func cleanupOpenReestablishmentEpisodes(now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-reestablishmentEpisodeTTL)
+        openReestablishmentEpisodes = openReestablishmentEpisodes.filter { _, startedAt in
+            startedAt > cutoff
+        }
+    }
+
+    /// `true` when a reestablishment episode for this peer device is already open.
+    func hasOpenReestablishmentEpisode(
+        sender: String,
+        deviceId: UUID,
+        now: Date = Date()
+    ) -> Bool {
+        cleanupOpenReestablishmentEpisodes(now: now)
+        return openReestablishmentEpisodes[reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)] != nil
+    }
+
+    /// Opens a single-flight episode. Returns `true` when this caller is the leader
+    /// (should attempt reset + peerRefresh). Returns `false` when an episode is
+    /// already open and the caller must only coalesce deferred resend.
+    @discardableResult
+    func tryBeginReestablishmentEpisode(
+        sender: String,
+        deviceId: UUID,
+        now: Date = Date()
+    ) -> Bool {
+        cleanupOpenReestablishmentEpisodes(now: now)
+        let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
+        if openReestablishmentEpisodes[key] != nil {
+            return false
+        }
+        openReestablishmentEpisodes[key] = now
+        return true
+    }
+
+    func endReestablishmentEpisode(sender: String, deviceId: UUID) {
+        openReestablishmentEpisodes.removeValue(
+            forKey: reestablishmentEpisodeKey(sender: sender, deviceId: deviceId))
     }
 
     func takePendingResendsAfterReestablishment(

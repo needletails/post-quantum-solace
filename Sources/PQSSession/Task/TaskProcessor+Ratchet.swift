@@ -1003,6 +1003,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                 let pending = await session.takePendingResendsAfterReestablishment(
                                     sender: inboundTask.senderSecretName,
                                     deviceId: inboundTask.senderDeviceId)
+                                await session.endReestablishmentEpisode(
+                                    sender: inboundTask.senderSecretName,
+                                    deviceId: inboundTask.senderDeviceId)
                                 await sendDeferredResendRequests(
                                     pending,
                                     session: session,
@@ -1243,6 +1246,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                             failureClass: pendingRequest.failureClass)
                     }
                 } else {
+                    // Active-session decrypt proves the peer device session is usable;
+                    // close the single-flight episode before draining deferred resends.
+                    await session.endReestablishmentEpisode(
+                        sender: inboundTask.senderSecretName,
+                        deviceId: inboundTask.senderDeviceId)
                     await sendDeferredResendRequests(
                         pending,
                         session: session,
