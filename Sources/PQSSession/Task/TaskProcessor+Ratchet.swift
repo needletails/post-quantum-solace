@@ -727,7 +727,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 sessionId: sessionIdentity.id)
             signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
         } catch {
-            try await restoreSessionIdentityData(
+            try await replaceRestoredSessionIdentityObject(
                 sessionIdentity,
                 data: outboundSessionIdentityDataBeforeAttempt,
                 session: session,
@@ -871,6 +871,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 }
 
                 guard let data = fallbackData else {
+                    try await replaceRestoredSessionIdentityObject(
+                        activeSessionIdentity,
+                        data: activeSessionIdentityDataBeforeAttempt,
+                        session: session,
+                        reason: "active and archived inbound decrypt attempts failed")
                     throw activeError
                 }
                 try await replaceRestoredSessionIdentityObject(
@@ -1134,16 +1139,23 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
 
                                 let foundMessage: EncryptedMessage?
                                 do {
-                                    foundMessage = try await session.cache?.fetchMessage(sharedId: failedSharedMessageId)
+                                    foundMessage = try await session.cache?.fetchMessageIfExists(sharedId: failedSharedMessageId)
                                 } catch {
                                     replayMissingCount += 1
                                     logger.log(
                                         level: .info,
-                                        message: "pqs.recovery.resendReplaySkipped reason=missingLocalMessage sharedId=\(failedSharedMessageId) error=\(error)")
+                                        message: "pqs.recovery.resendReplaySkipped reason=messageLookupFailed sharedId=\(failedSharedMessageId) error=\(error)")
+                                    continue
+                                }
+                                guard let foundMessage else {
+                                    replayMissingCount += 1
+                                    logger.log(
+                                        level: .info,
+                                        message: "pqs.recovery.resendReplaySkipped reason=missingLocalMessage sharedId=\(failedSharedMessageId)")
                                     continue
                                 }
 
-                                guard let fetchedCryptoMessage = await foundMessage?.props(symmetricKey: symmetricKey)?.message else {
+                                guard let fetchedCryptoMessage = await foundMessage.props(symmetricKey: symmetricKey)?.message else {
                                     replayMissingCount += 1
                                     logger.log(
                                         level: .info,
@@ -1483,9 +1495,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             }
 
             do {
-                guard let foundMessage = try await session.cache?.fetchMessage(sharedId: sharedId),
-                      let cryptoMessage = await foundMessage.props(symmetricKey: symmetricKey)?.message
-                else {
+                guard let foundMessage = try await session.cache?.fetchMessageIfExists(sharedId: sharedId) else {
+                    missingCount += 1
+                    permanentlyUnavailableIds.append(sharedId)
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.outOfBandResendSkipped reason=missingLocalMessage sharedId=\(sharedId)")
+                    continue
+                }
+                guard let cryptoMessage = await foundMessage.props(symmetricKey: symmetricKey)?.message else {
                     missingCount += 1
                     permanentlyUnavailableIds.append(sharedId)
                     logger.log(
@@ -1506,7 +1524,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 permanentlyUnavailableIds.append(sharedId)
                 logger.log(
                     level: .info,
-                    message: "pqs.recovery.outOfBandResendSkipped reason=missingLocalMessage sharedId=\(sharedId) error=\(error)")
+                    message: "pqs.recovery.outOfBandResendSkipped reason=messageLookupFailed sharedId=\(sharedId) error=\(error)")
             }
         }
 

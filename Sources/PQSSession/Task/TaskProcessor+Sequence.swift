@@ -964,6 +964,27 @@ extension TaskProcessor {
             try await cache.deleteJob(job)
             return .deleted
         }
+        if await session.hasPendingResendAfterReestablishment(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId) {
+            auditInboundDecryptFailure(
+                message: message,
+                failureClass: failureClass,
+                error: diagnostic,
+                action: "coalescedPendingPeerRecovery",
+                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
+            await session.deferPeerResendUntilReestablished(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                failedMessageId: message.sharedMessageId,
+                failureClass: failureClass)
+            await session.markInboundFailure(message, failureClass: failureClass)
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=pendingPeerRefresh")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
         if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
             auditInboundDecryptFailure(
                 message: message,
@@ -1045,6 +1066,7 @@ extension TaskProcessor {
             deviceId: message.senderDeviceId,
             failedMessageId: message.sharedMessageId,
             failureClass: failureClass)
+        await session.markInboundFailure(message, failureClass: failureClass)
         logger.log(
             level: .info,
             message: "pqs.recovery.deferred failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) waitingFor=peerRefresh")

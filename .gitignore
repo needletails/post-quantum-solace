@@ -32,3 +32,4 @@ Package.resolved
 *.log
 *.orig
 *.rej
+SECURITY_REVIEW.md

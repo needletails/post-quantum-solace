@@ -251,6 +251,22 @@ public actor SessionCache: PQSSessionStore {
         }
     }
 
+    /// Fetches a message by its shared message ID, returning `nil` when it does not exist.
+    /// Recovery paths use this to probe for replayable messages without treating an
+    /// expected miss as a store failure.
+    /// - Parameter sharedId: The shared message ID of the message to fetch.
+    /// - Returns: The fetched message, or `nil` if no message exists for the shared ID.
+    public func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage? {
+        if let message = messages.first(where: { $0.sharedId == sharedId }) {
+            return message
+        }
+        guard let message = try await store.fetchMessageIfExists(sharedId: sharedId) else {
+            return nil
+        }
+        messages.append(message) // Cache the fetched message
+        return message
+    }
+
     /// Fetches a message using a custom predicate.
     /// - Parameter predicate: A closure that takes a message and returns an optional message if it matches the criteria.
     /// - Returns: The first message that matches the predicate, or nil if none found.

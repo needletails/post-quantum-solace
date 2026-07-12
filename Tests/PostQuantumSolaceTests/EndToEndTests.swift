@@ -7384,6 +7384,7 @@ actor EndToEndTests {
             var corruptionArmed = false
             var recoveryStarted = false
             var cleanDecryptSucceeded = false
+            var corruptedMessage: ReceivedMessage?
 
             func arm() { corruptionArmed = true }
             func disarm() { corruptionArmed = false }
@@ -7396,6 +7397,8 @@ actor EndToEndTests {
             func isArmed() -> Bool { corruptionArmed }
             func markRecoveryStarted() { recoveryStarted = true }
             func markCleanSuccess() { cleanDecryptSucceeded = true }
+            func captureCorruptedMessage(_ message: ReceivedMessage) { corruptedMessage = message }
+            func getCorruptedMessage() -> ReceivedMessage? { corruptedMessage }
         }
 
         let probe = CryptoFailureProbe()
@@ -7454,7 +7457,7 @@ actor EndToEndTests {
                 message: corruptedMessage,
                 signingPrivateKey: aliceSigningKey
             )
-            return ReceivedMessage(
+            let corruptedReceived = ReceivedMessage(
                 message: reSigned,
                 sender: received.sender,
                 recipient: received.recipient,
@@ -7462,6 +7465,8 @@ actor EndToEndTests {
                 messageId: received.messageId,
                 transportEvent: received.transportEvent
             )
+            await probe.captureCorruptedMessage(corruptedReceived)
+            return corruptedReceived
         }
 
         aliceTask = Task {
@@ -7539,6 +7544,15 @@ actor EndToEndTests {
         }
         #expect(await probe.recoveryStarted,
                 "Bob should emit recovery controls for the corrupted message")
+
+        // Re-deliver the exact old-epoch ciphertext after recovery has started. This used
+        // to poison DRK's in-memory entry because PQS restored state=nil in place under
+        // the same SessionIdentity UUID. The next genuine frame then failed with
+        // stateUninitialized instead of initializing a fresh ratchet.
+        let corruptedMessage = try #require(
+            await probe.getCorruptedMessage(),
+            "The corrupted old-epoch message should have been captured")
+        aliceTransport.continuation?.yield(corruptedMessage)
 
         // Corruption auto-disarmed after one message; let recovery control messages flow
         try await Task.sleep(for: .milliseconds(2000))

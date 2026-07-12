@@ -159,6 +159,14 @@ public protocol PQSSessionStore: Sendable {
     /// - Throws: An error if the operation fails.
     func fetchMessage(sharedId: String) async throws -> EncryptedMessage
 
+    /// Fetches a message by its shared message identifier, returning `nil` when no
+    /// message exists. Recovery paths probe for replayable messages with this method,
+    /// where "not found" is an expected outcome rather than a store failure.
+    /// - Parameter sharedId: The shared identifier of the message to be fetched.
+    /// - Returns: The corresponding `EncryptedMessage`, or `nil` if no message exists.
+    /// - Throws: An error only if the lookup itself fails (e.g. the database is unavailable).
+    func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage?
+
     /// Creates a new message in the database.
     /// - Parameters:
     ///   - message: The `EncryptedMessage` to be created.
@@ -246,4 +254,14 @@ public protocol PQSSessionStore: Sendable {
     /// - Parameter id: The unique identifier of the media job to be deleted.
     /// - Throws: An error if the operation fails.
     func deleteMediaJob(_ id: UUID) async throws
+}
+
+public extension PQSSessionStore {
+    /// Default bridge for stores that only implement the throwing lookup: a thrown
+    /// error is treated as "no message", so probing callers do not surface expected
+    /// misses as store failures. Stores should override this with a real optional
+    /// query to avoid error-level logging inside their throwing implementation.
+    func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage? {
+        try? await fetchMessage(sharedId: sharedId)
+    }
 }

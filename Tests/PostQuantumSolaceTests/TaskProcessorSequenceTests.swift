@@ -852,6 +852,47 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    @Test("Fresh-session failures coalesce into one peer recovery episode")
+    func testFreshSessionFailuresCoalescePerPeer() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
+        )
+
+        let peerName = "bob_coalesced_repair"
+        let peerDeviceId = UUID()
+        let first = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "coalesced_repair_1")
+        let second = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "coalesced_repair_2")
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(first)),
+            session: session)
+        #expect(try await waitForPendingRepair(sender: peerName, deviceId: peerDeviceId))
+
+        let reconciliationAttemptsAfterFirst = await session.lastReconciliationAtByPeer.count
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(second)),
+            session: session)
+
+        let pendingIds = await Set(
+            session.pendingResendAfterReestablishment.values
+                .filter { $0.senderName == peerName && $0.senderDeviceId == peerDeviceId }
+                .map(\.failedSharedMessageId))
+        #expect(pendingIds == ["coalesced_repair_1", "coalesced_repair_2"])
+        #expect(
+            await session.lastReconciliationAtByPeer.count == reconciliationAttemptsAfterFirst,
+            "A pending peer recovery must coalesce later failures without another identity reset attempt")
+
+        await session.shutdown()
+    }
+
     @Test("Expired skipped key is treated as replay and does not reset session")
     func testExpiredKeyDropsWithoutFreshSessionRepair() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
