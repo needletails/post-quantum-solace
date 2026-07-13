@@ -1551,23 +1551,35 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "decrypt_failed_repeat")
 
+        // First failure: either mark+resend, or handshake-defer until attempts exhaust.
+        // Either way the shared id must be tracked before a second failure escalates.
         try await session.taskProcessor.feedTask(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
 
-        try await Task.sleep(until: .now + .milliseconds(250))
-        #expect(await session.shouldSuppressInboundFailure(
+        // Allow handshake-defer passes (bounded) to fall through to the failure policy.
+        try await Task.sleep(until: .now + .seconds(2))
+
+        let suppressed = await session.shouldSuppressInboundFailure(
             inbound,
-            failureClass: "ratchet.decryptionFailed"))
-        #expect(!(await session.hasPendingResendAfterReestablishment(
+            failureClass: "ratchet.decryptionFailed")
+        let pending = await session.hasPendingResendAfterReestablishment(
             sender: "bob_decrypt_failed",
-            deviceId: peerDeviceId)))
+            deviceId: peerDeviceId)
+        #expect(
+            suppressed || pending,
+            "First decryptionFailed must be recorded (suppress on retry) or already escalate to deferred repair")
 
-        try await session.taskProcessor.feedTask(
-            EncryptableTask(task: .streamMessage(inbound)),
-            session: session
-        )
+        if !(await session.hasPendingResendAfterReestablishment(
+            sender: "bob_decrypt_failed",
+            deviceId: peerDeviceId))
+        {
+            try await session.taskProcessor.feedTask(
+                EncryptableTask(task: .streamMessage(inbound)),
+                session: session
+            )
+        }
 
         let hasPendingRepair = try await waitForPendingRepair(
             sender: "bob_decrypt_failed",

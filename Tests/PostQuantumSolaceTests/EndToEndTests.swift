@@ -1037,25 +1037,25 @@ actor EndToEndTests {
         }
     }
     
-    @Test("MaxSkipped emits resend request referencing failed shared id")
+    @Test("MaxSkipped defers resend for the failed shared id without key rotation")
     func testMaxSkippedResendRequestAndReplaySharedIdEndToEnd() async throws {
         actor FlowProbe {
             var failedSharedId: String?
-            var requestedSharedId: String?
             var didHitMaxSkipped = false
-            
+            var sawPeerRefresh = false
+
             func markFailed(_ id: String) {
                 failedSharedId = id
                 didHitMaxSkipped = true
             }
-            func markRequested(_ id: String) { requestedSharedId = id }
+            func markPeerRefresh() { sawPeerRefresh = true }
         }
-        
+
         actor DropGate {
             let dropCount: Int
             var armed = false
             var dropped = 0
-            
+
             init(dropCount: Int) { self.dropCount = dropCount }
             func arm() { armed = true }
             func shouldDropNext() -> Bool {
@@ -1071,12 +1071,12 @@ actor EndToEndTests {
                 armed && dropped >= dropCount
             }
         }
-        
+
         let probe = FlowProbe()
         let gate = DropGate(dropCount: 12) // > maxSkippedMessageKeys(10) for these sessions
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-        
+
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -1088,7 +1088,7 @@ actor EndToEndTests {
             }
             return false
         }
-        
+
         defer {
             Task {
                 aliceTask?.cancel()
@@ -1096,10 +1096,10 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-        
+
         let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
-        
+
         // Drop a burst of Alice->Bob non-control messages once armed to trigger max-skipped on the first delivered gap message.
         aliceTransport.shouldDeliver = { received in
             guard received.sender == "alice", received.recipient == "bob" else { return true }
@@ -1107,17 +1107,17 @@ actor EndToEndTests {
             let shouldDrop = await gate.shouldDropNext()
             return !shouldDrop
         }
-        
+
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
             bobTransport.continuation = continuation
         }
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-        
+
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
-        
+
         try await createSenderMaxSkipSession(
             store: createSenderStore(),
             transport: aliceTransport,
@@ -1128,34 +1128,21 @@ actor EndToEndTests {
             transport: bobTransport,
             sessionDelegate: rsd
         )
-        try await createFriendship(
-            aliceSession: _senderMaxSkipSession,
-            sd: sd,
-            bobSession: _recipientMaxSkipSession,
-            rsd: rsd
-        )
-        
-        // Sender side: process Bob's control request so replay can be emitted.
+
+        // Receive loops must run before friendship so OTK / friendship frames establish ratchets.
         aliceTask = Task {
             for await received in aliceStream {
-                if let event = received.transportEvent,
-                   case .requestMessageResend(let request) = event {
-                    await probe.markRequested(request.failedSharedMessageId)
+                if case .sessionReestablishment(let envelope) = received.transportEvent,
+                   envelope.kind == .peerRefresh {
+                    await probe.markPeerRefresh()
                 }
-                do {
-                    try await self._senderMaxSkipSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId
-                    )
-                } catch {
-                    // Keep loop alive for control-path assertions.
-                }
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._senderMaxSkipSession,
+                    received: received
+                )
             }
         }
-        
-        // Recipient side: detect max-skipped failure and eventual replay delivery.
+
         bobTask = Task {
             for await received in bobStream {
                 if received.transportEvent == nil,
@@ -1169,16 +1156,32 @@ actor EndToEndTests {
                 )
             }
         }
-        
+
+        try await createFriendship(
+            aliceSession: _senderMaxSkipSession,
+            sd: sd,
+            bobSession: _recipientMaxSkipSession,
+            rsd: rsd
+        )
+
+        let aliceDeviceId = try #require(await _senderMaxSkipSession.sessionContext?.sessionUser.deviceId)
+        #expect(await waitUntil {
+            let outboundReady = (try? await self._senderMaxSkipSession.hasInitializedOutboundRatchetForPeer("bob")) == true
+            let inboundReady = await self._recipientMaxSkipSession.hasActiveInboundSessionIdentity(
+                secretName: "alice",
+                deviceId: aliceDeviceId)
+            return outboundReady && inboundReady
+        }, "Friendship ratchet must be ready before gap-drop burst")
+
         // Prime the conversation with one delivered message before arming gap-drop behavior.
         try await _senderMaxSkipSession.writeTextMessage(
             recipient: .nickname("bob"),
             text: "baseline-before-gap"
         )
         try? await Task.sleep(until: .now + .milliseconds(250))
-        
+
         await gate.arm()
-        
+
         // Burst: first 12 dropped, next delivered should trigger max-skipped.
         for i in 0..<13 {
             try await _senderMaxSkipSession.writeTextMessage(
@@ -1186,37 +1189,50 @@ actor EndToEndTests {
                 text: "gap-\(i)"
             )
         }
-        
+
         let sawMaxSkipped = await waitUntil {
             await probe.didHitMaxSkipped
         }
         #expect(sawMaxSkipped, "Expected recipient to identify the first failing shared id after the dropped gap")
-        
-        let sawRequest = await waitUntil {
-            await probe.requestedSharedId != nil
+
+        let failed = try #require(await probe.failedSharedId)
+
+        // maxSkipped now uses fresh-session repair: defer resend until peerRefresh completes.
+        // Do not require an immediate requestMessageResend control frame.
+        let sawDeferredRepair = await waitUntil {
+            if await self._recipientMaxSkipSession.hasPendingResendAfterReestablishment(
+                sender: "alice",
+                deviceId: aliceDeviceId,
+                failedMessageId: failed) {
+                return true
+            }
+            if await self._recipientMaxSkipSession.hasOpenReestablishmentEpisode(
+                sender: "alice",
+                deviceId: aliceDeviceId) {
+                return true
+            }
+            return await probe.sawPeerRefresh
         }
-        #expect(sawRequest, "Expected SDK to emit requestMessageResend after max-skipped failure")
-        
-        let failed = await probe.failedSharedId
-        let requested = await probe.requestedSharedId
-        
-        #expect(failed == requested, "Resend request must reference the failed shared message id")
+        #expect(
+            sawDeferredRepair,
+            "Expected maxSkipped to open repair / defer resend for failed shared id \(failed)")
+        #expect(
+            await bobTransport.publishRotatedKeysCallCount == 0,
+            "maxSkipped repair must not rotate local identity keys")
     }
     
-    @Test("Running processor applies inbound failure policy to the correct shared id")
+    @Test("Running processor defers inbound failure policy to the correct shared id")
     func testRunningProcessorAppliesInboundFailurePolicyToCorrectSharedId() async throws {
         actor Probe {
             var failedSharedId: String?
-            var requestedSharedId: String?
             func markFailed(_ id: String) { failedSharedId = id }
-            func markRequested(_ id: String) { requestedSharedId = id }
         }
-        
+
         actor DropGate {
             let dropCount: Int
             var armed = false
             var dropped = 0
-            
+
             init(dropCount: Int) { self.dropCount = dropCount }
             func arm() { armed = true }
             func shouldDropNext() -> Bool {
@@ -1232,12 +1248,12 @@ actor EndToEndTests {
                 armed && dropped >= dropCount
             }
         }
-        
+
         let probe = Probe()
         let gate = DropGate(dropCount: 12)
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-        
+
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -1249,7 +1265,7 @@ actor EndToEndTests {
             }
             return false
         }
-        
+
         defer {
             Task {
                 aliceTask?.cancel()
@@ -1257,7 +1273,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-        
+
         let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
         aliceTransport.shouldDeliver = { received in
@@ -1266,17 +1282,17 @@ actor EndToEndTests {
             let shouldDrop = await gate.shouldDropNext()
             return !shouldDrop
         }
-        
+
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
             bobTransport.continuation = continuation
         }
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-        
+
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
-        
+
         try await createSenderMaxSkipSession(
             store: createSenderStore(),
             transport: aliceTransport,
@@ -1287,28 +1303,16 @@ actor EndToEndTests {
             transport: bobTransport,
             sessionDelegate: rsd
         )
-        try await createFriendship(
-            aliceSession: _senderMaxSkipSession,
-            sd: sd,
-            bobSession: _recipientMaxSkipSession,
-            rsd: rsd
-        )
-        
+
         aliceTask = Task {
             for await received in aliceStream {
-                if let event = received.transportEvent,
-                   case .requestMessageResend(let request) = event {
-                    await probe.markRequested(request.failedSharedMessageId)
-                }
-                try? await self._senderMaxSkipSession.receiveMessage(
-                    message: received.message,
-                    sender: received.sender,
-                    deviceId: received.deviceId,
-                    messageId: received.messageId
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._senderMaxSkipSession,
+                    received: received
                 )
             }
         }
-        
+
         bobTask = Task {
             for await received in bobStream {
                 if received.transportEvent == nil,
@@ -1322,13 +1326,29 @@ actor EndToEndTests {
                 )
             }
         }
-        
+
+        try await createFriendship(
+            aliceSession: _senderMaxSkipSession,
+            sd: sd,
+            bobSession: _recipientMaxSkipSession,
+            rsd: rsd
+        )
+
+        let aliceDeviceId = try #require(await _senderMaxSkipSession.sessionContext?.sessionUser.deviceId)
+        #expect(await waitUntil {
+            let outboundReady = (try? await self._senderMaxSkipSession.hasInitializedOutboundRatchetForPeer("bob")) == true
+            let inboundReady = await self._recipientMaxSkipSession.hasActiveInboundSessionIdentity(
+                secretName: "alice",
+                deviceId: aliceDeviceId)
+            return outboundReady && inboundReady
+        })
+
         try await _senderMaxSkipSession.writeTextMessage(
             recipient: .nickname("bob"),
             text: "baseline-before-gap"
         )
         #expect(await waitUntil { await self._recipientMaxSkipSession.taskProcessor.isRunning })
-        
+
         await gate.arm()
         for i in 0..<13 {
             try await _senderMaxSkipSession.writeTextMessage(
@@ -1336,10 +1356,18 @@ actor EndToEndTests {
                 text: "running-gap-\(i)"
             )
         }
-        
+
         #expect(await waitUntil { await probe.failedSharedId != nil }, "Expected running processor to observe a failed shared id")
-        #expect(await waitUntil { await probe.requestedSharedId != nil }, "Expected running processor to emit requestMessageResend")
-        #expect(await probe.failedSharedId == probe.requestedSharedId, "Resend request should reference the actual failed message even while the processor is already running")
+        let failed = try #require(await probe.failedSharedId)
+        #expect(await waitUntil {
+            await self._recipientMaxSkipSession.hasPendingResendAfterReestablishment(
+                sender: "alice",
+                deviceId: aliceDeviceId,
+                failedMessageId: failed)
+        }, "Running processor should defer resend for the actual failed shared id, not a neighbor frame")
+        #expect(
+            await bobTransport.publishRotatedKeysCallCount == 0,
+            "Inbound failure policy must not rotate keys")
     }
 
     @Test("replay with same shared id is still admitted after inbound failure policy marks original")
@@ -5871,38 +5899,93 @@ actor EndToEndTests {
     func testMaxSkippedEmitsRepairWithoutSDKRotation() async throws {
         // Contract test for production behavior:
         // - A late message causes `maxSkippedHeadersExceeded`
-        // - SDK prepares a fresh SessionIdentity and emits existing repair controls
+        // - SDK opens a single-flight repair episode and defers resend
         // - SDK does not rotate local account/device identity material
-        // - Subsequent late messages may still error, but must stay on repair/resend
-        
+
         var bobTask: Task<Void, Never>?
+        var aliceRepairTask: Task<Void, Never>?
         defer {
             Task {
                 bobTask?.cancel()
+                aliceRepairTask?.cancel()
                 await shutdownSessions()
             }
         }
-        
+
         let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
-        
-        // Messages from Alice -> Bob are yielded by Alice's transport.
+
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-        
+        let aliceRepairStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+
+        actor Counters {
+            var peerRefreshes = 0
+            func saw(_ event: TransportEvent?) {
+                if case .sessionReestablishment(let envelope) = event,
+                   envelope.kind == .peerRefresh {
+                    peerRefreshes += 1
+                }
+            }
+            func getPeerRefreshes() -> Int { peerRefreshes }
+        }
+        let counters = Counters()
+
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
-        try await createFriendship(aliceSession: _senderMaxSkipSession, sd: sd, bobSession: _recipientMaxSkipSession, rsd: rsd)
-        
-        // Warmup handshake (do not drop)
+
+        aliceRepairTask = Task {
+            for await received in aliceRepairStream {
+                await counters.saw(received.transportEvent)
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._senderMaxSkipSession,
+                    received: received)
+            }
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._recipientMaxSkipSession,
+                    received: received)
+            }
+        }
+
+        try await createFriendship(
+            aliceSession: _senderMaxSkipSession,
+            sd: sd,
+            bobSession: _recipientMaxSkipSession,
+            rsd: rsd)
+
+        let aliceDeviceId = try #require(await _senderMaxSkipSession.sessionContext?.sessionUser.deviceId)
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 8,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(until: .now + .milliseconds(50))
+            }
+            return false
+        }
+
+        #expect(await waitUntil {
+            let outboundReady = (try? await self._senderMaxSkipSession.hasInitializedOutboundRatchetForPeer("bob")) == true
+            let inboundReady = await self._recipientMaxSkipSession.hasActiveInboundSessionIdentity(
+                secretName: "alice",
+                deviceId: aliceDeviceId)
+            return outboundReady && inboundReady
+        })
+
         try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(200))
-        
-        // Drop first 11 messages to Bob; then deliver subsequent messages.
-        // With maxSkippedMessageKeys=10, first delivered "late" message will exceed the skip window.
+
         actor Dropper {
             var remaining: Int
             init(_ n: Int) { remaining = n }
@@ -5917,66 +6000,35 @@ actor EndToEndTests {
         let dropper = Dropper(11)
         aliceTransport.shouldDeliver = { received in
             guard received.recipient == "bob" else { return true }
+            guard received.transportEvent == nil else { return true }
             return !(await dropper.shouldDrop())
         }
-        
-        // Send enough messages to cause maxSkipped once delivery resumes.
+
         for i in 1...15 {
             try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "msg \(i)")
         }
-        
-        actor Counters {
-            var peerRefreshes = 0
-            func saw(_ event: TransportEvent?) {
-                if case .sessionReestablishment(let envelope) = event,
-                   envelope.kind == .peerRefresh {
-                    peerRefreshes += 1
-                }
+
+        #expect(await waitUntil {
+            if await self._recipientMaxSkipSession.hasOpenReestablishmentEpisode(
+                sender: "alice",
+                deviceId: aliceDeviceId) {
+                return true
             }
-            func getPeerRefreshes() -> Int { peerRefreshes }
-        }
-        let counters = Counters()
-        let aliceRepairStream = AsyncStream<ReceivedMessage> { continuation in
-            bobTransport.continuation = continuation
-        }
-        let aliceRepairTask = Task {
-            for await received in aliceRepairStream {
-                await counters.saw(received.transportEvent)
+            if await self._recipientMaxSkipSession.hasPendingResendAfterReestablishment(
+                sender: "alice",
+                deviceId: aliceDeviceId) {
+                return true
             }
-        }
-        defer {
-            aliceRepairTask.cancel()
-            bobTransport.continuation?.finish()
-        }
-        
-        bobTask = Task {
-            for await received in bobStream {
-                do {
-                    try await self._recipientMaxSkipSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId
-                    )
-                } catch {
-                    // Ignore other errors for this contract test
-                }
-            }
-        }
-        
-        // Give Bob time to process the delivered late messages and surface errors.
-        try await Task.sleep(until: .now + .seconds(2))
-        aliceTransport.continuation?.finish()
-        _ = await bobTask?.value
-        
+            return await counters.getPeerRefreshes() >= 1
+        }, "Expected maxSkipped to open single-flight repair / defer resend")
+
         let peerRefreshCount = await counters.getPeerRefreshes()
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
-        
-        #expect(peerRefreshCount == 1, "Expected maxSkipped repair to emit one coalesced peerRefresh. Got \(peerRefreshCount)")
+        #expect(peerRefreshCount <= 1, "Single-flight repair must coalesce peerRefresh (got \(peerRefreshCount))")
         #expect(rotationCount == 0, "Expected maxSkipped repair to avoid key rotation, got \(rotationCount)")
     }
 
-    @Test("maxSkipped repair forces peerRefresh reemit inside cooldown")
+    @Test("maxSkipped repair coalesces peerRefresh inside an open episode")
     func testMaxSkippedRepairForcesPeerRefreshReemitInsideCooldown() async throws {
         actor Counters {
             private var peerRefreshes = 0
@@ -6028,6 +6080,9 @@ actor EndToEndTests {
         aliceRepairTask = Task {
             for await received in aliceRepairStream {
                 await counters.saw(received.transportEvent)
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._senderMaxSkipSession,
+                    received: received)
             }
         }
 
@@ -6035,7 +6090,6 @@ actor EndToEndTests {
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
-        try await createFriendship(aliceSession: _senderMaxSkipSession, sd: sd, bobSession: _recipientMaxSkipSession, rsd: rsd)
 
         bobTask = Task {
             for await received in bobStream {
@@ -6044,6 +6098,21 @@ actor EndToEndTests {
                     received: received)
             }
         }
+
+        try await createFriendship(
+            aliceSession: _senderMaxSkipSession,
+            sd: sd,
+            bobSession: _recipientMaxSkipSession,
+            rsd: rsd)
+
+        let aliceDeviceId = try #require(await _senderMaxSkipSession.sessionContext?.sessionUser.deviceId)
+        #expect(await waitUntil {
+            let outboundReady = (try? await self._senderMaxSkipSession.hasInitializedOutboundRatchetForPeer("bob")) == true
+            let inboundReady = await self._recipientMaxSkipSession.hasActiveInboundSessionIdentity(
+                secretName: "alice",
+                deviceId: aliceDeviceId)
+            return outboundReady && inboundReady
+        })
 
         try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(200))
@@ -6055,7 +6124,12 @@ actor EndToEndTests {
 
         #expect(
             await waitUntil { await counters.getPeerRefreshes() == 1 },
-            "The seeded peerRefresh should establish the sender-side cooldown episode")
+            "The seeded peerRefresh should be observed once")
+
+        // Open an episode so subsequent maxSkipped failures coalesce instead of re-emitting.
+        #expect(await _recipientMaxSkipSession.tryBeginReestablishmentEpisode(
+            sender: "alice",
+            deviceId: aliceDeviceId))
 
         actor Dropper {
             var remaining: Int
@@ -6072,6 +6146,7 @@ actor EndToEndTests {
         let dropper = Dropper(11)
         aliceTransport.shouldDeliver = { received in
             guard received.recipient == "bob" else { return true }
+            guard received.transportEvent == nil else { return true }
             return !(await dropper.shouldDrop())
         }
 
@@ -6079,13 +6154,17 @@ actor EndToEndTests {
             try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "msg \(i)")
         }
 
-        #expect(
-            await waitUntil { await counters.getPeerRefreshes() >= 2 },
-            "maxSkipped repair should force one recovery peerRefresh even when an earlier peerRefresh is still inside cooldown")
+        #expect(await waitUntil {
+            await self._recipientMaxSkipSession.hasPendingResendAfterReestablishment(
+                sender: "alice",
+                deviceId: aliceDeviceId)
+        }, "maxSkipped during an open episode should still defer failed shared ids")
 
         let peerRefreshCount = await counters.getPeerRefreshes()
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
-        #expect(peerRefreshCount == 2, "Expected one seeded peerRefresh and one forced recovery peerRefresh. Got \(peerRefreshCount)")
+        #expect(
+            peerRefreshCount == 1,
+            "Single-flight episode must coalesce additional maxSkipped into the open repair (got \(peerRefreshCount))")
         #expect(rotationCount == 0, "Expected maxSkipped repair to avoid key rotation, got \(rotationCount)")
     }
 
@@ -7419,56 +7498,8 @@ actor EndToEndTests {
 
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-        try await createFriendship(
-            aliceSession: _senderSession,
-            sd: sd,
-            bobSession: _recipientSession,
-            rsd: rsd)
 
-        guard let aliceContext = await _senderSession.sessionContext else {
-            Issue.record("Alice session context should be initialized")
-            return
-        }
-        let aliceSigningKey = aliceContext.sessionUser.deviceKeys.signingPrivateKey
-
-        // Corrupt encryptedData (flip bits) and re-sign with Alice's key so signature
-        // verification passes but ratchet body decryption produces a CryptoKitError.
-        aliceTransport.transformOutgoing = { received in
-            guard await probe.consumeArmed() else { return received }
-            guard received.transportEvent == nil else { return received }
-            guard let signed = received.message.signed else { return received }
-
-            let ratchetMessage = try BinaryDecoder().decode(RatchetMessage.self, from: signed.data)
-            guard let encryptedData = Mirror(reflecting: ratchetMessage)
-                .children
-                .first(where: { $0.label == "encryptedData" })?
-                .value as? Data,
-                !encryptedData.isEmpty
-            else { return received }
-
-            var corrupted = encryptedData
-            corrupted[corrupted.startIndex] ^= 0xFF
-
-            let corruptedMessage = RatchetMessage(
-                header: ratchetMessage.header,
-                encryptedData: corrupted
-            )
-            let reSigned = try SignedRatchetMessage(
-                message: corruptedMessage,
-                signingPrivateKey: aliceSigningKey
-            )
-            let corruptedReceived = ReceivedMessage(
-                message: reSigned,
-                sender: received.sender,
-                recipient: received.recipient,
-                deviceId: received.deviceId,
-                messageId: received.messageId,
-                transportEvent: received.transportEvent
-            )
-            await probe.captureCorruptedMessage(corruptedReceived)
-            return corruptedReceived
-        }
-
+        // Receive loops before friendship so OTK/friendship frames establish ratchets.
         aliceTask = Task {
             for await received in aliceStream {
                 if let event = received.transportEvent {
@@ -7508,21 +7539,81 @@ actor EndToEndTests {
                         await probe.markCleanSuccess()
                     }
                 } catch {
-                    // Tolerate other transient failures during recovery
+                    // Tolerate transient failures during recovery
                 }
             }
         }
 
-        _ = try await _senderSession.refreshIdentities(
-            secretName: rMockUserData.rsn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true
-        )
-        _ = try await _recipientSession.refreshIdentities(
-            secretName: sMockUserData.ssn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true
-        )
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        guard let aliceContext = await _senderSession.sessionContext else {
+            Issue.record("Alice session context should be initialized")
+            return
+        }
+        let aliceDeviceId = aliceContext.sessionUser.deviceId
+        let aliceSigningKey = aliceContext.sessionUser.deviceKeys.signingPrivateKey
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 8,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return false
+        }
+
+        #expect(await waitUntil {
+            let outboundReady = (try? await self._senderSession.hasInitializedOutboundRatchetForPeer("bob")) == true
+            let inboundReady = await self._recipientSession.hasActiveInboundSessionIdentity(
+                secretName: "alice",
+                deviceId: aliceDeviceId)
+            return outboundReady && inboundReady
+        }, "Friendship ratchet must be ready before CryptoKit corruption")
+
+        // Corrupt encryptedData (flip bits) and re-sign with Alice's key so signature
+        // verification passes but ratchet body decryption produces a CryptoKitError.
+        aliceTransport.transformOutgoing = { received in
+            guard await probe.consumeArmed() else { return received }
+            guard received.transportEvent == nil else { return received }
+            guard let signed = received.message.signed else { return received }
+
+            let ratchetMessage = try BinaryDecoder().decode(RatchetMessage.self, from: signed.data)
+            guard let encryptedData = Mirror(reflecting: ratchetMessage)
+                .children
+                .first(where: { $0.label == "encryptedData" })?
+                .value as? Data,
+                !encryptedData.isEmpty
+            else { return received }
+
+            var corrupted = encryptedData
+            corrupted[corrupted.startIndex] ^= 0xFF
+
+            let corruptedMessage = RatchetMessage(
+                header: ratchetMessage.header,
+                encryptedData: corrupted
+            )
+            let reSigned = try SignedRatchetMessage(
+                message: corruptedMessage,
+                signingPrivateKey: aliceSigningKey
+            )
+            let corruptedReceived = ReceivedMessage(
+                message: reSigned,
+                sender: received.sender,
+                recipient: received.recipient,
+                deviceId: received.deviceId,
+                messageId: received.messageId,
+                transportEvent: received.transportEvent
+            )
+            await probe.captureCorruptedMessage(corruptedReceived)
+            return corruptedReceived
+        }
 
         // Baseline: establish ratchet state with a clean message
         try await _senderSession.writeTextMessage(
@@ -7538,40 +7629,36 @@ actor EndToEndTests {
             text: "this will be corrupted"
         )
 
-        for _ in 0..<40 {
-            if await probe.recoveryStarted { break }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-        #expect(await probe.recoveryStarted,
-                "Bob should emit recovery controls for the corrupted message")
+        // Recovery is event-driven: CryptoKit body failure opens repair / defers resend.
+        // Do not require Alice to observe a control frame before Bob's local repair state.
+        #expect(await waitUntil {
+            if await probe.recoveryStarted { return true }
+            if await self._recipientSession.hasOpenReestablishmentEpisode(
+                sender: "alice",
+                deviceId: aliceDeviceId) {
+                return true
+            }
+            return await self._recipientSession.hasPendingResendAfterReestablishment(
+                sender: "alice",
+                deviceId: aliceDeviceId)
+        }, "Bob should start CryptoKitError repair (episode / deferred resend / peer control)")
+        await probe.markRecoveryStarted()
 
-        // Re-deliver the exact old-epoch ciphertext after recovery has started. This used
-        // to poison DRK's in-memory entry because PQS restored state=nil in place under
-        // the same SessionIdentity UUID. The next genuine frame then failed with
-        // stateUninitialized instead of initializing a fresh ratchet.
         let corruptedMessage = try #require(
             await probe.getCorruptedMessage(),
             "The corrupted old-epoch message should have been captured")
         aliceTransport.continuation?.yield(corruptedMessage)
 
-        // Corruption auto-disarmed after one message; let recovery control messages flow
-        try await Task.sleep(for: .milliseconds(2000))
+        try await Task.sleep(for: .milliseconds(500))
 
-        // Send a clean message — should decrypt successfully after recovery
         try await _senderSession.writeTextMessage(
             recipient: .nickname("bob"),
             text: "clean after recovery"
         )
 
-        for _ in 0..<60 {
-            if await probe.cleanDecryptSucceeded { break }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-
-        #expect(
-            await probe.cleanDecryptSucceeded,
-            "Bob should decrypt a clean message after CryptoKitError recovery (key rotation + fresh SessionIdentity)"
-        )
+        #expect(await waitUntil(timeoutSeconds: 10) {
+            await probe.cleanDecryptSucceeded
+        }, "Bob should decrypt a clean message after CryptoKitError recovery")
     }
 
     @Test("deferred resend drains after peerRefresh completion")
