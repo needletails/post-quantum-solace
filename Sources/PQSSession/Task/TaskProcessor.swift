@@ -23,6 +23,19 @@ import Crypto
 import BinaryCodable
 import AsyncAlgorithms
 
+enum DeviceTargetedIdentityFilter {
+    static func select(
+        _ identities: [SessionIdentity],
+        targetDeviceId: UUID?,
+        symmetricKey: SymmetricKey
+    ) async -> [SessionIdentity] {
+        guard let targetDeviceId else { return identities }
+        return await identities.asyncFilter {
+            await $0.props(symmetricKey: symmetricKey)?.deviceId == targetDeviceId
+        }
+    }
+}
+
 /// `TaskProcessor` manages the asynchronous execution of encryption and decryption tasks
 /// using Double Ratchet and other cryptographic mechanisms. It handles inbound and outbound
 /// messaging for sessions, including persistence, identity resolution, and communication state.
@@ -134,6 +147,11 @@ public actor TaskProcessor {
     /// Last time we sent a peer `refreshOneTimeKeys` control message for a given peer secret name.
     /// Used to debounce control-plane churn during reconnect bursts.
     var lastPeerRefreshRequestAt: [String: Date] = [:]
+
+    /// The active identity row that most recently decrypted traffic for a concrete peer device.
+    /// Legacy persistence races can leave more than one active row for the same device; retaining
+    /// the cryptographically proven row prevents alternating between divergent ratchet states.
+    var preferredSessionIdentityIdByPeerDevice: [String: UUID] = [:]
 
     /// Minimum interval between peer refresh control messages for the same peer.
     /// Keeps recovery behavior while reducing startup storms that can race with live traffic.
@@ -293,6 +311,7 @@ public actor TaskProcessor {
         sender: String,
         type: MessageRecipient,
         sharedIdOverride: String? = nil,
+        targetDeviceId: UUID? = nil,
         shouldPersist: Bool,
         logger: NeedleTailLogger
     ) async throws {
@@ -460,6 +479,14 @@ public actor TaskProcessor {
                 }
             }
             recipients.insert(sender)
+        }
+
+        identities = await DeviceTargetedIdentityFilter.select(
+            identities,
+            targetDeviceId: targetDeviceId,
+            symmetricKey: symmetricKey)
+        if targetDeviceId != nil, identities.isEmpty {
+            throw PQSSession.SessionErrors.invalidDeviceIdentity
         }
 
         /// Utility for selecting matching identities by secret name and device ID.

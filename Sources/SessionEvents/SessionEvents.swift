@@ -529,21 +529,27 @@ public extension SessionEvents {
     ) async throws {
         let mySecretName = sessionContext.sessionUser.secretName
         let contacts = try await cache.fetchContacts()
-        
-        let filteredContactInfos = await contactInfos.asyncFilter { contactInfo in
-            // Check if contacts is not nil and does not contain the secretName
-            let containsSecretName = await contacts.asyncContains { contact in
-                if let secretName = await contact.props(symmetricKey: symmetricKey)?.secretName {
-                    return contactInfo.secretName == secretName
-                }
-                return false
+
+        for contactInfo in contactInfos {
+            let contactAlreadyExists = await contacts.asyncContains { contact in
+                await contact.props(symmetricKey: symmetricKey)?.secretName == contactInfo.secretName
             }
-            
-            // We want to include `contactInfo` only if `containsSecretName` is false
-            return !containsSecretName
-        }
-        
-        for contactInfo in filteredContactInfos {
+
+            // Linked-device sync is also a repair event. A restored or partially
+            // synchronized device may already have the contact row but not its
+            // nickname communication, so never skip communication convergence.
+            if contactAlreadyExists {
+                _ = try await updateOrCreateCommunication(
+                    mySecretName: mySecretName,
+                    recipient: .nickname(contactInfo.secretName),
+                    preferredSharedIdentifier: contactInfo.sharedCommunicationId,
+                    cache: cache,
+                    receiver: receiver,
+                    symmetricKey: symmetricKey,
+                    logger: logger)
+                continue
+            }
+
             let userConfiguration = try await transport.findConfiguration(for: contactInfo.secretName)
             
             let contact = Contact(
@@ -564,22 +570,14 @@ public extension SessionEvents {
             
             try await cache.createContact(contactModel)
             
-            logger.log(level: .debug, message: "Creating Communication Model")
-            // Create communication model
-            let communicationModel = try await createCommunicationModel(
-                recipients: [mySecretName, contactInfo.secretName],
-                communicationType: .nickname(contactInfo.secretName),
-                symmetricKey: symmetricKey)
-            
-            guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
-                throw EventErrors.propsError
-            }
-            
-            props.sharedId = contactInfo.sharedCommunicationId
-            
-            _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
-            try await cache.createCommunication(communicationModel)
-            await receiver.updatedCommunication(communicationModel, members: [contactInfo.secretName])
+            _ = try await updateOrCreateCommunication(
+                mySecretName: mySecretName,
+                recipient: .nickname(contactInfo.secretName),
+                preferredSharedIdentifier: contactInfo.sharedCommunicationId,
+                cache: cache,
+                receiver: receiver,
+                symmetricKey: symmetricKey,
+                logger: logger)
             logger.log(level: .debug, message: "Created Communication Model for \(contactInfo.secretName)")
             
             // Notify UI only after the communication shell exists so sidebar loaders
@@ -740,6 +738,18 @@ public extension SessionEvents {
             )
             
             try await cache.updateContact(contactModel)
+
+            // Contact and communication rows can arrive independently on linked
+            // devices, and a best-effort delete can leave only the contact row.
+            // Repair the communication shell before notifying the UI or starting
+            // friendship synchronization.
+            _ = try await updateOrCreateCommunication(
+                mySecretName: mySecretName,
+                recipient: .nickname(newContactSecretName),
+                cache: cache,
+                receiver: receiver,
+                symmetricKey: symmetricKey,
+                logger: logger)
             try await receiver.updateContact(updatedContact)
 
             // Mirror the new-contact branch: when a UI add (re-)requests friendship,
@@ -825,6 +835,7 @@ public extension SessionEvents {
     private func updateOrCreateCommunication(
         mySecretName: String,
         recipient: MessageRecipient,
+        preferredSharedIdentifier: UUID? = nil,
         cache: PQSSessionStore,
         receiver: EventReceiver,
         symmetricKey: SymmetricKey,
@@ -876,7 +887,7 @@ public extension SessionEvents {
         }
         
         if props.sharedId == nil {
-            let sharedIdentifier = UUID()
+            let sharedIdentifier = preferredSharedIdentifier ?? UUID()
             props.sharedId = sharedIdentifier
             
             _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
@@ -892,7 +903,7 @@ public extension SessionEvents {
             return sharedIdentifier.uuidString
         } else {
             logger.log(level: .info, message: "Shared Id already exists")
-            return nil
+            return props.sharedId?.uuidString
         }
     }
     

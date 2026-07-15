@@ -158,18 +158,31 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
     /// reestablishment request and refreshed its local view.
     public let isResponse: Bool
 
+    /// Concrete recipient device for device-scoped recovery. `nil` preserves
+    /// compatibility with legacy account-wide refresh controls.
+    public let targetDeviceId: UUID?
+
+    /// The transport must expose this request as a bounded pre-decryption bootstrap.
+    /// This lets the exact recipient device clear a divergent lane before decrypting
+    /// the freshly initialized request. Responses never set this flag.
+    public let requiresPreDecryptionReset: Bool
+
     public init(
         kind: SessionReestablishmentKind,
         intentId: UUID? = nil,
         epoch: UInt64 = 0,
         emittedAt: Date = Date(),
-        isResponse: Bool = false
+        isResponse: Bool = false,
+        targetDeviceId: UUID? = nil,
+        requiresPreDecryptionReset: Bool = false
     ) {
         self.kind = kind
         self.intentId = intentId
         self.epoch = epoch
         self.emittedAt = emittedAt
         self.isResponse = isResponse
+        self.targetDeviceId = targetDeviceId
+        self.requiresPreDecryptionReset = requiresPreDecryptionReset
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -182,6 +195,8 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
         case epoch = "e"
         case emittedAt = "t"
         case isResponse = "r"
+        case targetDeviceId = "d"
+        case requiresPreDecryptionReset = "p"
     }
 
     public init(from decoder: Decoder) throws {
@@ -193,6 +208,9 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
             self.epoch = (try? container.decode(UInt64.self, forKey: .epoch)) ?? 0
             self.emittedAt = (try? container.decode(Date.self, forKey: .emittedAt)) ?? Date()
             self.isResponse = (try? container.decode(Bool.self, forKey: .isResponse)) ?? false
+            self.targetDeviceId = try? container.decodeIfPresent(UUID.self, forKey: .targetDeviceId)
+            self.requiresPreDecryptionReset =
+                (try? container.decode(Bool.self, forKey: .requiresPreDecryptionReset)) ?? false
             return
         }
         // Legacy fallback for serializers that handed us a bare `SessionReestablishmentKind`.
@@ -204,6 +222,8 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
             self.epoch = 0
             self.emittedAt = Date()
             self.isResponse = false
+            self.targetDeviceId = nil
+            self.requiresPreDecryptionReset = false
             return
         }
         throw DecodingError.dataCorrupted(
@@ -221,6 +241,8 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
         try container.encode(epoch, forKey: .epoch)
         try container.encode(emittedAt, forKey: .emittedAt)
         try container.encode(isResponse, forKey: .isResponse)
+        try container.encodeIfPresent(targetDeviceId, forKey: .targetDeviceId)
+        try container.encode(requiresPreDecryptionReset, forKey: .requiresPreDecryptionReset)
     }
 }
 

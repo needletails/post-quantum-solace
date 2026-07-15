@@ -35,11 +35,14 @@ struct SessionReestablishmentCoalescingTests {
 
     @Test("Envelope round-trips through BinaryCodable preserving all fields")
     func envelopeRoundTrip() throws {
+        let targetDeviceId = UUID()
         let original = SessionReestablishmentEnvelope(
             kind: .linkedDeviceCompromiseObserved,
             intentId: UUID(),
             epoch: 42,
-            emittedAt: Date(timeIntervalSince1970: 1_700_000_000)
+            emittedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            targetDeviceId: targetDeviceId,
+            requiresPreDecryptionReset: true
         )
         let encoded = try BinaryEncoder().encode(original)
         let decoded = try BinaryDecoder().decode(SessionReestablishmentEnvelope.self, from: encoded)
@@ -48,6 +51,8 @@ struct SessionReestablishmentCoalescingTests {
         #expect(decoded.intentId == original.intentId)
         #expect(decoded.epoch == original.epoch)
         #expect(decoded.emittedAt == original.emittedAt)
+        #expect(decoded.targetDeviceId == targetDeviceId)
+        #expect(decoded.requiresPreDecryptionReset)
     }
 
     @Test("TransportEvent.sessionReestablishment encodes/decodes the envelope")
@@ -81,6 +86,28 @@ struct SessionReestablishmentCoalescingTests {
     }
 
     // MARK: - Sender single-flight
+
+    @Test("Simultaneous peerRefresh bootstraps choose one deterministic requester")
+    func simultaneousBootstrapCollisionHasSingleWinner() async throws {
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let lower = try #require(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
+        let higher = try #require(UUID(uuidString: "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"))
+
+        #expect(await session.localPeerRefreshBootstrapWinsCollision(
+            localDeviceId: lower,
+            senderDeviceId: higher,
+            hasPendingLocalRequest: true))
+        #expect(!(await session.localPeerRefreshBootstrapWinsCollision(
+            localDeviceId: higher,
+            senderDeviceId: lower,
+            hasPendingLocalRequest: true)))
+        #expect(!(await session.localPeerRefreshBootstrapWinsCollision(
+            localDeviceId: lower,
+            senderDeviceId: higher,
+            hasPendingLocalRequest: false)))
+        await session.shutdown()
+    }
 
     @Test("Sender suppresses repeat emission to same scope within cooldown")
     func senderCooldownSuppressesDuplicateEmission() async {
@@ -140,6 +167,62 @@ struct SessionReestablishmentCoalescingTests {
         #expect(alice?.intentId != bob?.intentId)
         #expect(alice?.intentId != personal?.intentId)
         #expect(bob?.intentId != personal?.intentId)
+        await session.shutdown()
+    }
+
+    @Test("Sender treats different devices of one peer independently")
+    func senderDifferentPeerDevicesDoNotDedupe() async {
+        let session = PQSSession()
+        let deviceA = UUID()
+        let deviceB = UUID()
+
+        let firstA = await session.makeSessionReestablishmentEnvelope(
+            kind: .peerRefresh,
+            scope: .peerDevice(secretName: "alice", deviceId: deviceA))
+        let duplicateA = await session.makeSessionReestablishmentEnvelope(
+            kind: .peerRefresh,
+            scope: .peerDevice(secretName: "alice", deviceId: deviceA))
+        let firstB = await session.makeSessionReestablishmentEnvelope(
+            kind: .peerRefresh,
+            scope: .peerDevice(secretName: "alice", deviceId: deviceB))
+
+        #expect(firstA?.targetDeviceId == deviceA)
+        #expect(duplicateA == nil)
+        #expect(firstB?.targetDeviceId == deviceB)
+        #expect(firstA?.intentId != firstB?.intentId)
+        await session.shutdown()
+    }
+
+    @Test("Peer refresh completion requires matching device and intent")
+    func peerRefreshCompletionRequiresMatchingDeviceAndIntent() async {
+        let session = PQSSession()
+        let deviceA = UUID()
+        let deviceB = UUID()
+        let expectedIntent = UUID()
+
+        await session.registerExpectedPeerRefreshResponse(
+            sender: "alice",
+            deviceId: deviceB,
+            intentId: expectedIntent)
+
+        #expect(!(await session.isExpectedPeerRefreshResponse(
+            sender: "alice",
+            deviceId: deviceA,
+            intentId: expectedIntent)))
+        #expect(!(await session.isExpectedPeerRefreshResponse(
+            sender: "alice",
+            deviceId: deviceB,
+            intentId: UUID())))
+        #expect(await session.isExpectedPeerRefreshResponse(
+            sender: "alice",
+            deviceId: deviceB,
+            intentId: expectedIntent))
+
+        await session.endReestablishmentEpisode(sender: "alice", deviceId: deviceB)
+        #expect(!(await session.isExpectedPeerRefreshResponse(
+            sender: "alice",
+            deviceId: deviceB,
+            intentId: expectedIntent)))
         await session.shutdown()
     }
 

@@ -257,6 +257,9 @@ extension TaskProcessor {
             case .streamMessage(let message):
                 let failureClass = "ratchet.maxSkippedHeadersExceeded"
 
+                // Never retry the same failed ciphertext locally. Preserve the
+                // still-shared outbound ratchet for the peerRefresh request; reset only
+                // after its correlated response has been transported.
                 return try await handleFreshSessionRepair(
                     message: message,
                     failureClass: failureClass,
@@ -319,8 +322,7 @@ extension TaskProcessor {
                         job: job,
                         cache: cache,
                         session: session,
-                        diagnostic: "repeatFailureClass=\(failureClass)",
-                        retryOriginalAfterReset: false)
+                        diagnostic: "repeatFailureClass=\(failureClass)")
                 }
 
                 let didRequestResend = await requestPeerResendIfAllowed(
@@ -347,8 +349,7 @@ extension TaskProcessor {
                     failureClass: inboundSessionDesyncFailureClass(ratchetError),
                     job: job,
                     cache: cache,
-                    session: session,
-                    retryOriginalAfterReset: false)
+                    session: session)
             case .writeMessage(let message):
                 logger.log(level: .error, message: "\(ratchetError) for writeMessage to recipient: \(message.message.recipient)")
                 try await cache.deleteJob(job)
@@ -406,13 +407,16 @@ extension TaskProcessor {
                     return .deleted
                 }
 
-                let hasPendingOTKRecovery = await session.hasPendingResendAfterReestablishment(
-                    sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId)
+                // Pending replay IDs outlive the single-flight episode. Only a live
+                // episode (or an active responder bootstrap hold, which owns the lane)
+                // may suppress a new event-driven repair attempt.
                 let hasOpenOTKEpisode = await session.hasOpenReestablishmentEpisode(
                     sender: message.senderSecretName,
                     deviceId: message.senderDeviceId)
-                if hasPendingOTKRecovery || hasOpenOTKEpisode {
+                let hasOTKResponderHold = await session.hasRecentInboundPeerRefreshBootstrap(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId)
+                if hasOpenOTKEpisode || hasOTKResponderHold {
                     auditInboundDecryptFailure(
                         message: message,
                         failureClass: failureClass,
@@ -424,7 +428,7 @@ extension TaskProcessor {
                         failureClass: failureClass)
                     logger.log(
                         level: .info,
-                        message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=pendingPeerRefresh")
+                        message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=\(hasOpenOTKEpisode ? "pendingPeerRefresh" : "responderBootstrapHold")")
                     await session.markInboundFailure(message, failureClass: failureClass)
                     try await cache.deleteJob(job)
                     return .deleted
@@ -438,6 +442,9 @@ extension TaskProcessor {
                     level: .warning,
                     message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=replaceOTKBatchThenPeerRefresh")
 
+                _ = await session.tryBeginReestablishmentEpisode(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId)
                 await session.deferPeerResendUntilReestablished(
                     sender: message.senderSecretName,
                     deviceId: message.senderDeviceId,
@@ -463,10 +470,14 @@ extension TaskProcessor {
                 Task {
                     let curveReplaced = await session.refreshOneTimeKeysTask(policy: .replacePublishedBatch)
                     let mlKEMReplaced = await session.refreshMLKEMOneTimeKeysTask(policy: .replacePublishedBatch)
-                    if !curveReplaced || !mlKEMReplaced {
+                    guard curveReplaced && mlKEMReplaced else {
                         logger.log(
                             level: .error,
                             message: "pqs.recovery.failed failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=otkBatchReplacementFailed")
+                        await session.endReestablishmentEpisode(
+                            sender: message.senderSecretName,
+                            deviceId: message.senderDeviceId)
+                        return
                     }
 
                     let mySecretName = await session.sessionContext?.sessionUser.secretName
@@ -476,11 +487,17 @@ extension TaskProcessor {
                         _ = try await session.emitSessionReestablishment(
                             kind: .peerRefresh,
                             recipient: isSelf ? .personalMessage : .nickname(message.senderSecretName),
-                            scope: isSelf ? .personal : .peer(secretName: message.senderSecretName),
+                            scope: isSelf
+                                ? .personalDevice(deviceId: message.senderDeviceId)
+                                : .peerDevice(
+                                    secretName: message.senderSecretName,
+                                    deviceId: message.senderDeviceId),
                             forceReemit: true)
                         logger.log(
                             level: .info,
                             message: "pqs.recovery.reestablishmentQueued kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
+                    } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
+                        await self.reportPeerSigningKeyOutOfSync(message: message, session: session)
                     } catch {
                         logger.log(
                             level: .warning,
@@ -507,6 +524,8 @@ extension TaskProcessor {
                     failureClass: "crypto.bodyDecryptionFailed") {
                     return deferred
                 }
+                // Same as maxSkipped: unilateral reset cannot decrypt the failed
+                // ciphertext; always fall through to peerRefresh + deferred resend.
                 return try await handleFreshSessionRepair(
                     message: message,
                     failureClass: "crypto.bodyDecryptionFailed",
@@ -931,11 +950,28 @@ extension TaskProcessor {
                 deviceId: message.senderDeviceId,
                 failedMessageId: message.sharedMessageId,
                 failureClass: failureClass)
+            let hasResponderBootstrapHold = await session.hasRecentInboundPeerRefreshBootstrap(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId)
+            if hasResponderBootstrapHold {
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=responderBootstrapHold")
+                try await cache.deleteJob(job)
+                return .deleted
+            }
+            _ = await session.tryBeginReestablishmentEpisode(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId)
             do {
                 _ = try await session.emitSessionReestablishment(
                     kind: .peerRefresh,
                     recipient: .nickname(message.senderSecretName),
-                    scope: .peer(secretName: message.senderSecretName))
+                    scope: .peerDevice(
+                        secretName: message.senderSecretName,
+                        deviceId: message.senderDeviceId))
+            } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
+                await reportPeerSigningKeyOutOfSync(message: message, session: session)
             } catch {
                 logger.log(level: .warning, message: "Failed to emit peerRefresh after \(failureClass): \(error)")
             }
@@ -951,8 +987,7 @@ extension TaskProcessor {
         job: JobModel,
         cache: SessionCache,
         session: PQSSession,
-        diagnostic: String? = nil,
-        retryOriginalAfterReset: Bool = true
+        diagnostic: String? = nil
     ) async throws -> JobProcessingOutcome {
         if await session.shouldSuppressInboundRecoveryFromSender(message.senderSecretName) {
             auditInboundDecryptFailure(
@@ -968,13 +1003,20 @@ extension TaskProcessor {
             try await cache.deleteJob(job)
             return .deleted
         }
-        let hasPendingRecovery = await session.hasPendingResendAfterReestablishment(
-            sender: message.senderSecretName,
-            deviceId: message.senderDeviceId)
+        // Pending replay IDs are work to drain after recovery, not a recovery lock.
+        // Once the concrete peer-device episode expires, the next failure event must
+        // be allowed to establish a fresh session and emit another peerRefresh.
         let hasOpenEpisode = await session.hasOpenReestablishmentEpisode(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId)
-        if hasPendingRecovery || hasOpenEpisode {
+        // While this device is the responder of a peer-coordinated bootstrap, a local
+        // reset would clobber the lane the peer just prepared and reopen divergence.
+        // Failures here are stale ciphertext from before that repair; defer them so
+        // the responder-completion drain requests their resend on the healthy lane.
+        let hasResponderBootstrapHold = await session.hasRecentInboundPeerRefreshBootstrap(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId)
+        if hasOpenEpisode || hasResponderBootstrapHold {
             auditInboundDecryptFailure(
                 message: message,
                 failureClass: failureClass,
@@ -989,7 +1031,7 @@ extension TaskProcessor {
             await session.markInboundFailure(message, failureClass: failureClass)
             logger.log(
                 level: .info,
-                message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=pendingPeerRefresh")
+                message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=\(hasOpenEpisode ? "pendingPeerRefresh" : "responderBootstrapHold")")
             try await cache.deleteJob(job)
             return .deleted
         }
@@ -1017,69 +1059,24 @@ extension TaskProcessor {
             level: .warning,
             message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=freshSessionRepairThenDeferredResend\(diagnosticSuffix)")
 
-        // Single-flight: only one reset+peerRefresh leader per peer device episode.
+        // Single-flight: only one peerRefresh leader per peer-device episode.
         let isEpisodeLeader = await session.tryBeginReestablishmentEpisode(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId)
-        let canAttempt = await session.canAttemptReconciliation(
-            sender: message.senderSecretName,
-            deviceId: message.senderDeviceId,
-            flow: .inbound)
-        let canReset = isEpisodeLeader && canAttempt
-        var resetSucceeded = false
-        if canReset {
-            do {
-                // Repair must not consume a server OTK per decrypt failure. Nil curve
-                // OTK (X3DH without one-time prekey); coalesced peerRefresh / first
-                // outbound bootstrap is the only place that should burn an OTK.
-                _ = try await session.resetSessionIdentityForFreshSession(
-                    secretName: message.senderSecretName,
-                    deviceId: message.senderDeviceId,
-                    sendOneTimeIdentities: false)
-                await session.markReconciliationAttempt(
-                    sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId,
-                    flow: .inbound)
-                resetSucceeded = true
-            } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
-                await session.endReestablishmentEpisode(
-                    sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId)
-                return try await handlePeerSigningKeyOutOfSync(
-                    message: message,
-                    job: job,
-                    cache: cache,
-                    session: session)
-            } catch {
-                logger.log(level: .warning, message: "Fresh session reset failed for \(message.senderSecretName) (\(message.senderDeviceId)): \(error)")
-            }
-        } else if !isEpisodeLeader {
+        if !isEpisodeLeader {
             logger.log(
                 level: .info,
-                message: "Skipping inbound SessionIdentity reset for \(message.senderSecretName) (\(message.senderDeviceId)); reestablishment episode already open")
-        } else {
-            logger.log(level: .info, message: "Skipping inbound SessionIdentity reset for \(message.senderSecretName) (\(message.senderDeviceId)); reconciliation cooldown is active")
-        }
-
-        if resetSucceeded && retryOriginalAfterReset {
-            logger.log(level: .info, message: "Retrying inbound message after fresh SessionIdentity reset for \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
-            try await cache.deleteJob(job)
-            try await feedTask(
-                EncryptableTask(
-                    task: .streamMessage(message),
-                    priority: .urgent),
-                session: session)
-            return .deleted
-        }
-
-        if resetSucceeded {
-            logger.log(level: .info, message: "Prepared fresh SessionIdentity for repair controls to \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+                message: "Skipping duplicate peerRefresh leader for \(message.senderSecretName) (\(message.senderDeviceId)); reestablishment episode already open")
         }
 
         let mySecretName = await session.sessionContext?.sessionUser.secretName
         let isSelf = message.senderSecretName == mySecretName
         let recipient: MessageRecipient = isSelf ? .personalMessage : .nickname(message.senderSecretName)
-        let scope: ControlEventScope = isSelf ? .personal : .peer(secretName: message.senderSecretName)
+        let scope: ControlEventScope = isSelf
+            ? .personalDevice(deviceId: message.senderDeviceId)
+            : .peerDevice(
+                secretName: message.senderSecretName,
+                deviceId: message.senderDeviceId)
         let hadPendingRecovery = await session.hasPendingResendAfterReestablishment(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId)
@@ -1099,11 +1096,7 @@ extension TaskProcessor {
                 kind: .peerRefresh,
                 recipient: recipient,
                 scope: scope,
-                forceReemit: !hadPendingRecovery,
-                freshOutboundRepair: resetSucceeded ? nil : (
-                    secretName: message.senderSecretName,
-                    deviceId: message.senderDeviceId,
-                    failureClass: failureClass))
+                forceReemit: !hadPendingRecovery)
             if !emitted {
                 logger.log(
                     level: .info,
@@ -1113,6 +1106,8 @@ extension TaskProcessor {
                     level: .info,
                     message: "pqs.recovery.reestablishmentQueued kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
             }
+        } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
+            await reportPeerSigningKeyOutOfSync(message: message, session: session)
         } catch {
             logger.log(
                 level: .warning,
@@ -1129,6 +1124,19 @@ extension TaskProcessor {
         cache: SessionCache,
         session: PQSSession
     ) async throws -> JobProcessingOutcome {
+        await reportPeerSigningKeyOutOfSync(message: message, session: session)
+        try await cache.deleteJob(job)
+        return .deleted
+    }
+
+    /// Trust-blocked recovery: the peer's pinned signing key no longer matches the
+    /// advertised bundle, so no lane reset or peerRefresh may proceed until the user
+    /// reverifies the contact. Clears the recovery episode and deferred resends for
+    /// this device lane so recovery does not stay open against a blocked identity.
+    private func reportPeerSigningKeyOutOfSync(
+        message: InboundTaskMessage,
+        session: PQSSession
+    ) async {
         let failureClass = "identity.peerSigningKeyOutOfSync"
         auditInboundDecryptFailure(
             message: message,
@@ -1138,6 +1146,12 @@ extension TaskProcessor {
             level: .error,
             message: "pqs.recovery.blocked.trust failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=notifyPeerAccountIdentityChanged")
 
+        _ = await session.takePendingResendsAfterReestablishment(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId)
+        await session.endReestablishmentEpisode(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId)
         await session.markInboundFailure(message, failureClass: failureClass)
         await session.quarantineInboundFailure(
             sender: message.senderSecretName,
@@ -1147,9 +1161,6 @@ extension TaskProcessor {
             secretName: message.senderSecretName,
             deviceId: message.senderDeviceId,
             failedSharedMessageId: message.sharedMessageId)
-
-        try await cache.deleteJob(job)
-        return .deleted
     }
 
     private func handleFreshOutboundRepair(
@@ -1162,6 +1173,25 @@ extension TaskProcessor {
     ) async throws -> JobProcessingOutcome {
         guard let props = await message.recipientIdentity.props(symmetricKey: symmetricKey) else {
             logger.log(level: .error, message: "Fresh outbound repair failed: missing recipient props for \(error)")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+
+        // A coordinated peerRefresh exchange owns this lane: either we emitted a
+        // device-scoped request (open episode) or the peer bootstrapped us as the
+        // responder. Resetting here would clobber that freshly coordinated state and
+        // every subsequent ciphertext from the peer, restarting the divergence loop.
+        // Drop the job; the exchange repairs the lane and deferred resends drain it.
+        let hasOpenEpisode = await session.hasOpenReestablishmentEpisode(
+            sender: props.secretName,
+            deviceId: props.deviceId)
+        let hasResponderBootstrapHold = await session.hasRecentInboundPeerRefreshBootstrap(
+            sender: props.secretName,
+            deviceId: props.deviceId)
+        if hasOpenEpisode || hasResponderBootstrapHold {
+            logger.log(
+                level: .warning,
+                message: "pqs.recovery.outboundRepairSkipped failureClass=\(freshSessionFailureClass(error)) recipient=\(props.secretName) deviceId=\(props.deviceId) sharedId=\(message.sharedId) reason=\(hasOpenEpisode ? "openReestablishmentEpisode" : "responderBootstrapHold")")
             try await cache.deleteJob(job)
             return .deleted
         }

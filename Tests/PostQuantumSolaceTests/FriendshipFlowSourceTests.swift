@@ -69,6 +69,22 @@ private enum PQSFriendshipSource {
 @Suite("Friendship flow source guards")
 struct FriendshipFlowSourceTests {
 
+    @Test("contact synchronization repairs communication shells on every linked device")
+    func contactSynchronizationRepairsCommunicationShells() throws {
+        let source = try PQSFriendshipSource.read("Sources/SessionEvents/SessionEvents.swift")
+        let communicationBody = try PQSFriendshipSource.functionBody(
+            named: "private func updateOrCreateCommunication",
+            in: source)
+
+        #expect(source.contains("Linked-device sync is also a repair event"))
+        #expect(source.contains("if contactAlreadyExists"))
+        #expect(source.contains("preferredSharedIdentifier: contactInfo.sharedCommunicationId"))
+        #expect(source.contains("Repair the communication shell before notifying the UI"))
+        #expect(source.contains("preferredSharedIdentifier: UUID? = nil"))
+        #expect(communicationBody.contains("preferredSharedIdentifier ?? UUID()"))
+        #expect(communicationBody.contains("return props.sharedId?.uuidString"))
+    }
+
     @Test("explicit friendship packets can override settled stored metadata")
     func explicitFriendshipPacketsCanOverrideSettledStoredMetadata() throws {
         let source = try PQSFriendshipSource.read("Sources/SessionEvents/SessionEvents.swift")
@@ -237,17 +253,65 @@ struct FriendshipFlowSourceTests {
         #expect(inboundMerge.contains("passed.myState == .blockedByOther || passed.theirState == .blocked"))
     }
 
-    @Test("inbound decrypt recovery resets without consuming server OTKs")
-    func inboundDecryptRecoveryResetsWithoutConsumingServerOTKs() throws {
+    @Test("inbound decrypt recovery bootstraps before decrypt and keeps the proven lane")
+    func inboundDecryptRecoveryCoordinatesResetAfterPeerRefreshResponse() throws {
         let source = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
+        let ratchetSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
+        let controlSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession+ControlEventCoalescing.swift")
+        let repairBody = try PQSFriendshipSource.functionBody(
+            named: "private func handleFreshSessionRepair",
+            in: source)
         #expect(source.contains("action=freshSessionRepairThenDeferredResend"))
-        #expect(source.contains("Repair must not consume a server OTK per decrypt failure"))
-        #expect(source.contains("sendOneTimeIdentities: false"))
         #expect(source.contains("tryBeginReestablishmentEpisode"))
         #expect(source.contains("hasOpenReestablishmentEpisode"))
-        // Cooldown is recorded only after a successful reset so a failed OTK/repair
-        // attempt can retry instead of being silenced for 15s.
-        #expect(source.contains("markReconciliationAttempt(\n                    sender: message.senderSecretName,\n                    deviceId: message.senderDeviceId,\n                    flow: .inbound)"))
+        // The peerRefresh request must use the still-shared ratchet. Resetting before
+        // sending is safe only when the transport marks the exact-device pre-decrypt reset.
+        #expect(!repairBody.contains("resetSessionIdentityForFreshSession"))
+        #expect(controlSource.contains("requiresPreDecryptionReset"))
+        #expect(controlSource.contains("resetSessionIdentityForFreshSession"))
+        #expect(controlSource.contains("sendOneTimeIdentities: false"))
+        #expect(ratchetSource.contains("Completed responder peerRefresh on bootstrapped device lane"))
+        #expect(ratchetSource.contains("resetting again"))
+        #expect(ratchetSource.contains("outOfBandResendReusingCoordinatedIdentity"))
+        #expect(source.contains("ratchet.maxSkippedHeadersExceeded"))
+        #expect(source.contains("Preserve the\n                // still-shared outbound ratchet"))
+    }
+
+    @Test("simultaneous recovery converges on one lane owner")
+    func simultaneousRecoveryConvergesOnOneLaneOwner() throws {
+        let controlSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession+ControlEventCoalescing.swift")
+        let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
+
+        // The pending request must be registered before the reset suspension point,
+        // otherwise a simultaneous inbound bootstrap cannot see it and both devices
+        // accept each other's bootstrap, clobbering freshly reset lanes.
+        let emitBody = try PQSFriendshipSource.functionBody(
+            named: "func emitSessionReestablishment",
+            in: controlSource)
+        let registerIndex = try #require(emitBody.range(of: "registerExpectedPeerRefreshResponse"))
+        let resetIndex = try #require(emitBody.range(of: "resetSessionIdentityForFreshSession"))
+        #expect(registerIndex.lowerBound < resetIndex.lowerBound)
+        #expect(emitBody.contains("unregisterExpectedPeerRefreshResponse"))
+
+        // While the peer coordinated this lane as responder, local failure events must
+        // coalesce into deferred resends instead of starting a competing reset.
+        let repairBody = try PQSFriendshipSource.functionBody(
+            named: "private func handleFreshSessionRepair",
+            in: sequenceSource)
+        #expect(repairBody.contains("hasRecentInboundPeerRefreshBootstrap"))
+        #expect(repairBody.contains("responderBootstrapHold"))
+
+        // Outbound ratchet errors must never reset a lane owned by a coordinated
+        // peerRefresh exchange; resetting invalidates the peer's in-flight ciphertext.
+        let outboundRepairBody = try PQSFriendshipSource.functionBody(
+            named: "private func handleFreshOutboundRepair",
+            in: sequenceSource)
+        #expect(outboundRepairBody.contains("hasOpenReestablishmentEpisode"))
+        #expect(outboundRepairBody.contains("hasRecentInboundPeerRefreshBootstrap"))
+        #expect(outboundRepairBody.contains("pqs.recovery.outboundRepairSkipped"))
+        let skipIndex = try #require(outboundRepairBody.range(of: "pqs.recovery.outboundRepairSkipped"))
+        let outboundResetIndex = try #require(outboundRepairBody.range(of: "resetSessionIdentityForFreshSession"))
+        #expect(skipIndex.lowerBound < outboundResetIndex.lowerBound)
     }
 
     @Test("outbound user ciphertext is prioritized over control frames")
@@ -282,7 +346,7 @@ struct FriendshipFlowSourceTests {
         #expect(consumeIndex.lowerBound < deleteIndex.lowerBound)
     }
 
-    @Test("out-of-band resend reuses identity for recent control replay")
+    @Test("out-of-band resend reuses the coordinated device identity")
     func outOfBandResendReusesIdentityForRecentControlReplay() throws {
         let source = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
         let body = try PQSFriendshipSource.functionBody(named: "func handleOutOfBandResendRequest", in: source)
@@ -290,11 +354,10 @@ struct FriendshipFlowSourceTests {
         #expect(body.contains("onlyRecentControls"))
         #expect(body.contains("activeSessionIdentityForPeer"))
         #expect(body.contains("permanentlyUnavailableIds"))
-        #expect(body.contains("flow: .outbound"))
         #expect(body.contains("isFriendshipStateControlMessage"))
         #expect(body.contains("staleFriendshipControl"))
-        #expect(body.contains("sendOneTimeIdentities: false"))
-        #expect(!body.contains("sendOneTimeIdentities: true)"))
+        #expect(body.contains("outOfBandResendReusingCoordinatedIdentity"))
+        #expect(!body.contains("resetSessionIdentityForFreshSession"))
     }
 
     @Test("session cache delete is idempotent when row is already absent")

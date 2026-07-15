@@ -86,7 +86,8 @@ public extension PQSSession {
         metadata: Data = .init(),
         destructionTime: TimeInterval? = nil,
         sharedIdOverride: String? = nil,
-        shouldPersistOverride: Bool? = nil
+        shouldPersistOverride: Bool? = nil,
+        targetDeviceId: UUID? = nil
     ) async throws {
         do {
             let message = CryptoMessage(
@@ -101,7 +102,8 @@ public extension PQSSession {
                 message: message,
                 session: self,
                 sharedIdOverride: sharedIdOverride,
-                shouldPersistOverride: shouldPersistOverride
+                shouldPersistOverride: shouldPersistOverride,
+                targetDeviceId: targetDeviceId
             )
         } catch {
             logger.log(level: .error, message: "\(error)")
@@ -298,7 +300,8 @@ public extension PQSSession {
         message: CryptoMessage,
         session: PQSSession,
         sharedIdOverride: String? = nil,
-        shouldPersistOverride: Bool? = nil
+        shouldPersistOverride: Bool? = nil,
+        targetDeviceId: UUID? = nil
     ) async throws {
         
         guard let sessionContext = await session.sessionContext else {
@@ -341,6 +344,7 @@ public extension PQSSession {
             sender: mySecretName,
             type: message.recipient,
             sharedIdOverride: sharedIdOverride,
+            targetDeviceId: targetDeviceId,
             shouldPersist: shouldPersist,
             logger: logger)
     }

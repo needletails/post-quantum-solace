@@ -54,6 +54,28 @@ struct BroadcastOutboundTests {
         )
     }
 
+    @Test("Device-targeted controls select only the requested identity")
+    func deviceTargetedIdentitySelection() async throws {
+        let deviceA = UUID()
+        let deviceB = UUID()
+        let deviceC = UUID()
+        let identities = [
+            try identity(secretName: "bob", deviceId: deviceA),
+            try identity(secretName: "bob", deviceId: deviceB),
+            try identity(secretName: "bob", deviceId: deviceC)
+        ]
+
+        let selected = await DeviceTargetedIdentityFilter.select(
+            identities,
+            targetDeviceId: deviceB,
+            symmetricKey: symmetricKey)
+        let selectedDeviceIds = await selected.asyncCompactMap {
+            await $0.props(symmetricKey: symmetricKey)?.deviceId
+        }
+
+        #expect(selectedDeviceIds == [deviceB])
+    }
+
     @Test("collectPeerSecretNames excludes sender and gathers identity peers")
     func identityPeersExcludeSender() async throws {
         let sender = "self_user"

@@ -875,6 +875,9 @@ actor TaskProcessorSequenceTests {
             EncryptableTask(task: .streamMessage(first)),
             session: session)
         #expect(try await waitForPendingRepair(sender: peerName, deviceId: peerDeviceId))
+        #expect(
+            await session.hasOpenReestablishmentEpisode(sender: peerName, deviceId: peerDeviceId),
+            "maxSkipped must keep the reestablishment episode open until peerRefresh completes")
 
         let reconciliationAttemptsAfterFirst = await session.lastReconciliationAtByPeer.count
         try await session.taskProcessor.feedTask(
@@ -889,6 +892,148 @@ actor TaskProcessorSequenceTests {
         #expect(
             await session.lastReconciliationAtByPeer.count == reconciliationAttemptsAfterFirst,
             "A pending peer recovery must coalesce later failures without another identity reset attempt")
+
+        await session.shutdown()
+    }
+
+    @Test("Pending replay does not block a new episode after the prior episode expires")
+    func testExpiredRecoveryEpisodeRestartsWithPendingReplay() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
+        )
+
+        let peerName = "bob_expired_recovery_episode"
+        let peerDeviceId = UUID()
+        let expiredStart = Date().addingTimeInterval(
+            -(await session.reestablishmentEpisodeTTL + 1)
+        )
+        #expect(await session.tryBeginReestablishmentEpisode(
+            sender: peerName,
+            deviceId: peerDeviceId,
+            now: expiredStart))
+        await session.deferPeerResendUntilReestablished(
+            sender: peerName,
+            deviceId: peerDeviceId,
+            failedMessageId: "expired_recovery_pending",
+            failureClass: "ratchet.maxSkippedHeadersExceeded",
+            notifyDelegate: false)
+
+        let next = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "expired_recovery_next")
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(next)),
+            session: session)
+
+        #expect(
+            await session.hasOpenReestablishmentEpisode(
+                sender: peerName,
+                deviceId: peerDeviceId),
+            "A pending replay marker must not extend the expired single-flight episode")
+
+        let pendingIds = await Set(
+            session.pendingResendAfterReestablishment.values
+                .filter { $0.senderName == peerName && $0.senderDeviceId == peerDeviceId }
+                .map(\.failedSharedMessageId))
+        #expect(pendingIds == ["expired_recovery_pending", "expired_recovery_next"])
+
+        await session.shutdown()
+    }
+
+    @Test("Responder bootstrap hold coalesces inbound failures without a competing reset")
+    func testResponderBootstrapHoldCoalescesInboundFailures() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
+        )
+
+        let peerName = "bob_bootstrap_hold"
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerBundle.deviceKeys.deviceId,
+            config: peerBundle.userConfiguration)
+
+        guard let localDeviceId = await session.sessionContext?.sessionUser.deviceId else {
+            Issue.record("Session context should be available")
+            await session.shutdown()
+            return
+        }
+
+        let envelope = SessionReestablishmentEnvelope(
+            kind: .peerRefresh,
+            intentId: UUID(),
+            epoch: 1,
+            targetDeviceId: localDeviceId,
+            requiresPreDecryptionReset: true)
+        #expect(try await session.prepareInboundPeerRefreshBootstrap(
+            sender: peerName,
+            deviceId: peerBundle.deviceKeys.deviceId,
+            envelope: envelope))
+        #expect(await session.hasRecentInboundPeerRefreshBootstrap(
+            sender: peerName,
+            deviceId: peerBundle.deviceKeys.deviceId))
+
+        let reconciliationAttemptsBefore = await session.lastReconciliationAtByPeer.count
+        let inbound = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerBundle.deviceKeys.deviceId,
+            sharedMessageId: "bootstrap_hold_stale_cipher")
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session)
+
+        #expect(try await waitForPendingRepair(sender: peerName, deviceId: peerBundle.deviceKeys.deviceId))
+        #expect(
+            !(await session.hasOpenReestablishmentEpisode(
+                sender: peerName,
+                deviceId: peerBundle.deviceKeys.deviceId)),
+            "A responder bootstrap hold must coalesce failures instead of opening a competing episode")
+        #expect(
+            await session.lastReconciliationAtByPeer.count == reconciliationAttemptsBefore,
+            "No local reset may run while the peer-coordinated bootstrap owns the lane")
+        let pending = await session.pendingResendAfterReestablishment.values.filter {
+            $0.senderName == peerName && $0.senderDeviceId == peerBundle.deviceKeys.deviceId
+        }
+        #expect(pending.map(\.failedSharedMessageId) == ["bootstrap_hold_stale_cipher"])
+
+        await session.shutdown()
+    }
+
+    @Test("maxSkipped repair emits peerRefresh instead of retrying ciphertext")
+    func testMaxSkippedRepairDoesNotRetryCiphertextAlone() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
+        )
+
+        let peerName = "bob_max_skipped_refresh"
+        let peerDeviceId = UUID()
+        let inbound = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "max_skipped_needs_refresh")
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session)
+
+        #expect(try await waitForPendingRepair(sender: peerName, deviceId: peerDeviceId))
+        #expect(
+            await session.hasOpenReestablishmentEpisode(sender: peerName, deviceId: peerDeviceId),
+            "Episode must stay open while waiting for peerRefresh")
+        // Unilateral reset + re-feed of the same ciphertext used to return before
+        // deferring/emitting peerRefresh. Pending resend proves we fell through.
+        let pending = await session.pendingResendAfterReestablishment.values.filter {
+            $0.senderName == peerName && $0.senderDeviceId == peerDeviceId
+        }
+        #expect(pending.map(\.failedSharedMessageId) == ["max_skipped_needs_refresh"])
+        #expect(pending.map(\.failureClass) == ["ratchet.maxSkippedHeadersExceeded"])
 
         await session.shutdown()
     }

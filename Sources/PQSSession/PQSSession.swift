@@ -337,6 +337,16 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// coalesce into deferred resend instead of starting another identity reset.
     var openReestablishmentEpisodes: [String: Date] = [:]
 
+    /// Expected response intent for each concrete peer-device recovery lane.
+    /// A response cannot close another device's or an older recovery episode.
+    var expectedPeerRefreshIntentByPeer: [String: UUID] = [:]
+
+    /// Last peerRefresh bootstrap applied before decryption for each peer-device lane.
+    /// Replayed transport wrappers must not repeatedly clear a healthy ratchet.
+    var preparedInboundPeerRefreshBootstrapByPeer: [
+        String: (intentId: UUID, preparedAt: Date)
+    ] = [:]
+
     /// Maximum lifetime of a single-flight reestablishment episode before a new
     /// leader is allowed. Bounds stuck recovery without timer-based retry loops.
     let reestablishmentEpisodeTTL: TimeInterval = 90
@@ -751,8 +761,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
     func cleanupOpenReestablishmentEpisodes(now: Date = Date()) {
         let cutoff = now.addingTimeInterval(-reestablishmentEpisodeTTL)
+        let expiredKeys = openReestablishmentEpisodes.compactMap { key, startedAt in
+            startedAt <= cutoff ? key : nil
+        }
         openReestablishmentEpisodes = openReestablishmentEpisodes.filter { _, startedAt in
             startedAt > cutoff
+        }
+        for key in expiredKeys {
+            expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
         }
     }
 
@@ -785,8 +801,117 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     func endReestablishmentEpisode(sender: String, deviceId: UUID) {
-        openReestablishmentEpisodes.removeValue(
+        let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
+        openReestablishmentEpisodes.removeValue(forKey: key)
+        expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
+    }
+
+    func registerExpectedPeerRefreshResponse(
+        sender: String,
+        deviceId: UUID,
+        intentId: UUID
+    ) {
+        expectedPeerRefreshIntentByPeer[
+            reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
+        ] = intentId
+    }
+
+    func unregisterExpectedPeerRefreshResponse(sender: String, deviceId: UUID) {
+        expectedPeerRefreshIntentByPeer.removeValue(
             forKey: reestablishmentEpisodeKey(sender: sender, deviceId: deviceId))
+    }
+
+    /// `true` while this device recently applied a pre-decryption bootstrap for the
+    /// peer device and is acting as the responder of that peerRefresh exchange.
+    /// During this hold, local failure events must coalesce into deferred resends
+    /// instead of resetting the lane the peer just coordinated.
+    func hasRecentInboundPeerRefreshBootstrap(
+        sender: String,
+        deviceId: UUID,
+        now: Date = Date()
+    ) -> Bool {
+        guard let prepared = preparedInboundPeerRefreshBootstrapByPeer[
+            reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
+        ] else {
+            return false
+        }
+        return now.timeIntervalSince(prepared.preparedAt) < reestablishmentEpisodeTTL
+    }
+
+    func isExpectedPeerRefreshResponse(
+        sender: String,
+        deviceId: UUID,
+        intentId: UUID?
+    ) -> Bool {
+        guard let intentId else { return false }
+        return expectedPeerRefreshIntentByPeer[
+            reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
+        ] == intentId
+    }
+
+    /// Applies the clear transport bootstrap for a freshly initialized, device-scoped
+    /// peerRefresh request before its signed ciphertext is handed to the ratchet.
+    ///
+    /// Simultaneous recovery requests converge deterministically: the lower requester
+    /// device UUID wins. The losing request is dropped without resetting the winner's
+    /// fresh lane.
+    func localPeerRefreshBootstrapWinsCollision(
+        localDeviceId: UUID,
+        senderDeviceId: UUID,
+        hasPendingLocalRequest: Bool
+    ) -> Bool {
+        hasPendingLocalRequest
+            && localDeviceId.uuidString < senderDeviceId.uuidString
+    }
+
+    public func prepareInboundPeerRefreshBootstrap(
+        sender: String,
+        deviceId: UUID,
+        envelope: SessionReestablishmentEnvelope
+    ) async throws -> Bool {
+        guard envelope.kind == .peerRefresh,
+              !envelope.isResponse,
+              envelope.requiresPreDecryptionReset,
+              let intentId = envelope.intentId,
+              let context = _sessionContext
+        else {
+            return true
+        }
+        if let targetDeviceId = envelope.targetDeviceId,
+           targetDeviceId != context.sessionUser.deviceId {
+            return false
+        }
+
+        let now = Date()
+        preparedInboundPeerRefreshBootstrapByPeer =
+            preparedInboundPeerRefreshBootstrapByPeer.filter {
+                now.timeIntervalSince($0.value.preparedAt) < reestablishmentEpisodeTTL
+            }
+        let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
+        if preparedInboundPeerRefreshBootstrapByPeer[key]?.intentId == intentId {
+            return true
+        }
+
+        if localPeerRefreshBootstrapWinsCollision(
+            localDeviceId: context.sessionUser.deviceId,
+            senderDeviceId: deviceId,
+            hasPendingLocalRequest: expectedPeerRefreshIntentByPeer[key] != nil
+        ) {
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.bootstrapDropped reason=simultaneousLocalRequestWins sender=\(sender) deviceId=\(deviceId) intent=\(intentId)")
+            return false
+        }
+
+        _ = try await resetSessionIdentityForFreshSession(
+            secretName: sender,
+            deviceId: deviceId,
+            sendOneTimeIdentities: false)
+        preparedInboundPeerRefreshBootstrapByPeer[key] = (intentId, now)
+        logger.log(
+            level: .warning,
+            message: "pqs.recovery.bootstrapPrepared sender=\(sender) deviceId=\(deviceId) intent=\(intentId)")
+        return true
     }
 
     func takePendingResendsAfterReestablishment(

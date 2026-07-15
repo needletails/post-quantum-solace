@@ -549,12 +549,23 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         guard candidates.isEmpty == false else { return nil }
         guard candidates.count > 1 else { return candidates[0].identity }
 
+        let preferenceKey = peerDeviceIdentityPreferenceKey(
+            secretName: secretName,
+            deviceId: deviceId)
+        if let preferredId = preferredSessionIdentityIdByPeerDevice[preferenceKey],
+           let preferred = candidates.first(where: { $0.identity.id == preferredId }) {
+            return preferred.identity
+        }
+
         if let preferredDevice {
             let currentBundleMatches = candidates.filter { candidate in
                 candidate.props.longTermPublicKey == preferredDevice.longTermPublicKey &&
                 candidate.props.signingPublicKey == preferredDevice.signingPublicKey
             }
-            if let match = bestCandidatePreservingStoreOrder(currentBundleMatches) {
+            let initializedBundleMatches = currentBundleMatches.filter { $0.props.state != nil }
+            if let match = bestCandidatePreservingStoreOrder(
+                initializedBundleMatches.isEmpty ? currentBundleMatches : initializedBundleMatches
+            ) {
                 return match.identity
             }
         }
@@ -572,6 +583,13 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         }
 
         return bestCandidatePreservingStoreOrder(candidates)?.identity
+    }
+
+    private func peerDeviceIdentityPreferenceKey(
+        secretName: String,
+        deviceId: UUID
+    ) -> String {
+        "\(secretName)|\(deviceId.uuidString)"
     }
 
     private func bestCandidatePreservingStoreOrder(
@@ -673,6 +691,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 case .synchronizeOneTimeKeys(var info):
                     info.senderCurveId = results.localOneTimePrivateKey?.id.uuidString
                     info.senderMLKEMId = results.localMLKEMPrivateKey.id.uuidString
+                    transportEvent = .synchronizeOneTimeKeys(info)
                     let encodedData = try BinaryEncoder().encode(info)
                     await session.setAddingContact(encodedData)
                     outboundTask.message.transportInfo = encodedData
@@ -757,6 +776,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         if shouldRememberPendingTransport {
             pendingOutboundTransportBySharedId.removeValue(forKey: outboundTask.sharedId)
         }
+        await completeResponderPeerRefreshIfNeeded(
+            transportEvent,
+            peerSecretName: props.secretName,
+            peerDeviceId: props.deviceId,
+            session: session)
 
         await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
 
@@ -771,6 +795,34 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 curveId: results.localOneTimePrivateKey?.id.uuidString,
                 mlKEMId: results.localMLKEMPrivateKey.id.uuidString)
         }
+    }
+
+    private func completeResponderPeerRefreshIfNeeded(
+        _ event: TransportEvent?,
+        peerSecretName: String,
+        peerDeviceId: UUID,
+        session: PQSSession
+    ) async {
+        guard case .sessionReestablishment(let envelope) = event,
+              envelope.kind == .peerRefresh,
+              envelope.isResponse
+        else {
+            return
+        }
+
+        let pending = await session.takePendingResendsAfterReestablishment(
+            sender: peerSecretName,
+            deviceId: peerDeviceId)
+        await session.endReestablishmentEpisode(
+            sender: peerSecretName,
+            deviceId: peerDeviceId)
+        await sendDeferredResendRequests(
+            pending,
+            session: session,
+            reason: "peerRefresh response transported")
+        logger.log(
+            level: .info,
+            message: "Completed responder peerRefresh on bootstrapped device lane peer=\(peerSecretName) deviceId=\(peerDeviceId)")
     }
     
     // MARK: - Inbound Message Handling
@@ -816,8 +868,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         let verificationResult = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
         
         do {
-            // Attempt decryption with the active identity first, falling back to archived
-            // identities if needed (previous-state decryption).
+            // Attempt decryption with the preferred active identity first. Legacy
+            // persistence races may have left alternate active rows for the same
+            // peer device, so try those before archived previous-state snapshots.
             let activeSessionIdentity = verificationResult.sessionIdentity
             let activeSessionIdentityDataBeforeAttempt = activeSessionIdentity.data
             var decryptedFromArchivedIdentity = false
@@ -839,33 +892,52 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     data: activeSessionIdentityDataBeforeAttempt,
                     session: session,
                     reason: "active inbound decrypt failed before archived fallback")
+                let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
+                let activeIdentities = try await session.getSessionIdentities(
+                    with: inboundTask.senderSecretName)
+                let alternateActiveIdentities = await activeIdentities.asyncFilter { identity in
+                    guard identity.id != activeSessionIdentity.id,
+                          let props = await identity.props(symmetricKey: databaseSymmetricKey)
+                    else {
+                        return false
+                    }
+                    return props.deviceId == inboundTask.senderDeviceId
+                }
                 let archivedIdentities = try await session.fetchArchivedSessionIdentities(
                     secretName: inboundTask.senderSecretName,
                     deviceId: inboundTask.senderDeviceId)
 
                 var fallbackData: Data?
-                for archived in archivedIdentities {
-                    let archivedDataBeforeAttempt = archived.data
+                let fallbackIdentities = alternateActiveIdentities.map {
+                    (identity: $0, isArchived: false)
+                } + archivedIdentities.map {
+                    (identity: $0, isArchived: true)
+                }
+                for candidate in fallbackIdentities {
+                    let fallbackIdentity = candidate.identity
+                    let fallbackDataBeforeAttempt = fallbackIdentity.data
                     do {
                         try await initializeRecipient(
-                            sessionIdentity: archived,
+                            sessionIdentity: fallbackIdentity,
                             session: session,
                             ratchetMessage: verificationResult.ratchetMessage)
 
                         let data = try await ratchetManager.ratchetDecrypt(
                             verificationResult.ratchetMessage,
-                            sessionId: archived.id)
-                        logger.log(level: .info, message: "Archived identity fallback succeeded for \(inboundTask.senderSecretName)")
-                        decryptedFromArchivedIdentity = true
-                        decryptionSessionIdentity = archived
+                            sessionId: fallbackIdentity.id)
+                        logger.log(
+                            level: .info,
+                            message: "\(candidate.isArchived ? "Archived" : "Alternate active") identity fallback succeeded for \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId))")
+                        decryptedFromArchivedIdentity = candidate.isArchived
+                        decryptionSessionIdentity = fallbackIdentity
                         fallbackData = data
                         break
                     } catch {
                         try? await restoreSessionIdentityData(
-                            archived,
-                            data: archivedDataBeforeAttempt,
+                            fallbackIdentity,
+                            data: fallbackDataBeforeAttempt,
                             session: session,
-                            reason: "archived inbound fallback attempt failed")
+                            reason: "inbound identity fallback attempt failed")
                         continue
                     }
                 }
@@ -885,6 +957,12 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     reason: "archived inbound fallback succeeded after active decrypt failure")
                 decryptedData = data
             }
+
+            preferredSessionIdentityIdByPeerDevice[
+                peerDeviceIdentityPreferenceKey(
+                    secretName: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId)
+            ] = decryptionSessionIdentity.id
 
 #if DEBUG
             if let transform = await session._testDecryptedPayloadTransform {
@@ -919,14 +997,25 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         canSaveMessage = false
 
                         guard let context = await session.sessionContext else { return }
+                        if let targetDeviceId = envelope.targetDeviceId,
+                           targetDeviceId != context.sessionUser.deviceId {
+                            logger.log(
+                                level: .info,
+                                message: "Ignoring peerRefresh for another local device target=\(targetDeviceId) local=\(context.sessionUser.deviceId)")
+                            return
+                        }
 
                         if decryptedFromArchivedIdentity,
                            envelope.kind == .peerRefresh {
-                            logger.log(
-                                level: .info,
-                                message: "Ignoring archived peerRefresh control from \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId)); waiting for active reestablishment before continuing recovery"
-                            )
-                            return
+                            let promoted = try await session.promoteArchivedSessionIdentityToActive(
+                                decryptionSessionIdentity)
+                            decryptionSessionIdentity = promoted
+                            decryptedFromArchivedIdentity = false
+                            preferredSessionIdentityIdByPeerDevice[
+                                peerDeviceIdentityPreferenceKey(
+                                    secretName: inboundTask.senderSecretName,
+                                    deviceId: inboundTask.senderDeviceId)
+                            ] = promoted.id
                         }
 
                         // Receiver-side coalescing: drop duplicates and stale-epoch replays from
@@ -1000,6 +1089,24 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
 
                         if kind == .peerRefresh {
                             if envelope.isResponse {
+                                guard await session.isExpectedPeerRefreshResponse(
+                                    sender: inboundTask.senderSecretName,
+                                    deviceId: inboundTask.senderDeviceId,
+                                    intentId: envelope.intentId)
+                                else {
+                                    logger.log(
+                                        level: .info,
+                                        message: "Ignoring unmatched peerRefresh response sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) intent=\(envelope.intentId?.uuidString ?? "nil")")
+                                    return
+                                }
+                                // The request established a fresh exact-device lane before
+                                // encryption and the transport bootstrap prepared the peer
+                                // before decryption. Keep that proven lane; resetting again
+                                // after the response would immediately diverge both devices.
+                                await session.markReconciliationAttempt(
+                                    sender: inboundTask.senderSecretName,
+                                    deviceId: inboundTask.senderDeviceId,
+                                    flow: .inbound)
                                 let pending = await session.takePendingResendsAfterReestablishment(
                                     sender: inboundTask.senderSecretName,
                                     deviceId: inboundTask.senderDeviceId)
@@ -1017,7 +1124,8 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                     _ = try await session.emitSessionReestablishmentResponse(
                                         kind: .peerRefresh,
                                         recipient: recipient,
-                                        respondingTo: envelope)
+                                        respondingTo: envelope,
+                                        targetDeviceId: inboundTask.senderDeviceId)
                                 } catch {
                                     await session.forgetReceivedSessionReestablishment(
                                         envelope: envelope,
@@ -1374,6 +1482,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             pendingTransport.metadata.transportEvent,
             sharedId: outboundTask.sharedId)
         pendingOutboundTransportBySharedId.removeValue(forKey: outboundTask.sharedId)
+        await completeResponderPeerRefreshIfNeeded(
+            pendingTransport.metadata.transportEvent,
+            peerSecretName: pendingTransport.metadata.secretName,
+            peerDeviceId: pendingTransport.metadata.deviceId,
+            session: session)
 
         await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
 
@@ -1546,39 +1659,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         }
 
         let onlyRecentControls = replayableMessages.allSatisfy { !$0.servicedFromPersistedStore }
-        let needsRatchetReset = replayableMessages.contains(where: { $0.servicedFromPersistedStore })
-        let identity: SessionIdentity
-        if onlyRecentControls {
-            identity = try await session.activeSessionIdentityForPeer(
-                secretName: senderName,
-                deviceId: senderDeviceId)
-            logger.log(
-                level: .info,
-                message: "pqs.recovery.outOfBandResendReusingIdentity sender=\(senderName) deviceId=\(senderDeviceId) replayCount=\(replayableMessages.count)")
-        } else if needsRatchetReset,
-                  await session.canAttemptReconciliation(
-                    sender: senderName,
-                    deviceId: senderDeviceId,
-                    flow: .outbound) {
-            // Resend repair must not consume a fresh OTK per request; reuse/repair
-            // with published keys and let outbound bootstrap consume at most once.
-            identity = try await session.resetSessionIdentityForFreshSession(
-                secretName: senderName,
-                deviceId: senderDeviceId,
-                sendOneTimeIdentities: false)
-            await session.markReconciliationAttempt(
-                sender: senderName,
-                deviceId: senderDeviceId,
-                flow: .outbound)
-        } else {
-            identity = try await session.activeSessionIdentityForPeer(
-                secretName: senderName,
-                deviceId: senderDeviceId,
-                sendOneTimeIdentities: needsRatchetReset)
-            logger.log(
-                level: .info,
-                message: "pqs.recovery.outOfBandResendReusingIdentity sender=\(senderName) deviceId=\(senderDeviceId) reason=reconciliationCooldown replayCount=\(replayableMessages.count)")
-        }
+        // A persisted replay request arrives only after peerRefresh request/response
+        // transport has completed and both exact-device lanes have reset. Resetting
+        // again here would put the responder one epoch ahead of the requester.
+        let identity = try await session.activeSessionIdentityForPeer(
+            secretName: senderName,
+            deviceId: senderDeviceId)
+        logger.log(
+            level: .info,
+            message: "pqs.recovery.outOfBandResendReusingCoordinatedIdentity sender=\(senderName) deviceId=\(senderDeviceId) controlsOnly=\(onlyRecentControls) replayCount=\(replayableMessages.count)")
 
         var queuedIds: [String] = []
         for replayable in replayableMessages {

@@ -2243,11 +2243,7 @@ actor EndToEndTests {
         _ = try await _senderSession.emitSessionReestablishment(
             kind: .peerRefresh,
             recipient: .nickname(rMockUserData.rsn),
-            scope: .peer(secretName: rMockUserData.rsn),
-            freshOutboundRepair: (
-                secretName: rMockUserData.rsn,
-                deviceId: bobDeviceId,
-                failureClass: "test.stateUninitialized"))
+            scope: .peer(secretName: rMockUserData.rsn))
 
         #expect(
             await waitUntil { await probe.sawPeerRefresh },
@@ -6022,8 +6018,13 @@ actor EndToEndTests {
             return await counters.getPeerRefreshes() >= 1
         }, "Expected maxSkipped to open single-flight repair / defer resend")
 
+        #expect(await waitUntil {
+            await counters.getPeerRefreshes() >= 1
+        }, "maxSkipped repair must emit peerRefresh after SessionIdentity reset (must not retry-only)")
+
         let peerRefreshCount = await counters.getPeerRefreshes()
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
+        #expect(peerRefreshCount >= 1, "Expected at least one peerRefresh after maxSkipped, got \(peerRefreshCount)")
         #expect(peerRefreshCount <= 1, "Single-flight repair must coalesce peerRefresh (got \(peerRefreshCount))")
         #expect(rotationCount == 0, "Expected maxSkipped repair to avoid key rotation, got \(rotationCount)")
     }
@@ -7504,7 +7505,16 @@ actor EndToEndTests {
             for await received in aliceStream {
                 if let event = received.transportEvent {
                     switch event {
-                    case .sessionReestablishment(_), .requestMessageResend(_):
+                    case .sessionReestablishment(let envelope):
+                        await probe.markRecoveryStarted()
+                        if envelope.requiresPreDecryptionReset,
+                           (try? await self._senderSession.prepareInboundPeerRefreshBootstrap(
+                               sender: received.sender,
+                               deviceId: received.deviceId,
+                               envelope: envelope)) != true {
+                            continue
+                        }
+                    case .requestMessageResend(_):
                         await probe.markRecoveryStarted()
                     default:
                         break
@@ -7520,6 +7530,14 @@ actor EndToEndTests {
         bobTask = Task {
             for await received in bobStream {
                 guard received.transportEvent == nil else {
+                    if case .sessionReestablishment(let envelope)? = received.transportEvent,
+                       envelope.requiresPreDecryptionReset,
+                       (try? await self._recipientSession.prepareInboundPeerRefreshBootstrap(
+                           sender: received.sender,
+                           deviceId: received.deviceId,
+                           envelope: envelope)) != true {
+                        continue
+                    }
                     _ = try? await self.receiveIgnoringRecoverableErrors(
                         self._recipientSession,
                         received: received
@@ -7754,6 +7772,10 @@ actor EndToEndTests {
             kind: .peerRefresh,
             intentId: UUID(),
             epoch: 1)
+        await _recipientSession.registerExpectedPeerRefreshResponse(
+            sender: "alice",
+            deviceId: aliceDeviceId,
+            intentId: try #require(originalPeerRefresh.intentId))
         _ = try await _senderSession.emitSessionReestablishmentResponse(
             kind: .peerRefresh,
             recipient: .nickname("bob"),

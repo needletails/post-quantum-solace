@@ -1167,6 +1167,63 @@ public extension PQSSession {
         return ranked.map(\.identity)
     }
 
+    /// Promotes the exact archived row that successfully decrypted a live recovery
+    /// control. This preserves the proven ratchet state so the response is encrypted
+    /// on the same lane, instead of using an unrelated freshly reset active row.
+    internal func promoteArchivedSessionIdentityToActive(
+        _ archived: SessionIdentity
+    ) async throws -> SessionIdentity {
+        guard let cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        guard let archivedProps = await archived.props(symmetricKey: symmetricKey),
+              archivedProps.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+        else {
+            return archived
+        }
+
+        let allIdentities = try await cache.fetchSessionIdentities()
+        for identity in allIdentities {
+            guard let props = await identity.props(symmetricKey: symmetricKey),
+                  props.secretName == archivedProps.secretName,
+                  props.deviceId == archivedProps.deviceId,
+                  !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            else {
+                continue
+            }
+            try await cache.deleteSessionIdentity(identity.id)
+        }
+
+        let restoredDeviceName = String(
+            archivedProps.deviceName.dropFirst(
+                PQSSessionConstants.inactiveSessionDeviceNamePrefix.count))
+        let restoredProps = SessionIdentity.UnwrappedProps(
+            secretName: archivedProps.secretName,
+            deviceId: archivedProps.deviceId,
+            sessionContextId: archivedProps.sessionContextId,
+            longTermPublicKey: archivedProps.longTermPublicKey,
+            signingPublicKey: archivedProps.signingPublicKey,
+            mlKEMPublicKey: archivedProps.mlKEMPublicKey,
+            oneTimePublicKey: archivedProps.oneTimePublicKey,
+            state: archivedProps.state,
+            deviceName: restoredDeviceName,
+            serverTrusted: archivedProps.serverTrusted,
+            previousRekey: archivedProps.previousRekey,
+            isMasterDevice: archivedProps.isMasterDevice,
+            verifiedIdentity: archivedProps.verifiedIdentity,
+            verificationCode: archivedProps.verificationCode)
+        try await archived.updateIdentityProps(
+            symmetricKey: symmetricKey,
+            props: restoredProps)
+        try await cache.updateSessionIdentity(archived)
+        removeIdentity(with: archivedProps.secretName)
+        logger.log(
+            level: .info,
+            message: "Promoted cryptographically proven archived SessionIdentity for \(archivedProps.secretName) (\(archivedProps.deviceId))")
+        return archived
+    }
+
     /// Archives and replaces the active identity for one peer device with a fresh,
     /// state-less identity built from the currently advertised key bundle.
     ///

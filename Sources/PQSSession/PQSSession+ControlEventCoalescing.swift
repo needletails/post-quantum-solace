@@ -26,8 +26,30 @@ import SessionModels
 public enum ControlEventScope: Hashable, Sendable {
     /// Targets the sender's own master/linked devices (`MessageRecipient.personalMessage`).
     case personal
+    /// Targets one linked device on the sender's account.
+    case personalDevice(deviceId: UUID)
     /// Targets a specific peer secretName (typically `MessageRecipient.nickname(name)`).
     case peer(secretName: String)
+    /// Targets one concrete device belonging to a peer.
+    case peerDevice(secretName: String, deviceId: UUID)
+
+    var targetDeviceId: UUID? {
+        switch self {
+        case .personal, .peer:
+            return nil
+        case .personalDevice(let deviceId), .peerDevice(_, let deviceId):
+            return deviceId
+        }
+    }
+
+    var recoveryPeer: (secretName: String, deviceId: UUID)? {
+        switch self {
+        case .peerDevice(let secretName, let deviceId):
+            return (secretName, deviceId)
+        default:
+            return nil
+        }
+    }
 }
 
 /// Composite key for the sender-side episode table.
@@ -110,7 +132,8 @@ extension PQSSession {
     func makeSessionReestablishmentEnvelope(
         kind: SessionReestablishmentKind,
         scope: ControlEventScope,
-        forceReemit: Bool = false
+        forceReemit: Bool = false,
+        requiresPreDecryptionReset: Bool = false
     ) -> SessionReestablishmentEnvelope? {
         pruneStaleSenderEpisodes()
         let now = Date()
@@ -140,7 +163,9 @@ extension PQSSession {
                     kind: kind,
                     intentId: existing.intentId,
                     epoch: nextEpoch,
-                    emittedAt: now)
+                    emittedAt: now,
+                    targetDeviceId: scope.targetDeviceId,
+                    requiresPreDecryptionReset: requiresPreDecryptionReset)
             }
             // Past episode lifetime: fall through to fresh-episode mint below.
             logger.log(
@@ -168,7 +193,9 @@ extension PQSSession {
             kind: kind,
             intentId: intentId,
             epoch: nextEpoch,
-            emittedAt: now)
+            emittedAt: now,
+            targetDeviceId: scope.targetDeviceId,
+            requiresPreDecryptionReset: requiresPreDecryptionReset)
     }
 
     /// Throttled, single-flight emission of a session-reestablishment control event.
@@ -181,61 +208,57 @@ extension PQSSession {
         kind: SessionReestablishmentKind,
         recipient: MessageRecipient,
         scope: ControlEventScope,
-        forceReemit: Bool = false,
-        freshOutboundRepair: (secretName: String, deviceId: UUID, failureClass: String)? = nil
+        forceReemit: Bool = false
     ) async throws -> Bool {
+        let localSecretName = await sessionContext?.sessionUser.secretName
+        let recoveryPeer: (secretName: String, deviceId: UUID)?
+        if let peer = scope.recoveryPeer {
+            recoveryPeer = peer
+        } else if case .personalDevice(let deviceId) = scope,
+                  let localSecretName {
+            recoveryPeer = (localSecretName, deviceId)
+        } else {
+            recoveryPeer = nil
+        }
+        let requiresPreDecryptionReset = kind == .peerRefresh && recoveryPeer != nil
         guard let envelope = makeSessionReestablishmentEnvelope(
             kind: kind,
             scope: scope,
-            forceReemit: forceReemit) else {
+            forceReemit: forceReemit,
+            requiresPreDecryptionReset: requiresPreDecryptionReset) else {
             return false
         }
-        if let freshOutboundRepair {
-            await prepareFreshOutboundSessionForRepairControls(
-                secretName: freshOutboundRepair.secretName,
-                deviceId: freshOutboundRepair.deviceId,
-                failureClass: freshOutboundRepair.failureClass)
+        // Register the pending request before any suspension point. A simultaneous
+        // inbound peerRefresh bootstrap resolves its collision against this exact
+        // state; registering after the reset `await` opens a window where both
+        // devices accept each other's bootstrap and clobber freshly reset lanes.
+        if let recoveryPeer, let intentId = envelope.intentId {
+            registerExpectedPeerRefreshResponse(
+                sender: recoveryPeer.secretName,
+                deviceId: recoveryPeer.deviceId,
+                intentId: intentId)
+        }
+        if requiresPreDecryptionReset, let recoveryPeer {
+            do {
+                _ = try await resetSessionIdentityForFreshSession(
+                    secretName: recoveryPeer.secretName,
+                    deviceId: recoveryPeer.deviceId,
+                    sendOneTimeIdentities: false)
+            } catch {
+                senderControlEpisodes.removeValue(
+                    forKey: ControlEventEpisodeKey(kind: kind, scope: scope))
+                unregisterExpectedPeerRefreshResponse(
+                    sender: recoveryPeer.secretName,
+                    deviceId: recoveryPeer.deviceId)
+                throw error
+            }
         }
         let metadata = try BinaryEncoder().encode(TransportEvent.sessionReestablishment(envelope))
-        try await writeTextMessage(recipient: recipient, transportInfo: metadata)
+        try await writeTextMessage(
+            recipient: recipient,
+            transportInfo: metadata,
+            targetDeviceId: scope.targetDeviceId)
         return true
-    }
-
-    private func prepareFreshOutboundSessionForRepairControls(
-        secretName: String,
-        deviceId: UUID,
-        failureClass: String
-    ) async {
-        guard canAttemptReconciliation(
-            sender: secretName,
-            deviceId: deviceId,
-            flow: .outbound)
-        else {
-            logger.log(
-                level: .info,
-                message: "Skipping outbound SessionIdentity reset for repair controls to \(secretName) (\(deviceId)); reconciliation cooldown is active")
-            return
-        }
-
-        do {
-            // Do not consume a server OTK just to emit repair controls — that is what
-            // caused multi-device recovery to thrash OTKs into HTTP 409 conflicts.
-            _ = try await resetSessionIdentityForFreshSession(
-                secretName: secretName,
-                deviceId: deviceId,
-                sendOneTimeIdentities: false)
-            markReconciliationAttempt(
-                sender: secretName,
-                deviceId: deviceId,
-                flow: .outbound)
-            logger.log(
-                level: .info,
-                message: "Prepared fresh outbound SessionIdentity for repair controls to \(secretName) deviceId=\(deviceId) after \(failureClass)")
-        } catch {
-            logger.log(
-                level: .warning,
-                message: "Fresh outbound SessionIdentity reset before repair controls failed for \(secretName) (\(deviceId)): \(error)")
-        }
     }
 
     /// Emits a response for a reestablishment request after the local refresh work has
@@ -245,7 +268,8 @@ extension PQSSession {
     func emitSessionReestablishmentResponse(
         kind: SessionReestablishmentKind,
         recipient: MessageRecipient,
-        respondingTo envelope: SessionReestablishmentEnvelope
+        respondingTo envelope: SessionReestablishmentEnvelope,
+        targetDeviceId: UUID? = nil
     ) async throws -> Bool {
         let nextEpoch = max(
             (senderControlEpochCounters[kind] ?? 0) + 1,
@@ -255,9 +279,13 @@ extension PQSSession {
             kind: kind,
             intentId: envelope.intentId ?? UUID(),
             epoch: nextEpoch,
-            isResponse: true)
+            isResponse: true,
+            targetDeviceId: targetDeviceId)
         let metadata = try BinaryEncoder().encode(TransportEvent.sessionReestablishment(response))
-        try await writeTextMessage(recipient: recipient, transportInfo: metadata)
+        try await writeTextMessage(
+            recipient: recipient,
+            transportInfo: metadata,
+            targetDeviceId: targetDeviceId)
         return true
     }
 
