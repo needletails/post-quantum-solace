@@ -1255,6 +1255,9 @@ public extension PQSSession {
 
         let symmetricKey = try await getDatabaseSymmetricKey()
         let configuration = try await transportDelegate.findConfiguration(for: secretName)
+        // Config lookup succeeded — clear any dependency block for this lane so a
+        // subsequent decrypt failure may emit peerRefresh again.
+        clearRecoveryEmitBlocked(sender: secretName, deviceId: deviceId)
 
         try validateUserConfigurationSignatures(configuration)
         if secretName != sessionUser.secretName {

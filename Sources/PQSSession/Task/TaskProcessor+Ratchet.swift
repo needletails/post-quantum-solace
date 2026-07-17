@@ -979,6 +979,17 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             } catch {
                 throw PQSSession.SessionErrors.sessionDecryptionError
             }
+
+            // The ratchet advanced and the payload decoded: the ciphertext is consumed.
+            // Emit before control-event handling so transport can delete the offline
+            // spool copy even for non-persisted frames and deduplicated replays —
+            // a spooled copy replayed after this point can only poison the ratchet.
+            let acceptedSharedId = inboundTask.sharedMessageId
+            let acceptedDelegate = await session.sessionDelegate
+            Task {
+                await acceptedDelegate?.inboundCiphertextAccepted(sharedMessageId: acceptedSharedId)
+            }
+
             var canSaveMessage = true
             
             if let sessionDelegate = await session.sessionDelegate {

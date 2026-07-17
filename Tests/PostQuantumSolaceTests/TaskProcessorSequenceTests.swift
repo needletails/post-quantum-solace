@@ -861,7 +861,12 @@ actor TaskProcessorSequenceTests {
         )
 
         let peerName = "bob_coalesced_repair"
-        let peerDeviceId = UUID()
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
         let first = try makeTestInboundTaskMessage(
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
@@ -905,7 +910,12 @@ actor TaskProcessorSequenceTests {
         )
 
         let peerName = "bob_expired_recovery_episode"
-        let peerDeviceId = UUID()
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
         let expiredStart = Date().addingTimeInterval(
             -(await session.reestablishmentEpisodeTTL + 1)
         )
@@ -1013,7 +1023,12 @@ actor TaskProcessorSequenceTests {
         )
 
         let peerName = "bob_max_skipped_refresh"
-        let peerDeviceId = UUID()
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
         let inbound = try makeTestInboundTaskMessage(
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,

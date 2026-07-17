@@ -347,6 +347,17 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         String: (intentId: UUID, preparedAt: Date)
     ] = [:]
 
+    /// Local account signing-key pin is out of sync with the server-trusted configuration.
+    /// Same-account peerRefresh must not emit until the user acknowledges the change
+    /// (or a verified reprovisioning path updates the pin). Cleared only by that event.
+    public internal(set) var accountIdentityRequiresAcknowledgement: Bool = false
+
+    /// Peer-device lanes where peerRefresh emit failed on a recoverable dependency
+    /// (e.g. `findConfiguration` timeout). Blocks opening a new episode until a
+    /// concrete readiness event clears the lane — successful config lookup, inbound
+    /// bootstrap, identity acknowledgement, or transport-ready notification.
+    var recoveryEmitBlockedLanes: Set<String> = []
+
     /// Maximum lifetime of a single-flight reestablishment episode before a new
     /// leader is allowed. Bounds stuck recovery without timer-based retry loops.
     let reestablishmentEpisodeTTL: TimeInterval = 90
@@ -773,13 +784,20 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// `true` when a reestablishment episode for this peer device is already open.
-    func hasOpenReestablishmentEpisode(
+    public func hasOpenReestablishmentEpisode(
         sender: String,
         deviceId: UUID,
         now: Date = Date()
     ) -> Bool {
         cleanupOpenReestablishmentEpisodes(now: now)
         return openReestablishmentEpisodes[reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)] != nil
+    }
+
+    /// `true` when any peer-device recovery episode is open. Used by transport to
+    /// coalesce offline backlog requests while recovery owns inbound decrypt order.
+    public func hasAnyOpenReestablishmentEpisode(now: Date = Date()) -> Bool {
+        cleanupOpenReestablishmentEpisodes(now: now)
+        return !openReestablishmentEpisodes.isEmpty
     }
 
     /// Opens a single-flight episode. Returns `true` when this caller is the leader
@@ -802,8 +820,45 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
     func endReestablishmentEpisode(sender: String, deviceId: UUID) {
         let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
-        openReestablishmentEpisodes.removeValue(forKey: key)
+        let wasOpen = openReestablishmentEpisodes.removeValue(forKey: key) != nil
         expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
+        guard wasOpen else { return }
+        let delegate = sessionDelegate
+        Task {
+            await delegate?.reestablishmentEpisodeDidEnd(
+                senderSecretName: sender,
+                senderDeviceId: deviceId)
+        }
+    }
+
+    func isRecoveryEmitBlocked(sender: String, deviceId: UUID) -> Bool {
+        recoveryEmitBlockedLanes.contains(reestablishmentEpisodeKey(sender: sender, deviceId: deviceId))
+    }
+
+    func markRecoveryEmitBlocked(sender: String, deviceId: UUID) {
+        recoveryEmitBlockedLanes.insert(reestablishmentEpisodeKey(sender: sender, deviceId: deviceId))
+    }
+
+    func clearRecoveryEmitBlocked(sender: String, deviceId: UUID) {
+        recoveryEmitBlockedLanes.remove(reestablishmentEpisodeKey(sender: sender, deviceId: deviceId))
+    }
+
+    func clearRecoveryEmitBlocked(secretName: String) {
+        let prefix = "\(secretName)|"
+        recoveryEmitBlockedLanes = recoveryEmitBlockedLanes.filter { !$0.hasPrefix(prefix) }
+    }
+
+    /// Transport-ready / config-ready event: unblock emit so the next decrypt failure
+    /// may open a fresh episode. Does not itself emit or schedule retries.
+    public func noteRecoveryDependenciesBecameReady() {
+        recoveryEmitBlockedLanes.removeAll()
+    }
+
+    func setAccountIdentityRequiresAcknowledgement(_ requiresAcknowledgement: Bool) {
+        accountIdentityRequiresAcknowledgement = requiresAcknowledgement
+        if !requiresAcknowledgement {
+            recoveryEmitBlockedLanes.removeAll()
+        }
     }
 
     func registerExpectedPeerRefreshResponse(
@@ -825,7 +880,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// peer device and is acting as the responder of that peerRefresh exchange.
     /// During this hold, local failure events must coalesce into deferred resends
     /// instead of resetting the lane the peer just coordinated.
-    func hasRecentInboundPeerRefreshBootstrap(
+    public func hasRecentInboundPeerRefreshBootstrap(
         sender: String,
         deviceId: UUID,
         now: Date = Date()
@@ -908,6 +963,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             deviceId: deviceId,
             sendOneTimeIdentities: false)
         preparedInboundPeerRefreshBootstrapByPeer[key] = (intentId, now)
+        clearRecoveryEmitBlocked(sender: sender, deviceId: deviceId)
         logger.log(
             level: .warning,
             message: "pqs.recovery.bootstrapPrepared sender=\(sender) deviceId=\(deviceId) intent=\(intentId)")
@@ -2015,8 +2071,12 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 level: .error,
                 message: "[adoptVerifiedUserConfiguration] account signing key changed without an authenticated rotation; refusing to adopt. pinnedPrefix=\(pinnedKey.prefix(8).map { String(format: "%02x", $0) }.joined()) incomingPrefix=\(configuration.signingPublicKey.prefix(8).map { String(format: "%02x", $0) }.joined())"
             )
+            setAccountIdentityRequiresAcknowledgement(true)
             throw SessionErrors.signingKeyOutOfSync
         }
+
+        // Healthy adoption restores the TOFU pin match; clear any prior mismatch gate.
+        setAccountIdentityRequiresAcknowledgement(false)
 
         sessionContext.activeUserConfiguration = userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
             configuration,
@@ -2092,6 +2152,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 throw PQSSession.SessionErrors.sessionEncryptionError
             }
             try await cache.updateLocalSessionContext(encryptedConfig)
+            setAccountIdentityRequiresAcknowledgement(false)
             return
         }
 
@@ -2111,6 +2172,29 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             throw PQSSession.SessionErrors.sessionEncryptionError
         }
         try await cache.updateLocalSessionContext(encryptedConfig)
+
+        // Pin is now trusted. Close any zombie same-account recovery episodes that
+        // opened before the ack so the next decrypt failure may emit peerRefresh.
+        setAccountIdentityRequiresAcknowledgement(false)
+        let localSecretName = sessionContext.sessionUser.secretName
+        let staleKeys = openReestablishmentEpisodes.keys.filter { $0.hasPrefix("\(localSecretName)|") }
+        for key in staleKeys {
+            openReestablishmentEpisodes.removeValue(forKey: key)
+            expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
+        }
+        clearRecoveryEmitBlocked(secretName: localSecretName)
+        if !staleKeys.isEmpty {
+            let delegate = sessionDelegate
+            Task {
+                for key in staleKeys {
+                    let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
+                    guard parts.count == 2, let deviceId = UUID(uuidString: parts[1]) else { continue }
+                    await delegate?.reestablishmentEpisodeDidEnd(
+                        senderSecretName: parts[0],
+                        senderDeviceId: deviceId)
+                }
+            }
+        }
     }
 
     /// Updates the user's configuration with new device configurations.

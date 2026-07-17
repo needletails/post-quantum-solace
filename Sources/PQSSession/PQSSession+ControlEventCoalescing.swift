@@ -254,10 +254,24 @@ extension PQSSession {
             }
         }
         let metadata = try BinaryEncoder().encode(TransportEvent.sessionReestablishment(envelope))
-        try await writeTextMessage(
-            recipient: recipient,
-            transportInfo: metadata,
-            targetDeviceId: scope.targetDeviceId)
+        do {
+            try await writeTextMessage(
+                recipient: recipient,
+                transportInfo: metadata,
+                targetDeviceId: scope.targetDeviceId)
+        } catch {
+            // Reset may already have committed a state-less row. Drop the expected
+            // intent so a later successful emit can register a fresh one; the caller
+            // owns ending the open reestablishment episode.
+            senderControlEpisodes.removeValue(
+                forKey: ControlEventEpisodeKey(kind: kind, scope: scope))
+            if let recoveryPeer {
+                unregisterExpectedPeerRefreshResponse(
+                    sender: recoveryPeer.secretName,
+                    deviceId: recoveryPeer.deviceId)
+            }
+            throw error
+        }
         return true
     }
 

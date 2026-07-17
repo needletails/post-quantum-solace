@@ -298,6 +298,19 @@ public protocol PQSSessionDelegate: Sendable {
         failureClass: String
     ) async
 
+    /// Called when inbound ciphertext was successfully decrypted and accepted.
+    /// Transport uses this to ACK/delete offline spool entries that were held
+    /// until decrypt completed (instead of deleting on enqueue).
+    func inboundCiphertextAccepted(sharedMessageId: String) async
+
+    /// Called when a peer-device reestablishment episode closes (success, terminal
+    /// failure, identity ack cleanup, or explicit end). Transport may resume a
+    /// deferred offline backlog replay when no episodes remain open.
+    func reestablishmentEpisodeDidEnd(
+        senderSecretName: String,
+        senderDeviceId: UUID
+    ) async
+
     /// When `true`, the session may notify message senders that their message was stored on this device
     /// (e.g. automatic `.delivered` delivery-state updates). Return `false` when the user has disabled
     /// read/delivery receipts so peers do not receive that signal.
@@ -359,6 +372,13 @@ public extension PQSSessionDelegate {
         senderDeviceId: UUID,
         failedSharedMessageId: String,
         failureClass: String
+    ) async {}
+
+    func inboundCiphertextAccepted(sharedMessageId: String) async {}
+
+    func reestablishmentEpisodeDidEnd(
+        senderSecretName: String,
+        senderDeviceId: UUID
     ) async {}
 
     func shouldSendAutomaticDeliveryReceipts() async -> Bool { true }

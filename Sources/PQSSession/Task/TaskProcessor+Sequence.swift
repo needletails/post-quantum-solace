@@ -1006,6 +1006,47 @@ extension TaskProcessor {
         // Pending replay IDs are work to drain after recovery, not a recovery lock.
         // Once the concrete peer-device episode expires, the next failure event must
         // be allowed to establish a fresh session and emit another peerRefresh.
+        if await session.accountIdentityRequiresAcknowledgement {
+            auditInboundDecryptFailure(
+                message: message,
+                failureClass: failureClass,
+                error: diagnostic,
+                action: "blockedAccountIdentity",
+                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
+            await session.deferPeerResendUntilReestablished(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                failedMessageId: message.sharedMessageId,
+                failureClass: failureClass)
+            await session.markInboundFailure(message, failureClass: failureClass)
+            logger.log(
+                level: .error,
+                message: "pqs.recovery.blocked.accountIdentity failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) waitingFor=acknowledgeAccountIdentityChange")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+        if await session.isRecoveryEmitBlocked(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId
+        ) {
+            auditInboundDecryptFailure(
+                message: message,
+                failureClass: failureClass,
+                error: diagnostic,
+                action: "blockedRecoveryDependency",
+                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
+            await session.deferPeerResendUntilReestablished(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                failedMessageId: message.sharedMessageId,
+                failureClass: failureClass)
+            await session.markInboundFailure(message, failureClass: failureClass)
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.blocked.dependency failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) waitingFor=configurationOrTransportReady")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
         let hasOpenEpisode = await session.hasOpenReestablishmentEpisode(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId)
@@ -1067,6 +1108,14 @@ extension TaskProcessor {
             logger.log(
                 level: .info,
                 message: "Skipping duplicate peerRefresh leader for \(message.senderSecretName) (\(message.senderDeviceId)); reestablishment episode already open")
+            await session.deferPeerResendUntilReestablished(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                failedMessageId: message.sharedMessageId,
+                failureClass: failureClass)
+            await session.markInboundFailure(message, failureClass: failureClass)
+            try await cache.deleteJob(job)
+            return .deleted
         }
 
         let mySecretName = await session.sessionContext?.sessionUser.secretName
@@ -1098,6 +1147,11 @@ extension TaskProcessor {
                 scope: scope,
                 forceReemit: !hadPendingRecovery)
             if !emitted {
+                // Cooldown suppressed the wire send; close the episode so the next
+                // failure event can become leader instead of zombie-coalescing for 90s.
+                await session.endReestablishmentEpisode(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId)
                 logger.log(
                     level: .info,
                     message: "pqs.recovery.reestablishmentSuppressed reason=coalescedPending failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
@@ -1108,7 +1162,21 @@ extension TaskProcessor {
             }
         } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
             await reportPeerSigningKeyOutOfSync(message: message, session: session)
+        } catch let sessionError as PQSSession.SessionErrors where sessionError == .signingKeyOutOfSync {
+            await session.setAccountIdentityRequiresAcknowledgement(true)
+            await session.endReestablishmentEpisode(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId)
+            logger.log(
+                level: .warning,
+                message: "pqs.recovery.reestablishmentFailed kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) error=signingKeyOutOfSync waitingFor=acknowledgeAccountIdentityChange")
         } catch {
+            await session.markRecoveryEmitBlocked(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId)
+            await session.endReestablishmentEpisode(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId)
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.reestablishmentFailed kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) error=\(error)")
@@ -1188,7 +1256,13 @@ extension TaskProcessor {
         let hasResponderBootstrapHold = await session.hasRecentInboundPeerRefreshBootstrap(
             sender: props.secretName,
             deviceId: props.deviceId)
-        if hasOpenEpisode || hasResponderBootstrapHold {
+        // The peerRefresh/request-resend control is the event that completes the
+        // coordinated lane. Dropping that control because its own episode is open
+        // leaves a zombie episode until the TTL expires and a later user message
+        // happens to become the next recovery leader. Ordinary outbound ciphertext
+        // must still yield to the coordinated lane.
+        let isRecoveryCriticalControl = isRecoveryCriticalControlMessage(message.message)
+        if (hasOpenEpisode || hasResponderBootstrapHold) && !isRecoveryCriticalControl {
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.outboundRepairSkipped failureClass=\(freshSessionFailureClass(error)) recipient=\(props.secretName) deviceId=\(props.deviceId) sharedId=\(message.sharedId) reason=\(hasOpenEpisode ? "openReestablishmentEpisode" : "responderBootstrapHold")")
@@ -1204,10 +1278,17 @@ extension TaskProcessor {
             sender: props.secretName,
             deviceId: props.deviceId,
             flow: .outbound)
-        let isRecoveryCriticalControl = isRecoveryCriticalControlMessage(message.message)
         let canBypassCooldown = isRecoveryCriticalControl && consumeOutboundControlRepairBypass(sharedId: message.sharedId)
 
         guard canAttempt || canBypassCooldown else {
+            if isRecoveryCriticalControl {
+                await session.endReestablishmentEpisode(
+                    sender: props.secretName,
+                    deviceId: props.deviceId)
+                logger.log(
+                    level: .warning,
+                    message: "pqs.recovery.criticalControlRepairExhausted failureClass=\(freshSessionFailureClass(error)) recipient=\(props.secretName) deviceId=\(props.deviceId) sharedId=\(message.sharedId) action=closeEpisode")
+            }
             logger.log(level: .warning, message: "Suppressing repeated fresh outbound repair for \(props.secretName) (\(props.deviceId))")
             try await cache.deleteJob(job)
             return .deleted
@@ -1245,6 +1326,11 @@ extension TaskProcessor {
             try await feedTask(retry, session: session)
             return .deleted
         } catch {
+            if isRecoveryCriticalControl {
+                await session.endReestablishmentEpisode(
+                    sender: props.secretName,
+                    deviceId: props.deviceId)
+            }
             logger.log(level: .error, message: "Fresh outbound repair failed for \(props.secretName) (\(props.deviceId)): \(error)")
             try await cache.deleteJob(job)
             return .deleted

@@ -231,48 +231,70 @@ actor EndToEndTests {
         try await senderReceiver.setKey(_senderMaxSkipSession.getDatabaseSymmetricKey())
     }
     
-    func linkSenderChildSession1(store: MockIdentityStore, transport: _MockTransportDelegate) async throws {
+    func linkSenderChildSession1(
+        store: MockIdentityStore,
+        transport: _MockTransportDelegate,
+        useProvidedTransport: Bool = false
+    ) async throws {
         await store.setLocalSalt("testChildSalt1")
         _senderChildSession1.isViable = true
         await self.store.setPublishableName(sMockUserData.ssn)
         _senderChildSession1.linkDelegate = senderChild1LinkDelegate
         
         let bundle = try await _senderChildSession1.createDeviceCryptographicBundle(isMaster: false)
-        senderChild1LinkDelegate.userConfiguration = try await linkedConfiguration(
+        let configuration = try await linkedConfiguration(
             masterSession: _senderSession,
             childBundle: bundle)
+        senderChild1LinkDelegate.userConfiguration = configuration
         await conformSessionDelegate(
             session: _senderChildSession1,
             pqsDelegate: SessionDelegate(session: _senderChildSession1),
             store: store,
             receiver: senderChildReceiver1,
-            transport: _MockTransportDelegate(session: _senderChildSession1, store: self.store))
+            transport: useProvidedTransport
+                ? transport
+                : _MockTransportDelegate(session: _senderChildSession1, store: self.store))
         _senderChildSession1 = try await _senderChildSession1.linkDevice(
             bundle: bundle, password: "123")
         try await senderChildReceiver1.setKey(_senderChildSession1.getDatabaseSymmetricKey())
+        await self.store.upsertUserConfiguration(
+            secretName: sMockUserData.ssn,
+            deviceId: bundle.deviceKeys.deviceId,
+            config: configuration)
         _ = try await _senderChildSession1.refreshIdentities(
             secretName: sMockUserData.ssn, forceRefresh: true)
     }
     
-    func linkSenderChildSession2(store: MockIdentityStore, transport: _MockTransportDelegate) async throws {
+    func linkSenderChildSession2(
+        store: MockIdentityStore,
+        transport: _MockTransportDelegate,
+        useProvidedTransport: Bool = false
+    ) async throws {
         await store.setLocalSalt("testChildSalt2")
         await _senderChildSession2.setLogLevel(.trace)
         _senderChildSession2.isViable = true
         await self.store.setPublishableName(sMockUserData.ssn)
         _senderChildSession2.linkDelegate = senderChild2LinkDelegate
         let bundle = try await _senderChildSession2.createDeviceCryptographicBundle(isMaster: false)
-        senderChild2LinkDelegate.userConfiguration = try await linkedConfiguration(
+        let configuration = try await linkedConfiguration(
             masterSession: _senderSession,
             childBundle: bundle)
+        senderChild2LinkDelegate.userConfiguration = configuration
         await conformSessionDelegate(
             session: _senderChildSession2,
             pqsDelegate: SessionDelegate(session: _senderChildSession2),
             store: store,
             receiver: senderChildReceiver2,
-            transport: _MockTransportDelegate(session: _senderChildSession2, store: self.store))
+            transport: useProvidedTransport
+                ? transport
+                : _MockTransportDelegate(session: _senderChildSession2, store: self.store))
         _senderChildSession2 = try await _senderChildSession2.linkDevice(
             bundle: bundle, password: "123")
         try await senderChildReceiver2.setKey(_senderChildSession2.getDatabaseSymmetricKey())
+        await self.store.upsertUserConfiguration(
+            secretName: sMockUserData.ssn,
+            deviceId: bundle.deviceKeys.deviceId,
+            config: configuration)
         _ = try await _senderChildSession2.refreshIdentities(
             secretName: sMockUserData.ssn, forceRefresh: true)
     }
@@ -317,25 +339,36 @@ actor EndToEndTests {
         try await recipientReceiver.setKey(_recipientMaxSkipSession.getDatabaseSymmetricKey())
     }
     
-    func linkRecipientChildSession1(store: MockIdentityStore, transport: _MockTransportDelegate) async throws {
+    func linkRecipientChildSession1(
+        store: MockIdentityStore,
+        transport: _MockTransportDelegate,
+        useProvidedTransport: Bool = false
+    ) async throws {
         await store.setLocalSalt("testChildSalt1")
         _recipientChildSession1.isViable = true
         await self.store.setPublishableName(rMockUserData.rsn)
         _recipientChildSession1.linkDelegate = recipientChild1LinkDelegate
         let bundle = try await _recipientChildSession1.createDeviceCryptographicBundle(
             isMaster: false)
-        recipientChild1LinkDelegate.userConfiguration = try await linkedConfiguration(
+        let configuration = try await linkedConfiguration(
             masterSession: _recipientSession,
             childBundle: bundle)
+        recipientChild1LinkDelegate.userConfiguration = configuration
         await conformSessionDelegate(
             session: _recipientChildSession1,
             pqsDelegate: SessionDelegate(session: _recipientChildSession1),
             store: store,
             receiver: recipientChildReceiver1,
-            transport: _MockTransportDelegate(session: _recipientChildSession1, store: self.store))
+            transport: useProvidedTransport
+                ? transport
+                : _MockTransportDelegate(session: _recipientChildSession1, store: self.store))
         _recipientChildSession1 = try await _recipientChildSession1.linkDevice(
             bundle: bundle, password: "123")
         try await recipientChildReceiver1.setKey(_recipientChildSession1.getDatabaseSymmetricKey())
+        await self.store.upsertUserConfiguration(
+            secretName: rMockUserData.rsn,
+            deviceId: bundle.deviceKeys.deviceId,
+            config: configuration)
         _ = try await _recipientChildSession1.refreshIdentities(
             secretName: rMockUserData.rsn, forceRefresh: true)
     }
@@ -2129,8 +2162,8 @@ actor EndToEndTests {
             "peerRefresh retry must replay the same signed ratchet frame instead of advancing the ratchet again")
     }
 
-    @Test("peerRefresh control survives outbound repair cooldown")
-    func testPeerRefreshControlSurvivesOutboundRepairCooldown() async throws {
+    @Test("peerRefresh control survives its owning open episode and outbound repair cooldown")
+    func testPeerRefreshControlSurvivesOwningEpisodeAndOutboundRepairCooldown() async throws {
         actor Probe {
             private(set) var sawPeerRefresh = false
             func markPeerRefresh() { sawPeerRefresh = true }
@@ -2148,9 +2181,13 @@ actor EndToEndTests {
         final class OneShotPeerRefreshFailureDelegate: @unchecked Sendable, TaskSequenceDelegate {
             let processor: TaskProcessor
             let gate = OneShotFailureGate()
+            let peerName: String
+            let peerDeviceId: UUID
 
-            init(processor: TaskProcessor) {
+            init(processor: TaskProcessor, peerName: String, peerDeviceId: UUID) {
                 self.processor = processor
+                self.peerName = peerName
+                self.peerDeviceId = peerDeviceId
             }
 
             func performRatchet(task: TaskType, session: PQSSession) async throws {
@@ -2160,7 +2197,12 @@ actor EndToEndTests {
                    case .sessionReestablishment(let envelope) = event,
                    envelope.kind == .peerRefresh,
                    await gate.consumeFailure() {
-                    throw RatchetError.stateUninitialized
+                    // Reproduce the production ordering exactly: the peerRefresh owns
+                    // the lane when its first outbound encryption attempt fails.
+                    _ = await session.tryBeginReestablishmentEpisode(
+                        sender: peerName,
+                        deviceId: peerDeviceId)
+                    throw RatchetError.sendingKeyIsNil
                 }
 
                 try await processor.performRatchet(task: task, session: session)
@@ -2233,8 +2275,15 @@ actor EndToEndTests {
         }
 
         let senderProcessor = await _senderSession.taskProcessor
-        await senderProcessor.setTaskDelegate(OneShotPeerRefreshFailureDelegate(processor: senderProcessor))
+        await senderProcessor.setTaskDelegate(OneShotPeerRefreshFailureDelegate(
+            processor: senderProcessor,
+            peerName: rMockUserData.rsn,
+            peerDeviceId: bobDeviceId))
 
+        #expect(await _senderSession.tryBeginReestablishmentEpisode(
+            sender: rMockUserData.rsn,
+            deviceId: bobDeviceId
+        ), "The peerRefresh under test must own the open exact-device recovery episode")
         await _senderSession.markReconciliationAttempt(
             sender: rMockUserData.rsn,
             deviceId: bobDeviceId,
@@ -2247,7 +2296,302 @@ actor EndToEndTests {
 
         #expect(
             await waitUntil { await probe.sawPeerRefresh },
-            "peerRefresh must be retried instead of dropped when the first control send hits outbound repair cooldown")
+            "peerRefresh must be retried instead of dropped when its owning episode is open")
+    }
+
+    @Test("three-device account receives child's first synchronized message after lane repair")
+    func testThreeDeviceAccountReceivesFirstChildMessageAfterLaneRepair() async throws {
+        actor OneShotFailureGate {
+            private var shouldFail = true
+            private(set) var failures = 0
+
+            func consumeFailure() -> Bool {
+                guard shouldFail else { return false }
+                shouldFail = false
+                failures += 1
+                return true
+            }
+        }
+
+        final class OneShotPersonalPeerRefreshFailureDelegate: @unchecked Sendable, TaskSequenceDelegate {
+            let processor: TaskProcessor
+            let gate = OneShotFailureGate()
+            let peerName: String
+            let peerDeviceId: UUID
+
+            init(processor: TaskProcessor, peerName: String, peerDeviceId: UUID) {
+                self.processor = processor
+                self.peerName = peerName
+                self.peerDeviceId = peerDeviceId
+            }
+
+            func performRatchet(task: TaskType, session: PQSSession) async throws {
+                if case .writeMessage(let outbound) = task,
+                   let transportInfo = outbound.message.transportInfo,
+                   let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo),
+                   case .sessionReestablishment(let envelope) = event,
+                   envelope.kind == .peerRefresh,
+                   await gate.consumeFailure() {
+                    _ = await session.tryBeginReestablishmentEpisode(
+                        sender: peerName,
+                        deviceId: peerDeviceId)
+                    throw RatchetError.sendingKeyIsNil
+                }
+
+                try await processor.performRatchet(task: task, session: session)
+            }
+        }
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 10,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return false
+        }
+
+        var transportTasks = [Task<Void, Never>]()
+        defer {
+            for task in transportTasks {
+                task.cancel()
+            }
+            Task {
+                await shutdownSessions()
+            }
+        }
+
+        let senderStore = createSenderStore()
+        let senderChildStore = createSenderChildStore1()
+        let senderChildStore2 = createSenderChildStore2()
+        let recipientStore = createRecipientStore()
+        let recipientChildStore = createRecipientChildStore1()
+
+        let senderParentTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let senderChildTransport = _MockTransportDelegate(session: _senderChildSession1, store: store)
+        let senderChildTransport2 = _MockTransportDelegate(session: _senderChildSession2, store: store)
+        let recipientParentTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let recipientChildTransport = _MockTransportDelegate(session: _recipientChildSession1, store: store)
+
+        let senderDelegate = SessionDelegate(session: _senderSession)
+        let recipientDelegate = SessionDelegate(session: _recipientSession)
+        try await createSenderSession(
+            store: senderStore,
+            transport: senderParentTransport,
+            sessionDelegate: senderDelegate)
+        try await createRecipientSession(
+            store: recipientStore,
+            transport: recipientParentTransport,
+            sessionDelegate: recipientDelegate)
+        try await linkSenderChildSession1(
+            store: senderChildStore,
+            transport: senderChildTransport,
+            useProvidedTransport: true)
+        try await linkRecipientChildSession1(
+            store: recipientChildStore,
+            transport: recipientChildTransport,
+            useProvidedTransport: true)
+
+        guard let senderLinkedConfiguration =
+                await _senderChildSession1.sessionContext?.activeUserConfiguration,
+              let recipientLinkedConfiguration =
+                await _recipientChildSession1.sessionContext?.activeUserConfiguration
+        else {
+            Issue.record("Linked-device configurations should be available")
+            return
+        }
+
+        if let senderIndex = await store.userConfigurations.firstIndex(where: {
+            $0.secretName == sMockUserData.ssn
+        }) {
+            await store.setUserConfigurations(
+                index: senderIndex,
+                config: senderLinkedConfiguration)
+        }
+        if let recipientIndex = await store.userConfigurations.firstIndex(where: {
+            $0.secretName == rMockUserData.rsn
+        }) {
+            await store.setUserConfigurations(
+                index: recipientIndex,
+                config: recipientLinkedConfiguration)
+        }
+        try await _senderSession.updateUserConfiguration(
+            senderLinkedConfiguration.getVerifiedDevices())
+        try await _recipientSession.updateUserConfiguration(
+            recipientLinkedConfiguration.getVerifiedDevices())
+
+        // Add a third sender-account device after the master has adopted child 1.
+        // The resulting signed configuration contains master + both children.
+        try await linkSenderChildSession2(
+            store: senderChildStore2,
+            transport: senderChildTransport2,
+            useProvidedTransport: true)
+        guard let senderThreeDeviceConfiguration =
+                await _senderChildSession2.sessionContext?.activeUserConfiguration
+        else {
+            Issue.record("Three-device sender configuration should be available")
+            return
+        }
+        if let senderIndex = await store.userConfigurations.firstIndex(where: {
+            $0.secretName == sMockUserData.ssn
+        }) {
+            await store.setUserConfigurations(
+                index: senderIndex,
+                config: senderThreeDeviceConfiguration)
+        }
+        try await _senderSession.updateUserConfiguration(
+            senderThreeDeviceConfiguration.getVerifiedDevices())
+        try await _senderChildSession1.adoptVerifiedUserConfiguration(
+            senderThreeDeviceConfiguration)
+        try await _senderChildSession2.adoptVerifiedUserConfiguration(
+            senderThreeDeviceConfiguration)
+
+        guard let senderParentId = await _senderSession.sessionContext?.sessionUser.deviceId,
+              let senderChildId = await _senderChildSession1.sessionContext?.sessionUser.deviceId,
+              let senderChildId2 = await _senderChildSession2.sessionContext?.sessionUser.deviceId,
+              let recipientParentId = await _recipientSession.sessionContext?.sessionUser.deviceId,
+              let recipientChildId = await _recipientChildSession1.sessionContext?.sessionUser.deviceId
+        else {
+            Issue.record("All five device sessions should be initialized")
+            return
+        }
+
+        let routes: [UUID: PQSSession] = [
+            senderParentId: _senderSession,
+            senderChildId: _senderChildSession1,
+            senderChildId2: _senderChildSession2,
+            recipientParentId: _recipientSession,
+            recipientChildId: _recipientChildSession1
+        ]
+        let route: @Sendable (ReceivedMessage) async -> Void = { received in
+            guard let recipientDeviceId = received.recipientDeviceId,
+                  let target = routes[recipientDeviceId]
+            else {
+                return
+            }
+            if case .sessionReestablishment(let envelope)? = received.transportEvent,
+               envelope.kind == .peerRefresh,
+               envelope.requiresPreDecryptionReset {
+                guard (try? await target.prepareInboundPeerRefreshBootstrap(
+                    sender: received.sender,
+                    deviceId: received.deviceId,
+                    envelope: envelope)) == true
+                else {
+                    return
+                }
+            }
+            _ = try? await target.receiveMessage(
+                message: received.message,
+                sender: received.sender,
+                deviceId: received.deviceId,
+                messageId: received.messageId)
+        }
+
+        let senderParentStream = AsyncStream<ReceivedMessage> {
+            senderParentTransport.continuation = $0
+        }
+        let senderChildStream = AsyncStream<ReceivedMessage> {
+            senderChildTransport.continuation = $0
+        }
+        let senderChildStream2 = AsyncStream<ReceivedMessage> {
+            senderChildTransport2.continuation = $0
+        }
+        let recipientParentStream = AsyncStream<ReceivedMessage> {
+            recipientParentTransport.continuation = $0
+        }
+        let recipientChildStream = AsyncStream<ReceivedMessage> {
+            recipientChildTransport.continuation = $0
+        }
+
+        transportTasks = [
+            Task {
+                for await received in senderParentStream {
+                    await route(received)
+                }
+            },
+            Task {
+                for await received in senderChildStream {
+                    await route(received)
+                }
+            },
+            Task {
+                for await received in senderChildStream2 {
+                    await route(received)
+                }
+            },
+            Task {
+                for await received in recipientParentStream {
+                    await route(received)
+                }
+            },
+            Task {
+                for await received in recipientChildStream {
+                    await route(received)
+                }
+            }
+        ]
+
+        let childProcessor = await _senderChildSession1.taskProcessor
+        let peerRefreshFailureDelegate = OneShotPersonalPeerRefreshFailureDelegate(
+            processor: childProcessor,
+            peerName: sMockUserData.ssn,
+            peerDeviceId: senderParentId)
+        await childProcessor.setTaskDelegate(peerRefreshFailureDelegate)
+
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: senderDelegate,
+            bobSession: _recipientSession,
+            rsd: recipientDelegate)
+
+        #expect(
+            await waitUntil { await peerRefreshFailureDelegate.gate.failures == 1 },
+            "The child's recovery peerRefresh should hit the injected sendingKeyIsNil failure")
+        #expect(
+            await waitUntil {
+                !(await self._senderChildSession1.hasOpenReestablishmentEpisode(
+                    sender: self.sMockUserData.ssn,
+                    deviceId: senderParentId))
+            },
+            "The retried peerRefresh response should close the child-to-parent repair episode")
+
+        _ = try await _senderChildSession1.refreshIdentities(
+            secretName: rMockUserData.rsn,
+            forceRefresh: true)
+        _ = try await _recipientChildSession1.refreshIdentities(
+            secretName: sMockUserData.ssn,
+            forceRefresh: true)
+
+        let sharedId = "linked-parent-first-child-message-\(UUID().uuidString)"
+        try await _senderChildSession1.writeTextMessage(
+            recipient: .nickname(rMockUserData.rsn),
+            text: "single child message after linked-device repair",
+            sharedIdOverride: sharedId)
+
+        #expect(
+            await waitUntil {
+                await senderStore.createdMessages.contains(where: { $0.sharedId == sharedId })
+            },
+            "The linked parent must receive the child's first synchronized copy without a second send")
+        #expect(
+            await waitUntil {
+                await senderChildStore2.createdMessages.contains(where: { $0.sharedId == sharedId })
+            },
+            "The second linked child must receive the first child's synchronized copy without a second send")
+        #expect(
+            await waitUntil {
+                let parentReceived = await recipientStore.createdMessages.contains {
+                    $0.sharedId == sharedId
+                }
+                let childReceived = await recipientChildStore.createdMessages.contains {
+                    $0.sharedId == sharedId
+                }
+                return parentReceived || childReceived
+            },
+            "At least one online recipient device should receive the child's contact message")
     }
     
     @Test
@@ -9438,8 +9782,27 @@ struct ReceivedMessage {
     let sender: String
     let recipient: String
     let deviceId: UUID
+    let recipientDeviceId: UUID?
     let messageId: String
     let transportEvent: TransportEvent?
+
+    init(
+        message: SignedRatchetMessage,
+        sender: String,
+        recipient: String,
+        deviceId: UUID,
+        recipientDeviceId: UUID? = nil,
+        messageId: String,
+        transportEvent: TransportEvent?
+    ) {
+        self.message = message
+        self.sender = sender
+        self.recipient = recipient
+        self.deviceId = deviceId
+        self.recipientDeviceId = recipientDeviceId
+        self.messageId = messageId
+        self.transportEvent = transportEvent
+    }
 }
 
 actor TransportStore {
@@ -9889,6 +10252,7 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
             sender: sessionContext.sessionUser.secretName,
             recipient: metadata.secretName,
             deviceId: sessionContext.sessionUser.deviceId,
+            recipientDeviceId: metadata.deviceId,
             messageId: metadata.sharedMessageId,
             transportEvent: metadata.transportEvent
         )

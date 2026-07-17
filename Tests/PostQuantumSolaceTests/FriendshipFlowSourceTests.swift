@@ -314,6 +314,31 @@ struct FriendshipFlowSourceTests {
         #expect(skipIndex.lowerBound < outboundResetIndex.lowerBound)
     }
 
+    @Test("terminal peerRefresh emit failures close the episode and gate identity")
+    func terminalPeerRefreshEmitFailuresCloseEpisodeAndGateIdentity() throws {
+        let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
+        let sessionSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession.swift")
+        let repairBody = try PQSFriendshipSource.functionBody(
+            named: "private func handleFreshSessionRepair",
+            in: sequenceSource)
+
+        #expect(repairBody.contains("blockedAccountIdentity"))
+        #expect(repairBody.contains("blockedRecoveryDependency"))
+        #expect(repairBody.contains("setAccountIdentityRequiresAcknowledgement(true)"))
+        #expect(repairBody.contains("markRecoveryEmitBlocked"))
+        #expect(repairBody.contains("endReestablishmentEpisode"))
+        // Non-leaders must not emit or close the open leader episode.
+        let nonLeaderSkip = try #require(repairBody.range(of: "Skipping duplicate peerRefresh leader"))
+        let emitIndex = try #require(repairBody.range(of: "emitSessionReestablishment"))
+        #expect(nonLeaderSkip.lowerBound < emitIndex.lowerBound)
+        #expect(repairBody.contains("return .deleted"))
+
+        #expect(sessionSource.contains("accountIdentityRequiresAcknowledgement"))
+        #expect(sessionSource.contains("recoveryEmitBlockedLanes"))
+        #expect(sessionSource.contains("noteRecoveryDependenciesBecameReady"))
+        #expect(sessionSource.contains("reestablishmentEpisodeDidEnd"))
+    }
+
     @Test("outbound user ciphertext is prioritized over control frames")
     func outboundUserCiphertextIsPrioritizedOverControlFrames() throws {
         let taskSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor.swift")
