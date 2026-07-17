@@ -109,6 +109,55 @@ struct SessionReestablishmentCoalescingTests {
         await session.shutdown()
     }
 
+    @Test("Expired peerRefresh request cannot win a later bootstrap collision")
+    func expiredPeerRefreshRequestDoesNotBlockInboundBootstrap() async throws {
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let peerDeviceId = UUID()
+        let expiredStart = Date().addingTimeInterval(
+            -(await session.reestablishmentEpisodeTTL + 1)
+        )
+
+        #expect(await session.tryBeginReestablishmentEpisode(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            now: expiredStart))
+        await session.registerExpectedPeerRefreshResponse(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            intentId: UUID())
+
+        #expect(!(await session.hasActiveLocalPeerRefreshRequest(
+            sender: "alice",
+            deviceId: peerDeviceId)))
+        #expect(await session.expectedPeerRefreshIntentByPeer.isEmpty)
+        await session.shutdown()
+    }
+
+    @Test("Ending peerRefresh clears responder bootstrap hold")
+    func endingPeerRefreshClearsResponderBootstrapHold() async {
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let peerDeviceId = UUID()
+
+        await session.markInboundPeerRefreshBootstrapPrepared(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            intentId: UUID())
+        #expect(await session.hasRecentInboundPeerRefreshBootstrap(
+            sender: "alice",
+            deviceId: peerDeviceId))
+
+        await session.endReestablishmentEpisode(
+            sender: "alice",
+            deviceId: peerDeviceId)
+
+        #expect(!(await session.hasRecentInboundPeerRefreshBootstrap(
+            sender: "alice",
+            deviceId: peerDeviceId)))
+        await session.shutdown()
+    }
+
     @Test("Sender suppresses repeat emission to same scope within cooldown")
     func senderCooldownSuppressesDuplicateEmission() async {
         let session = PQSSession()

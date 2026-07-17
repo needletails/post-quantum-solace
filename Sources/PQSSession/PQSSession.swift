@@ -822,6 +822,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
         let wasOpen = openReestablishmentEpisodes.removeValue(forKey: key) != nil
         expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
+        // The responder bootstrap hold protects the freshly coordinated lane only
+        // until the request/response exchange ends. Keeping it afterward makes new
+        // failures coalesce without a leader or another completion event.
+        preparedInboundPeerRefreshBootstrapByPeer.removeValue(forKey: key)
         guard wasOpen else { return }
         let delegate = sessionDelegate
         Task {
@@ -893,6 +897,17 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         return now.timeIntervalSince(prepared.preparedAt) < reestablishmentEpisodeTTL
     }
 
+    func markInboundPeerRefreshBootstrapPrepared(
+        sender: String,
+        deviceId: UUID,
+        intentId: UUID,
+        now: Date = Date()
+    ) {
+        preparedInboundPeerRefreshBootstrapByPeer[
+            reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
+        ] = (intentId, now)
+    }
+
     func isExpectedPeerRefreshResponse(
         sender: String,
         deviceId: UUID,
@@ -917,6 +932,25 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     ) -> Bool {
         hasPendingLocalRequest
             && localDeviceId.uuidString < senderDeviceId.uuidString
+    }
+
+    /// Returns whether this lane still owns a live local peer-refresh request.
+    ///
+    /// `expectedPeerRefreshIntentByPeer` is correlated response state, not an
+    /// independent recovery lock. If its single-flight episode has expired or
+    /// already closed, it must not keep winning future bootstrap collisions.
+    func hasActiveLocalPeerRefreshRequest(
+        sender: String,
+        deviceId: UUID,
+        now: Date = Date()
+    ) -> Bool {
+        cleanupOpenReestablishmentEpisodes(now: now)
+        let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
+        guard openReestablishmentEpisodes[key] != nil else {
+            expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
+            return false
+        }
+        return expectedPeerRefreshIntentByPeer[key] != nil
     }
 
     public func prepareInboundPeerRefreshBootstrap(
@@ -950,7 +984,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         if localPeerRefreshBootstrapWinsCollision(
             localDeviceId: context.sessionUser.deviceId,
             senderDeviceId: deviceId,
-            hasPendingLocalRequest: expectedPeerRefreshIntentByPeer[key] != nil
+            hasPendingLocalRequest: hasActiveLocalPeerRefreshRequest(
+                sender: sender,
+                deviceId: deviceId,
+                now: now)
         ) {
             logger.log(
                 level: .info,
@@ -962,7 +999,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             secretName: sender,
             deviceId: deviceId,
             sendOneTimeIdentities: false)
-        preparedInboundPeerRefreshBootstrapByPeer[key] = (intentId, now)
+        markInboundPeerRefreshBootstrapPrepared(
+            sender: sender,
+            deviceId: deviceId,
+            intentId: intentId,
+            now: now)
         clearRecoveryEmitBlocked(sender: sender, deviceId: deviceId)
         logger.log(
             level: .warning,
