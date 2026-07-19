@@ -15,6 +15,7 @@
 //
 
 import BinaryCodable
+import DoubleRatchetKit
 import Foundation
 @testable import PQSSession
 import SessionModels
@@ -52,7 +53,9 @@ struct SessionReestablishmentCoalescingTests {
         #expect(decoded.epoch == original.epoch)
         #expect(decoded.emittedAt == original.emittedAt)
         #expect(decoded.targetDeviceId == targetDeviceId)
-        #expect(decoded.requiresPreDecryptionReset)
+        // Legacy pre-decrypt flag is retained on the wire type but always false.
+        #expect(!decoded.requiresPreDecryptionReset)
+        #expect(!original.requiresPreDecryptionReset)
     }
 
     @Test("TransportEvent.sessionReestablishment encodes/decodes the envelope")
@@ -73,6 +76,29 @@ struct SessionReestablishmentCoalescingTests {
         #expect(roundTrip == envelope)
     }
 
+    @Test("TransportEvent.messageResendUnavailable round-trips and caps at 64 ids")
+    func messageResendUnavailableRoundTripAndCap() throws {
+        let respondingDeviceId = UUID()
+        let ids = (0..<80).map { "shared-\($0)" }
+        let notice = MessageResendUnavailableNotice(
+            unavailableSharedMessageIds: ids,
+            respondingDeviceId: respondingDeviceId)
+        #expect(notice.unavailableSharedMessageIds.count == MessageResendUnavailableNotice.maxBatchedIds)
+        #expect(notice.unavailableSharedMessageIds.first == "shared-0")
+        #expect(notice.unavailableSharedMessageIds.last == "shared-63")
+
+        let event = TransportEvent.messageResendUnavailable(notice)
+        let encoded = try BinaryEncoder().encode(event)
+        let decoded = try BinaryDecoder().decode(TransportEvent.self, from: encoded)
+        guard case .messageResendUnavailable(let roundTrip) = decoded else {
+            Issue.record("Expected .messageResendUnavailable case, got \(decoded)")
+            return
+        }
+        #expect(roundTrip == notice)
+        #expect(roundTrip.respondingDeviceId == respondingDeviceId)
+        #expect(roundTrip.unavailableSharedMessageIds.count == 64)
+    }
+
     @Test("All three SessionReestablishmentKind cases round-trip through the envelope")
     func envelopeRoundTripsEveryKind() throws {
         for kind in [SessionReestablishmentKind.peerRefresh,
@@ -87,30 +113,8 @@ struct SessionReestablishmentCoalescingTests {
 
     // MARK: - Sender single-flight
 
-    @Test("Simultaneous peerRefresh bootstraps choose one deterministic requester")
-    func simultaneousBootstrapCollisionHasSingleWinner() async throws {
-        let session = PQSSession()
-        defer { Task { await session.shutdown() } }
-        let lower = try #require(UUID(uuidString: "00000000-0000-0000-0000-000000000001"))
-        let higher = try #require(UUID(uuidString: "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"))
-
-        #expect(await session.localPeerRefreshBootstrapWinsCollision(
-            localDeviceId: lower,
-            senderDeviceId: higher,
-            hasPendingLocalRequest: true))
-        #expect(!(await session.localPeerRefreshBootstrapWinsCollision(
-            localDeviceId: higher,
-            senderDeviceId: lower,
-            hasPendingLocalRequest: true)))
-        #expect(!(await session.localPeerRefreshBootstrapWinsCollision(
-            localDeviceId: lower,
-            senderDeviceId: higher,
-            hasPendingLocalRequest: false)))
-        await session.shutdown()
-    }
-
-    @Test("Expired peerRefresh request cannot win a later bootstrap collision")
-    func expiredPeerRefreshRequestDoesNotBlockInboundBootstrap() async throws {
+    @Test("Expired peerRefresh request is not an active local request")
+    func expiredPeerRefreshRequestIsNotActiveLocalRequest() async throws {
         let session = PQSSession()
         defer { Task { await session.shutdown() } }
         let peerDeviceId = UUID()
@@ -134,17 +138,20 @@ struct SessionReestablishmentCoalescingTests {
         await session.shutdown()
     }
 
-    @Test("Ending peerRefresh clears responder bootstrap hold")
-    func endingPeerRefreshClearsResponderBootstrapHold() async {
+    @Test("Ending peerRefresh clears expected response intent")
+    func endingPeerRefreshClearsExpectedResponseIntent() async {
         let session = PQSSession()
         defer { Task { await session.shutdown() } }
         let peerDeviceId = UUID()
 
-        await session.markInboundPeerRefreshBootstrapPrepared(
+        #expect(await session.tryBeginReestablishmentEpisode(
+            sender: "alice",
+            deviceId: peerDeviceId))
+        await session.registerExpectedPeerRefreshResponse(
             sender: "alice",
             deviceId: peerDeviceId,
             intentId: UUID())
-        #expect(await session.hasRecentInboundPeerRefreshBootstrap(
+        #expect(await session.hasActiveLocalPeerRefreshRequest(
             sender: "alice",
             deviceId: peerDeviceId))
 
@@ -152,9 +159,78 @@ struct SessionReestablishmentCoalescingTests {
             sender: "alice",
             deviceId: peerDeviceId)
 
-        #expect(!(await session.hasRecentInboundPeerRefreshBootstrap(
+        #expect(!(await session.hasActiveLocalPeerRefreshRequest(
             sender: "alice",
             deviceId: peerDeviceId)))
+        await session.shutdown()
+    }
+
+    @Test("Episode TTL expiry fires reestablishmentEpisodeDidEnd on the host")
+    func episodeTTLExpiryFiresReestablishmentEpisodeDidEnd() async throws {
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let probe = EpisodeEndProbe()
+        await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
+
+        let peerDeviceId = UUID()
+        let expiredStart = Date().addingTimeInterval(
+            -(await session.reestablishmentEpisodeTTL + 1)
+        )
+        #expect(await session.tryBeginReestablishmentEpisode(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            now: expiredStart))
+
+        // Cleanup runs on the next episode-related call (event-driven, no timer).
+        #expect(!(await session.hasOpenReestablishmentEpisode(
+            sender: "alice",
+            deviceId: peerDeviceId)))
+
+        var observed: [(String, UUID)] = []
+        for _ in 0..<40 {
+            observed = await probe.endedEpisodes()
+            if !observed.isEmpty { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        #expect(observed.contains(where: { $0.0 == "alice" && $0.1 == peerDeviceId }))
+        await session.shutdown()
+    }
+
+    @Test("Pending resend TTL expiry notifies the host that content is unrecoverable")
+    func pendingResendTTLExpiryNotifiesHostContentUnrecoverable() async throws {
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let probe = EpisodeEndProbe()
+        await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
+
+        let peerDeviceId = UUID()
+        let sharedId = "expired-pending-resend-id"
+        let expiredCreation = Date().addingTimeInterval(
+            -(await session.inboundFailurePolicyTTL + 1)
+        )
+        await session.deferPeerResendUntilReestablished(
+            sender: "alice",
+            deviceId: peerDeviceId,
+            failedMessageId: sharedId,
+            failureClass: "crypto.bodyDecryptionFailed",
+            now: expiredCreation,
+            notifyDelegate: false)
+
+        // Cleanup is event-driven: the next pending-resend access performs it and
+        // must treat the aged-out entry as terminal content loss for the host.
+        #expect(!(await session.hasPendingResendAfterReestablishment(
+            sender: "alice",
+            deviceId: peerDeviceId)))
+
+        var observed: [(String, UUID, String)] = []
+        for _ in 0..<40 {
+            observed = await probe.unrecoverableContent()
+            if !observed.isEmpty { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        #expect(observed.contains(where: {
+            $0.0 == "alice" && $0.1 == peerDeviceId && $0.2 == sharedId
+        }))
         await session.shutdown()
     }
 
@@ -658,5 +734,85 @@ extension PQSSession {
     func setOTKBreakerForTesting(open: Bool) {
         otkUploadCircuitOpen = open
         otkUploadCircuitOpenedAt = open ? Date() : nil
+    }
+}
+
+actor EpisodeEndProbe {
+    private var ended: [(String, UUID)] = []
+    private var unrecoverable: [(String, UUID, String)] = []
+
+    func record(sender: String, deviceId: UUID) {
+        ended.append((sender, deviceId))
+    }
+
+    func endedEpisodes() -> [(String, UUID)] {
+        ended
+    }
+
+    func recordUnrecoverable(sender: String, deviceId: UUID, sharedMessageId: String) {
+        unrecoverable.append((sender, deviceId, sharedMessageId))
+    }
+
+    func unrecoverableContent() -> [(String, UUID, String)] {
+        unrecoverable
+    }
+}
+
+/// Minimal host stub that records episode-end lifecycle events for TTL/expiry tests.
+struct RecordingEpisodeEndDelegate: PQSSessionDelegate {
+    let probe: EpisodeEndProbe
+
+    func synchronizeCommunication(
+        recipient: MessageRecipient,
+        sharedIdentifier: String,
+        metadata: Data
+    ) async throws {}
+
+    func requestFriendshipStateChange(
+        recipient: MessageRecipient,
+        blockData: Data?,
+        metadata: Data,
+        currentState: FriendshipMetadata.State
+    ) async throws {}
+
+    func deliveryStateChanged(recipient: MessageRecipient, metadata: Data) async throws {}
+    func contactCreated(recipient: MessageRecipient) async throws {}
+    func requestMetadata(recipient: MessageRecipient) async throws {}
+    func editMessage(recipient: MessageRecipient, metadata: Data) async throws {}
+    func shouldPersist(transportInfo: Data?) -> Bool { true }
+    func retrieveUserInfo(_ transportInfo: Data?) async -> (secretName: String, deviceId: String)? { nil }
+    func updateCryptoMessageMetadata(
+        _ message: CryptoMessage,
+        sharedMessageId: String
+    ) -> CryptoMessage { message }
+    func updateEncryptableMessageMetadata(
+        _ message: EncryptedMessage,
+        transportInfo: Data?,
+        identity: SessionIdentity,
+        recipient: MessageRecipient
+    ) async -> EncryptedMessage { message }
+    func shouldFinishCommunicationSynchronization(_ transportInfo: Data?) -> Bool { false }
+    func processMessage(
+        _ message: CryptoMessage,
+        senderSecretName: String,
+        senderDeviceId: UUID
+    ) async -> Bool { true }
+
+    func reestablishmentEpisodeDidEnd(
+        senderSecretName: String,
+        senderDeviceId: UUID
+    ) async {
+        await probe.record(sender: senderSecretName, deviceId: senderDeviceId)
+    }
+
+    func inboundContentUnrecoverable(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        sharedMessageId: String
+    ) async {
+        await probe.recordUnrecoverable(
+            sender: senderSecretName,
+            deviceId: senderDeviceId,
+            sharedMessageId: sharedMessageId)
     }
 }

@@ -132,8 +132,7 @@ extension PQSSession {
     func makeSessionReestablishmentEnvelope(
         kind: SessionReestablishmentKind,
         scope: ControlEventScope,
-        forceReemit: Bool = false,
-        requiresPreDecryptionReset: Bool = false
+        forceReemit: Bool = false
     ) -> SessionReestablishmentEnvelope? {
         pruneStaleSenderEpisodes()
         let now = Date()
@@ -164,8 +163,7 @@ extension PQSSession {
                     intentId: existing.intentId,
                     epoch: nextEpoch,
                     emittedAt: now,
-                    targetDeviceId: scope.targetDeviceId,
-                    requiresPreDecryptionReset: requiresPreDecryptionReset)
+                    targetDeviceId: scope.targetDeviceId)
             }
             // Past episode lifetime: fall through to fresh-episode mint below.
             logger.log(
@@ -194,8 +192,7 @@ extension PQSSession {
             intentId: intentId,
             epoch: nextEpoch,
             emittedAt: now,
-            targetDeviceId: scope.targetDeviceId,
-            requiresPreDecryptionReset: requiresPreDecryptionReset)
+            targetDeviceId: scope.targetDeviceId)
     }
 
     /// Throttled, single-flight emission of a session-reestablishment control event.
@@ -220,38 +217,20 @@ extension PQSSession {
         } else {
             recoveryPeer = nil
         }
-        let requiresPreDecryptionReset = kind == .peerRefresh && recoveryPeer != nil
+        // Multi-session: do not pre-reset the peer lane or smuggle a clear-transport
+        // bootstrap. peerRefresh rides normal signed ciphertext; the receiver tries
+        // active + inactive sessions and promotes on success.
         guard let envelope = makeSessionReestablishmentEnvelope(
             kind: kind,
             scope: scope,
-            forceReemit: forceReemit,
-            requiresPreDecryptionReset: requiresPreDecryptionReset) else {
+            forceReemit: forceReemit) else {
             return false
         }
-        // Register the pending request before any suspension point. A simultaneous
-        // inbound peerRefresh bootstrap resolves its collision against this exact
-        // state; registering after the reset `await` opens a window where both
-        // devices accept each other's bootstrap and clobber freshly reset lanes.
         if let recoveryPeer, let intentId = envelope.intentId {
             registerExpectedPeerRefreshResponse(
                 sender: recoveryPeer.secretName,
                 deviceId: recoveryPeer.deviceId,
                 intentId: intentId)
-        }
-        if requiresPreDecryptionReset, let recoveryPeer {
-            do {
-                _ = try await resetSessionIdentityForFreshSession(
-                    secretName: recoveryPeer.secretName,
-                    deviceId: recoveryPeer.deviceId,
-                    sendOneTimeIdentities: false)
-            } catch {
-                senderControlEpisodes.removeValue(
-                    forKey: ControlEventEpisodeKey(kind: kind, scope: scope))
-                unregisterExpectedPeerRefreshResponse(
-                    sender: recoveryPeer.secretName,
-                    deviceId: recoveryPeer.deviceId)
-                throw error
-            }
         }
         let metadata = try BinaryEncoder().encode(TransportEvent.sessionReestablishment(envelope))
         do {
@@ -260,9 +239,6 @@ extension PQSSession {
                 transportInfo: metadata,
                 targetDeviceId: scope.targetDeviceId)
         } catch {
-            // Reset may already have committed a state-less row. Drop the expected
-            // intent so a later successful emit can register a fresh one; the caller
-            // owns ending the open reestablishment episode.
             senderControlEpisodes.removeValue(
                 forKey: ControlEventEpisodeKey(kind: kind, scope: scope))
             if let recoveryPeer {

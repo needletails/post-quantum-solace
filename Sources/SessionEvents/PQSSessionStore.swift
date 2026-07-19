@@ -254,6 +254,18 @@ public protocol PQSSessionStore: Sendable {
     /// - Parameter id: The unique identifier of the media job to be deleted.
     /// - Throws: An error if the operation fails.
     func deleteMediaJob(_ id: UUID) async throws
+
+    /// Upserts a per-device outbound encrypt ledger entry.
+    func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws
+
+    /// Fetches the send record for `(sharedId, recipientDeviceId)`, if any.
+    func fetchOutboundDeviceSendRecord(
+        sharedId: String,
+        recipientDeviceId: UUID
+    ) async throws -> OutboundDeviceSendRecord?
+
+    /// Deletes all send records for a shared message id (e.g. when the message is removed).
+    func deleteOutboundDeviceSendRecords(sharedId: String) async throws
 }
 
 public extension PQSSessionStore {
@@ -264,4 +276,15 @@ public extension PQSSessionStore {
     func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage? {
         try? await fetchMessage(sharedId: sharedId)
     }
+
+    func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws {}
+
+    func fetchOutboundDeviceSendRecord(
+        sharedId: String,
+        recipientDeviceId: UUID
+    ) async throws -> OutboundDeviceSendRecord? {
+        nil
+    }
+
+    func deleteOutboundDeviceSendRecords(sharedId: String) async throws {}
 }

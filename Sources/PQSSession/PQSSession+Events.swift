@@ -332,6 +332,8 @@ public extension PQSSession {
                     shouldPersist = false
                 case .requestMessageResend(_):
                     shouldPersist = false
+                case .messageResendUnavailable(_):
+                    shouldPersist = false
                 }
             } catch {}
         }

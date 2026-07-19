@@ -108,14 +108,17 @@ public enum PQSSessionConstants: Sendable {
 
     /// Maximum number of inactive ratchet states to retain **per (secretName, deviceId)**.
     ///
-    /// This bounds storage and limits how many fallback attempts are performed.
-    public static let inactiveSessionMaxCountPerDevice = 5
+    /// Bounds storage while keeping enough history for promote-on-decrypt
+    /// after multi-device / offline lag.
+    public static let inactiveSessionMaxCountPerDevice = 40
 
     /// Maximum age (in seconds) to retain inactive ratchet states.
     ///
     /// States older than this are deleted opportunistically during invalidation and on inbound recovery.
-    /// This should be aligned with your transport's offline mailbox retention window.
-    public static let inactiveSessionMaxAgeSeconds: TimeInterval = 60 * 60 * 48 // 48 hours
+    public static let inactiveSessionMaxAgeSeconds: TimeInterval = 60 * 60 * 24 * 30 // 30 days
+
+    /// Bound for in-memory outbound device-send ledger entries (`OutboundDeviceSendRecord`).
+    public static let outboundDeviceSendRecordMaxCount = 2_000
 
     // MARK: - Session Reestablishment Coalescing
 
@@ -155,6 +158,15 @@ public enum PQSSessionConstants: Sendable {
     /// pending resend-after-reestablishment). Oldest entries are evicted first.
     /// Bounds memory growth under floods of unique failed-message identifiers.
     public static let recoveryTrackingMaxEntries = 512
+
+    /// Maximum total resend-request submissions per failed message before the
+    /// requester drops it as exhausted. Defense in depth for when the responder's
+    /// `messageResendUnavailable` notice is lost in transit.
+    public static let peerResendRequestMaxSubmissions = 3
+
+    /// Maximum responder-side memory of known-unavailable resend ids
+    /// (`requestingDeviceId|sharedId`) before oldest entries are evicted.
+    public static let unavailableResendMemoryMaxEntries = 256
 
     // MARK: - Schema versioning
 

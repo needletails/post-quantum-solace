@@ -308,6 +308,24 @@ public actor SessionCache: PQSSessionStore {
     public func deleteMessage(_ message: EncryptedMessage) async throws {
         messages.removeAll(where: { $0.id == message.id })
         try await store.deleteMessage(message)
+        try await store.deleteOutboundDeviceSendRecords(sharedId: message.sharedId)
+    }
+
+    public func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws {
+        try await store.upsertOutboundDeviceSendRecord(record)
+    }
+
+    public func fetchOutboundDeviceSendRecord(
+        sharedId: String,
+        recipientDeviceId: UUID
+    ) async throws -> OutboundDeviceSendRecord? {
+        try await store.fetchOutboundDeviceSendRecord(
+            sharedId: sharedId,
+            recipientDeviceId: recipientDeviceId)
+    }
+
+    public func deleteOutboundDeviceSendRecords(sharedId: String) async throws {
+        try await store.deleteOutboundDeviceSendRecords(sharedId: sharedId)
     }
 
     /// Inserts a message into the cache with proper ordering.

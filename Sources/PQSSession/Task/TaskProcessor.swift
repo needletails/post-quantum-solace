@@ -191,6 +191,25 @@ public actor TaskProcessor {
     var pendingOutboundTransportBySharedId: [String: PendingOutboundTransport] = [:]
     let pendingOutboundTransportTTL: TimeInterval = 60 * 10
     let pendingOutboundTransportLimit = 256
+
+    /// Replay jobs queued to service a peer's resend request, keyed by shared id.
+    /// A resend replay that dies before transport is invisible to the requester (it
+    /// just never receives the frame), so every terminal outcome of these jobs is
+    /// audited: transported, or dropped with the reason that killed the job.
+    ///
+    /// `servicedFromPersistedStore` delays the responder servicing cooldown until
+    /// transport hand-off — arming it at queue time let dropped replays silence the
+    /// next request via coalesce-with-no-reply.
+    struct PendingResendReplay: Sendable {
+        let requesterName: String
+        let requesterDeviceId: UUID
+        let servicedFromPersistedStore: Bool
+        let queuedAt: Date
+    }
+
+    var pendingResendReplayBySharedId: [String: PendingResendReplay] = [:]
+    let pendingResendReplayTTL: TimeInterval = 60 * 10
+    let pendingResendReplayLimit = 256
     
     /// Represents a stashed inbound task for later processing.
     ///
@@ -360,13 +379,22 @@ public actor TaskProcessor {
                 restrictPeerFanoutToMasterDevices = true
             }
 
-            identities = try await gatherPrivateMessageIdentities(
-                session: session,
-                target: nickname,
-                logger: logger,
-                createIdentity: createIdentity,
-                sendOneTimeIdentities: sendOneTimeIdentities,
-                forceRefresh: forceIdentityRefresh)
+            // Friendship / OTK bootstrap keep the master-scoped gather path.
+            // Persistable chat uses verified-device fan-out: one active lane per device.
+            if forceIdentityRefresh || sendOneTimeIdentities || !createIdentity {
+                identities = try await gatherPrivateMessageIdentities(
+                    session: session,
+                    target: nickname,
+                    logger: logger,
+                    createIdentity: createIdentity,
+                    sendOneTimeIdentities: sendOneTimeIdentities,
+                    forceRefresh: forceIdentityRefresh)
+            } else {
+                identities = try await session.sessionIdentitiesForChatFanout(secretName: nickname)
+                logger.log(
+                    level: .info,
+                    message: "Gathered \(identities.count) chat fan-out Session Identities for \(nickname)")
+            }
 
             // OTK handshake notify must encrypt to the bootstrap-target device
             // (online / OTK-capable), not every master-flagged row. Ghost devices
@@ -1041,7 +1069,12 @@ public actor TaskProcessor {
                 }
                 try await feedTask(task, session: session)
             } catch {
-                logger.log(level: .error, message: "Error handling recipient identity: \(error)")
+                // One device's prep/encrypt failure must not abort fan-out to others.
+                logger.log(
+                    level: .warning,
+                    message: "pqs.send.deviceSkipped recipientDevice=\(identity.id) error=\(error)")
+                DecryptFailureAuditLog.log(
+                    "pqs.send.deviceSkipped sessionIdentityId=\(identity.id.uuidString) error=\(String(describing: error))")
             }
         }
     }

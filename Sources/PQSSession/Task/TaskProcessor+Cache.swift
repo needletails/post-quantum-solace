@@ -257,7 +257,7 @@ extension TaskProcessor {
 
         if shouldUpdateCommunication {
             try await cache.updateCommunication(communication)
-            Task {
+            await session.scheduleBackgroundWork {
                 await session.receiverDelegate?.updatedCommunication(communication, members: members)
             }
         }

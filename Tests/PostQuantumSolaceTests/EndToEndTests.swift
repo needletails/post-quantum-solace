@@ -2472,17 +2472,6 @@ actor EndToEndTests {
             else {
                 return
             }
-            if case .sessionReestablishment(let envelope)? = received.transportEvent,
-               envelope.kind == .peerRefresh,
-               envelope.requiresPreDecryptionReset {
-                guard (try? await target.prepareInboundPeerRefreshBootstrap(
-                    sender: received.sender,
-                    deviceId: received.deviceId,
-                    envelope: envelope)) == true
-                else {
-                    return
-                }
-            }
             _ = try? await target.receiveMessage(
                 message: received.message,
                 sender: received.sender,
@@ -7849,15 +7838,8 @@ actor EndToEndTests {
             for await received in aliceStream {
                 if let event = received.transportEvent {
                     switch event {
-                    case .sessionReestablishment(let envelope):
+                    case .sessionReestablishment:
                         await probe.markRecoveryStarted()
-                        if envelope.requiresPreDecryptionReset,
-                           (try? await self._senderSession.prepareInboundPeerRefreshBootstrap(
-                               sender: received.sender,
-                               deviceId: received.deviceId,
-                               envelope: envelope)) != true {
-                            continue
-                        }
                     case .requestMessageResend(_):
                         await probe.markRecoveryStarted()
                     default:
@@ -7874,14 +7856,6 @@ actor EndToEndTests {
         bobTask = Task {
             for await received in bobStream {
                 guard received.transportEvent == nil else {
-                    if case .sessionReestablishment(let envelope)? = received.transportEvent,
-                       envelope.requiresPreDecryptionReset,
-                       (try? await self._recipientSession.prepareInboundPeerRefreshBootstrap(
-                           sender: received.sender,
-                           deviceId: received.deviceId,
-                           envelope: envelope)) != true {
-                        continue
-                    }
                     _ = try? await self.receiveIgnoringRecoverableErrors(
                         self._recipientSession,
                         received: received
@@ -7991,8 +7965,9 @@ actor EndToEndTests {
             text: "this will be corrupted"
         )
 
-        // Recovery is event-driven: CryptoKit body failure opens repair / defers resend.
-        // Do not require Alice to observe a control frame before Bob's local repair state.
+        // Undecryptable: first CryptoKit body failure requests resend; peerRefresh
+        // only on repeat. Accept either a resend request on the wire or deferred /
+        // episode state from an escalated repeat.
         #expect(await waitUntil {
             if await probe.recoveryStarted { return true }
             if await self._recipientSession.hasOpenReestablishmentEpisode(
@@ -8003,7 +7978,7 @@ actor EndToEndTests {
             return await self._recipientSession.hasPendingResendAfterReestablishment(
                 sender: "alice",
                 deviceId: aliceDeviceId)
-        }, "Bob should start CryptoKitError repair (episode / deferred resend / peer control)")
+        }, "Bob should start CryptoKitError recovery (resend / deferred / episode)")
         await probe.markRecoveryStarted()
 
         let corruptedMessage = try #require(
@@ -8128,12 +8103,25 @@ actor EndToEndTests {
         #expect(
             await waitUntil { await probe.contains(responseDrainedSharedId) },
             "peerRefresh response should submit the deferred resend request")
+        // Alice has no local replay for this synthetic sharedId, so she answers
+        // with messageResendUnavailable. Bob must clear the pending marker
+        // (terminal content loss) instead of looping until TTL.
         #expect(
-            await _recipientSession.hasPendingResendAfterReestablishment(
-                sender: "alice",
-                deviceId: aliceDeviceId,
-                failedMessageId: responseDrainedSharedId),
-            "Deferred resend marker should remain until the requested replay succeeds")
+            await waitUntil {
+                !(await self._recipientSession.hasPendingResendAfterReestablishment(
+                    sender: "alice",
+                    deviceId: aliceDeviceId,
+                    failedMessageId: responseDrainedSharedId))
+            },
+            "Unavailable notice should clear the deferred resend marker")
+        #expect(
+            await waitUntil {
+                await self._recipientSession.isInboundFailureQuarantined(
+                    sender: "alice",
+                    deviceId: aliceDeviceId,
+                    messageId: responseDrainedSharedId)
+            },
+            "Unavailable ids should be quarantined so poison redelivery cannot reopen recovery")
 
         let successfulInboundDrainedSharedId = UUID().uuidString
         await _recipientSession.deferPeerResendUntilReestablished(
@@ -8767,8 +8755,9 @@ actor EndToEndTests {
             "Old message encrypted with previous keys should be decrypted from the archived snapshot"
         )
 
-        // Assert only against the active rows we cleared. Archive fallback may replace the
-        // object identity; any later recovery-created row is outside this invariant.
+        // Assert only against the active rows we cleared. Archive fallback promotes
+        // the proven archived row (deleting these cleared actives); any surviving
+        // cleared id must still have nil state.
         var activeStateWasMutated = false
         for identity in try await bobCache.fetchSessionIdentities() {
             guard clearedActiveIdentityIds.contains(identity.id) else { continue }
@@ -8779,7 +8768,25 @@ actor EndToEndTests {
         }
         #expect(
             !activeStateWasMutated,
-            "Archived fallback must not leave partial ratchet state on the active SessionIdentity"
+            "Archived fallback must not leave partial ratchet state on the failed active SessionIdentity"
+        )
+
+        // Converge: the proven archived decrypt must become the active
+        // send/receive lane for alice — not stay archived with preferred pointing
+        // at an inactive row outbound cannot select.
+        var promotedActiveWithState = false
+        for identity in try await bobCache.fetchSessionIdentities() {
+            guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
+            guard props.secretName == sMockUserData.ssn else { continue }
+            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            else { continue }
+            if props.state != nil {
+                promotedActiveWithState = true
+            }
+        }
+        #expect(
+            promotedActiveWithState,
+            "Archived fallback must promote the proven SessionIdentity to the active lane"
         )
     }
 
@@ -9582,6 +9589,8 @@ struct SessionDelegate: PQSSessionDelegate {
                 case .requestMessageResend(_):
                     break
                 case .linkedDeviceReprovisioning(_):
+                    break
+                case .messageResendUnavailable(_):
                     break
                 }
             }

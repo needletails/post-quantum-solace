@@ -279,6 +279,69 @@ public extension PQSSession {
         }
     }
 
+    /// Chat fan-out: one active `SessionIdentity` per server-verified device.
+    ///
+    /// Refreshes when the local set is empty, contains devices absent from the verified
+    /// snapshot, or is missing a verified device. Encrypt prepares initiating sessions
+    /// for state-less rows — this helper does not run a second prep engine.
+    func sessionIdentitiesForChatFanout(secretName: String) async throws -> [SessionIdentity] {
+        guard let transportDelegate else {
+            throw PQSSession.SessionErrors.transportNotInitialized
+        }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let existing = try await getSessionIdentities(with: secretName)
+
+        let configuration = try await transportDelegate.findConfiguration(for: secretName)
+        try validateUserConfigurationSignatures(configuration)
+        let verifiedDevices = try verifiedDevicesWithUsableKeyMaterial(
+            in: configuration,
+            secretName: secretName,
+            source: "remote")
+        let verifiedIds = Set(verifiedDevices.map(\.deviceId))
+
+        let localActiveDeviceIds = await Set(existing.asyncCompactMap { identity -> UUID? in
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { return nil }
+            guard props.secretName == secretName else { return nil }
+            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else {
+                return nil
+            }
+            return props.deviceId
+        })
+        let hasDevicesAbsentFromVerified = !localActiveDeviceIds.isSubset(of: verifiedIds)
+        let missingVerifiedDevices = !verifiedIds.isSubset(of: localActiveDeviceIds)
+        let forceRefresh = existing.isEmpty
+            || hasDevicesAbsentFromVerified
+            || missingVerifiedDevices
+
+        let refreshed = try await refreshIdentities(
+            secretName: secretName,
+            createIdentity: true,
+            forceRefresh: forceRefresh,
+            sendOneTimeIdentities: false)
+
+        var byDevice: [UUID: SessionIdentity] = [:]
+        for identity in refreshed {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            guard props.secretName == secretName else { continue }
+            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else {
+                continue
+            }
+            guard verifiedIds.contains(props.deviceId) else { continue }
+            if let existingIdentity = byDevice[props.deviceId],
+               let existingProps = await existingIdentity.props(symmetricKey: symmetricKey),
+               existingProps.state != nil,
+               props.state == nil {
+                continue
+            }
+            byDevice[props.deviceId] = identity
+        }
+        let result = Array(byDevice.values)
+        logger.log(
+            level: .info,
+            message: "Chat fan-out resolved \(result.count) device lane(s) for \(secretName) forceRefresh=\(forceRefresh)")
+        return result
+    }
+
     /// Removes local `SessionIdentity` rows whose device IDs are absent from `verifiedDeviceIds`.
     private func pruneStaleSessionIdentities(
         secretName: String,
@@ -307,6 +370,8 @@ public extension PQSSession {
                 do {
                     try await cache?.deleteSessionIdentity(identityToRemove.id)
                     logger.log(level: .info, message: "Did remove stale session identity for recipient: \(secretName)")
+                    DecryptFailureAuditLog.log(
+                        "pqs.recovery.laneStalePruned peer=\(secretName) deviceId=\(deviceId.uuidString) verifiedDeviceCount=\(verifiedDeviceIds.count)")
                     identities.removeAll { $0.id == identityToRemove.id }
                 } catch {
                     logger.log(
@@ -542,7 +607,8 @@ public extension PQSSession {
         _ = try await resetSessionIdentityForFreshSession(
             secretName: secretName,
             deviceId: targetDevice.deviceId,
-            sendOneTimeIdentities: false)
+            sendOneTimeIdentities: false,
+            reason: "friendshipOutboundBootstrap")
 
         logger.log(
             level: .info,
@@ -565,7 +631,8 @@ public extension PQSSession {
         _ = try await resetSessionIdentityForFreshSession(
             secretName: secretName,
             deviceId: targetDevice.deviceId,
-            sendOneTimeIdentities: false)
+            sendOneTimeIdentities: false,
+            reason: "friendshipReplyPrepare")
 
         logger.log(
             level: .info,
@@ -776,6 +843,8 @@ public extension PQSSession {
         logger.log(
             level: .info,
             message: "wipePeerRelationshipState: removed \(deletedCount) session identity row(s) and transient handshake state for \(secretName)")
+        DecryptFailureAuditLog.log(
+            "pqs.recovery.laneWiped peer=\(secretName) deletedRows=\(deletedCount)")
     }
 
     /// Re-promotes the newest archived peer ratchet when accept bootstrap left only a state-less row.
@@ -852,6 +921,8 @@ public extension PQSSession {
         logger.log(
             level: .info,
             message: "restoreEncryptablePeerSessionFromArchiveIfNeeded: restored active peer session from archive for \(secretName) deviceId=\(deviceId)")
+        DecryptFailureAuditLog.log(
+            "pqs.recovery.laneRestoredFromArchive peer=\(secretName) deviceId=\(deviceId.uuidString)")
     }
 
     /// Waits briefly for the peer to replenish published OTKs. Returns whether keys are available.
@@ -1167,9 +1238,10 @@ public extension PQSSession {
         return ranked.map(\.identity)
     }
 
-    /// Promotes the exact archived row that successfully decrypted a live recovery
-    /// control. This preserves the proven ratchet state so the response is encrypted
-    /// on the same lane, instead of using an unrelated freshly reset active row.
+    /// Promotes the exact archived row that successfully decrypted inbound
+    /// ciphertext (decrypt on inactive → activate for send/receive).
+    /// Preserves the proven ratchet state so subsequent outbound uses the same
+    /// lane, instead of rematerializing a failed active or a freshly reset row.
     internal func promoteArchivedSessionIdentityToActive(
         _ archived: SessionIdentity
     ) async throws -> SessionIdentity {
@@ -1221,6 +1293,8 @@ public extension PQSSession {
         logger.log(
             level: .info,
             message: "Promoted cryptographically proven archived SessionIdentity for \(archivedProps.secretName) (\(archivedProps.deviceId))")
+        DecryptFailureAuditLog.log(
+            "pqs.recovery.lanePromotedFromArchive peer=\(archivedProps.secretName) deviceId=\(archivedProps.deviceId.uuidString)")
         return archived
     }
 
@@ -1241,7 +1315,8 @@ public extension PQSSession {
     internal func resetSessionIdentityForFreshSession(
         secretName: String,
         deviceId: UUID,
-        sendOneTimeIdentities: Bool = true
+        sendOneTimeIdentities: Bool = true,
+        reason: String = "unspecified"
     ) async throws -> SessionIdentity {
         guard let cache else {
             throw PQSSession.SessionErrors.databaseNotInitialized
@@ -1311,6 +1386,8 @@ public extension PQSSession {
                 logger.log(
                     level: .info,
                     message: "Reusing existing state-less SessionIdentity for \(secretName) (\(device.deviceId)); repair lane does not consume OTKs")
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.laneReset outcome=reusedStateLessRow reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString)")
                 return reusable.identity
             }
         }
@@ -1366,6 +1443,11 @@ public extension PQSSession {
         logger.log(
             level: .info,
             message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); archived=\(archivedActiveCount) deletedActive=\(deletedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
+        // Lane teardown in the same audit file as the decrypt failures: a proven
+        // inbound lane failing right after one of these entries identifies the
+        // caller that clobbered it.
+        DecryptFailureAuditLog.log(
+            "pqs.recovery.laneReset outcome=reset reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) archivedActive=\(archivedActiveCount) deletedActive=\(deletedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
 
         return identity
     }
@@ -1542,10 +1624,11 @@ public extension PQSSession {
                                 level: .info,
                                 message: "Detected rotated identity keys for \(secretName) (\(device.deviceId)); replacing active SessionIdentity")
 
-                            let replacement = try await resetSessionIdentityForFreshSession(
-                                secretName: secretName,
-                                deviceId: device.deviceId,
-                                sendOneTimeIdentities: sendOneTimeIdentities)
+                        let replacement = try await resetSessionIdentityForFreshSession(
+                            secretName: secretName,
+                            deviceId: device.deviceId,
+                            sendOneTimeIdentities: sendOneTimeIdentities,
+                            reason: "rotatedIdentityKeysDetected")
 
                             identities.removeAll(where: { identity in
                                 identity.id == foundIdentity.id

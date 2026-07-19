@@ -303,6 +303,21 @@ public protocol PQSSessionDelegate: Sendable {
     /// until decrypt completed (instead of deleting on enqueue).
     func inboundCiphertextAccepted(sharedMessageId: String) async
 
+    /// Called when the peer reported that a previously failed message has no replay
+    /// source anywhere — the content is permanently unrecoverable and no further
+    /// resend will be requested. Hosts may delete a held offline spool copy or
+    /// surface the gap in UI.
+    func inboundContentUnrecoverable(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        sharedMessageId: String
+    ) async
+
+    /// Called when this device cannot re-encrypt/replay an outbound message that a
+    /// peer requested after decrypt failure. Hosts should mark the local outbound
+    /// row as failed so the UI does not keep a delivered/read glyph for lost content.
+    func outboundMessageUnrecoverable(sharedMessageId: String, reason: String) async
+
     /// Called when a peer-device reestablishment episode closes (success, terminal
     /// failure, identity ack cleanup, or explicit end). Transport may resume a
     /// deferred offline backlog replay when no episodes remain open.
@@ -317,11 +332,13 @@ public protocol PQSSessionDelegate: Sendable {
     func shouldSendAutomaticDeliveryReceipts() async -> Bool
 
     /// Called when a linked device on the same account reports a potential compromise
-    /// (e.g. it hit `maxSkippedHeadersExceeded` during decryption).
+    /// (e.g. same-account `invalidSignature`, or inbound `.linkedDeviceCompromiseObserved`).
+    /// This is not raised for session repair signals such as `maxSkippedHeadersExceeded`
+    /// (those use peerRefresh / fresh-session repair).
     ///
     /// The master device can use this callback to decide whether to trigger
     /// `rotateKeysOnPotentialCompromise()`. Child devices may use it for
-    /// informational logging or UI alerts.
+    /// informational logging or UI alerts. Do not auto-rotate from this callback.
     ///
     /// - Parameters:
     ///   - deviceId: The device ID of the linked device that detected the anomaly.
@@ -375,6 +392,14 @@ public extension PQSSessionDelegate {
     ) async {}
 
     func inboundCiphertextAccepted(sharedMessageId: String) async {}
+
+    func inboundContentUnrecoverable(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        sharedMessageId: String
+    ) async {}
+
+    func outboundMessageUnrecoverable(sharedMessageId: String, reason: String) async {}
 
     func reestablishmentEpisodeDidEnd(
         senderSecretName: String,

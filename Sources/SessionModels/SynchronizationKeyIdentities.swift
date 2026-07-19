@@ -162,9 +162,9 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
     /// compatibility with legacy account-wide refresh controls.
     public let targetDeviceId: UUID?
 
-    /// The transport must expose this request as a bounded pre-decryption bootstrap.
-    /// This lets the exact recipient device clear a divergent lane before decrypting
-    /// the freshly initialized request. Responses never set this flag.
+    /// Legacy wire field. Always `false` on new emits. Kept for BinaryCodable
+    /// decode of older clients that set a pre-decryption bootstrap flag; receivers
+    /// ignore it (try-all sessions + promote — no peer wipe before decrypt).
     public let requiresPreDecryptionReset: Bool
 
     public init(
@@ -182,7 +182,9 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
         self.emittedAt = emittedAt
         self.isResponse = isResponse
         self.targetDeviceId = targetDeviceId
-        self.requiresPreDecryptionReset = requiresPreDecryptionReset
+        // Never honor pre-decrypt wipe on new traffic (parameter retained for API compat).
+        _ = requiresPreDecryptionReset
+        self.requiresPreDecryptionReset = false
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -209,8 +211,9 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
             self.emittedAt = (try? container.decode(Date.self, forKey: .emittedAt)) ?? Date()
             self.isResponse = (try? container.decode(Bool.self, forKey: .isResponse)) ?? false
             self.targetDeviceId = try? container.decodeIfPresent(UUID.self, forKey: .targetDeviceId)
-            self.requiresPreDecryptionReset =
-                (try? container.decode(Bool.self, forKey: .requiresPreDecryptionReset)) ?? false
+            // Decode the legacy flag for wire compat, then discard it.
+            _ = try? container.decode(Bool.self, forKey: .requiresPreDecryptionReset)
+            self.requiresPreDecryptionReset = false
             return
         }
         // Legacy fallback for serializers that handed us a bare `SessionReestablishmentKind`.
@@ -254,6 +257,10 @@ public enum TransportEvent: Sendable, Codable {
     case requestMessageResend(FailedMessageResendRequest)
     /// Peer acknowledges that a published OTK replenish batch is on the server.
     case publishedOneTimeKeysReplenished
+    /// Responder tells a resend requester that these sharedIds can never be
+    /// replayed (not persisted locally, unreadable, or stale controls). The
+    /// requester must stop re-requesting them and treat the content as lost.
+    case messageResendUnavailable(MessageResendUnavailableNotice)
     
     enum CodingKeys: String, CodingKey {
         case sessionReestablishment = "a"
@@ -262,6 +269,7 @@ public enum TransportEvent: Sendable, Codable {
         case refreshOneTimeKeys = "d"
         case requestMessageResend = "e"
         case publishedOneTimeKeysReplenished = "f"
+        case messageResendUnavailable = "g"
     }
 }
 
@@ -329,6 +337,60 @@ public struct FailedMessageResendRequest: Sendable, Codable {
         var seen = Set<String>()
         var normalized: [String] = []
         for id in ids where !id.isEmpty && !seen.contains(id) {
+            seen.insert(id)
+            normalized.append(id)
+            if normalized.count == Self.maxBatchedIds {
+                break
+            }
+        }
+        return normalized
+    }
+}
+
+/// Terminal answer to a `FailedMessageResendRequest`: the responding device has
+/// no replayable frame for these sharedIds and never will (content was never
+/// persisted, is unreadable, or is a stale control). Receiving this clears the
+/// requester's pending resend state so it stops re-requesting on every drain.
+public struct MessageResendUnavailableNotice: Sendable, Codable, Equatable {
+    /// Same batch cap as `FailedMessageResendRequest`, enforced on encode and
+    /// decode so a hostile peer cannot clear an unbounded amount of state.
+    public static let maxBatchedIds = FailedMessageResendRequest.maxBatchedIds
+
+    public let respondingDeviceId: UUID
+    public let unavailableSharedMessageIds: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case respondingDeviceId = "a"
+        case unavailableSharedMessageIds = "b"
+    }
+
+    public init(
+        unavailableSharedMessageIds: [String],
+        respondingDeviceId: UUID
+    ) {
+        self.unavailableSharedMessageIds = Self.normalizedIds(unavailableSharedMessageIds)
+        self.respondingDeviceId = respondingDeviceId
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        respondingDeviceId = try container.decode(UUID.self, forKey: .respondingDeviceId)
+        let ids = try container.decode([String].self, forKey: .unavailableSharedMessageIds)
+        unavailableSharedMessageIds = Self.normalizedIds(ids)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(respondingDeviceId, forKey: .respondingDeviceId)
+        try container.encode(unavailableSharedMessageIds, forKey: .unavailableSharedMessageIds)
+    }
+
+    private static func normalizedIds(_ ids: [String]) -> [String] {
+        var seen = Set<String>()
+        var normalized: [String] = []
+        for rawId in ids {
+            let id = rawId.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, !seen.contains(id) else { continue }
             seen.insert(id)
             normalized.append(id)
             if normalized.count == Self.maxBatchedIds {

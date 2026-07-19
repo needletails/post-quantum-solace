@@ -185,16 +185,70 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     private var refreshOTKeysTask: Task<Bool, Never>?
     private var refreshMLKEMOTKeysTask: Task<Bool, Never>?
 
+    /// Session-lifetime root that owns background child work (OTK recovery, host
+    /// notifies). Cancelled on `shutdown()` so fire-and-forget work cannot outlive
+    /// the session. One unstructured Task at the boundary; children are structured.
+    private var sessionWorkRoot: Task<Void, Never>?
+    private var backgroundWorkContinuation: AsyncStream<@Sendable () async -> Void>.Continuation?
+
     var otkUploadCircuitOpen = false
     var otkUploadCircuitOpenedAt: Date?
     private let otkCircuitCooldownSeconds: TimeInterval = 300
 
-    private func openOTKUploadCircuitAndScheduleRecovery() {
+    /// Schedules non-blocking work as a child of the session work tree.
+    /// No-ops after shutdown (continuation finished / root cancelled).
+    func scheduleBackgroundWork(_ operation: @escaping @Sendable () async -> Void) {
+        ensureSessionWorkTreeRunning()
+        guard let continuation = backgroundWorkContinuation else { return }
+        continuation.yield { [weak self] in
+            guard let self else { return }
+            guard !Task.isCancelled else { return }
+            let viable = await self.isViable
+            guard viable else { return }
+            await operation()
+        }
+    }
+
+    private func ensureSessionWorkTreeRunning() {
+        guard sessionWorkRoot == nil else { return }
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: (@Sendable () async -> Void).self,
+            bufferingPolicy: .unbounded
+        )
+        backgroundWorkContinuation = continuation
+        sessionWorkRoot = Task { [weak self] in
+            await withTaskGroup(of: Void.self) { group in
+                for await work in stream {
+                    guard !Task.isCancelled else { break }
+                    group.addTask {
+                        guard !Task.isCancelled else { return }
+                        await work()
+                    }
+                }
+                group.cancelAll()
+            }
+            _ = self
+        }
+    }
+
+    private func cancelSessionWorkTree() {
+        backgroundWorkContinuation?.finish()
+        backgroundWorkContinuation = nil
+        sessionWorkRoot?.cancel()
+        sessionWorkRoot = nil
+    }
+
+    /// Opens the OTK upload circuit and runs signing-key mismatch recovery inline
+    /// (already on the refresh singleflight path — not a fire-and-forget Task).
+    private func openOTKUploadCircuitAndScheduleRecovery() async {
         otkUploadCircuitOpen = true
         otkUploadCircuitOpenedAt = Date()
-        Task { [weak self] in
-            guard let self else { return }
-            try? await self.recoverFromSigningKeyMismatch()
+        do {
+            try await recoverFromSigningKeyMismatch()
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "Signing-key mismatch recovery failed after opening OTK circuit: \(error)")
         }
     }
 
@@ -320,6 +374,17 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Key format: "<requestingDeviceUUID>|<sharedId>".
     var lastServicedResendAtByRequest: [String: Date] = [:]
 
+    /// Responder-side memory of `(requestingDeviceId, sharedId)` tuples that have no
+    /// local replay source. Repeat requests for these ids short-circuit the DB lookup
+    /// and are answered with a `messageResendUnavailable` notice without re-auditing.
+    /// Key format: "<requestingDeviceUUID>|<sharedId>".
+    var unavailableResendIds: [String: Date] = [:]
+
+    /// Requester-side count of resend-request submissions per failed message, used to
+    /// make the deferred-resend loop terminal even when the responder's unavailable
+    /// notice is lost. Key format matches ``peerResendRequestKey(sender:deviceId:failedMessageId:)``.
+    var resendRequestAttemptsByKey: [String: (attempts: Int, lastAt: Date)] = [:]
+
     struct PendingResendAfterReestablishment: Sendable, Equatable {
         let senderName: String
         let senderDeviceId: UUID
@@ -341,12 +406,6 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// A response cannot close another device's or an older recovery episode.
     var expectedPeerRefreshIntentByPeer: [String: UUID] = [:]
 
-    /// Last peerRefresh bootstrap applied before decryption for each peer-device lane.
-    /// Replayed transport wrappers must not repeatedly clear a healthy ratchet.
-    var preparedInboundPeerRefreshBootstrapByPeer: [
-        String: (intentId: UUID, preparedAt: Date)
-    ] = [:]
-
     /// Local account signing-key pin is out of sync with the server-trusted configuration.
     /// Same-account peerRefresh must not emit until the user acknowledges the change
     /// (or a verified reprovisioning path updates the pin). Cleared only by that event.
@@ -354,9 +413,13 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
     /// Peer-device lanes where peerRefresh emit failed on a recoverable dependency
     /// (e.g. `findConfiguration` timeout). Blocks opening a new episode until a
-    /// concrete readiness event clears the lane — successful config lookup, inbound
-    /// bootstrap, identity acknowledgement, or transport-ready notification.
+    /// concrete readiness event clears the lane — successful config lookup,
+    /// identity acknowledgement, or transport-ready notification.
     var recoveryEmitBlockedLanes: Set<String> = []
+
+    /// Outbound device-send ledger: which local SessionIdentity encrypted each
+    /// `(sharedId, recipientDeviceId)`. Hot path is in-memory; mirrored to the store.
+    var outboundDeviceSendRecordsByKey: [String: OutboundDeviceSendRecord] = [:]
 
     /// Maximum lifetime of a single-flight reestablishment episode before a new
     /// leader is allowed. Bounds stuck recovery without timer-based retry loops.
@@ -685,11 +748,51 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         return true
     }
     
-    /// Marks a resend/refresh control request as sent for this failed message.
+    /// Marks a resend/refresh control request as sent (queued) for this failed message.
+    /// Only arms the request cooldown; attempts toward
+    /// `PQSSessionConstants.peerResendRequestMaxSubmissions` are counted by
+    /// ``markPeerResendRequestTransported(sender:deviceId:failedMessageIds:now:)`` when
+    /// the request frame actually reaches the transport. Queue-time counting burned
+    /// attempts for requests that died before the wire and dropped recoverable content.
     func markPeerResendRequestSent(sender: String, deviceId: UUID, failedMessageId: String, now: Date = Date()) {
         let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
         pruneRecoveryTimestamps(&lastResendRequestAtByPeer, ttl: peerResendRequestCooldown, now: now)
         lastResendRequestAtByPeer[requestKey] = now
+    }
+
+    /// Counts one confirmed submission per failed message id after the resend-request
+    /// frame was handed to the transport. This is the event that spends an attempt
+    /// toward `PQSSessionConstants.peerResendRequestMaxSubmissions`.
+    func markPeerResendRequestTransported(sender: String, deviceId: UUID, failedMessageIds: [String], now: Date = Date()) {
+        pruneResendRequestAttempts(now: now)
+        for failedMessageId in failedMessageIds {
+            let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+            let attempts = (resendRequestAttemptsByKey[requestKey]?.attempts ?? 0) + 1
+            resendRequestAttemptsByKey[requestKey] = (attempts, now)
+        }
+    }
+
+    /// Total transport-confirmed resend-request submissions recorded for this failed
+    /// message inside the pending-resend TTL window.
+    func resendRequestSubmissionCount(sender: String, deviceId: UUID, failedMessageId: String, now: Date = Date()) -> Int {
+        pruneResendRequestAttempts(now: now)
+        let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        return resendRequestAttemptsByKey[requestKey]?.attempts ?? 0
+    }
+
+    private func pruneResendRequestAttempts(now: Date) {
+        resendRequestAttemptsByKey = resendRequestAttemptsByKey.filter { _, entry in
+            now.timeIntervalSince(entry.lastAt) < inboundFailurePolicyTTL
+        }
+        let cap = PQSSessionConstants.recoveryTrackingMaxEntries
+        guard resendRequestAttemptsByKey.count >= cap else { return }
+        let overflowKeys = resendRequestAttemptsByKey
+            .sorted { $0.value.lastAt < $1.value.lastAt }
+            .prefix(resendRequestAttemptsByKey.count - cap + 1)
+            .map(\.key)
+        for key in overflowKeys {
+            resendRequestAttemptsByKey.removeValue(forKey: key)
+        }
     }
 
     /// Builds a stable key for responder-side resend servicing, scoped to the requesting device
@@ -717,6 +820,28 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         lastServicedResendAtByRequest[requestKey] = now
     }
 
+    /// Remembers that a requested shared message id has no local replay source for this
+    /// requesting device, so repeat requests can skip the lookup and just re-notify.
+    func markResendUnavailable(requestingDeviceId: UUID, sharedId: String, now: Date = Date()) {
+        let key = peerResendServiceKey(requestingDeviceId: requestingDeviceId, sharedId: sharedId)
+        let cap = PQSSessionConstants.unavailableResendMemoryMaxEntries
+        if unavailableResendIds[key] == nil, unavailableResendIds.count >= cap {
+            let overflowKeys = unavailableResendIds
+                .sorted { $0.value < $1.value }
+                .prefix(unavailableResendIds.count - cap + 1)
+                .map(\.key)
+            for overflowKey in overflowKeys {
+                unavailableResendIds.removeValue(forKey: overflowKey)
+            }
+        }
+        unavailableResendIds[key] = now
+    }
+
+    /// True when a previous replay lookup already proved this requested id unreplayable.
+    func isKnownUnavailableResend(requestingDeviceId: UUID, sharedId: String) -> Bool {
+        unavailableResendIds[peerResendServiceKey(requestingDeviceId: requestingDeviceId, sharedId: sharedId)] != nil
+    }
+
     func deferPeerResendUntilReestablished(
         sender: String,
         deviceId: UUID,
@@ -735,7 +860,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             createdAt: now)
         guard notifyDelegate else { return }
         let delegate = sessionDelegate
-        Task {
+        scheduleBackgroundWork {
             await delegate?.inboundRecoveryDeferred(
                 senderSecretName: sender,
                 senderDeviceId: deviceId,
@@ -775,11 +900,35 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let expiredKeys = openReestablishmentEpisodes.compactMap { key, startedAt in
             startedAt <= cutoff ? key : nil
         }
+        guard !expiredKeys.isEmpty else { return }
         openReestablishmentEpisodes = openReestablishmentEpisodes.filter { _, startedAt in
             startedAt > cutoff
         }
         for key in expiredKeys {
             expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
+        }
+        // TTL expiry is a terminal lifecycle event, same as an explicit end. Hosts
+        // latch state on open episodes (e.g. NudgeKit defers its offline backlog
+        // request) and only release it from `reestablishmentEpisodeDidEnd` — a
+        // silently expired episode would leave that state stuck until an unrelated
+        // episode ends or the app foregrounds.
+        let expiredPeers = expiredKeys.compactMap { key -> (sender: String, deviceId: UUID)? in
+            let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
+            guard parts.count == 2, let deviceId = UUID(uuidString: parts[1]) else { return nil }
+            return (parts[0], deviceId)
+        }
+        for peer in expiredPeers {
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.episodeExpired sender=\(peer.sender) deviceId=\(peer.deviceId.uuidString) ttlSeconds=\(Int(reestablishmentEpisodeTTL))")
+        }
+        guard !expiredPeers.isEmpty else { return }
+        let delegate = sessionDelegate
+        scheduleBackgroundWork {
+            for peer in expiredPeers {
+                await delegate?.reestablishmentEpisodeDidEnd(
+                    senderSecretName: peer.sender,
+                    senderDeviceId: peer.deviceId)
+            }
         }
     }
 
@@ -822,13 +971,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
         let wasOpen = openReestablishmentEpisodes.removeValue(forKey: key) != nil
         expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
-        // The responder bootstrap hold protects the freshly coordinated lane only
-        // until the request/response exchange ends. Keeping it afterward makes new
-        // failures coalesce without a leader or another completion event.
-        preparedInboundPeerRefreshBootstrapByPeer.removeValue(forKey: key)
         guard wasOpen else { return }
+        DecryptFailureAuditLog.log(
+            "pqs.recovery.episodeEnded sender=\(sender) deviceId=\(deviceId.uuidString)")
         let delegate = sessionDelegate
-        Task {
+        scheduleBackgroundWork {
             await delegate?.reestablishmentEpisodeDidEnd(
                 senderSecretName: sender,
                 senderDeviceId: deviceId)
@@ -880,34 +1027,6 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             forKey: reestablishmentEpisodeKey(sender: sender, deviceId: deviceId))
     }
 
-    /// `true` while this device recently applied a pre-decryption bootstrap for the
-    /// peer device and is acting as the responder of that peerRefresh exchange.
-    /// During this hold, local failure events must coalesce into deferred resends
-    /// instead of resetting the lane the peer just coordinated.
-    public func hasRecentInboundPeerRefreshBootstrap(
-        sender: String,
-        deviceId: UUID,
-        now: Date = Date()
-    ) -> Bool {
-        guard let prepared = preparedInboundPeerRefreshBootstrapByPeer[
-            reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
-        ] else {
-            return false
-        }
-        return now.timeIntervalSince(prepared.preparedAt) < reestablishmentEpisodeTTL
-    }
-
-    func markInboundPeerRefreshBootstrapPrepared(
-        sender: String,
-        deviceId: UUID,
-        intentId: UUID,
-        now: Date = Date()
-    ) {
-        preparedInboundPeerRefreshBootstrapByPeer[
-            reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
-        ] = (intentId, now)
-    }
-
     func isExpectedPeerRefreshResponse(
         sender: String,
         deviceId: UUID,
@@ -919,26 +1038,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         ] == intentId
     }
 
-    /// Applies the clear transport bootstrap for a freshly initialized, device-scoped
-    /// peerRefresh request before its signed ciphertext is handed to the ratchet.
-    ///
-    /// Simultaneous recovery requests converge deterministically: the lower requester
-    /// device UUID wins. The losing request is dropped without resetting the winner's
-    /// fresh lane.
-    func localPeerRefreshBootstrapWinsCollision(
-        localDeviceId: UUID,
-        senderDeviceId: UUID,
-        hasPendingLocalRequest: Bool
-    ) -> Bool {
-        hasPendingLocalRequest
-            && localDeviceId.uuidString < senderDeviceId.uuidString
-    }
-
     /// Returns whether this lane still owns a live local peer-refresh request.
-    ///
-    /// `expectedPeerRefreshIntentByPeer` is correlated response state, not an
-    /// independent recovery lock. If its single-flight episode has expired or
-    /// already closed, it must not keep winning future bootstrap collisions.
+    /// Used to defer resend drain until the correlated peerRefresh response arrives.
     func hasActiveLocalPeerRefreshRequest(
         sender: String,
         deviceId: UUID,
@@ -953,62 +1054,86 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         return expectedPeerRefreshIntentByPeer[key] != nil
     }
 
-    public func prepareInboundPeerRefreshBootstrap(
+    /// Records which local SessionIdentity encrypted `sharedId` to a recipient device
+    /// (per-device outbound encrypt ledger).
+    func recordOutboundDeviceSend(
+        sharedId: String,
+        recipientSecretName: String,
+        recipientDeviceId: UUID,
+        sessionIdentityId: UUID
+    ) async {
+        let record = OutboundDeviceSendRecord(
+            sharedId: sharedId,
+            recipientSecretName: recipientSecretName,
+            recipientDeviceId: recipientDeviceId,
+            sessionIdentityId: sessionIdentityId)
+        let key = OutboundDeviceSendRecord.key(
+            sharedId: sharedId,
+            recipientDeviceId: recipientDeviceId)
+        outboundDeviceSendRecordsByKey[key] = record
+        if outboundDeviceSendRecordsByKey.count > PQSSessionConstants.outboundDeviceSendRecordMaxCount {
+            let overflow = outboundDeviceSendRecordsByKey.count
+                - PQSSessionConstants.outboundDeviceSendRecordMaxCount
+            let oldestKeys = outboundDeviceSendRecordsByKey
+                .sorted { $0.value.createdAt < $1.value.createdAt }
+                .prefix(overflow)
+                .map(\.key)
+            for oldKey in oldestKeys {
+                outboundDeviceSendRecordsByKey.removeValue(forKey: oldKey)
+            }
+        }
+        do {
+            try await cache?.upsertOutboundDeviceSendRecord(record)
+        } catch {
+            logger.log(
+                level: .debug,
+                message: "pqs.send.recordPersistFailed sharedId=\(sharedId) deviceId=\(recipientDeviceId) error=\(error)")
+        }
+    }
+
+    func outboundDeviceSendRecord(
+        sharedId: String,
+        recipientDeviceId: UUID
+    ) async -> OutboundDeviceSendRecord? {
+        let key = OutboundDeviceSendRecord.key(
+            sharedId: sharedId,
+            recipientDeviceId: recipientDeviceId)
+        if let cached = outboundDeviceSendRecordsByKey[key] {
+            return cached
+        }
+        if let stored = try? await cache?.fetchOutboundDeviceSendRecord(
+            sharedId: sharedId,
+            recipientDeviceId: recipientDeviceId
+        ) {
+            outboundDeviceSendRecordsByKey[key] = stored
+            return stored
+        }
+        return nil
+    }
+
+    /// Terminal clear for ids the peer reported as unreplayable: drops their pending
+    /// resend entries and attempt/cooldown bookkeeping, and quarantines each tuple so
+    /// a redelivered poison copy is dropped instead of reopening recovery.
+    /// Returns the ids that actually had a pending resend entry.
+    @discardableResult
+    func clearPendingResends(
         sender: String,
         deviceId: UUID,
-        envelope: SessionReestablishmentEnvelope
-    ) async throws -> Bool {
-        guard envelope.kind == .peerRefresh,
-              !envelope.isResponse,
-              envelope.requiresPreDecryptionReset,
-              let intentId = envelope.intentId,
-              let context = _sessionContext
-        else {
-            return true
-        }
-        if let targetDeviceId = envelope.targetDeviceId,
-           targetDeviceId != context.sessionUser.deviceId {
-            return false
-        }
-
-        let now = Date()
-        preparedInboundPeerRefreshBootstrapByPeer =
-            preparedInboundPeerRefreshBootstrapByPeer.filter {
-                now.timeIntervalSince($0.value.preparedAt) < reestablishmentEpisodeTTL
+        messageIds: [String],
+        now: Date = Date()
+    ) -> [String] {
+        cleanupPendingResendAfterReestablishment(now: now)
+        var clearedIds: [String] = []
+        for messageId in messageIds {
+            let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: messageId)
+            if pendingResendAfterReestablishment.removeValue(forKey: requestKey) != nil {
+                clearedIds.append(messageId)
             }
-        let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
-        if preparedInboundPeerRefreshBootstrapByPeer[key]?.intentId == intentId {
-            return true
+            resendRequestAttemptsByKey.removeValue(forKey: requestKey)
+            lastResendRequestAtByPeer.removeValue(forKey: requestKey)
+            quarantineInboundFailure(sender: sender, deviceId: deviceId, messageId: messageId, now: now)
         }
-
-        if localPeerRefreshBootstrapWinsCollision(
-            localDeviceId: context.sessionUser.deviceId,
-            senderDeviceId: deviceId,
-            hasPendingLocalRequest: hasActiveLocalPeerRefreshRequest(
-                sender: sender,
-                deviceId: deviceId,
-                now: now)
-        ) {
-            logger.log(
-                level: .info,
-                message: "pqs.recovery.bootstrapDropped reason=simultaneousLocalRequestWins sender=\(sender) deviceId=\(deviceId) intent=\(intentId)")
-            return false
-        }
-
-        _ = try await resetSessionIdentityForFreshSession(
-            secretName: sender,
-            deviceId: deviceId,
-            sendOneTimeIdentities: false)
-        markInboundPeerRefreshBootstrapPrepared(
-            sender: sender,
-            deviceId: deviceId,
-            intentId: intentId,
-            now: now)
-        clearRecoveryEmitBlocked(sender: sender, deviceId: deviceId)
-        logger.log(
-            level: .warning,
-            message: "pqs.recovery.bootstrapPrepared sender=\(sender) deviceId=\(deviceId) intent=\(intentId)")
-        return true
+        return clearedIds
     }
 
     func takePendingResendsAfterReestablishment(
@@ -1031,8 +1156,30 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
     private func cleanupPendingResendAfterReestablishment(now: Date = Date()) {
         let cutoff = now.addingTimeInterval(-inboundFailurePolicyTTL)
+        let expired = pendingResendAfterReestablishment.values.filter { $0.createdAt <= cutoff }
         pendingResendAfterReestablishment = pendingResendAfterReestablishment.filter { _, pending in
             pending.createdAt > cutoff
+        }
+        // A pending entry aging out unresolved is terminal silent content loss for
+        // that sharedId: no further resend will be requested for it. Audit it so
+        // production forensics can distinguish "healed" from "gave up", and tell the
+        // host — same terminal contract as the attempt-cap path — so the UI can mark
+        // the message failed instead of leaving it pending forever.
+        if !expired.isEmpty {
+            let delegate = sessionDelegate
+            for pending in expired {
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.pendingResendExpired sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) failureClass=\(pending.failureClass) ttlSeconds=\(Int(inboundFailurePolicyTTL))")
+                let senderName = pending.senderName
+                let senderDeviceId = pending.senderDeviceId
+                let sharedMessageId = pending.failedSharedMessageId
+                scheduleBackgroundWork {
+                    await delegate?.inboundContentUnrecoverable(
+                        senderSecretName: senderName,
+                        senderDeviceId: senderDeviceId,
+                        sharedMessageId: sharedMessageId)
+                }
+            }
         }
         let cap = PQSSessionConstants.recoveryTrackingMaxEntries
         guard pendingResendAfterReestablishment.count >= cap else { return }
@@ -2226,8 +2373,9 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         clearRecoveryEmitBlocked(secretName: localSecretName)
         if !staleKeys.isEmpty {
             let delegate = sessionDelegate
-            Task {
-                for key in staleKeys {
+            let keys = Array(staleKeys)
+            scheduleBackgroundWork {
+                for key in keys {
                     let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
                     guard parts.count == 2, let deviceId = UUID(uuidString: parts[1]) else { continue }
                     await delegate?.reestablishmentEpisodeDidEnd(
@@ -2663,7 +2811,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 } catch let sessionError as SessionErrors where sessionError == .oneTimeKeyUploadFailed {
                     if attempt < retryDelays.count {
                         await logger.log(level: .warning, message: "Curve OTK upload failed (attempt \(attempt + 1)/\(retryDelays.count + 1)), retrying after backoff")
-                        try? await Task.sleep(nanoseconds: retryDelays[attempt])
+                        do {
+                            try await Task.sleep(nanoseconds: retryDelays[attempt])
+                        } catch {
+                            return false
+                        }
                     } else {
                         await logger.log(level: .error, message: "Curve OTK upload failed after \(attempt + 1) attempts")
                         await removeExpiredOTKeys()
@@ -2725,7 +2877,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 } catch let sessionError as SessionErrors where sessionError == .oneTimeKeyUploadFailed {
                     if attempt < retryDelays.count {
                         await logger.log(level: .warning, message: "MLKEM OTK upload failed (attempt \(attempt + 1)/\(retryDelays.count + 1)), retrying after backoff")
-                        try? await Task.sleep(nanoseconds: retryDelays[attempt])
+                        do {
+                            try await Task.sleep(nanoseconds: retryDelays[attempt])
+                        } catch {
+                            return false
+                        }
                     } else {
                         await logger.log(level: .error, message: "MLKEM OTK upload failed after \(attempt + 1) attempts")
                         await removeExpiredMLKEMOTKeys()
@@ -3378,13 +3534,21 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// - Important: This method clears sensitive data from memory. Ensure all
     ///   operations are complete before calling this method.
     public func shutdown() async {
+        // Cancel background work before clearing delegates so children see
+        // isViable=false / cancellation and do not notify a torn-down host.
+        isViable = false
+        cancelSessionWorkTree()
+        refreshOTKeysTask?.cancel()
+        refreshOTKeysTask = nil
+        refreshMLKEMOTKeysTask?.cancel()
+        refreshMLKEMOTKeysTask = nil
+        await taskProcessor.cancelBackgroundKeyTasks()
         do {
             try await taskProcessor.ratchetManager.shutdown()
         } catch {
             // Teardown can race with in-flight session cleanup; do not crash the app.
             logger.log(level: .warning, message: "Ratchet manager shutdown encountered non-fatal error: \(error)")
         }
-        isViable = false
         cache = nil
         transportDelegate = nil
         receiverDelegate = nil
