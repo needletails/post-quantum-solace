@@ -255,25 +255,27 @@ extension TaskProcessor {
         } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
             switch props.task.task {
             case .streamMessage(let message):
-                let failureClass = "ratchet.maxSkippedHeadersExceeded"
-
-                // Never retry the same failed ciphertext locally. Preserve the
-                // still-shared outbound ratchet for the peerRefresh request (emit does
-                // not wipe the lane; response keeps the proven session).
-                return try await handleFreshSessionRepair(
+                // Orphan-resend policy: request resend only. Sender creates a new initiating
+                // session on orphanResend when still on the orphaned SessionID.
+                return try await handleUndecryptableInboundResend(
                     message: message,
-                    failureClass: failureClass,
+                    failureClass: "ratchet.maxSkippedHeadersExceeded",
                     job: job,
                     cache: cache,
                     session: session,
                     diagnostic: "compromiseRotation=false")
             case .writeMessage(let message):
                 logger.log(level: .error, message: "MaxSkippedHeadersExceeded for writeMessage to recipient: \(message.message.recipient)")
-                noteResendReplayDropped(sharedId: message.sharedId, reason: "maxSkippedHeadersExceeded")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "maxSkippedHeadersExceeded")
                 try await cache.deleteJob(job)
             }
             
-        } catch let ratchetError as RatchetError where isFreshSessionRepairError(ratchetError) {
+        } catch let ratchetError as RatchetError where ratchetError == .stateUninitialized {
+            // Dogfood poison: try-all fails with stateUninitialized when the preferred
+            // row is state-less (prior outboundRepair / freshSessionRepair). Orphan-resend:
+            // discard + request resend; the **sender** inserts a new initiating session
+            // on orphanResend. Receive-side ASR here leaves another state-less active
+            // that cannot decrypt the peer's already-sent non-initiating frames.
             switch props.task.task {
             case .streamMessage(let message):
                 if let deferred = try await tryDeferInboundDuringContactBootstrap(
@@ -286,7 +288,38 @@ extension TaskProcessor {
                     symmetricKey: symmetricKey) {
                     return deferred
                 }
-                return try await handleFreshSessionRepair(
+                return try await handleUndecryptableInboundResend(
+                    message: message,
+                    failureClass: "ratchet.stateUninitialized",
+                    job: job,
+                    cache: cache,
+                    session: session)
+            case .writeMessage(let message):
+                return try await handleFreshOutboundRepair(
+                    message: message,
+                    error: ratchetError,
+                    job: job,
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey)
+            }
+
+        } catch let ratchetError as RatchetError where isFreshSessionRepairError(ratchetError) {
+            switch props.task.task {
+            case .streamMessage(let message):
+                // Orphan-resend: these classes mean no usable matching session for the
+                // frame. Request resend; do not open receive-side ASR / peerRefresh.
+                if let deferred = try await tryDeferInboundDuringContactBootstrap(
+                    message: message,
+                    error: ratchetError,
+                    job: job,
+                    props: props,
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey) {
+                    return deferred
+                }
+                return try await handleUndecryptableInboundResend(
                     message: message,
                     failureClass: freshSessionFailureClass(ratchetError),
                     job: job,
@@ -315,7 +348,7 @@ extension TaskProcessor {
                     symmetricKey: symmetricKey) {
                     return deferred
                 }
-                return try await handleUndecryptableInboundResendThenEscalate(
+                return try await handleUndecryptableInboundResend(
                     message: message,
                     failureClass: "ratchet.decryptionFailed",
                     job: job,
@@ -323,15 +356,14 @@ extension TaskProcessor {
                     session: session)
             case .writeMessage(let message):
                 logger.log(level: .error, message: "decryptionFailed for writeMessage to recipient: \(message.message.recipient)")
-                noteResendReplayDropped(sharedId: message.sharedId, reason: "decryptionFailed")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "decryptionFailed")
                 try await cache.deleteJob(job)
             }
 
         } catch let ratchetError as RatchetError where isInboundSessionDesyncError(ratchetError) {
             switch props.task.task {
             case .streamMessage(let message):
-                // After all sessions failed, drop + retry request first.
-                // peerRefresh only on repeat of the same undecryptable class.
+                // After all sessions failed, drop + retry request (orphan-resend).
                 if let deferred = try await tryDeferInboundDuringContactBootstrap(
                     message: message,
                     error: ratchetError,
@@ -342,7 +374,7 @@ extension TaskProcessor {
                     symmetricKey: symmetricKey) {
                     return deferred
                 }
-                return try await handleUndecryptableInboundResendThenEscalate(
+                return try await handleUndecryptableInboundResend(
                     message: message,
                     failureClass: inboundSessionDesyncFailureClass(ratchetError),
                     job: job,
@@ -350,7 +382,7 @@ extension TaskProcessor {
                     session: session)
             case .writeMessage(let message):
                 logger.log(level: .error, message: "\(ratchetError) for writeMessage to recipient: \(message.message.recipient)")
-                noteResendReplayDropped(sharedId: message.sharedId, reason: "\(ratchetError)")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "\(ratchetError)")
                 try await cache.deleteJob(job)
             }
 
@@ -377,7 +409,7 @@ extension TaskProcessor {
                 return .deleted
             case .writeMessage(let message):
                 logger.log(level: .error, message: "expiredKey for writeMessage to recipient: \(message.message.recipient)")
-                noteResendReplayDropped(sharedId: message.sharedId, reason: "expiredKey")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "expiredKey")
                 try await cache.deleteJob(job)
             }
 
@@ -403,6 +435,28 @@ extension TaskProcessor {
                         failureClass: failureClass,
                         suppressed: true)
                     logger.log(level: .info, message: "Suppressing repeated \(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+                    try await cache.deleteJob(job)
+                    return .deleted
+                }
+
+                // Orphan-resend already owns this sharedId (maxSkipped/body fail → resend).
+                // Do not open receive-side OTK ASR — that poisoned dogfood orphan replay
+                // (`883B532C`: maxSkipped → missingOneTimeKey → coalescedPendingPeerRecovery).
+                if await session.isAwaitingSenderOrphanResend(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId,
+                    messageId: message.sharedMessageId)
+                {
+                    auditInboundDecryptFailure(
+                        message: message,
+                        failureClass: failureClass,
+                        action: "resendAwaitingSender",
+                        suppressed: true)
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.resendAwaitingSender failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=orphanResendOwnsSharedId")
+                    DecryptFailureAuditLog.log(
+                        "pqs.recovery.otkBootstrapDeferredToOrphanResend sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
                     try await cache.deleteJob(job)
                     return .deleted
                 }
@@ -485,6 +539,12 @@ extension TaskProcessor {
                     let isSelf = senderSecretName == mySecretName
 
                     do {
+                        // Documented receive-side ASR must not emit peerRefresh toward a
+                        // peer whose advertised signing key no longer matches the pin.
+                        if !isSelf {
+                            try await session.validatePeerAccountSigningKeyAgainstRemote(
+                                secretName: senderSecretName)
+                        }
                         _ = try await session.emitSessionReestablishment(
                             kind: .peerRefresh,
                             recipient: isSelf ? .personalMessage : .nickname(senderSecretName),
@@ -519,7 +579,7 @@ extension TaskProcessor {
                 return .deleted
             case .writeMessage(let message):
                 logger.log(level: .error, message: "missingOneTimeKey for writeMessage to recipient: \(message.message.recipient)")
-                noteResendReplayDropped(sharedId: message.sharedId, reason: "missingOneTimeKey")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "missingOneTimeKey")
                 try await cache.deleteJob(job)
             }
         } catch let cryptoError as CryptoKitError {
@@ -535,10 +595,9 @@ extension TaskProcessor {
                     failureClass: "crypto.bodyDecryptionFailed") {
                     return deferred
                 }
-                // Body AEAD auth failure is the same user-visible class as
-                // `ratchet.decryptionFailed`: bounded resend first, peerRefresh
-                // only on repeat — not immediate fresh-session repair.
-                return try await handleUndecryptableInboundResendThenEscalate(
+                // Body AEAD auth failure: same orphan-resend policy as
+                // `ratchet.decryptionFailed` (sender orphanResend heals).
+                return try await handleUndecryptableInboundResend(
                     message: message,
                     failureClass: "crypto.bodyDecryptionFailed",
                     job: job,
@@ -547,7 +606,7 @@ extension TaskProcessor {
                     diagnostic: "error=\(cryptoError)")
             case .writeMessage(let message):
                 logger.log(level: .error, message: "CryptoKitError for writeMessage to recipient: \(message.message.recipient) — \(cryptoError)")
-                noteResendReplayDropped(sharedId: message.sharedId, reason: "cryptoKitError")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "cryptoKitError")
                 try await cache.deleteJob(job)
             }
         } catch let sessionError as PQSSession.SessionErrors where sessionError == .sessionDecryptionError {
@@ -555,7 +614,7 @@ extension TaskProcessor {
             case .streamMessage(let message):
                 // Payload/context decode failure after ratchet decrypt: same
                 // Same undecryptable policy as CryptoKit / decryptionFailed.
-                return try await handleUndecryptableInboundResendThenEscalate(
+                return try await handleUndecryptableInboundResend(
                     message: message,
                     failureClass: "payload.sessionDecryptionError",
                     job: job,
@@ -563,7 +622,7 @@ extension TaskProcessor {
                     session: session)
             case .writeMessage(let message):
                 logger.log(level: .error, message: "sessionDecryptionError for writeMessage to recipient: \(message.message.recipient)")
-                noteResendReplayDropped(sharedId: message.sharedId, reason: "sessionDecryptionError")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "sessionDecryptionError")
                 try await cache.deleteJob(job)
             }
         } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
@@ -578,7 +637,7 @@ extension TaskProcessor {
                 logger.log(
                     level: .error,
                     message: "peerSigningKeyOutOfSync for writeMessage to recipient: \(message.message.recipient); dropping until peer identity is reverified")
-                noteResendReplayDropped(sharedId: message.sharedId, reason: "peerSigningKeyOutOfSync")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "peerSigningKeyOutOfSync")
             }
             try await cache.deleteJob(job)
             return .deleted
@@ -609,7 +668,7 @@ extension TaskProcessor {
                     session: session)
             case .writeMessage(let message):
                 logger.log(level: .error, message: "invalidSignature for writeMessage to recipient: \(message.message.recipient)")
-                noteResendReplayDropped(sharedId: message.sharedId, reason: "invalidSignature")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "invalidSignature")
                 try await cache.deleteJob(job)
             }
         } catch {
@@ -623,7 +682,7 @@ extension TaskProcessor {
                     error: error)
             }
             if case .writeMessage(let message) = props.task.task {
-                noteResendReplayDropped(sharedId: message.sharedId, reason: "unhandledError=\(error)")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "unhandledError=\(error)")
             }
             logger.log(level: .error, message: "Unhandled error during job processing: \(error)")
             try await cache.deleteJob(job)
@@ -714,6 +773,7 @@ extension TaskProcessor {
     ) async throws -> JobProcessingOutcome? {
         guard isFreshSessionRepairError(error)
             || error == .decryptionFailed
+            || error == .stateUninitialized
             || isInboundSessionDesyncError(error)
         else {
             return nil
@@ -723,6 +783,8 @@ extension TaskProcessor {
             failureClass = inboundSessionDesyncFailureClass(error)
         } else if error == .decryptionFailed {
             failureClass = "ratchet.decryptionFailed"
+        } else if error == .stateUninitialized {
+            failureClass = "ratchet.stateUninitialized"
         } else {
             failureClass = freshSessionFailureClass(error)
         }
@@ -736,10 +798,14 @@ extension TaskProcessor {
             failureClass: failureClass)
     }
 
-    /// Undecryptable inbound policy: drop the frame, request a
-    /// bounded resend on first failure of this class, escalate to peerRefresh
-    /// only when the same `(sender, device, sharedId, failureClass)` repeats.
-    private func handleUndecryptableInboundResendThenEscalate(
+    /// Undecryptable inbound policy (orphan-resend):
+    /// 1. Drop the frame and request a bounded resend.
+    /// 2. Never open receive-side Automatic Session Reset / `peerRefresh` for these
+    ///    classes — the **sender** inserts a new initiating session on orphanResend
+    ///    when still encrypting with the orphaned SessionID.
+    /// 3. Repeats of the same failure are suppressed (cooldown); distinct ids keep
+    ///    requesting resend until the sender heals or reports unavailable.
+    private func handleUndecryptableInboundResend(
         message: InboundTaskMessage,
         failureClass: String,
         job: JobModel,
@@ -747,25 +813,95 @@ extension TaskProcessor {
         session: PQSSession,
         diagnostic: String? = nil
     ) async throws -> JobProcessingOutcome {
-        if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
-            return try await handleFreshSessionRepair(
+        // While another recovery episode is open (e.g. hard ratchet repair), coalesce.
+        if await session.hasOpenReestablishmentEpisode(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId)
+        {
+            auditInboundDecryptFailure(
                 message: message,
-                failureClass: "\(failureClass).repeated",
-                job: job,
-                cache: cache,
-                session: session,
-                diagnostic: diagnostic ?? "repeatFailureClass=\(failureClass)")
+                failureClass: failureClass,
+                error: diagnostic,
+                action: "coalescedPendingPeerRecovery",
+                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
+            await session.deferPeerResendUntilReestablished(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                failedMessageId: message.sharedMessageId,
+                failureClass: failureClass)
+            await session.markInboundFailure(message, failureClass: failureClass)
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=pendingPeerRefresh")
+            try await cache.deleteJob(job)
+            return .deleted
         }
 
+        if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
+            let submissionCount = await session.resendRequestSubmissionCount(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                failedMessageId: message.sharedMessageId)
+            if submissionCount >= PQSSessionConstants.peerResendRequestMaxSubmissions {
+                // Lost-NACK safety while awaiting sender: close this sharedId only.
+                await session.clearPendingResends(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId,
+                    messageIds: [message.sharedMessageId])
+                auditInboundDecryptFailure(
+                    message: message,
+                    failureClass: failureClass,
+                    error: diagnostic,
+                    action: "contentUnrecoverable",
+                    suppressed: true,
+                    metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
+                await session.sessionDelegate?.inboundContentUnrecoverable(
+                    senderSecretName: message.senderSecretName,
+                    senderDeviceId: message.senderDeviceId,
+                    sharedMessageId: message.sharedMessageId)
+                logger.log(
+                    level: .warning,
+                    message: "pqs.recovery.resendRequestExhausted failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) attempts=\(submissionCount)")
+                try await cache.deleteJob(job)
+                return .deleted
+            }
+            // Already requested resend for this tuple; wait for sender orphanResend /
+            // replay. Do not mint a receive-side repair session.
+            auditInboundDecryptFailure(
+                message: message,
+                failureClass: failureClass,
+                error: diagnostic,
+                action: "resendAwaitingSender",
+                suppressed: true,
+                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.resendAwaitingSender failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+
+        let laneSaturated = await session.noteUndecryptableLaneFailure(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            sharedId: message.sharedMessageId)
         let didRequestResend = await requestPeerResendIfAllowed(
             message: message,
             failureClass: failureClass,
             session: session)
+        var action = didRequestResend ? "resendRequested" : "resendSkipped"
+        if laneSaturated {
+            action = didRequestResend ? "resendRequested.lane" : "resendSkipped.lane"
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.undecryptableLaneSaturated sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId) awaitingSenderOrphanResend=true")
+        }
         auditInboundDecryptFailure(
             message: message,
             failureClass: failureClass,
             error: diagnostic,
-            action: didRequestResend ? "resendRequested" : "resendSkipped",
+            action: action,
             metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
         await session.markInboundFailure(message, failureClass: failureClass)
         try await cache.deleteJob(job)
@@ -846,12 +982,13 @@ extension TaskProcessor {
     }
 
     private func isFreshSessionRepairError(_ error: RatchetError) -> Bool {
+        // Inbound: these are routed to orphan-resend (not receive-side ASR).
+        // Outbound: still use handleFreshOutboundRepair to insert an initiating row.
         [
             .initialMessageNotReceived,
             .rootKeyIsNil,
             .missingCipherText,
-            .sendingKeyIsNil,
-            .stateUninitialized
+            .sendingKeyIsNil
         ].contains(error)
     }
 
@@ -898,6 +1035,29 @@ extension TaskProcessor {
         failureClass: String,
         session: PQSSession
     ) async -> Bool {
+        let submissionCount = await session.resendRequestSubmissionCount(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            failedMessageId: message.sharedMessageId)
+        if submissionCount >= PQSSessionConstants.peerResendRequestMaxSubmissions {
+            // Lost-NACK safety: the peer is expected to answer; when our NACK never
+            // arrives, stop asking for this sharedId only. Never open receive ASR.
+            await session.clearPendingResends(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                messageIds: [message.sharedMessageId])
+            logger.log(
+                level: .warning,
+                message: "pqs.recovery.resendRequestExhausted failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) attempts=\(submissionCount)")
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
+            await session.sessionDelegate?.inboundContentUnrecoverable(
+                senderSecretName: message.senderSecretName,
+                senderDeviceId: message.senderDeviceId,
+                sharedMessageId: message.sharedMessageId)
+            return false
+        }
+
         guard await session.canSendPeerResendRequest(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId,
@@ -1047,208 +1207,9 @@ extension TaskProcessor {
         return .deleted
     }
 
-    private func handleFreshSessionRepair(
-        message: InboundTaskMessage,
-        failureClass: String,
-        job: JobModel,
-        cache: SessionCache,
-        session: PQSSession,
-        diagnostic: String? = nil
-    ) async throws -> JobProcessingOutcome {
-        if await session.shouldSuppressInboundRecoveryFromSender(message.senderSecretName) {
-            auditInboundDecryptFailure(
-                message: message,
-                failureClass: failureClass,
-                error: diagnostic,
-                action: "dropDeletedPeer",
-                suppressed: true,
-                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
-            logger.log(
-                level: .info,
-                message: "Dropping \(failureClass) for deleted peer \(message.senderSecretName); skipping fresh-session repair")
-            try await cache.deleteJob(job)
-            return .deleted
-        }
-        // Pending replay IDs are work to drain after recovery, not a recovery lock.
-        // Once the concrete peer-device episode expires, the next failure event must
-        // be allowed to establish a fresh session and emit another peerRefresh.
-        if await session.accountIdentityRequiresAcknowledgement {
-            auditInboundDecryptFailure(
-                message: message,
-                failureClass: failureClass,
-                error: diagnostic,
-                action: "blockedAccountIdentity",
-                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
-            await session.deferPeerResendUntilReestablished(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId,
-                failedMessageId: message.sharedMessageId,
-                failureClass: failureClass)
-            await session.markInboundFailure(message, failureClass: failureClass)
-            logger.log(
-                level: .error,
-                message: "pqs.recovery.blocked.accountIdentity failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) waitingFor=acknowledgeAccountIdentityChange")
-            try await cache.deleteJob(job)
-            return .deleted
-        }
-        if await session.isRecoveryEmitBlocked(
-            sender: message.senderSecretName,
-            deviceId: message.senderDeviceId
-        ) {
-            auditInboundDecryptFailure(
-                message: message,
-                failureClass: failureClass,
-                error: diagnostic,
-                action: "blockedRecoveryDependency",
-                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
-            await session.deferPeerResendUntilReestablished(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId,
-                failedMessageId: message.sharedMessageId,
-                failureClass: failureClass)
-            await session.markInboundFailure(message, failureClass: failureClass)
-            logger.log(
-                level: .info,
-                message: "pqs.recovery.blocked.dependency failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) waitingFor=configurationOrTransportReady")
-            try await cache.deleteJob(job)
-            return .deleted
-        }
-        let hasOpenEpisode = await session.hasOpenReestablishmentEpisode(
-            sender: message.senderSecretName,
-            deviceId: message.senderDeviceId)
-        if hasOpenEpisode {
-            auditInboundDecryptFailure(
-                message: message,
-                failureClass: failureClass,
-                error: diagnostic,
-                action: "coalescedPendingPeerRecovery",
-                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
-            await session.deferPeerResendUntilReestablished(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId,
-                failedMessageId: message.sharedMessageId,
-                failureClass: failureClass)
-            await session.markInboundFailure(message, failureClass: failureClass)
-            logger.log(
-                level: .info,
-                message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=pendingPeerRefresh")
-            try await cache.deleteJob(job)
-            return .deleted
-        }
-        if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
-            // Distinct audit action: this is a redelivered frame whose recovery was
-            // already accepted, not a new fresh-repair attempt. Sharing the
-            // fresh-repair action string made production audits look like thrash.
-            auditInboundDecryptFailure(
-                message: message,
-                failureClass: failureClass,
-                error: diagnostic,
-                action: "suppressedRepeatedFailure",
-                suppressed: true,
-                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
-            logger.log(level: .info, message: "Suppressing repeated \(failureClass) for sender \(message.senderSecretName) deviceId=\(message.senderDeviceId)")
-            try await cache.deleteJob(job)
-            return .deleted
-        }
-
-        let diagnosticSuffix = diagnostic.map { " \($0)" } ?? ""
-        auditInboundDecryptFailure(
-            message: message,
-            failureClass: failureClass,
-            error: diagnostic,
-            action: "freshSessionRepairThenDeferredResend",
-            metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
-        logger.log(
-            level: .warning,
-            message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=freshSessionRepairThenDeferredResend\(diagnosticSuffix)")
-
-        // Single-flight: only one peerRefresh leader per peer-device episode.
-        let isEpisodeLeader = await session.tryBeginReestablishmentEpisode(
-            sender: message.senderSecretName,
-            deviceId: message.senderDeviceId)
-        if !isEpisodeLeader {
-            logger.log(
-                level: .info,
-                message: "Skipping duplicate peerRefresh leader for \(message.senderSecretName) (\(message.senderDeviceId)); reestablishment episode already open")
-            await session.deferPeerResendUntilReestablished(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId,
-                failedMessageId: message.sharedMessageId,
-                failureClass: failureClass)
-            await session.markInboundFailure(message, failureClass: failureClass)
-            try await cache.deleteJob(job)
-            return .deleted
-        }
-
-        let mySecretName = await session.sessionContext?.sessionUser.secretName
-        let isSelf = message.senderSecretName == mySecretName
-        let recipient: MessageRecipient = isSelf ? .personalMessage : .nickname(message.senderSecretName)
-        let scope: ControlEventScope = isSelf
-            ? .personalDevice(deviceId: message.senderDeviceId)
-            : .peerDevice(
-                secretName: message.senderSecretName,
-                deviceId: message.senderDeviceId)
-
-        await session.deferPeerResendUntilReestablished(
-            sender: message.senderSecretName,
-            deviceId: message.senderDeviceId,
-            failedMessageId: message.sharedMessageId,
-            failureClass: failureClass)
-        await session.markInboundFailure(message, failureClass: failureClass)
-        logger.log(
-            level: .info,
-            message: "pqs.recovery.deferred failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) waitingFor=peerRefresh")
-
-        do {
-            // Winning the single-flight episode is the event that must put one
-            // peerRefresh on the wire. The episode itself gates duplicates, so the
-            // control-event cooldown must not suppress the leader's emit: pending
-            // deferred resends live for 10 minutes while the cooldown is 30s, so a
-            // non-forced emit would be suppressed for the full pending TTL and the
-            // lane would thrash fresh leaders with zero coalescing.
-            let emitted = try await session.emitSessionReestablishment(
-                kind: .peerRefresh,
-                recipient: recipient,
-                scope: scope,
-                forceReemit: true)
-            if !emitted {
-                // Keep the episode open so subsequent failures coalesce against it.
-                // The episode ends on peerRefresh completion, terminal errors, or the
-                // episode TTL — closing it here would let every redelivered poison
-                // frame elect a new leader (fresh-repair thrash).
-                logger.log(
-                    level: .info,
-                    message: "pqs.recovery.reestablishmentSuppressed reason=coalescedPending failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
-            } else {
-                logger.log(
-                    level: .info,
-                    message: "pqs.recovery.reestablishmentQueued kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
-            }
-        } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
-            await reportPeerSigningKeyOutOfSync(message: message, session: session)
-        } catch let sessionError as PQSSession.SessionErrors where sessionError == .signingKeyOutOfSync {
-            await session.setAccountIdentityRequiresAcknowledgement(true)
-            await session.endReestablishmentEpisode(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId)
-            logger.log(
-                level: .warning,
-                message: "pqs.recovery.reestablishmentFailed kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) error=signingKeyOutOfSync waitingFor=acknowledgeAccountIdentityChange")
-        } catch {
-            await session.markRecoveryEmitBlocked(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId)
-            await session.endReestablishmentEpisode(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId)
-            logger.log(
-                level: .warning,
-                message: "pqs.recovery.reestablishmentFailed kind=peerRefresh failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) error=\(error)")
-        }
-
-        try await cache.deleteJob(job)
-        return .deleted
-    }
+    // Receive-side Automatic Session Reset for decrypt-failure classes was removed
+    // (orphan-resend). Documented product ASR remains only on missingOneTimeKey
+    // bootstrap (`replaceOTKBatchThenPeerRefresh`) and invalidSignature handling.
 
     private func handlePeerSigningKeyOutOfSync(
         message: InboundTaskMessage,
@@ -1305,7 +1266,7 @@ extension TaskProcessor {
     ) async throws -> JobProcessingOutcome {
         guard let props = await message.recipientIdentity.props(symmetricKey: symmetricKey) else {
             logger.log(level: .error, message: "Fresh outbound repair failed: missing recipient props for \(error)")
-            noteResendReplayDropped(sharedId: message.sharedId, reason: "outboundRepairMissingProps")
+            await noteResendReplayDropped(sharedId: message.sharedId, reason: "outboundRepairMissingProps")
             try await cache.deleteJob(job)
             return .deleted
         }
@@ -1320,6 +1281,14 @@ extension TaskProcessor {
             level: .warning,
             message: "\(freshSessionFailureClass(error)) while sending to \(props.secretName) deviceId=\(props.deviceId); resetting SessionIdentity and retrying once")
 
+        let isPendingResendReplay = pendingResendReplayBySharedId[message.sharedId] != nil
+        if isPendingResendReplay {
+            // Orphan-resend replays must not be deleted by the outbound repair
+            // cooldown — that drops the orphan-resend recovery wave with no wire frame.
+            await session.clearOutboundReconciliationCooldown(
+                secretName: props.secretName,
+                deviceId: props.deviceId)
+        }
         let canAttempt = await session.canAttemptReconciliation(
             sender: props.secretName,
             deviceId: props.deviceId,
@@ -1336,7 +1305,11 @@ extension TaskProcessor {
                     message: "pqs.recovery.criticalControlRepairExhausted failureClass=\(freshSessionFailureClass(error)) recipient=\(props.secretName) deviceId=\(props.deviceId) sharedId=\(message.sharedId) action=closeEpisode")
             }
             logger.log(level: .warning, message: "Suppressing repeated fresh outbound repair for \(props.secretName) (\(props.deviceId))")
-            noteResendReplayDropped(sharedId: message.sharedId, reason: "outboundRepairSuppressed")
+            // Failed repair must not leave a state-less preferred zombie (dogfood poison).
+            try? await session.demoteZombieStateLessActives(
+                secretName: props.secretName,
+                deviceId: props.deviceId)
+            await noteResendReplayDropped(sharedId: message.sharedId, reason: "outboundRepairSuppressed")
             try await cache.deleteJob(job)
             return .deleted
         }
@@ -1348,13 +1321,38 @@ extension TaskProcessor {
         }
 
         do {
-            // Outbound repair only needs a fresh state-less row. Consuming an OTK
-            // here races with inbound recovery and depletes the peer's pool.
-            let replacement = try await session.resetSessionIdentityForFreshSession(
+            // Prefer the orphan-resend initiating session when replaying; a second
+            // `outboundRepair` reset would mint yet another SessionID mid-wave.
+            let replacement: SessionIdentity
+            if let protectedId = await session.orphanResendInitiatingSessionId(
                 secretName: props.secretName,
-                deviceId: props.deviceId,
-                sendOneTimeIdentities: false,
-                reason: "outboundRepair")
+                deviceId: props.deviceId
+            ),
+               let existing = try await cache.fetchSessionIdentities().first(where: { $0.id == protectedId }),
+               let existingProps = await existing.props(symmetricKey: symmetricKey),
+               existingProps.secretName == props.secretName,
+               existingProps.deviceId == props.deviceId,
+               !existingProps.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            {
+                replacement = existing
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.outboundRepairReusedOrphanResend recipient=\(props.secretName) deviceId=\(props.deviceId) sessionId=\(existing.id)")
+            } else {
+                // Outbound repair only needs a fresh state-less row. Consuming an OTK
+                // here races with inbound recovery and depletes the peer's pool.
+                replacement = try await session.resetSessionIdentityForFreshSession(
+                    secretName: props.secretName,
+                    deviceId: props.deviceId,
+                    sendOneTimeIdentities: false,
+                    reason: "outboundRepair")
+                if isPendingResendReplay {
+                    await session.markOrphanResendInitiatingSession(
+                        secretName: props.secretName,
+                        deviceId: props.deviceId,
+                        sessionId: replacement.id)
+                }
+            }
             await session.markReconciliationAttempt(
                 sender: props.secretName,
                 deviceId: props.deviceId,
@@ -1380,7 +1378,10 @@ extension TaskProcessor {
                     deviceId: props.deviceId)
             }
             logger.log(level: .error, message: "Fresh outbound repair failed for \(props.secretName) (\(props.deviceId)): \(error)")
-            noteResendReplayDropped(sharedId: message.sharedId, reason: "outboundRepairFailed")
+            try? await session.demoteZombieStateLessActives(
+                secretName: props.secretName,
+                deviceId: props.deviceId)
+            await noteResendReplayDropped(sharedId: message.sharedId, reason: "outboundRepairFailed")
             try await cache.deleteJob(job)
             return .deleted
         }

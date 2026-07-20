@@ -122,9 +122,33 @@ struct FriendshipFlowSourceTests {
         let identitySource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession+SessionIdentity.swift")
         let sessionSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession.swift")
 
-        #expect(ratchetSource.contains("promoteArchivedSessionIdentityToActive("))
+        #expect(identitySource.contains("activateSessionIdentityAfterInboundDecrypt("))
+        #expect(identitySource.contains("promoteArchivedSessionIdentityToActive("))
+        #expect(identitySource.contains("demoteActiveSessionIdentityToInactive("))
         #expect(identitySource.contains("pqs.recovery.lanePromotedFromArchive"))
-        #expect(sequenceSource.contains("handleUndecryptableInboundResendThenEscalate("))
+        #expect(!identitySource.contains("lanePromoteDeferredOrphanResend"))
+        #expect(identitySource.contains("demotedActive="))
+        #expect(identitySource.contains("demoteZombieStateLessActives("))
+        #expect(identitySource.contains("zombieStateLessDemoted"))
+        #expect(sessionSource.contains("markOrphanResendInitiatingSession("))
+        // Serial recovery mailbox: orphan encrypt is inline; no inbound defer adapter.
+        #expect(!sequenceSource.contains("tryDeferInboundDuringOrphanResendWave("))
+        #expect(!sequenceSource.contains("inboundDeferredOrphanResendWave"))
+        #expect(ratchetSource.contains("handleWriteMessage("))
+        #expect(ratchetSource.contains("pendingOrphanEncrypts"))
+        #expect(ratchetSource.contains("orphanResendMessageRecordUpdated"))
+        #expect(ratchetSource.contains("activateSessionIdentityAfterInboundDecrypt("))
+        #expect(ratchetSource.contains("laneSelectedAfterInboundDecrypt"))
+        #expect(ratchetSource.contains("orphanResendReused"))
+        #expect(ratchetSource.contains("orphanResendWaveDrained"))
+        #expect(!ratchetSource.contains("lanePromoteDeferredOpenRepair"))
+        #expect(!ratchetSource.contains("laneDroppedLosingActive"))
+        #expect(!ratchetSource.contains("laneDemotedLosingActive"))
+        #expect(sequenceSource.contains("handleUndecryptableInboundResend("))
+        // Healthy orphan-resend audit baseline (dogfood when decrypt works).
+        #expect(sequenceSource.contains("resendRequested") || sequenceSource.contains("\"resendRequested\""))
+        #expect(ratchetSource.contains("pqs.recovery.orphanResend"))
+        #expect(ratchetSource.contains("pqs.recovery.messageRecordSessionId="))
         #expect(controlSource.contains("do not pre-reset the peer lane"))
         #expect(!controlSource.contains("peerRefreshEmitPreReset"))
         #expect(!sessionSource.contains("prepareInboundPeerRefreshBootstrap"))
@@ -201,37 +225,75 @@ struct FriendshipFlowSourceTests {
         #expect(ratchetSource.contains("recordOutboundDeviceSend("))
         #expect(ratchetSource.contains("reason: \"orphanResend\""))
         #expect(ratchetSource.contains("pqs.recovery.orphanResend"))
+        #expect(ratchetSource.contains("pqs.recovery.orphanResendReused"))
+        #expect(ratchetSource.contains("markOrphanResendInitiatingSession("))
+        #expect(ratchetSource.contains("pendingOrphanEncrypts"))
+        #expect(ratchetSource.contains("orphanResendMessageRecordUpdated"))
+        #expect(ratchetSource.contains("orphanResendWaveDrained"))
+        #expect(ratchetSource.contains("pqs.recovery.messageRecordSessionId="))
+        // Orphan-resend match: insert initiating only when active SessionID == MessageRecord.
+        #expect(ratchetSource.contains("record.sessionIdentityId == replayIdentity.id"))
+        #expect(sessionSource.contains("func markOrphanResendInitiatingSession("))
+        #expect(sessionSource.contains("clearOutboundReconciliationCooldown("))
+    }
+
+    @Test("Recovery invariants: zombie demote, serial orphan encrypt, no inbound defer")
+    func recoveryInvariantsAreLocked() throws {
+        let identitySource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession+SessionIdentity.swift")
+        let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
+        let ratchetSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
+        let zombieBody = try PQSFriendshipSource.functionBody(
+            named: "internal func demoteZombieStateLessActives",
+            in: identitySource)
+        #expect(zombieBody.contains("isOrphanResendInitiatingSession("))
+        #expect(!zombieBody.contains("clearOrphanResendInitiatingSession("))
+        #expect(!zombieBody.contains("removeIdentity(with:"))
+        #expect(zombieBody.contains("sessionIdentities.remove(secretName)"))
+        #expect(sequenceSource.contains("demoteZombieStateLessActives("))
+        #expect(!sequenceSource.contains("tryDeferInboundDuringOrphanResendWave("))
+        #expect(ratchetSource.contains("handleWriteMessage("))
+        #expect(ratchetSource.contains("pendingOrphanEncrypts"))
+        #expect(!sequenceSource.contains("private func handleFreshSessionRepair("))
+        #expect(sequenceSource.contains("replaceOTKBatchThenPeerRefresh"))
+        #expect(sequenceSource.contains("validatePeerAccountSigningKeyAgainstRemote("))
+        #expect(identitySource.contains("func validatePeerAccountSigningKeyAgainstRemote("))
     }
 
     @Test("undecryptable inbound uses resend-then-escalate for CryptoKit, desync, and sessionDecryptionError")
     func undecryptableInboundUsesResendThenEscalateForCryptoKitAndDesync() throws {
         let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
-        #expect(sequenceSource.contains("handleUndecryptableInboundResendThenEscalate("))
+        #expect(sequenceSource.contains("handleUndecryptableInboundResend("))
         #expect(sequenceSource.contains("Undecryptable inbound policy"))
 
         // CryptoKit body auth failure and session-desync errors share the
-        // decryptionFailed policy: resend first, peerRefresh only on repeat.
+        // Orphan-resend policy (sender orphanResend; no receive-side ASR).
         let cryptoCatch = try #require(sequenceSource.range(of: "catch let cryptoError as CryptoKitError"))
         let afterCrypto = sequenceSource[cryptoCatch.lowerBound...]
-        let escalateIdx = try #require(afterCrypto.range(of: "handleUndecryptableInboundResendThenEscalate("))
+        let escalateIdx = try #require(afterCrypto.range(of: "handleUndecryptableInboundResend("))
         #expect(afterCrypto[..<escalateIdx.lowerBound].contains("crypto.bodyDecryptionFailed")
             || afterCrypto[escalateIdx.lowerBound...].contains("crypto.bodyDecryptionFailed"))
-        // Must not jump straight to fresh-session repair on first CryptoKit hit.
+        // Must never jump to fresh-session repair on CryptoKit undecryptable.
         let cryptoBlockEnd = afterCrypto.range(of: "} catch let sessionError as PQSSession.SessionErrors where sessionError == .sessionDecryptionError")
         if let cryptoBlockEnd {
             let cryptoBlock = afterCrypto[..<cryptoBlockEnd.lowerBound]
             #expect(!cryptoBlock.contains("handleFreshSessionRepair("))
         }
+        let undecryptableBody = try PQSFriendshipSource.functionBody(
+            named: "private func handleUndecryptableInboundResend",
+            in: sequenceSource)
+        #expect(!undecryptableBody.contains("handleFreshSessionRepair("))
+        #expect(undecryptableBody.contains("resendAwaitingSender"))
+        #expect(undecryptableBody.contains("awaitingSenderOrphanResend"))
 
         let desyncCatch = try #require(sequenceSource.range(of: "isInboundSessionDesyncError(ratchetError)"))
         let afterDesync = sequenceSource[desyncCatch.lowerBound...]
-        #expect(afterDesync.contains("handleUndecryptableInboundResendThenEscalate("))
+        #expect(afterDesync.contains("handleUndecryptableInboundResend("))
 
         let sessionDecryptCatch = try #require(
             sequenceSource.range(of: "sessionError == .sessionDecryptionError"))
         let afterSessionDecrypt = sequenceSource[sessionDecryptCatch.lowerBound...]
         let sessionEscalate = try #require(
-            afterSessionDecrypt.range(of: "handleUndecryptableInboundResendThenEscalate("))
+            afterSessionDecrypt.range(of: "handleUndecryptableInboundResend("))
         #expect(afterSessionDecrypt[..<sessionEscalate.upperBound]
             .contains("payload.sessionDecryptionError")
             || afterSessionDecrypt[sessionEscalate.lowerBound...]
@@ -255,7 +317,7 @@ struct FriendshipFlowSourceTests {
         #expect(bootstrapBody.contains("peerCanAcceptFriendship"))
         #expect(bootstrapBody.contains("repairPeerPublishedOneTimeKeysIfPossible"))
         #expect(bootstrapBody.contains("peerCanSupplyCurveOneTimeKey"))
-        #expect(!bootstrapBody.contains("restoreEncryptablePeerSessionFromArchiveIfNeeded"))
+        #expect(!pqsSource.contains("restoreEncryptablePeerSessionFromArchiveIfNeeded"))
         #expect(!bootstrapBody.contains("ensurePeerSessionIdentityRow"))
         #expect(bootstrapBody.contains("deliverPeerHandshakeNotifyBeforeOutboundSenderInit"))
         #expect(bootstrapBody.contains("sendOneTimeIdentities: false"))
@@ -377,29 +439,57 @@ struct FriendshipFlowSourceTests {
         #expect(inboundMerge.contains("passed.myState == .blockedByOther || passed.theirState == .blocked"))
     }
 
-    @Test("inbound decrypt recovery emits peerRefresh without pre-decrypt wipe")
-    func inboundDecryptRecoveryCoordinatesResetAfterPeerRefreshResponse() throws {
+    @Test("inbound decrypt failures use orphan-resend; ASR only for OTK bootstrap")
+    func inboundDecryptFailuresUseOrphanResendNotReceiveASR() throws {
         let source = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
         let ratchetSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
+        let sessionSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession.swift")
         let controlSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession+ControlEventCoalescing.swift")
-        let repairBody = try PQSFriendshipSource.functionBody(
-            named: "private func handleFreshSessionRepair",
-            in: source)
         let emitBody = try PQSFriendshipSource.functionBody(
             named: "func emitSessionReestablishment",
             in: controlSource)
-        #expect(source.contains("action=freshSessionRepairThenDeferredResend"))
+        // Decrypt-failure ASR helper is gone; OTK bootstrap is the named exception.
+        #expect(!source.contains("private func handleFreshSessionRepair("))
+        #expect(!source.contains("action=freshSessionRepairThenDeferredResend"))
+        #expect(!source.contains("reason: \"freshSessionRepair\""))
+        #expect(source.contains("replaceOTKBatchThenPeerRefresh"))
         #expect(source.contains("tryBeginReestablishmentEpisode"))
         #expect(source.contains("hasOpenReestablishmentEpisode"))
-        // Multi-session: peerRefresh rides the still-shared ratchet; no pre-emit wipe.
-        #expect(!repairBody.contains("resetSessionIdentityForFreshSession"))
         #expect(!emitBody.contains("resetSessionIdentityForFreshSession"))
         #expect(!emitBody.contains("peerRefreshEmitPreReset"))
         #expect(emitBody.contains("registerExpectedPeerRefreshResponse"))
         #expect(ratchetSource.contains("Completed responder peerRefresh on device lane"))
         #expect(ratchetSource.contains("outOfBandResendReusingCoordinatedIdentity"))
-        #expect(source.contains("ratchet.maxSkippedHeadersExceeded"))
-        #expect(source.contains("Preserve the\n                // still-shared outbound ratchet"))
+        #expect(ratchetSource.contains("activateSessionIdentityAfterInboundDecrypt("))
+        // Orphan-resend: maxSkipped requests resend only; sender orphanResend heals.
+        let maxSkippedCatch = try #require(
+            source.range(of: "ratchetError == .maxSkippedHeadersExceeded"))
+        let afterMaxSkipped = source[maxSkippedCatch.lowerBound...]
+        #expect(afterMaxSkipped.contains("handleUndecryptableInboundResend("))
+        // Poisoned try-all (`stateUninitialized` on a state-less preferred row) is
+        // the same orphan-resend path — not receive-side freshSessionRepair / peerRefresh.
+        #expect(source.contains("ratchetError == .stateUninitialized"))
+        let stateUninitCatch = try #require(
+            source.range(of: "ratchetError == .stateUninitialized"))
+        let afterStateUninit = source[stateUninitCatch.lowerBound...]
+        #expect(afterStateUninit.contains("handleUndecryptableInboundResend("))
+        let freshCatch = try #require(source.range(of: "isFreshSessionRepairError(ratchetError)"))
+        let afterFresh = source[freshCatch.lowerBound...]
+        #expect(afterFresh.contains("handleUndecryptableInboundResend("))
+        #expect(!source.contains("handleFreshSessionRepair("))
+
+        // Dogfood 883B532C: after orphan-resend owns a sharedId, missingOneTimeKey must not
+        // open replaceOTKBatchThenPeerRefresh for that same tuple.
+        #expect(sessionSource.contains("func isAwaitingSenderOrphanResend("))
+        let otkCatch = try #require(source.range(of: "ratchetError == .missingOneTimeKey"))
+        let otkBlock = String(source[otkCatch.lowerBound...].prefix(5_500))
+        #expect(otkBlock.contains("isAwaitingSenderOrphanResend("))
+        #expect(otkBlock.contains("resendAwaitingSender"))
+        #expect(otkBlock.contains("otkBootstrapDeferredToOrphanResend")
+            || otkBlock.contains("orphanResendOwnsSharedId"))
+        let deferIdx = try #require(otkBlock.range(of: "isAwaitingSenderOrphanResend("))
+        let asrIdx = try #require(otkBlock.range(of: "replaceOTKBatchThenPeerRefresh"))
+        #expect(deferIdx.lowerBound < asrIdx.lowerBound)
     }
 
     @Test("open peerRefresh episode coalesces competing resets")
@@ -414,22 +504,23 @@ struct FriendshipFlowSourceTests {
         #expect(emitBody.contains("unregisterExpectedPeerRefreshResponse"))
         #expect(!emitBody.contains("resetSessionIdentityForFreshSession"))
 
-        // While an episode is open, local failure events coalesce into deferred resends.
-        let repairBody = try PQSFriendshipSource.functionBody(
-            named: "private func handleFreshSessionRepair",
-            in: sequenceSource)
-        #expect(repairBody.contains("hasOpenReestablishmentEpisode"))
-        #expect(repairBody.contains("pendingPeerRefresh"))
-        #expect(!repairBody.contains("hasRecentInboundPeerRefreshBootstrap"))
-        #expect(!repairBody.contains("responderBootstrapHold"))
+        // Documented receive-side ASR: missingOneTimeKey coalesces into one episode.
+        let otkCatch = try #require(sequenceSource.range(of: "ratchetError == .missingOneTimeKey"))
+        let otkBlock = String(sequenceSource[otkCatch.lowerBound...].prefix(4_500))
+        #expect(otkBlock.contains("hasOpenReestablishmentEpisode"))
+        #expect(otkBlock.contains("pendingPeerRefresh") || otkBlock.contains("coalescedPendingPeerRecovery"))
+        #expect(otkBlock.contains("replaceOTKBatchThenPeerRefresh"))
+        #expect(!otkBlock.contains("hasRecentInboundPeerRefreshBootstrap"))
+        #expect(!otkBlock.contains("responderBootstrapHold"))
 
-        // Outbound encrypt failure repairs even during an open episode (open reestablishment episode);
+        // Outbound encrypt failure repairs even during an open episode;
         // do not silent-delete user jobs because peerRefresh is in flight.
         let outboundRepairBody = try PQSFriendshipSource.functionBody(
             named: "private func handleFreshOutboundRepair",
             in: sequenceSource)
         #expect(outboundRepairBody.contains("resetSessionIdentityForFreshSession"))
         #expect(outboundRepairBody.contains("reason: \"outboundRepair\""))
+        #expect(outboundRepairBody.contains("demoteZombieStateLessActives("))
         #expect(!outboundRepairBody.contains("outboundRepairSkipped"))
         #expect(!outboundRepairBody.contains("hasOpenReestablishmentEpisode"))
         #expect(!outboundRepairBody.contains("hasRecentInboundPeerRefreshBootstrap"))
@@ -439,20 +530,18 @@ struct FriendshipFlowSourceTests {
     func terminalPeerRefreshEmitFailuresCloseEpisodeAndGateIdentity() throws {
         let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
         let sessionSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession.swift")
-        let repairBody = try PQSFriendshipSource.functionBody(
-            named: "private func handleFreshSessionRepair",
+        let invalidSigBody = try PQSFriendshipSource.functionBody(
+            named: "private func handleInvalidSignature",
             in: sequenceSource)
 
-        #expect(repairBody.contains("blockedAccountIdentity"))
-        #expect(repairBody.contains("blockedRecoveryDependency"))
-        #expect(repairBody.contains("setAccountIdentityRequiresAcknowledgement(true)"))
-        #expect(repairBody.contains("markRecoveryEmitBlocked"))
-        #expect(repairBody.contains("endReestablishmentEpisode"))
-        // Non-leaders must not emit or close the open leader episode.
-        let nonLeaderSkip = try #require(repairBody.range(of: "Skipping duplicate peerRefresh leader"))
-        let emitIndex = try #require(repairBody.range(of: "emitSessionReestablishment"))
-        #expect(nonLeaderSkip.lowerBound < emitIndex.lowerBound)
-        #expect(repairBody.contains("return .deleted"))
+        // Terminal emit failures on remaining ASR paths close the episode and gate.
+        #expect(invalidSigBody.contains("markRecoveryEmitBlocked"))
+        #expect(invalidSigBody.contains("endReestablishmentEpisode"))
+        #expect(invalidSigBody.contains("forceReemit: true"))
+        let otkFailed = try #require(sequenceSource.range(of: "reason=otkBatchReplacementFailed"))
+        let afterOTK = String(sequenceSource[otkFailed.upperBound...].prefix(800))
+        #expect(afterOTK.contains("endReestablishmentEpisode"))
+        #expect(sequenceSource.contains("markRecoveryEmitBlocked"))
 
         #expect(sessionSource.contains("accountIdentityRequiresAcknowledgement"))
         #expect(sessionSource.contains("recoveryEmitBlockedLanes"))
@@ -463,27 +552,28 @@ struct FriendshipFlowSourceTests {
     @Test("decrypt-driven peerRefresh leader forces emit and keeps episode open on suppress")
     func decryptDrivenPeerRefreshLeaderForcesEmitAndKeepsEpisodeOpenOnSuppress() throws {
         let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
-        let repairBody = try PQSFriendshipSource.functionBody(
-            named: "private func handleFreshSessionRepair",
+        let invalidSigBody = try PQSFriendshipSource.functionBody(
+            named: "private func handleInvalidSignature",
             in: sequenceSource)
 
         // Winning the episode must put peerRefresh on the wire even when deferred
         // resend ids already exist (pending TTL is 10m; cooldown is 30s).
-        #expect(repairBody.contains("forceReemit: true"))
-        #expect(!repairBody.contains("forceReemit: !hadPendingRecovery"))
+        #expect(invalidSigBody.contains("forceReemit: true"))
+        #expect(!invalidSigBody.contains("forceReemit: !hadPendingRecovery"))
 
         // A suppressed emit must not close the episode — that was the thrash loop.
         let suppressedLog = try #require(
-            repairBody.range(of: "pqs.recovery.reestablishmentSuppressed reason=coalescedPending"))
-        let suppressedRegion = repairBody[suppressedLog.lowerBound...]
+            invalidSigBody.range(of: "pqs.recovery.reestablishmentSuppressed reason=coalescedPending"))
+        let suppressedRegion = invalidSigBody[suppressedLog.lowerBound...]
         let nextCatch = suppressedRegion.range(of: "} catch")
         let suppressedBranch = nextCatch.map { String(suppressedRegion[..<$0.lowerBound]) }
             ?? String(suppressedRegion.prefix(400))
         #expect(!suppressedBranch.contains("endReestablishmentEpisode"))
 
-        // Repeated redelivery of an already-accepted failure must audit distinctly
-        // so production logs do not look like fresh-repair thrash.
-        #expect(repairBody.contains("action: \"suppressedRepeatedFailure\""))
+        // OTK path also force-emits after batch replacement.
+        #expect(sequenceSource.contains("replaceOTKBatchThenPeerRefresh"))
+        let otkForce = try #require(sequenceSource.range(of: "forceReemit: true"))
+        #expect(otkForce.lowerBound > sequenceSource.startIndex)
     }
 
     @Test("OTK and invalidSignature recovery align terminal emit failure handling")
@@ -571,10 +661,12 @@ struct FriendshipFlowSourceTests {
         // Reuse of an existing state-less row is repair-lane only; consume-lane callers
         // must always reach the atomic server consume.
         #expect(resetBody.contains("if !sendOneTimeIdentities,"))
-        // Key material is acquired before the active row is torn down.
+        // Key material is acquired before the previous current is demoted.
         let consumeIndex = try #require(resetBody.range(of: "createOneTimeKeys"))
-        let deleteIndex = try #require(resetBody.range(of: "deleteSessionIdentity"))
-        #expect(consumeIndex.lowerBound < deleteIndex.lowerBound)
+        let demoteIndex = try #require(resetBody.range(of: "demoteActiveSessionIdentityToInactive"))
+        #expect(consumeIndex.lowerBound < demoteIndex.lowerBound)
+        #expect(!resetBody.contains("deleteSessionIdentity"))
+        #expect(!resetBody.contains("archiveActiveSessionIdentitySnapshot"))
     }
 
     @Test("out-of-band resend reuses the coordinated device identity")
@@ -596,6 +688,7 @@ struct FriendshipFlowSourceTests {
     @Test("deferred resend drain caps submissions and handles unavailable notice")
     func deferredResendDrainCapsAndHandlesUnavailableNotice() throws {
         let source = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
+        let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
         let drainBody = try PQSFriendshipSource.functionBody(
             named: "private func sendDeferredResendRequests",
             in: source)
@@ -603,6 +696,8 @@ struct FriendshipFlowSourceTests {
         #expect(drainBody.contains("pendingResendExhausted"))
         #expect(drainBody.contains("resendRequestSubmissionCount"))
         #expect(drainBody.contains("inboundContentUnrecoverable("))
+        #expect(drainBody.contains("clearPendingResends("))
+        #expect(drainBody.contains("reason=resendSubmissionCap"))
 
         #expect(source.contains("case .messageResendUnavailable(let notice):"))
         #expect(source.contains("clearPendingResends("))
@@ -610,6 +705,59 @@ struct FriendshipFlowSourceTests {
         #expect(source.contains("inboundContentUnrecoverable"))
         #expect(source.contains("outboundMessageUnrecoverable("))
         #expect(source.contains("emitResendUnavailableNotice("))
+
+        // Hot-path submission cap terminalizes sharedId without receive ASR.
+        let requestBody = try PQSFriendshipSource.functionBody(
+            named: "private func requestPeerResendIfAllowed",
+            in: sequenceSource)
+        #expect(requestBody.contains("peerResendRequestMaxSubmissions"))
+        #expect(requestBody.contains("clearPendingResends("))
+        #expect(requestBody.contains("reason=resendSubmissionCap"))
+        #expect(!requestBody.contains("emitSessionReestablishment("))
+        #expect(!requestBody.contains("peerRefresh"))
+        #expect(!requestBody.contains("handleFreshSessionRepair("))
+
+        let undecryptableBody = try PQSFriendshipSource.functionBody(
+            named: "private func handleUndecryptableInboundResend",
+            in: sequenceSource)
+        #expect(undecryptableBody.contains("resendRequestExhausted"))
+        #expect(undecryptableBody.contains("contentUnrecoverable"))
+        #expect(!undecryptableBody.contains("emitSessionReestablishment("))
+    }
+
+    @Test("unavailable NACK uses initiating delivery distinct from orphanResend")
+    func unavailableNACKUsesInitiatingDeliveryDistinctFromOrphanResend() throws {
+        // Dogfood closeout (post-implement): backlog should end in
+        // orphanResend→recovered/lanePromoted OR resendUnavailable*/contentUnrecoverable —
+        // not unbounded resendAwaitingSender + Resuming N pending multipart.
+        let ratchetSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
+        let emitBody = try PQSFriendshipSource.functionBody(
+            named: "private func emitResendUnavailableNotice",
+            in: ratchetSource)
+        #expect(emitBody.contains("orphanResendInitiatingSessionId("))
+        #expect(emitBody.contains("mintResendUnavailableInitiatingIdentity("))
+        #expect(emitBody.contains("handleWriteMessage("))
+        #expect(emitBody.contains("resendUnavailableQueued"))
+        #expect(emitBody.contains("resendUnavailableSent"))
+        #expect(emitBody.contains("resendUnavailableEmitFailed"))
+        #expect(emitBody.contains("resendUnavailableReused"))
+        #expect(!emitBody.contains("feedTask("))
+        #expect(!emitBody.contains("markOrphanResendInitiatingSession("))
+        #expect(!emitBody.contains("reason: \"orphanResend\""))
+
+        let mintBody = try PQSFriendshipSource.functionBody(
+            named: "private func mintResendUnavailableInitiatingIdentity",
+            in: ratchetSource)
+        #expect(mintBody.contains("reason: \"resendUnavailable\""))
+        #expect(mintBody.contains("sendOneTimeIdentities: false"))
+        #expect(!mintBody.contains("markOrphanResendInitiatingSession("))
+
+        // Anti-cascade: unavailable notices are recent-replayable.
+        let replayableBody = try PQSFriendshipSource.functionBody(
+            named: "private func isReplayableNonPersistentControl",
+            in: ratchetSource)
+        #expect(replayableBody.contains("case .messageResendUnavailable:"))
+        #expect(replayableBody.contains("return true"))
     }
 
     @Test("successful inbound does not close episode while peerRefresh response is still expected")
@@ -625,12 +773,35 @@ struct FriendshipFlowSourceTests {
         #expect(ratchetSource.contains("resendDrainDeferred"))
         #expect(ratchetSource.contains("awaitingPeerRefreshResponse"))
         // Archived success must promote the proven lane (activate proven lane), not
-        // rematerialize the failed active via laneReplaced.
-        #expect(ratchetSource.contains("promoteArchivedSessionIdentityToActive("))
-        #expect(ratchetSource.contains("lanePromotedAfterArchivedDecrypt"))
+        // rematerialize the failed active via laneReplaced. Total inbound failure
+        // rolls back ratchet mutations on the same row (discard).
+        #expect(ratchetSource.contains("activateSessionIdentityAfterInboundDecrypt("))
+        #expect(ratchetSource.contains("laneSelectedAfterInboundDecrypt"))
+        #expect(ratchetSource.contains("pqs.recovery.laneRolledBack reason="))
+        #expect(!ratchetSource.contains("lanePromoteDeferredOpenRepair"))
+        #expect(!ratchetSource.contains("lanePromotedAfterArchivedDecrypt"))
+        #expect(!ratchetSource.contains("laneDroppedLosingActive"))
         #expect(!ratchetSource.contains(
             "archived inbound fallback succeeded after active decrypt failure"))
+        #expect(identitySource.contains("activateSessionIdentityAfterInboundDecrypt("))
         #expect(identitySource.contains("pqs.recovery.lanePromotedFromArchive"))
+        #expect(!identitySource.contains("lanePromoteDeferredOrphanResend"))
+        #expect(identitySource.contains("demoteActiveSessionIdentityToInactive("))
+        #expect(!sequenceSource.contains("tryDeferInboundDuringOrphanResendWave("))
+        #expect(!sequenceSource.contains("inboundDeferredOrphanResendWave"))
+        // Inbound decrypt: activate demotes previous current; promote must not delete actives.
+        let promoteBody = try PQSFriendshipSource.functionBody(
+            named: "internal func promoteArchivedSessionIdentityToActive",
+            in: identitySource)
+        #expect(promoteBody.contains("demoteActiveSessionIdentityToInactive("))
+        #expect(!promoteBody.contains("deleteSessionIdentity("))
+        let activateBody = try PQSFriendshipSource.functionBody(
+            named: "internal func activateSessionIdentityAfterInboundDecrypt",
+            in: identitySource)
+        #expect(activateBody.contains("promoteArchivedSessionIdentityToActive("))
+        #expect(activateBody.contains("demoteActiveSessionIdentityToInactive("))
+        #expect(!activateBody.contains("lanePromoteDeferredOrphanResend"))
+        #expect(!activateBody.contains("orphanResendInitiatingSessionId("))
 
         // Do not park ordinary outbound while peerRefresh is in flight.
         // Encrypt on the active session; repair only when encrypt actually fails.
@@ -688,6 +859,10 @@ struct FriendshipFlowSourceTests {
         // Replay jobs that die in outbound failure handling must audit the drop.
         #expect(sequenceSource.contains("noteResendReplayDropped("))
         #expect(sequenceSource.contains("outboundRepairSuppressed"))
+        #expect(sequenceSource.contains("isPendingResendReplay"))
+        #expect(sequenceSource.contains("clearOutboundReconciliationCooldown("))
+        #expect(sequenceSource.contains("outboundRepairReusedOrphanResend"))
+        #expect(sequenceSource.contains("demoteZombieStateLessActives("))
         #expect(!sequenceSource.contains("outboundRepairSkipped.openEpisode"))
     }
 
@@ -717,16 +892,67 @@ struct FriendshipFlowSourceTests {
         #expect(ratchetSource.contains("reason: \"stateLessPersonalOutboundRefresh\""))
         #expect(!sessionSource.contains("reason: \"inboundPeerRefreshBootstrap\""))
         #expect(sequenceSource.contains("reason: \"outboundRepair\""))
+        #expect(sequenceSource.contains("reason: \"orphanResend\"")
+            || ratchetSource.contains("reason: \"orphanResend\""))
+        #expect(ratchetSource.contains("reason: \"resendUnavailable\""))
+        #expect(!sequenceSource.contains("reason: \"freshSessionRepair\""))
         #expect(!coalescingSource.contains("reason: \"peerRefreshEmitPreReset\""))
         #expect(identitySource.contains("reason: \"friendshipOutboundBootstrap\""))
         #expect(identitySource.contains("reason: \"friendshipReplyPrepare\""))
         #expect(identitySource.contains("reason: \"rotatedIdentityKeysDetected\""))
 
         // The remaining lane mutations are audited too.
-        #expect(ratchetSource.contains("pqs.recovery.laneReplaced reason="))
-        #expect(identitySource.contains("pqs.recovery.laneRestoredFromArchive"))
+        #expect(!ratchetSource.contains("pqs.recovery.laneReplaced reason="))
+        #expect(!ratchetSource.contains("replaceRestoredSessionIdentityObject("))
+        #expect(ratchetSource.contains("pqs.recovery.laneRolledBack reason="))
+        #expect(!identitySource.contains("pqs.recovery.laneRestoredFromArchive"))
+        #expect(!identitySource.contains("archiveActiveSessionIdentitySnapshot("))
         #expect(identitySource.contains("pqs.recovery.lanePromotedFromArchive"))
+        #expect(identitySource.contains("demotedActive="))
+        #expect(identitySource.contains("zombieStateLessDemoted"))
         #expect(identitySource.contains("pqs.recovery.laneWiped"))
         #expect(identitySource.contains("pqs.recovery.laneStalePruned"))
+    }
+
+    @Test("undecryptable lane saturation stays on sender orphanResend path")
+    func undecryptableLaneSaturationStaysOnSenderOrphanResendPath() throws {
+        let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
+        let ratchetSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
+        let sessionSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession.swift")
+        let constants = try PQSFriendshipSource.read("Sources/PQSSession/Constants.swift")
+
+        #expect(constants.contains("undecryptableLaneEscalateThreshold = 3"))
+        #expect(sessionSource.contains("func noteUndecryptableLaneFailure("))
+        #expect(sessionSource.contains("func clearUndecryptableLaneFailures("))
+        #expect(sequenceSource.contains("noteUndecryptableLaneFailure("))
+        #expect(sequenceSource.contains("undecryptableLaneSaturated"))
+        #expect(sequenceSource.contains("awaitingSenderOrphanResend"))
+        let undecryptableBody = try PQSFriendshipSource.functionBody(
+            named: "private func handleUndecryptableInboundResend",
+            in: sequenceSource)
+        #expect(!undecryptableBody.contains("handleFreshSessionRepair("))
+        #expect(ratchetSource.contains("reason: \"orphanResend\""))
+        #expect(ratchetSource.contains("pqs.recovery.orphanResend"))
+        #expect(ratchetSource.contains("pqs.recovery.orphanResendReused"))
+        #expect(ratchetSource.contains("orphanResendWaveDrained"))
+        #expect(ratchetSource.contains("pendingOrphanEncrypts"))
+        #expect(sessionSource.contains("markOrphanResendInitiatingSession("))
+        #expect(!sequenceSource.contains("tryDeferInboundDuringOrphanResendWave("))
+        #expect(!sequenceSource.contains("inboundDeferredOrphanResendWave"))
+        // Decrypt-failure classes (including former fresh-session repair errors) are
+        // Orphan-resend on inbound; receive-side ASR is not used for them.
+        let freshRepairErrors = try PQSFriendshipSource.functionBody(
+            named: "private func isFreshSessionRepairError",
+            in: sequenceSource)
+        #expect(!freshRepairErrors.contains(".stateUninitialized"))
+        #expect(sequenceSource.contains("ratchetError == .stateUninitialized"))
+        let freshCatch = try #require(sequenceSource.range(of: "isFreshSessionRepairError(ratchetError)"))
+        let afterFresh = sequenceSource[freshCatch.lowerBound...]
+        #expect(afterFresh.contains("handleUndecryptableInboundResend("))
+        let identitySource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession+SessionIdentity.swift")
+        #expect(!identitySource.contains("lanePromoteDeferredOrphanResend"))
+        #expect(identitySource.contains("demoteZombieStateLessActives("))
+        #expect(sequenceSource.contains("clearPreferredSessionIdentity(")
+            || ratchetSource.contains("clearPreferredSessionIdentity("))
     }
 }

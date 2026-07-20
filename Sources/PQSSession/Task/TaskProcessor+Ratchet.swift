@@ -605,6 +605,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         "\(secretName)|\(deviceId.uuidString)"
     }
 
+    /// Drops a stale preferred-lane pointer after automatic session reset so the
+    /// next inbound/outbound selection cannot pin a deleted SessionIdentity id.
+    func clearPreferredSessionIdentity(secretName: String, deviceId: UUID) {
+        preferredSessionIdentityIdByPeerDevice.removeValue(
+            forKey: peerDeviceIdentityPreferenceKey(
+                secretName: secretName,
+                deviceId: deviceId))
+    }
+
     private func bestCandidatePreservingStoreOrder(
         _ candidates: [(identity: SessionIdentity, props: SessionIdentity.UnwrappedProps, index: Int)]
     ) -> (identity: SessionIdentity, props: SessionIdentity.UnwrappedProps, index: Int)? {
@@ -761,7 +770,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 sessionId: sessionIdentity.id)
             signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
         } catch {
-            try await replaceRestoredSessionIdentityObject(
+            // Discard in-place mutations on encrypt failure. Do not remint a
+            // new SessionIdentity UUID (`laneReplaced`) — that broke ledger matching.
+            try await restoreSessionIdentityData(
                 sessionIdentity,
                 data: outboundSessionIdentityDataBeforeAttempt,
                 session: session,
@@ -794,6 +805,14 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             recipientSecretName: props.secretName,
             recipientDeviceId: props.deviceId,
             sessionIdentityId: sessionIdentity.id)
+        if await session.isOrphanResendInitiatingSession(
+            secretName: props.secretName,
+            deviceId: props.deviceId,
+            sessionId: sessionIdentity.id
+        ) || pendingResendReplayBySharedId[outboundTask.sharedId] != nil {
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.messageRecordSessionId=\(sessionIdentity.id.uuidString) sharedId=\(outboundTask.sharedId) recipientDeviceId=\(props.deviceId.uuidString)")
+        }
         logRecoveryTransportSendSuccess(transportEvent, sharedId: outboundTask.sharedId)
         if case .requestMessageResend(let request) = transportEvent {
             // The wire hand-off is the event that spends a resend attempt. Counting
@@ -901,35 +920,34 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         let verificationResult = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
         
         do {
-            // Attempt decryption with the preferred active identity first. Legacy
-            // persistence races may have left alternate active rows for the same
-            // peer device, so try those before archived previous-state snapshots.
-            let activeSessionIdentity = verificationResult.sessionIdentity
-            let activeSessionIdentityDataBeforeAttempt = activeSessionIdentity.data
-            var decryptedFromArchivedIdentity = false
-            var decryptionSessionIdentity = activeSessionIdentity
+            // Inbound decrypt: try the preferred/current session, then other
+            // actives, then inactive sessions. Whichever decrypts becomes current
+            // (activate = promote inactive / demote sibling actives).
+            let preferredSessionIdentity = verificationResult.sessionIdentity
+            let preferredSessionIdentityDataBeforeAttempt = preferredSessionIdentity.data
+            var decryptionSessionIdentity = preferredSessionIdentity
             var decryptedData: Data
             do {
                 try await initializeRecipient(
-                    sessionIdentity: activeSessionIdentity,
+                    sessionIdentity: preferredSessionIdentity,
                     session: session,
                     ratchetMessage: verificationResult.ratchetMessage)
                 
                 decryptedData = try await ratchetManager.ratchetDecrypt(
                     verificationResult.ratchetMessage,
-                    sessionId: activeSessionIdentity.id)
+                    sessionId: preferredSessionIdentity.id)
             } catch {
-                let activeError = error
+                let preferredError = error
                 try await restoreSessionIdentityData(
-                    activeSessionIdentity,
-                    data: activeSessionIdentityDataBeforeAttempt,
+                    preferredSessionIdentity,
+                    data: preferredSessionIdentityDataBeforeAttempt,
                     session: session,
-                    reason: "active inbound decrypt failed before archived fallback")
+                    reason: "preferred inbound decrypt failed before multi-session fallback")
                 let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
                 let activeIdentities = try await session.getSessionIdentities(
                     with: inboundTask.senderSecretName)
                 let alternateActiveIdentities = await activeIdentities.asyncFilter { identity in
-                    guard identity.id != activeSessionIdentity.id,
+                    guard identity.id != preferredSessionIdentity.id,
                           let props = await identity.props(symmetricKey: databaseSymmetricKey)
                     else {
                         return false
@@ -961,7 +979,6 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         logger.log(
                             level: .info,
                             message: "\(candidate.isArchived ? "Archived" : "Alternate active") identity fallback succeeded for \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId))")
-                        decryptedFromArchivedIdentity = candidate.isArchived
                         decryptionSessionIdentity = fallbackIdentity
                         fallbackData = data
                         break
@@ -976,44 +993,32 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 }
 
                 guard let data = fallbackData else {
-                    try await replaceRestoredSessionIdentityObject(
-                        activeSessionIdentity,
-                        data: activeSessionIdentityDataBeforeAttempt,
+                    // Inbound decrypt: no session decrypted — discard mutations and abort.
+                    try await restoreSessionIdentityData(
+                        preferredSessionIdentity,
+                        data: preferredSessionIdentityDataBeforeAttempt,
                         session: session,
                         reason: "active and archived inbound decrypt attempts failed")
-                    throw activeError
-                }
-                // Multi-session: a successful decrypt on a non-active session promotes
-                // that session to the send/receive lane. Rematerializing the *failed*
-                // active (previous `laneReplaced` path) left outbound on a dead ratchet
-                // while preferred pointed at an archived row `bestSessionIdentity`
-                // cannot select — every subsequent message paid archived fallback again.
-                if decryptedFromArchivedIdentity {
-                    let promoted = try await session.promoteArchivedSessionIdentityToActive(
-                        decryptionSessionIdentity)
-                    decryptionSessionIdentity = promoted
-                    decryptedFromArchivedIdentity = false
-                    logger.log(
-                        level: .info,
-                        message: "pqs.recovery.lanePromotedAfterArchivedDecrypt sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId)")
-                } else if decryptionSessionIdentity.id != activeSessionIdentity.id {
-                    // Alternate active won: drop the failed active so it cannot win
-                    // `bestSessionIdentity` over the proven row.
-                    if let cache = await session.cache {
-                        try? await cache.deleteSessionIdentity(activeSessionIdentity.id)
-                        await session.removeIdentity(with: inboundTask.senderSecretName)
-                        DecryptFailureAuditLog.log(
-                            "pqs.recovery.laneDroppedLosingActive reason=alternateActiveDecryptSucceeded peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-                    }
+                    DecryptFailureAuditLog.log(
+                        "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                    throw preferredError
                 }
                 decryptedData = data
             }
 
+            // Inbound decrypt: if the decrypting session is not current, activate it
+            // (and demote other actives). Also runs when verification selected an
+            // archived row that decrypted on the first attempt.
+            decryptionSessionIdentity = try await session.activateSessionIdentityAfterInboundDecrypt(
+                decryptionSessionIdentity)
             preferredSessionIdentityIdByPeerDevice[
                 peerDeviceIdentityPreferenceKey(
                     secretName: inboundTask.senderSecretName,
                     deviceId: inboundTask.senderDeviceId)
             ] = decryptionSessionIdentity.id
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.laneSelectedAfterInboundDecrypt sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) sessionId=\(decryptionSessionIdentity.id)")
 
 #if DEBUG
             if let transform = await session._testDecryptedPayloadTransform {
@@ -1067,18 +1072,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                             return
                         }
 
-                        if decryptedFromArchivedIdentity,
-                           envelope.kind == .peerRefresh {
-                            let promoted = try await session.promoteArchivedSessionIdentityToActive(
-                                decryptionSessionIdentity)
-                            decryptionSessionIdentity = promoted
-                            decryptedFromArchivedIdentity = false
-                            preferredSessionIdentityIdByPeerDevice[
-                                peerDeviceIdentityPreferenceKey(
-                                    secretName: inboundTask.senderSecretName,
-                                    deviceId: inboundTask.senderDeviceId)
-                            ] = promoted.id
-                        }
+                        // Decrypt path already activated the proven session (inbound decrypt).
 
                         // Receiver-side coalescing: drop duplicates and stale-epoch replays from
                         // an offline mailbox before any expensive work or delegate dispatch.
@@ -1289,6 +1283,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         var unavailableIds: [String] = []
                         var knownUnavailableCount = 0
                         var missingByReason: [String: Int] = [:]
+                        var pendingOrphanEncrypts: [(
+                            sharedId: String,
+                            message: CryptoMessage,
+                            identity: SessionIdentity
+                        )] = []
                         for failedSharedMessageId in request.failedSharedMessageIds {
                             // A previous lookup already proved this id unreplayable; skip the
                             // DB pass and just re-notify the requester below.
@@ -1370,25 +1369,73 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                 servicedFromPersistedStore = true
                             }
 
-                            // Orphan resend: if the active session is still the one that
-                            // originally encrypted this sharedId to the requester, insert
-                            // a new initiating session before re-encrypting.
+                            // Orphan-resend: one new initiating session per peer-device
+                            // recovery wave. Reuse it for every sharedId in this request
+                            // (and later requests) until inbound proves that session.
                             var replayIdentity = identity
-                            if let record = await session.outboundDeviceSendRecord(
+                            if let protectedId = await session.orphanResendInitiatingSessionId(
+                                secretName: inboundTask.senderSecretName,
+                                deviceId: request.requestingDeviceId
+                            ) {
+                                let latestIdentities = (try? await session.cache?.fetchSessionIdentities()) ?? identities
+                                if let protected = latestIdentities.first(where: { $0.id == protectedId }),
+                                   let protectedProps = await protected.props(symmetricKey: symmetricKey),
+                                   protectedProps.secretName == inboundTask.senderSecretName,
+                                   protectedProps.deviceId == request.requestingDeviceId,
+                                   !protectedProps.deviceName.hasPrefix(
+                                    PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+                                {
+                                    replayIdentity = protected
+                                    identity = protected
+                                    preferredSessionIdentityIdByPeerDevice[
+                                        peerDeviceIdentityPreferenceKey(
+                                            secretName: inboundTask.senderSecretName,
+                                            deviceId: request.requestingDeviceId)
+                                    ] = protected.id
+                                    logger.log(
+                                        level: .info,
+                                        message: "pqs.recovery.orphanResendReused sharedId=\(failedSharedMessageId) requester=\(inboundTask.senderSecretName) deviceId=\(request.requestingDeviceId) sessionId=\(protected.id)")
+                                    DecryptFailureAuditLog.log(
+                                        "pqs.recovery.orphanResendReused sharedId=\(failedSharedMessageId) requester=\(inboundTask.senderSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(protected.id.uuidString)")
+                                } else {
+                                    // Mark points at a demoted/missing row — drop it and fall through.
+                                    await session.clearOrphanResendInitiatingSession(
+                                        secretName: inboundTask.senderSecretName,
+                                        deviceId: request.requestingDeviceId)
+                                }
+                            }
+                            if await session.orphanResendInitiatingSessionId(
+                                secretName: inboundTask.senderSecretName,
+                                deviceId: request.requestingDeviceId
+                            ) == nil,
+                               let record = await session.outboundDeviceSendRecord(
                                 sharedId: failedSharedMessageId,
                                 recipientDeviceId: request.requestingDeviceId
-                            ), record.sessionIdentityId == replayIdentity.id {
+                               ), record.sessionIdentityId == replayIdentity.id {
                                 do {
                                     replayIdentity = try await session.resetSessionIdentityForFreshSession(
                                         secretName: inboundTask.senderSecretName,
                                         deviceId: request.requestingDeviceId,
                                         sendOneTimeIdentities: false,
                                         reason: "orphanResend")
+                                    await session.markOrphanResendInitiatingSession(
+                                        secretName: inboundTask.senderSecretName,
+                                        deviceId: request.requestingDeviceId,
+                                        sessionId: replayIdentity.id)
+                                    identity = replayIdentity
+                                    clearPreferredSessionIdentity(
+                                        secretName: inboundTask.senderSecretName,
+                                        deviceId: request.requestingDeviceId)
+                                    preferredSessionIdentityIdByPeerDevice[
+                                        peerDeviceIdentityPreferenceKey(
+                                            secretName: inboundTask.senderSecretName,
+                                            deviceId: request.requestingDeviceId)
+                                    ] = replayIdentity.id
                                     logger.log(
                                         level: .info,
-                                        message: "pqs.recovery.orphanResend sharedId=\(failedSharedMessageId) requester=\(inboundTask.senderSecretName) deviceId=\(request.requestingDeviceId)")
+                                        message: "pqs.recovery.orphanResend sharedId=\(failedSharedMessageId) requester=\(inboundTask.senderSecretName) deviceId=\(request.requestingDeviceId) newSessionId=\(replayIdentity.id)")
                                     DecryptFailureAuditLog.log(
-                                        "pqs.recovery.orphanResend sharedId=\(failedSharedMessageId) requester=\(inboundTask.senderSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
+                                        "pqs.recovery.orphanResend sharedId=\(failedSharedMessageId) requester=\(inboundTask.senderSecretName) deviceId=\(request.requestingDeviceId.uuidString) newSessionId=\(replayIdentity.id.uuidString)")
                                 } catch {
                                     logger.log(
                                         level: .warning,
@@ -1396,27 +1443,45 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                 }
                             }
 
-                            let task = EncryptableTask(
-                                task: .writeMessage(OutboundTaskMessage(
-                                    message: cryptoMessage,
-                                    recipientIdentity: replayIdentity,
-                                    localId: UUID(),
-                                    sharedId: failedSharedMessageId,
-                                    isPersistedOutbound: false
-                                ))
-                            )
-
-                            try await feedTask(task, session: session)
-                            // Do not arm the servicing cooldown here. A queued replay
-                            // that dies before transport would otherwise coalesce the
-                            // requester's next ask into silence. Cooldown is armed in
-                            // `noteResendReplayTransported` after the wire hand-off.
+                            // Track pending for the whole wave before any encrypt so
+                            // MessageRecord/ledger updates and wave-drain stay serial
+                            // within this mailbox item (no interleaved inbound jobs).
                             rememberResendReplayQueued(
                                 sharedId: failedSharedMessageId,
                                 requesterName: inboundTask.senderSecretName,
                                 requesterDeviceId: request.requestingDeviceId,
                                 servicedFromPersistedStore: servicedFromPersistedStore)
-                            replayQueuedCount += 1
+                            pendingOrphanEncrypts.append((
+                                sharedId: failedSharedMessageId,
+                                message: cryptoMessage,
+                                identity: replayIdentity
+                            ))
+                        }
+
+                        // Serial recovery mailbox: encrypt+send each orphan replay inline
+                        // before this requestMessageResend job completes (no feedTask race).
+                        for pending in pendingOrphanEncrypts {
+                            do {
+                                try await handleWriteMessage(
+                                    outboundTask: OutboundTaskMessage(
+                                        message: pending.message,
+                                        recipientIdentity: pending.identity,
+                                        localId: UUID(),
+                                        sharedId: pending.sharedId,
+                                        isPersistedOutbound: false
+                                    ),
+                                    session: session)
+                                DecryptFailureAuditLog.log(
+                                    "pqs.recovery.orphanResendMessageRecordUpdated sharedId=\(pending.sharedId) sessionId=\(pending.identity.id.uuidString) requesterDeviceId=\(request.requestingDeviceId.uuidString)")
+                                replayQueuedCount += 1
+                            } catch {
+                                logger.log(
+                                    level: .warning,
+                                    message: "pqs.recovery.orphanResendEncryptFailed sharedId=\(pending.sharedId) error=\(error)")
+                                await noteResendReplayDropped(
+                                    sharedId: pending.sharedId,
+                                    reason: "orphanResendEncryptFailed")
+                            }
                         }
                         if replayQueuedCount > 0 {
                             logger.log(
@@ -1460,6 +1525,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         await emitResendUnavailableNotice(
                             to: identity,
                             requesterName: inboundTask.senderSecretName,
+                            requesterDeviceId: request.requestingDeviceId,
                             unavailableIds: unavailableIds,
                             session: session)
                         // Local honesty: if we told the peer these ids are gone, any
@@ -1528,6 +1594,10 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     DecryptFailureAuditLog.log(
                         "pqs.recovery.recovered sharedId=\(inboundTask.sharedMessageId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) priorFailureClasses=\(recoveredFailureClasses.joined(separator: ","))")
                 }
+                // Proven decrypt heals the lane: clear distinct-failure escalate bookkeeping.
+                await session.clearUndecryptableLaneFailures(
+                    sender: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId)
 
                 let pending = await session.takePendingResendsAfterReestablishment(
                     sender: inboundTask.senderSecretName,
@@ -1539,8 +1609,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 // a lane the peer never accepted — Echo transported requests that Nudge
                 // never received.
                 //
-                // Archived fallback no longer keeps the episode open: the proven
-                // archived row was already promoted to the active send lane above.
+                // Still waiting for our own peerRefresh response: ordinary inbound
+                // decrypt (including activate-on-decrypt of an older session) does not
+                // complete the coordinated exchange.
                 let awaitingPeerRefreshResponse = await session.hasActiveLocalPeerRefreshRequest(
                     sender: inboundTask.senderSecretName,
                     deviceId: inboundTask.senderDeviceId)
@@ -1558,8 +1629,8 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                             failureClass: pendingRequest.failureClass)
                     }
                 } else {
-                    // Proven decrypt (active or promoted-from-archive) with no
-                    // outstanding local peerRefresh request: close the episode.
+                    // Proven decrypt with no outstanding local peerRefresh request:
+                    // close the episode and drain deferred resends.
                     await session.endReestablishmentEpisode(
                         sender: inboundTask.senderSecretName,
                         deviceId: inboundTask.senderDeviceId)
@@ -1830,6 +1901,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         guard let replay = pendingResendReplayBySharedId.removeValue(forKey: sharedId) else { return }
         DecryptFailureAuditLog.log(
             "pqs.recovery.resendReplayTransported sharedId=\(sharedId) requester=\(replay.requesterName) requesterDeviceId=\(replay.requesterDeviceId.uuidString)")
+        await clearOrphanResendWaveIfDrained(
+            requesterName: replay.requesterName,
+            requesterDeviceId: replay.requesterDeviceId)
         guard replay.servicedFromPersistedStore, let session else { return }
         await session.markPeerResendRequestServiced(
             requestingDeviceId: replay.requesterDeviceId,
@@ -1840,55 +1914,210 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     /// re-requests after its cooldown (bounded by the transported-attempt cap), so
     /// this is observability, not retry machinery. The servicing cooldown is
     /// intentionally not armed — a dropped replay must not silence the next ask.
-    func noteResendReplayDropped(sharedId: String, reason: String) {
+    func noteResendReplayDropped(sharedId: String, reason: String) async {
         guard let replay = pendingResendReplayBySharedId.removeValue(forKey: sharedId) else { return }
         DecryptFailureAuditLog.log(
             "pqs.recovery.resendReplayDropped sharedId=\(sharedId) requester=\(replay.requesterName) requesterDeviceId=\(replay.requesterDeviceId.uuidString) reason=\(reason)")
+        await clearOrphanResendWaveIfDrained(
+            requesterName: replay.requesterName,
+            requesterDeviceId: replay.requesterDeviceId)
+    }
+
+    func hasPendingResendReplay(requesterName: String, requesterDeviceId: UUID) -> Bool {
+        pendingResendReplayBySharedId.values.contains {
+            $0.requesterName == requesterName && $0.requesterDeviceId == requesterDeviceId
+        }
+    }
+
+    /// Serial recovery wave end: once no replay jobs remain for the requester, drop
+    /// the initiating-session mark so inbound session activation and later orphan checks resume.
+    private func clearOrphanResendWaveIfDrained(
+        requesterName: String,
+        requesterDeviceId: UUID
+    ) async {
+        guard !hasPendingResendReplay(
+            requesterName: requesterName,
+            requesterDeviceId: requesterDeviceId
+        ) else {
+            return
+        }
+        guard let session else { return }
+        await session.clearOrphanResendInitiatingSession(
+            secretName: requesterName,
+            deviceId: requesterDeviceId)
+        DecryptFailureAuditLog.log(
+            "pqs.recovery.orphanResendWaveDrained requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString)")
     }
 
     /// Tells the requesting device that these ids have no replay source anywhere so it
-    /// stops re-requesting them. Send failures are non-fatal: the requester-side attempt
+    /// stops re-requesting them. Delivered on an initiating session when Whisper on the
+    /// current active is already dead (product NACK; not orphan-resend MessageRecord replace).
+    /// Send failures are non-fatal: the requester-side attempt
     /// cap (`PQSSessionConstants.peerResendRequestMaxSubmissions`) still bounds the loop
     /// when the notice is lost.
     private func emitResendUnavailableNotice(
-        to identity: SessionIdentity,
+        to fallbackIdentity: SessionIdentity,
         requesterName: String,
+        requesterDeviceId: UUID,
         unavailableIds: [String],
         session: PQSSession
     ) async {
         guard !unavailableIds.isEmpty else { return }
         guard let context = await session.sessionContext else { return }
 
+        let deliveryIdentity: SessionIdentity
+        if let protectedId = await session.orphanResendInitiatingSessionId(
+            secretName: requesterName,
+            deviceId: requesterDeviceId
+        ) {
+            let identities = (try? await session.cache?.fetchSessionIdentities()) ?? []
+            let symmetricKey = try? await session.getDatabaseSymmetricKey()
+            if let symmetricKey,
+               let protected = identities.first(where: { $0.id == protectedId }),
+               let protectedProps = await protected.props(symmetricKey: symmetricKey),
+               protectedProps.secretName == requesterName,
+               protectedProps.deviceId == requesterDeviceId,
+               !protectedProps.deviceName.hasPrefix(
+                PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            {
+                deliveryIdentity = protected
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.resendUnavailableUsingOrphanInitiating requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(protected.id.uuidString) unavailableCount=\(unavailableIds.count)")
+            } else {
+                await session.clearOrphanResendInitiatingSession(
+                    secretName: requesterName,
+                    deviceId: requesterDeviceId)
+                deliveryIdentity = await mintResendUnavailableInitiatingIdentity(
+                    fallback: fallbackIdentity,
+                    requesterName: requesterName,
+                    requesterDeviceId: requesterDeviceId,
+                    session: session)
+            }
+        } else {
+            deliveryIdentity = await mintResendUnavailableInitiatingIdentity(
+                fallback: fallbackIdentity,
+                requesterName: requesterName,
+                requesterDeviceId: requesterDeviceId,
+                session: session)
+        }
+
         let notice = MessageResendUnavailableNotice(
             unavailableSharedMessageIds: unavailableIds,
             respondingDeviceId: context.sessionUser.deviceId)
+        let requesterKey = peerDeviceIdentityPreferenceKey(
+            secretName: requesterName,
+            deviceId: requesterDeviceId)
+        cleanupRecentUnavailableNotices()
+        let unavailableSet = Set(unavailableIds)
+        let sharedId: String
+        let message: CryptoMessage
+        if let prior = recentUnavailableNoticeByRequesterDevice[requesterKey],
+           prior.unavailableIds == unavailableSet,
+           Date().timeIntervalSince(prior.createdAt) < recentUnavailableNoticeTTL
+        {
+            sharedId = prior.sharedId
+            message = prior.message
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.resendUnavailableReused sharedId=\(sharedId) requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) unavailableCount=\(unavailableIds.count)")
+        } else {
+            sharedId = UUID().uuidString
+            do {
+                let encoded = try BinaryEncoder().encode(TransportEvent.messageResendUnavailable(notice))
+                let isSelf = requesterName == context.sessionUser.secretName
+                message = CryptoMessage(
+                    text: "",
+                    metadata: .init(),
+                    recipient: isSelf ? .personalMessage : .nickname(requesterName),
+                    transportInfo: encoded,
+                    sentDate: Date(),
+                    destructionTime: nil)
+            } catch {
+                logger.log(
+                    level: .warning,
+                    message: "pqs.recovery.resendUnavailableEmitFailed requester=\(requesterName) unavailableCount=\(unavailableIds.count) error=\(error)")
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.resendUnavailableEmitFailed requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) unavailableCount=\(unavailableIds.count) error=\(error)")
+                return
+            }
+            recentUnavailableNoticeByRequesterDevice[requesterKey] = RecentUnavailableNotice(
+                sharedId: sharedId,
+                message: message,
+                unavailableIds: unavailableSet,
+                createdAt: Date())
+            if recentUnavailableNoticeByRequesterDevice.count > recentUnavailableNoticeLimit {
+                let overflow = recentUnavailableNoticeByRequesterDevice.count - recentUnavailableNoticeLimit
+                let oldestKeys = recentUnavailableNoticeByRequesterDevice
+                    .sorted { $0.value.createdAt < $1.value.createdAt }
+                    .prefix(overflow)
+                    .map(\.key)
+                for key in oldestKeys {
+                    recentUnavailableNoticeByRequesterDevice.removeValue(forKey: key)
+                }
+            }
+        }
+
         do {
-            let encoded = try BinaryEncoder().encode(TransportEvent.messageResendUnavailable(notice))
-            let isSelf = requesterName == context.sessionUser.secretName
-            let message = CryptoMessage(
-                text: "",
-                metadata: .init(),
-                recipient: isSelf ? .personalMessage : .nickname(requesterName),
-                transportInfo: encoded,
-                sentDate: Date(),
-                destructionTime: nil)
-            let task = EncryptableTask(
-                task: .writeMessage(OutboundTaskMessage(
+            try await handleWriteMessage(
+                outboundTask: OutboundTaskMessage(
                     message: message,
-                    recipientIdentity: identity,
+                    recipientIdentity: deliveryIdentity,
                     localId: UUID(),
-                    sharedId: UUID().uuidString,
+                    sharedId: sharedId,
                     isPersistedOutbound: false
-                )),
-                priority: .urgent)
-            try await feedTask(task, session: session)
+                ),
+                session: session)
             logger.log(
                 level: .info,
                 message: "pqs.recovery.resendUnavailableQueued requester=\(requesterName) unavailableCount=\(notice.unavailableSharedMessageIds.count) ids=\(notice.unavailableSharedMessageIds.joined(separator: ","))")
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.resendUnavailableQueued sharedId=\(sharedId) requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(deliveryIdentity.id.uuidString) unavailableCount=\(notice.unavailableSharedMessageIds.count) ids=\(notice.unavailableSharedMessageIds.joined(separator: ","))")
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.resendUnavailableSent sharedId=\(sharedId) requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) unavailableCount=\(notice.unavailableSharedMessageIds.count) ids=\(notice.unavailableSharedMessageIds.joined(separator: ","))")
         } catch {
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.resendUnavailableEmitFailed requester=\(requesterName) unavailableCount=\(unavailableIds.count) error=\(error)")
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.resendUnavailableEmitFailed sharedId=\(sharedId) requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) unavailableCount=\(unavailableIds.count) error=\(error)")
+        }
+    }
+
+    /// Product initiating session for decryptable unavailable NACKs. Distinct from orphan-resend
+    /// `orphanResend` — does not mark orphanResend or rewrite MessageRecord ledgers.
+    private func mintResendUnavailableInitiatingIdentity(
+        fallback: SessionIdentity,
+        requesterName: String,
+        requesterDeviceId: UUID,
+        session: PQSSession
+    ) async -> SessionIdentity {
+        do {
+            let identity = try await session.resetSessionIdentityForFreshSession(
+                secretName: requesterName,
+                deviceId: requesterDeviceId,
+                sendOneTimeIdentities: false,
+                reason: "resendUnavailable")
+            preferredSessionIdentityIdByPeerDevice[
+                peerDeviceIdentityPreferenceKey(
+                    secretName: requesterName,
+                    deviceId: requesterDeviceId)
+            ] = identity.id
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.resendUnavailableInitiating requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) newSessionId=\(identity.id.uuidString)")
+            return identity
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "pqs.recovery.resendUnavailableInitiatingFailed requester=\(requesterName) deviceId=\(requesterDeviceId) error=\(error)")
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.resendUnavailableInitiatingFailed requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) error=\(error)")
+            return fallback
+        }
+    }
+
+    private func cleanupRecentUnavailableNotices(now: Date = Date()) {
+        let cutoff = now.addingTimeInterval(-recentUnavailableNoticeTTL)
+        recentUnavailableNoticeByRequesterDevice = recentUnavailableNoticeByRequesterDevice.filter {
+            $0.value.createdAt > cutoff
         }
     }
 
@@ -2016,6 +2245,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     await emitResendUnavailableNotice(
                         to: identity,
                         requesterName: senderName,
+                        requesterDeviceId: senderDeviceId,
                         unavailableIds: permanentlyUnavailableIds,
                         session: session)
                 } else {
@@ -2068,6 +2298,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         await emitResendUnavailableNotice(
             to: identity,
             requesterName: senderName,
+            requesterDeviceId: senderDeviceId,
             unavailableIds: permanentlyUnavailableIds,
             session: session)
         return PQSSession.OutOfBandResendResult(
@@ -2091,41 +2322,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             return envelope.isResponse
         case .linkedDeviceReprovisioning:
             return true
-        case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished, .requestMessageResend,
-             .messageResendUnavailable:
+        case .messageResendUnavailable:
+            // Re-emit the same NACK sharedId when the peer re-requests it; avoids
+            // missingLocalMessage → new UUID storms while recovery is in flight.
+            return true
+        case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished, .requestMessageResend:
             return false
         }
     }
 
-    private func replaceRestoredSessionIdentityObject(
-        _ identity: SessionIdentity,
-        data: Data,
-        session: PQSSession,
-        reason: String
-    ) async throws {
-        guard let cache = await session.cache else { return }
-
-        let symmetricKey = try await session.getDatabaseSymmetricKey()
-        guard let props = await identity.props(symmetricKey: symmetricKey) else { return }
-        guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { return }
-
-        let replacement = SessionIdentity(id: UUID(), data: data)
-        try await cache.createSessionIdentity(replacement)
-
-        do {
-            try await cache.deleteSessionIdentity(identity.id)
-            await session.removeIdentity(with: props.secretName)
-            logger.log(
-                level: .info,
-                message: "Replaced restored active SessionIdentity for \(props.secretName) (\(props.deviceId)) after \(reason)")
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.laneReplaced reason=\(reason) peer=\(props.secretName) deviceId=\(props.deviceId.uuidString)")
-        } catch {
-            try? await cache.deleteSessionIdentity(replacement.id)
-            throw error
-        }
-    }
-    
     private func removeKeys(session: PQSSession, curveId: String?, mlKEMId: String) async throws {
         
         guard let cache = await session.cache else { return }
@@ -2192,8 +2397,14 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         message: "pqs.recovery.pendingResendExhausted sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId) failureClass=\(pending.failureClass) attempts=\(attempts)")
                     DecryptFailureAuditLog.log(
                         "pqs.recovery.pendingResendExhausted sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) failureClass=\(pending.failureClass) attempts=\(attempts)")
-                    // Terminal on the requester: stop asking and let the host notify
-                    // the original sender so their outbound UI can show `.failed`.
+                    DecryptFailureAuditLog.log(
+                        "pqs.recovery.contentUnrecoverable sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(attempts)")
+                    // Terminal on the requester: stop asking and quarantine so poison
+                    // redelivery cannot reopen recovery for this sharedId.
+                    await session.clearPendingResends(
+                        sender: pending.senderName,
+                        deviceId: pending.senderDeviceId,
+                        messageIds: [pending.failedSharedMessageId])
                     await session.sessionDelegate?.inboundContentUnrecoverable(
                         senderSecretName: pending.senderName,
                         senderDeviceId: pending.senderDeviceId,

@@ -164,6 +164,12 @@ public enum PQSSessionConstants: Sendable {
     /// `messageResendUnavailable` notice is lost in transit.
     public static let peerResendRequestMaxSubmissions = 3
 
+    /// Distinct undecryptable inbound messages from the same peer device after which
+    /// recovery escalates from per-message resend to automatic session
+    /// reset (`peerRefresh` on a fresh initiating lane). Prevents a dead ratchet from
+    /// spraying unbounded resend requests when every new `sharedId` fails once.
+    public static let undecryptableLaneEscalateThreshold = 3
+
     /// Maximum responder-side memory of known-unavailable resend ids
     /// (`requestingDeviceId|sharedId`) before oldest entries are evicted.
     public static let unavailableResendMemoryMaxEntries = 256

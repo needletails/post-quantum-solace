@@ -847,84 +847,6 @@ public extension PQSSession {
             "pqs.recovery.laneWiped peer=\(secretName) deletedRows=\(deletedCount)")
     }
 
-    /// Re-promotes the newest archived peer ratchet when accept bootstrap left only a state-less row.
-    internal func restoreEncryptablePeerSessionFromArchiveIfNeeded(
-        secretName: String,
-        deviceId: UUID
-    ) async throws {
-        if try await peerHasEncryptableSessionForControl(secretName: secretName, deviceId: deviceId) {
-            return
-        }
-
-        let symmetricKey = try await getDatabaseSymmetricKey()
-        let archived = try await fetchArchivedSessionIdentities(secretName: secretName, deviceId: deviceId)
-        guard let source = await archived.asyncFirst(where: { identity in
-            guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
-            return props.state != nil
-        }),
-              let archivedProps = await source.props(symmetricKey: symmetricKey) else {
-            logger.log(
-                level: .warning,
-                message: "restoreEncryptablePeerSessionFromArchiveIfNeeded: no archived encryptable peer session for \(secretName) deviceId=\(deviceId)")
-            return
-        }
-
-        guard let cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
-        }
-
-        let inactivePrefix = PQSSessionConstants.inactiveSessionDeviceNamePrefix
-        let restoredDeviceName = archivedProps.deviceName.hasPrefix(inactivePrefix)
-            ? String(archivedProps.deviceName.dropFirst(inactivePrefix.count))
-            : archivedProps.deviceName
-
-        let allIdentities = try await cache.fetchSessionIdentities()
-        for identity in allIdentities {
-            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
-            guard props.secretName == secretName,
-                  props.deviceId == deviceId,
-                  !props.deviceName.hasPrefix(inactivePrefix) else { continue }
-            try await cache.deleteSessionIdentity(identity.id)
-        }
-
-        var generatedSessionContextIds = Set<Int>()
-        for identity in allIdentities {
-            if let props = await identity.props(symmetricKey: symmetricKey) {
-                generatedSessionContextIds.insert(props.sessionContextId)
-            }
-        }
-        var sessionContextId: Int
-        repeat {
-            sessionContextId = Int.random(in: 1 ..< Int.max)
-        } while generatedSessionContextIds.contains(sessionContextId)
-
-        let restored = try SessionIdentity(
-            id: UUID(),
-            props: .init(
-                secretName: archivedProps.secretName,
-                deviceId: archivedProps.deviceId,
-                sessionContextId: sessionContextId,
-                longTermPublicKey: archivedProps.longTermPublicKey,
-                signingPublicKey: archivedProps.signingPublicKey,
-                mlKEMPublicKey: archivedProps.mlKEMPublicKey,
-                oneTimePublicKey: archivedProps.oneTimePublicKey,
-                state: archivedProps.state,
-                deviceName: restoredDeviceName,
-                serverTrusted: archivedProps.serverTrusted,
-                previousRekey: archivedProps.previousRekey,
-                isMasterDevice: archivedProps.isMasterDevice,
-                verifiedIdentity: archivedProps.verifiedIdentity,
-                verificationCode: archivedProps.verificationCode),
-            symmetricKey: symmetricKey)
-        try await cache.createSessionIdentity(restored)
-        removeIdentity(with: secretName)
-        logger.log(
-            level: .info,
-            message: "restoreEncryptablePeerSessionFromArchiveIfNeeded: restored active peer session from archive for \(secretName) deviceId=\(deviceId)")
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.laneRestoredFromArchive peer=\(secretName) deviceId=\(deviceId.uuidString)")
-    }
-
     /// Waits briefly for the peer to replenish published OTKs. Returns whether keys are available.
     internal func awaitPeerReplenishCompletion(
         secretName: String,
@@ -1238,10 +1160,154 @@ public extension PQSSession {
         return ranked.map(\.identity)
     }
 
+    /// Inbound decrypt: after inbound decrypt succeeds, make `proven` the sole
+    /// active session for that peer device.
+    ///
+    /// - Inactive (archived) rows are promoted.
+    /// - Other actives for the same `(secretName, deviceId)` are demoted in place.
+    /// - The proven row is never deleted; losers stay available for later decrypt.
+    ///
+    /// Orphan-resend waves must not suppress this activate. Instead the task
+    /// processor defers *inbound jobs* for that peer until pending orphan-resend replays
+    /// finish (serial recovery mailbox vs resend).
+    @discardableResult
+    internal func activateSessionIdentityAfterInboundDecrypt(
+        _ proven: SessionIdentity
+    ) async throws -> SessionIdentity {
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        guard let provenProps = await proven.props(symmetricKey: symmetricKey) else {
+            return proven
+        }
+
+        if provenProps.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) {
+            return try await promoteArchivedSessionIdentityToActive(proven)
+        }
+
+        guard let cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let allIdentities = try await cache.fetchSessionIdentities()
+        var demotedSiblingCount = 0
+        for identity in allIdentities {
+            guard identity.id != proven.id,
+                  let props = await identity.props(symmetricKey: symmetricKey),
+                  props.secretName == provenProps.secretName,
+                  props.deviceId == provenProps.deviceId,
+                  !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            else {
+                continue
+            }
+            if try await demoteActiveSessionIdentityToInactive(identity) {
+                demotedSiblingCount += 1
+            }
+        }
+        if demotedSiblingCount > 0 {
+            removeIdentity(with: provenProps.secretName)
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.laneActivatedAfterDecrypt peer=\(provenProps.secretName) deviceId=\(provenProps.deviceId.uuidString) demotedSiblings=\(demotedSiblingCount)")
+        }
+        return proven
+    }
+
+    /// Demotes an active session row to inactive in place (device record).
+    ///
+    /// Inbound decrypt activates the session that decrypts and moves the previous
+    /// current into the inactive list. Deleting the losing active destroyed
+    /// concurrent Automatic Session Reset / `peerRefresh` initiating lanes while
+    /// offline backlog still decrypted on an older archive (heal-then-diverge).
+    @discardableResult
+    internal func demoteActiveSessionIdentityToInactive(
+        _ identity: SessionIdentity
+    ) async throws -> Bool {
+        guard let cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        guard let props = await identity.props(symmetricKey: symmetricKey),
+              !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+        else {
+            return false
+        }
+
+        let demotedProps = SessionIdentity.UnwrappedProps(
+            secretName: props.secretName,
+            deviceId: props.deviceId,
+            // Retention / newest-first ordering treat this as archive time.
+            sessionContextId: Int(Date().timeIntervalSince1970),
+            longTermPublicKey: props.longTermPublicKey,
+            signingPublicKey: props.signingPublicKey,
+            mlKEMPublicKey: props.mlKEMPublicKey,
+            oneTimePublicKey: props.oneTimePublicKey,
+            state: props.state,
+            deviceName: PQSSessionConstants.inactiveSessionDeviceNamePrefix + props.deviceName,
+            serverTrusted: props.serverTrusted,
+            previousRekey: props.previousRekey,
+            isMasterDevice: props.isMasterDevice,
+            verifiedIdentity: props.verifiedIdentity,
+            verificationCode: props.verificationCode)
+        try await identity.updateIdentityProps(
+            symmetricKey: symmetricKey,
+            props: demotedProps)
+        try await cache.updateSessionIdentity(identity)
+        return true
+    }
+
+    /// Recovery allows a state-less initiating active after orphan-resend insert. A *zombie*
+    /// is a state-less active left after failed outbound repair with no successful
+    /// initiating encrypt — it cannot decrypt peer Whisper frames and poisons try-all.
+    /// Demote such rows so they stop being preferred/current.
+    @discardableResult
+    internal func demoteZombieStateLessActives(
+        secretName: String,
+        deviceId: UUID
+    ) async throws -> Int {
+        guard let cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let allIdentities = try await cache.fetchSessionIdentities()
+        var demoted = 0
+        for identity in allIdentities {
+            guard let props = await identity.props(symmetricKey: symmetricKey),
+                  props.secretName == secretName,
+                  props.deviceId == deviceId,
+                  !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix),
+                  props.state == nil
+            else {
+                continue
+            }
+            // Do not demote an in-flight orphan-resend initiating session.
+            if isOrphanResendInitiatingSession(
+                secretName: secretName,
+                deviceId: deviceId,
+                sessionId: identity.id
+            ) {
+                continue
+            }
+            if try await demoteActiveSessionIdentityToInactive(identity) {
+                demoted += 1
+            }
+        }
+        if demoted > 0 {
+            // Do not call `removeIdentity` / `clearPeerTransientState` here: that
+            // clears in-flight orphan-resend `orphanResend` marks for the whole secretName.
+            // Prefer the surviving initiating active on the next encrypt lookup.
+            sessionIdentities.remove(secretName)
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.zombieStateLessDemoted peer=\(secretName) deviceId=\(deviceId.uuidString) demoted=\(demoted)")
+            logger.log(
+                level: .warning,
+                message: "Demoted \(demoted) zombie state-less active SessionIdentity row(s) for \(secretName) (\(deviceId))")
+        }
+        return demoted
+    }
+
     /// Promotes the exact archived row that successfully decrypted inbound
     /// ciphertext (decrypt on inactive → activate for send/receive).
     /// Preserves the proven ratchet state so subsequent outbound uses the same
     /// lane, instead of rematerializing a failed active or a freshly reset row.
+    ///
+    /// Previous actives are demoted to inactive (inbound decrypt), not deleted.
     internal func promoteArchivedSessionIdentityToActive(
         _ archived: SessionIdentity
     ) async throws -> SessionIdentity {
@@ -1256,15 +1322,19 @@ public extension PQSSession {
         }
 
         let allIdentities = try await cache.fetchSessionIdentities()
+        var demotedActiveCount = 0
         for identity in allIdentities {
-            guard let props = await identity.props(symmetricKey: symmetricKey),
+            guard identity.id != archived.id,
+                  let props = await identity.props(symmetricKey: symmetricKey),
                   props.secretName == archivedProps.secretName,
                   props.deviceId == archivedProps.deviceId,
                   !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
             else {
                 continue
             }
-            try await cache.deleteSessionIdentity(identity.id)
+            if try await demoteActiveSessionIdentityToInactive(identity) {
+                demotedActiveCount += 1
+            }
         }
 
         let restoredDeviceName = String(
@@ -1292,9 +1362,9 @@ public extension PQSSession {
         removeIdentity(with: archivedProps.secretName)
         logger.log(
             level: .info,
-            message: "Promoted cryptographically proven archived SessionIdentity for \(archivedProps.secretName) (\(archivedProps.deviceId))")
+            message: "Promoted cryptographically proven archived SessionIdentity for \(archivedProps.secretName) (\(archivedProps.deviceId)); demotedActive=\(demotedActiveCount)")
         DecryptFailureAuditLog.log(
-            "pqs.recovery.lanePromotedFromArchive peer=\(archivedProps.secretName) deviceId=\(archivedProps.deviceId.uuidString)")
+            "pqs.recovery.lanePromotedFromArchive peer=\(archivedProps.secretName) deviceId=\(archivedProps.deviceId.uuidString) demotedActive=\(demotedActiveCount)")
         return archived
     }
 
@@ -1333,6 +1403,11 @@ public extension PQSSession {
         // Config lookup succeeded — clear any dependency block for this lane so a
         // subsequent decrypt failure may emit peerRefresh again.
         clearRecoveryEmitBlocked(sender: secretName, deviceId: deviceId)
+        // A non-orphanReset replaces the intentional orphan-resend initiating mark; orphanResend
+        // callers re-mark the returned row after this returns.
+        if reason != "orphanResend" {
+            clearOrphanResendInitiatingSession(secretName: secretName, deviceId: deviceId)
+        }
 
         try validateUserConfigurationSignatures(configuration)
         if secretName != sessionUser.secretName {
@@ -1404,20 +1479,14 @@ public extension PQSSession {
             configuration: configuration,
             fetchOneTimeKeys: sendOneTimeIdentities)
 
-        var deletedActiveCount = 0
-        var archivedActiveCount = 0
-
+        // Device record: previous current becomes inactive (demote in place).
+        // Do not copy+delete — that minted a second inactive UUID and destroyed the
+        // original row id outbound ledgers may still reference.
+        var demotedActiveCount = 0
         for match in activeMatches {
-            if match.props.state != nil {
-                try await archiveActiveSessionIdentitySnapshot(
-                    props: match.props,
-                    symmetricKey: symmetricKey,
-                    cache: cache)
-                archivedActiveCount += 1
+            if try await demoteActiveSessionIdentityToInactive(match.identity) {
+                demotedActiveCount += 1
             }
-
-            try await cache.deleteSessionIdentity(match.identity.id)
-            deletedActiveCount += 1
         }
 
         var sessionContextId: Int
@@ -1442,41 +1511,14 @@ public extension PQSSession {
 
         logger.log(
             level: .info,
-            message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); archived=\(archivedActiveCount) deletedActive=\(deletedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
+            message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
         // Lane teardown in the same audit file as the decrypt failures: a proven
         // inbound lane failing right after one of these entries identifies the
         // caller that clobbered it.
         DecryptFailureAuditLog.log(
-            "pqs.recovery.laneReset outcome=reset reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) archivedActive=\(archivedActiveCount) deletedActive=\(deletedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
+            "pqs.recovery.laneReset outcome=reset reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
 
         return identity
-    }
-
-    private func archiveActiveSessionIdentitySnapshot(
-        props: SessionIdentity.UnwrappedProps,
-        symmetricKey: SymmetricKey,
-        cache: SessionCache
-    ) async throws {
-        let archived = try SessionIdentity(
-            id: UUID(),
-            props: .init(
-                secretName: props.secretName,
-                deviceId: props.deviceId,
-                sessionContextId: Int(Date().timeIntervalSince1970),
-                longTermPublicKey: props.longTermPublicKey,
-                signingPublicKey: props.signingPublicKey,
-                mlKEMPublicKey: props.mlKEMPublicKey,
-                oneTimePublicKey: props.oneTimePublicKey,
-                state: props.state,
-                deviceName: PQSSessionConstants.inactiveSessionDeviceNamePrefix + props.deviceName,
-                serverTrusted: props.serverTrusted,
-                previousRekey: props.previousRekey,
-                isMasterDevice: props.isMasterDevice,
-                verifiedIdentity: props.verifiedIdentity,
-                verificationCode: props.verificationCode
-            ),
-            symmetricKey: symmetricKey)
-        try await cache.createSessionIdentity(archived)
     }
 
     /// Refreshes the session identities for a specified recipient name based on the provided filtered identities.
@@ -1808,6 +1850,21 @@ public extension PQSSession {
                 level: .debug,
                 message: "Verified pinned peer account signing key for \(secretName)")
         }
+    }
+
+    /// Fetches the remote peer configuration and refuses recovery emit when the
+    /// advertised signing key no longer matches the locally pinned contact.
+    internal func validatePeerAccountSigningKeyAgainstRemote(secretName: String) async throws {
+        guard let transportDelegate else {
+            throw PQSSession.SessionErrors.transportNotInitialized
+        }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let configuration = try await transportDelegate.findConfiguration(for: secretName)
+        try validateUserConfigurationSignatures(configuration)
+        try await enforcePeerAccountSigningKeyPin(
+            for: secretName,
+            configuration: configuration,
+            symmetricKey: symmetricKey)
     }
     
     func createOneTimeKeys(

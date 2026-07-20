@@ -354,6 +354,44 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         "\(automaticRotationPeerKey(sender: sender, deviceId: deviceId))|\(flow.rawValue)"
     }
 
+    /// SessionID of the initiating session created for an orphan-resend
+    /// wave. Used to reuse one new session across MessageRecords (active already
+    /// differs from orphaned MessageRecord SessionIDs). Cleared when the wave's
+    /// pending replay jobs drain, or when the peer lane is wiped / replaced.
+    var orphanResendInitiatingSessionByPeer: [String: UUID] = [:]
+
+    func markOrphanResendInitiatingSession(
+        secretName: String,
+        deviceId: UUID,
+        sessionId: UUID
+    ) {
+        orphanResendInitiatingSessionByPeer[
+            automaticRotationPeerKey(sender: secretName, deviceId: deviceId)
+        ] = sessionId
+        // Orphan replays must be allowed to encrypt on the new initiating row even
+        // if a prior outbound repair attempt armed the peer cooldown.
+        clearOutboundReconciliationCooldown(secretName: secretName, deviceId: deviceId)
+    }
+
+    func orphanResendInitiatingSessionId(secretName: String, deviceId: UUID) -> UUID? {
+        orphanResendInitiatingSessionByPeer[
+            automaticRotationPeerKey(sender: secretName, deviceId: deviceId)
+        ]
+    }
+
+    func clearOrphanResendInitiatingSession(secretName: String, deviceId: UUID) {
+        orphanResendInitiatingSessionByPeer.removeValue(
+            forKey: automaticRotationPeerKey(sender: secretName, deviceId: deviceId))
+    }
+
+    func isOrphanResendInitiatingSession(
+        secretName: String,
+        deviceId: UUID,
+        sessionId: UUID
+    ) -> Bool {
+        orphanResendInitiatingSessionId(secretName: secretName, deviceId: deviceId) == sessionId
+    }
+
     /// Unified inbound-failure policy table.
     /// Keys are either:
     /// - "<sender>|<deviceUUID>|<messageId>" for explicit whole-tuple quarantine
@@ -379,6 +417,12 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// and are answered with a `messageResendUnavailable` notice without re-auditing.
     /// Key format: "<requestingDeviceUUID>|<sharedId>".
     var unavailableResendIds: [String: Date] = [:]
+
+    /// Distinct undecryptable inbound `sharedId`s per peer device. Used to escalate
+    /// from per-message resend to automatic session reset when the lane is dead
+    /// even though each frame has a unique id.
+    /// Key format: `"secretName|deviceUUID"`.
+    var undecryptableLaneFailureIdsByPeer: [String: (ids: Set<String>, firstAt: Date)] = [:]
 
     /// Requester-side count of resend-request submissions per failed message, used to
     /// make the deferred-resend loop terminal even when the responder's unavailable
@@ -625,6 +669,43 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         inboundFailurePolicyUntil[key] = now.addingTimeInterval(inboundFailurePolicyTTL)
     }
     
+    /// True when this sharedId already entered orphan-resend (discard + request resend) and is
+    /// awaiting sender `orphanResend`. Used to keep `missingOneTimeKey` bootstrap from opening
+    /// receive-side ASR on the same tuple (dogfood `883B532C`: maxSkipped → OTK ASR poisoned
+    /// the orphan replay).
+    func isAwaitingSenderOrphanResend(
+        sender: String,
+        deviceId: UUID,
+        messageId: String,
+        now: Date = Date()
+    ) -> Bool {
+        if resendRequestSubmissionCount(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: messageId,
+            now: now) > 0
+        {
+            return true
+        }
+        cleanupInboundFailurePolicy(now: now)
+        let prefix = "\(sender)|\(deviceId.uuidString)|\(messageId)|"
+        for (key, expiry) in inboundFailurePolicyUntil {
+            guard expiry > now, key.hasPrefix(prefix) else { continue }
+            let failureClass = String(key.dropFirst(prefix.count))
+            // OTK bootstrap is the documented product exception — it must not count
+            // as "already on orphan-resend" or we would never open a genuine OTK recovery.
+            if failureClass == "ratchet.missingOneTimeKey" { continue }
+            if failureClass.hasPrefix("ratchet.")
+                || failureClass.hasPrefix("crypto.")
+                || failureClass.hasPrefix("payload.")
+                || failureClass.hasPrefix("signature.")
+            {
+                return true
+            }
+        }
+        return false
+    }
+
     /// Returns whether a specific inbound failure class should be suppressed for this tuple.
     func shouldSuppressInboundFailure(_ inbound: InboundTaskMessage, failureClass: String, now: Date = Date()) -> Bool {
         cleanupInboundFailurePolicy(now: now)
@@ -681,6 +762,45 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             failureClass: failureClass
         )
         inboundFailurePolicyUntil[key] = now.addingTimeInterval(inboundFailurePolicyTTL)
+    }
+
+    /// Records a distinct undecryptable inbound for this peer device and returns
+    /// `true` when the lane is saturated (audit / metrics). Orphan-resend does **not**
+    /// open receive-side session reset — the sender heals via orphanResend.
+    func noteUndecryptableLaneFailure(
+        sender: String,
+        deviceId: UUID,
+        sharedId: String,
+        now: Date = Date()
+    ) -> Bool {
+        cleanupUndecryptableLaneFailures(now: now)
+        let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
+        var entry = undecryptableLaneFailureIdsByPeer[key] ?? (ids: [], firstAt: now)
+        entry.ids.insert(sharedId)
+        undecryptableLaneFailureIdsByPeer[key] = entry
+        return entry.ids.count >= PQSSessionConstants.undecryptableLaneEscalateThreshold
+    }
+
+    /// Clears lane-level undecryptable tracking after a heal or session reset.
+    func clearUndecryptableLaneFailures(sender: String, deviceId: UUID) {
+        undecryptableLaneFailureIdsByPeer.removeValue(
+            forKey: reestablishmentEpisodeKey(sender: sender, deviceId: deviceId))
+    }
+
+    private func cleanupUndecryptableLaneFailures(now: Date) {
+        let ttl = inboundFailurePolicyTTL
+        undecryptableLaneFailureIdsByPeer = undecryptableLaneFailureIdsByPeer.filter {
+            now.timeIntervalSince($0.value.firstAt) < ttl
+        }
+        let cap = PQSSessionConstants.recoveryTrackingMaxEntries
+        guard undecryptableLaneFailureIdsByPeer.count >= cap else { return }
+        let overflowKeys = undecryptableLaneFailureIdsByPeer
+            .sorted { $0.value.firstAt < $1.value.firstAt }
+            .prefix(undecryptableLaneFailureIdsByPeer.count - cap + 1)
+            .map(\.key)
+        for key in overflowKeys {
+            undecryptableLaneFailureIdsByPeer.removeValue(forKey: key)
+        }
     }
 
     func takeInboundFailureClasses(
@@ -971,6 +1091,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
         let wasOpen = openReestablishmentEpisodes.removeValue(forKey: key) != nil
         expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
+        clearUndecryptableLaneFailures(sender: sender, deviceId: deviceId)
         guard wasOpen else { return }
         DecryptFailureAuditLog.log(
             "pqs.recovery.episodeEnded sender=\(sender) deviceId=\(deviceId.uuidString)")
@@ -1225,6 +1346,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         peerOneTimeReplenishAcknowledgedPeers.remove(secretName)
         if let waiter = peerOneTimeReplenishWaiters.removeValue(forKey: secretName) {
             waiter.resume()
+        }
+        let orphanPrefix = "\(secretName)|"
+        orphanResendInitiatingSessionByPeer = orphanResendInitiatingSessionByPeer.filter {
+            !$0.key.hasPrefix(orphanPrefix)
         }
     }
 

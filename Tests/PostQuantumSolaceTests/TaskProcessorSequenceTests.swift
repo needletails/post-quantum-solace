@@ -738,8 +738,8 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
-    @Test("Fresh-session repair reports peer identity change when pin mismatch blocks reset")
-    func testFreshSessionRepairPeerSigningKeyMismatchReportsTrustChange() async throws {
+    @Test("OTK bootstrap reports peer identity change when pin mismatch blocks emit")
+    func testOTKBootstrapPeerSigningKeyMismatchReportsTrustChange() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
 
@@ -769,8 +769,11 @@ actor TaskProcessorSequenceTests {
         await session.setPQSSessionDelegate(conformer: SessionDelegate(
             session: session,
             peerIdentityTrustProbe: peerProbe))
+        // Documented receive-side ASR (missingOneTimeKey) still fetches the peer
+        // bundle on emit; pin mismatch must surface as trust change, not a silent
+        // open episode. Decrypt-failure classes are orphan-resend only.
         await session.taskProcessor.setTaskDelegate(
-            MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
         )
 
         let signingKey = Curve25519.Signing.PrivateKey()
@@ -801,10 +804,21 @@ actor TaskProcessorSequenceTests {
             session: session
         )
 
-        #expect(await peerProbe.contains(
-            secretName: peerName,
-            deviceId: foreignBundle.deviceKeys.deviceId,
-            failedSharedMessageId: "fresh_repair_peer_signing_key_out_of_sync"))
+        // OTK batch replace + peerRefresh emit run on scheduleBackgroundWork.
+        let deadline = Date().addingTimeInterval(8)
+        var sawTrustChange = false
+        while Date() < deadline {
+            if await peerProbe.contains(
+                secretName: peerName,
+                deviceId: foreignBundle.deviceKeys.deviceId,
+                failedSharedMessageId: "fresh_repair_peer_signing_key_out_of_sync")
+            {
+                sawTrustChange = true
+                break
+            }
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        #expect(sawTrustChange, "Pin mismatch during OTK peerRefresh emit must notify peer identity change")
         #expect(await session.isInboundFailureQuarantined(
             sender: peerName,
             deviceId: foreignBundle.deviceKeys.deviceId,
@@ -862,19 +876,18 @@ actor TaskProcessorSequenceTests {
                 session: session
             )
 
-            let hasPendingRepair = try await waitForPendingRepair(
-                sender: peerName,
-                deviceId: peerDeviceId)
             #expect(
-                hasPendingRepair,
-                "Repeated \(recoverable.failureClass) should escalate to peerRefresh repair")
+                !(await session.hasOpenReestablishmentEpisode(
+                    sender: peerName,
+                    deviceId: peerDeviceId)),
+                "Repeated \(recoverable.failureClass) must await sender orphanResend, not open peerRefresh")
         }
 
         await session.shutdown()
     }
 
-    @Test("CryptoKit body decryption failure resends first and repairs on repeat")
-    func testCryptoKitBodyDecryptionFailureResendsFirstThenRepairsOnRepeat() async throws {
+    @Test("CryptoKit body decryption failure resends and awaits sender orphanResend")
+    func testCryptoKitBodyDecryptionFailureResendsAndAwaitsSenderOrphanResend() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         await session.taskProcessor.setTaskDelegate(
@@ -899,7 +912,7 @@ actor TaskProcessorSequenceTests {
             failureClass: "crypto.bodyDecryptionFailed")
         #expect(
             marked,
-            "First crypto.bodyDecryptionFailed must be recorded for resend-then-escalate")
+            "First crypto.bodyDecryptionFailed must be recorded for resend cooldown")
         #expect(
             !(await session.hasOpenReestablishmentEpisode(
                 sender: peerName,
@@ -911,18 +924,48 @@ actor TaskProcessorSequenceTests {
             session: session
         )
 
-        let hasPendingRepair = try await waitForPendingRepair(
-            sender: peerName,
-            deviceId: peerDeviceId)
         #expect(
-            hasPendingRepair,
-            "Repeated crypto.bodyDecryptionFailed should escalate to peerRefresh repair")
+            !(await session.hasOpenReestablishmentEpisode(
+                sender: peerName,
+                deviceId: peerDeviceId)),
+            "Repeated crypto.bodyDecryptionFailed must await sender orphanResend")
 
         await session.shutdown()
     }
 
-    @Test("sessionDecryptionError resends first and repairs on repeat")
-    func testSessionDecryptionErrorResendsFirstThenRepairsOnRepeat() async throws {
+    @Test("Distinct undecryptable messages on one lane stay on resend without session reset")
+    func testDistinctUndecryptableMessagesStayOnResendWithoutSessionReset() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: CryptoKitError.authenticationFailure)
+        )
+
+        let peerDeviceId = UUID()
+        let peerName = "bob_lane_escalate"
+
+        for index in 0..<PQSSessionConstants.undecryptableLaneEscalateThreshold {
+            let inbound = try makeTestInboundTaskMessage(
+                senderSecretName: peerName,
+                senderDeviceId: peerDeviceId,
+                sharedMessageId: "lane_fail_\(index)")
+            try await session.taskProcessor.feedTask(
+                EncryptableTask(task: .streamMessage(inbound)),
+                session: session
+            )
+            try await Task.sleep(until: .now + .seconds(1))
+            #expect(
+                !(await session.hasOpenReestablishmentEpisode(
+                    sender: peerName,
+                    deviceId: peerDeviceId)),
+                "Distinct undecryptable \(index) must not open receive-side peerRefresh")
+        }
+
+        await session.shutdown()
+    }
+
+    @Test("sessionDecryptionError resends and awaits sender orphanResend")
+    func testSessionDecryptionErrorResendsAndAwaitsSenderOrphanResend() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         await session.taskProcessor.setTaskDelegate(
@@ -947,7 +990,7 @@ actor TaskProcessorSequenceTests {
             failureClass: "payload.sessionDecryptionError")
         #expect(
             marked,
-            "First payload.sessionDecryptionError must be recorded for resend-then-escalate")
+            "First payload.sessionDecryptionError must be recorded for resend cooldown")
         #expect(
             !(await session.hasOpenReestablishmentEpisode(
                 sender: peerName,
@@ -959,22 +1002,106 @@ actor TaskProcessorSequenceTests {
             session: session
         )
 
-        let hasPendingRepair = try await waitForPendingRepair(
-            sender: peerName,
-            deviceId: peerDeviceId)
         #expect(
-            hasPendingRepair,
-            "Repeated payload.sessionDecryptionError should escalate to peerRefresh repair")
+            !(await session.hasOpenReestablishmentEpisode(
+                sender: peerName,
+                deviceId: peerDeviceId)),
+            "Repeated payload.sessionDecryptionError must await sender orphanResend")
 
         await session.shutdown()
     }
 
-    @Test("Fresh-session failures coalesce into one peer recovery episode")
-    func testFreshSessionFailuresCoalescePerPeer() async throws {
+    @Test("Poisoned stateUninitialized after try-all requests resend; no receive-side ASR")
+    func testPoisonedStateUninitializedRequestsSenderOrphanResendNotASR() async throws {
+        // Dogfood (echo←nudge): preferred row is state-less / all sessions fail decrypt →
+        // `ratchet.stateUninitialized` + laneRolledBack. Orphan-resend: discard + retry;
+        // sender orphanResend inserts a new initiating session. Receive-side
+        // freshSessionRepair left a state-less active and never healed.
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         await session.taskProcessor.setTaskDelegate(
-            MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
+            MockTaskDelegateWithStreamError(error: RatchetError.stateUninitialized)
+        )
+
+        let peerName = "bob_poisoned_state_uninitialized"
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
+
+        let inbound = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "poisoned_state_uninit_0")
+
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+        try await Task.sleep(until: .now + .seconds(2))
+
+        let marked = await session.shouldSuppressInboundFailure(
+            inbound,
+            failureClass: "ratchet.stateUninitialized")
+        #expect(
+            marked,
+            "First stateUninitialized must record failure and request sender resend")
+        #expect(
+            !(await session.hasOpenReestablishmentEpisode(
+                sender: peerName,
+                deviceId: peerDeviceId)),
+            "Poisoned stateUninitialized must not open receive-side peerRefresh / ASR")
+        #expect(
+            !(await session.hasPendingResendAfterReestablishment(
+                sender: peerName,
+                deviceId: peerDeviceId)),
+            "Must not defer resend behind a freshSessionRepair episode")
+
+        // Repeat of the same sharedId: await sender, still no ASR.
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+        try await Task.sleep(until: .now + .seconds(1))
+        #expect(
+            !(await session.hasOpenReestablishmentEpisode(
+                sender: peerName,
+                deviceId: peerDeviceId)),
+            "Repeated poisoned stateUninitialized must await sender orphanResend")
+
+        // Distinct sharedId (three user messages in dogfood): still resend-only.
+        let second = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "poisoned_state_uninit_1")
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(second)),
+            session: session
+        )
+        try await Task.sleep(until: .now + .seconds(1))
+        #expect(
+            !(await session.hasOpenReestablishmentEpisode(
+                sender: peerName,
+                deviceId: peerDeviceId)),
+            "Additional poisoned frames must not open ASR; sender heals via orphanResend")
+        #expect(
+            await session.shouldSuppressInboundFailure(
+                second,
+                failureClass: "ratchet.stateUninitialized"),
+            "Second distinct poisoned frame must also request / record resend")
+
+        await session.shutdown()
+    }
+
+    @Test("Fresh-session / hard ratchet inbound failures use orphan-resend not ASR")
+    func testFreshSessionFailuresUseOrphanResendNotASR() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        // Orphan-resend: rootKeyIsNil after try-all is undecryptable → sender orphanResend.
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.rootKeyIsNil)
         )
 
         let peerName = "bob_coalesced_repair"
@@ -984,35 +1111,86 @@ actor TaskProcessorSequenceTests {
             secretName: peerName,
             deviceId: peerDeviceId,
             config: peerBundle.userConfiguration)
+
         let first = try makeTestInboundTaskMessage(
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
-            sharedMessageId: "coalesced_repair_1")
-        let second = try makeTestInboundTaskMessage(
+            sharedMessageId: "coalesced_repair_0")
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(first)),
+            session: session)
+        try await Task.sleep(until: .now + .seconds(2))
+        #expect(
+            await session.shouldSuppressInboundFailure(
+                first,
+                failureClass: "ratchet.rootKeyIsNil"))
+        #expect(
+            !(await session.hasOpenReestablishmentEpisode(sender: peerName, deviceId: peerDeviceId)),
+            "rootKeyIsNil must not open receive-side peerRefresh; orphan-resend awaits sender")
+
+        let extra = try makeTestInboundTaskMessage(
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
-            sharedMessageId: "coalesced_repair_2")
+            sharedMessageId: "coalesced_repair_extra")
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(extra)),
+            session: session)
+        try await Task.sleep(until: .now + .seconds(1))
+        #expect(
+            !(await session.hasOpenReestablishmentEpisode(sender: peerName, deviceId: peerDeviceId)))
+        #expect(
+            await session.shouldSuppressInboundFailure(
+                extra,
+                failureClass: "ratchet.rootKeyIsNil"))
 
+        await session.shutdown()
+    }
+
+    @Test("OTK missing still coalesces into one peer recovery episode")
+    func testMissingOneTimeKeyFailuresCoalescePerPeer() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.taskProcessor.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+
+        let peerName = "bob_otk_coalesced_repair"
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
+
+        let first = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "otk_coalesced_repair_0")
         try await session.taskProcessor.feedTask(
             EncryptableTask(task: .streamMessage(first)),
             session: session)
         #expect(try await waitForPendingRepair(sender: peerName, deviceId: peerDeviceId))
         #expect(
             await session.hasOpenReestablishmentEpisode(sender: peerName, deviceId: peerDeviceId),
-            "maxSkipped must keep the reestablishment episode open until peerRefresh completes")
+            "missingOneTimeKey bootstrap may open a reestablishment episode")
 
-        let reconciliationAttemptsAfterFirst = await session.lastReconciliationAtByPeer.count
+        let reconciliationAttemptsAfterOpen = await session.lastReconciliationAtByPeer.count
+        let extra = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "otk_coalesced_repair_extra")
         try await session.taskProcessor.feedTask(
-            EncryptableTask(task: .streamMessage(second)),
+            EncryptableTask(task: .streamMessage(extra)),
             session: session)
 
         let pendingIds = await Set(
             session.pendingResendAfterReestablishment.values
                 .filter { $0.senderName == peerName && $0.senderDeviceId == peerDeviceId }
                 .map(\.failedSharedMessageId))
-        #expect(pendingIds == ["coalesced_repair_1", "coalesced_repair_2"])
+        #expect(pendingIds.contains("otk_coalesced_repair_0"))
+        #expect(pendingIds.contains("otk_coalesced_repair_extra"))
         #expect(
-            await session.lastReconciliationAtByPeer.count == reconciliationAttemptsAfterFirst,
+            await session.lastReconciliationAtByPeer.count == reconciliationAttemptsAfterOpen,
             "A pending peer recovery must coalesce later failures without another identity reset attempt")
         #expect(
             await session.hasOpenReestablishmentEpisode(sender: peerName, deviceId: peerDeviceId),
@@ -1094,7 +1272,7 @@ actor TaskProcessorSequenceTests {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         await session.taskProcessor.setTaskDelegate(
-            MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
         )
 
         let peerName = "bob_expired_recovery_episode"
@@ -1115,7 +1293,7 @@ actor TaskProcessorSequenceTests {
             sender: peerName,
             deviceId: peerDeviceId,
             failedMessageId: "expired_recovery_pending",
-            failureClass: "ratchet.maxSkippedHeadersExceeded",
+            failureClass: "ratchet.missingOneTimeKey",
             notifyDelegate: false)
 
         let next = try makeTestInboundTaskMessage(
@@ -1141,8 +1319,8 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
-    @Test("maxSkipped repair emits peerRefresh instead of retrying ciphertext")
-    func testMaxSkippedRepairDoesNotRetryCiphertextAlone() async throws {
+    @Test("maxSkipped requests resend and never opens receive-side peerRefresh")
+    func testMaxSkippedRequestsResendWithoutReceiveSidePeerRefresh() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         await session.taskProcessor.setTaskDelegate(
@@ -1164,18 +1342,84 @@ actor TaskProcessorSequenceTests {
         try await session.taskProcessor.feedTask(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session)
-
-        #expect(try await waitForPendingRepair(sender: peerName, deviceId: peerDeviceId))
+        try await Task.sleep(until: .now + .seconds(1))
         #expect(
-            await session.hasOpenReestablishmentEpisode(sender: peerName, deviceId: peerDeviceId),
-            "Episode must stay open while waiting for peerRefresh")
-        // Unilateral reset + re-feed of the same ciphertext used to return before
-        // deferring/emitting peerRefresh. Pending resend proves we fell through.
-        let pending = await session.pendingResendAfterReestablishment.values.filter {
-            $0.senderName == peerName && $0.senderDeviceId == peerDeviceId
-        }
-        #expect(pending.map(\.failedSharedMessageId) == ["max_skipped_needs_refresh"])
-        #expect(pending.map(\.failureClass) == ["ratchet.maxSkippedHeadersExceeded"])
+            !(await session.hasOpenReestablishmentEpisode(sender: peerName, deviceId: peerDeviceId)),
+            "First maxSkipped must request resend only (orphan-resend)")
+
+        // Repeat: still await sender orphanResend — no receive-side ASR.
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session)
+
+        #expect(
+            !(await session.hasOpenReestablishmentEpisode(sender: peerName, deviceId: peerDeviceId)),
+            "Repeated maxSkipped must not open receive-side peerRefresh")
+        #expect(
+            await session.shouldSuppressInboundFailure(
+                inbound,
+                failureClass: "ratchet.maxSkippedHeadersExceeded"),
+            "maxSkipped failure must stay marked while awaiting sender replay")
+
+        await session.shutdown()
+    }
+
+    /// Dogfood `883B532C` (2026-07-20): nudge maxSkipped → resend, then same sharedId
+    /// hit missingOneTimeKey → replaceOTKBatchThenPeerRefresh. The open OTK episode
+    /// coalesced the child orphanResend replay (`bodyDecryptionFailed` /
+    /// `coalescedPendingPeerRecovery`) so it never `recovered` until an unrelated
+    /// inbound ~80s later drained deferred resends.
+    @Test("maxSkipped then missingOneTimeKey on same sharedId stays on orphan-resend")
+    func testMaxSkippedThenMissingOTKSameSharedIdDoesNotOpenASR() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        let sequenced = MockTaskDelegateWithSequencedStreamErrors(errors: [
+            RatchetError.maxSkippedHeadersExceeded,
+            RatchetError.missingOneTimeKey
+        ])
+        await session.taskProcessor.setTaskDelegate(sequenced)
+
+        let peerName = "bob_orphan_resend_owns_shared_id"
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
+        let sharedId = "883B532C-dogfood-orphan-gap"
+        let inbound = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: sharedId)
+
+        // 1) Orphan-resend maxSkipped → request resend only.
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session)
+        try await Task.sleep(until: .now + .milliseconds(400))
+        #expect(
+            !(await session.hasOpenReestablishmentEpisode(sender: peerName, deviceId: peerDeviceId)),
+            "maxSkipped must not open receive-side ASR")
+        #expect(
+            await session.isAwaitingSenderOrphanResend(
+                sender: peerName,
+                deviceId: peerDeviceId,
+                messageId: sharedId),
+            "orphan-resend must mark the sharedId as awaiting sender orphanResend")
+
+        // 2) Same sharedId reclassified as missingOneTimeKey — must NOT open OTK ASR.
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session)
+        try await Task.sleep(until: .now + .milliseconds(400))
+        #expect(
+            !(await session.hasOpenReestablishmentEpisode(sender: peerName, deviceId: peerDeviceId)),
+            "missingOneTimeKey must defer to orphan-resend when the sharedId already awaits orphanResend")
+        #expect(
+            await session.isAwaitingSenderOrphanResend(
+                sender: peerName,
+                deviceId: peerDeviceId,
+                messageId: sharedId))
 
         await session.shutdown()
     }
@@ -1761,6 +2005,54 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    @Test("Hot-path resend submission cap terminalizes sharedId without peerRefresh")
+    func testHotPathResendSubmissionCapTerminalizesWithoutASR() async {
+        let sender = "bob_hot_path_cap"
+        let deviceId = UUID()
+        let sharedId = "hot-path-cap-id"
+        let now = Date()
+
+        for _ in 0..<PQSSessionConstants.peerResendRequestMaxSubmissions {
+            await session.markPeerResendRequestTransported(
+                sender: sender,
+                deviceId: deviceId,
+                failedMessageIds: [sharedId],
+                now: now)
+        }
+        #expect(await session.resendRequestSubmissionCount(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: sharedId) == PQSSessionConstants.peerResendRequestMaxSubmissions)
+
+        await session.deferPeerResendUntilReestablished(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: sharedId,
+            failureClass: "ratchet.decryptionFailed",
+            notifyDelegate: false)
+
+        // Mimic requestPeerResendIfAllowed exhaustion: clear + quarantine only.
+        let cleared = await session.clearPendingResends(
+            sender: sender,
+            deviceId: deviceId,
+            messageIds: [sharedId],
+            now: now)
+        #expect(cleared == [sharedId])
+        #expect(await session.isInboundFailureQuarantined(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: sharedId))
+        #expect(!(await session.hasPendingResendAfterReestablishment(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: sharedId)))
+        #expect(!(await session.hasOpenReestablishmentEpisode(
+            sender: sender,
+            deviceId: deviceId)))
+
+        await session.shutdown()
+    }
+
     @Test("Out-of-band resend for unknown ids returns unavailable and short-circuits repeats")
     func testOutOfBandResendUnavailableShortCircuitsRepeats() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
@@ -1947,8 +2239,8 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
-    @Test("Ratchet decryption failure retries first and repairs on repeat")
-    func testRatchetDecryptionFailedRetriesFirstThenRepairsOnRepeat() async throws {
+    @Test("Ratchet decryption failure resends and awaits sender orphanResend")
+    func testRatchetDecryptionFailedResendsAndAwaitsSenderOrphanResend() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         await session.taskProcessor.setTaskDelegate(
@@ -1961,8 +2253,6 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "decrypt_failed_repeat")
 
-        // First failure: either mark+resend, or handshake-defer until attempts exhaust.
-        // Either way the shared id must be tracked before a second failure escalates.
         try await session.taskProcessor.feedTask(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
@@ -1974,27 +2264,24 @@ actor TaskProcessorSequenceTests {
         let suppressed = await session.shouldSuppressInboundFailure(
             inbound,
             failureClass: "ratchet.decryptionFailed")
-        let pending = await session.hasPendingResendAfterReestablishment(
-            sender: "bob_decrypt_failed",
-            deviceId: peerDeviceId)
         #expect(
-            suppressed || pending,
-            "First decryptionFailed must be recorded (suppress on retry) or already escalate to deferred repair")
+            suppressed,
+            "First decryptionFailed must be recorded for resend cooldown")
+        #expect(
+            !(await session.hasOpenReestablishmentEpisode(
+                sender: "bob_decrypt_failed",
+                deviceId: peerDeviceId)),
+            "decryptionFailed must not open receive-side peerRefresh")
 
-        if !(await session.hasPendingResendAfterReestablishment(
-            sender: "bob_decrypt_failed",
-            deviceId: peerDeviceId))
-        {
-            try await session.taskProcessor.feedTask(
-                EncryptableTask(task: .streamMessage(inbound)),
-                session: session
-            )
-        }
-
-        let hasPendingRepair = try await waitForPendingRepair(
-            sender: "bob_decrypt_failed",
-            deviceId: peerDeviceId)
-        #expect(hasPendingRepair, "Repeated ratchet.decryptionFailed should escalate to peerRefresh repair")
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+        #expect(
+            !(await session.hasOpenReestablishmentEpisode(
+                sender: "bob_decrypt_failed",
+                deviceId: peerDeviceId)),
+            "Repeated decryptionFailed must await sender orphanResend")
 
         await session.shutdown()
     }
@@ -2843,6 +3130,34 @@ final class MockTaskDelegateWithStreamError: TaskSequenceDelegate, @unchecked Se
     func performRatchet(task: SessionModels.TaskType, session: PQSSession) async throws {
         switch task {
         case .streamMessage:
+            throw error
+        case .writeMessage:
+            break
+        }
+    }
+}
+
+/// Returns successive stream errors (last error repeats). Models dogfood where the
+/// same sharedId is first undecryptable (orphan-resend) then reclassified as missingOneTimeKey.
+final class MockTaskDelegateWithSequencedStreamErrors: TaskSequenceDelegate, @unchecked Sendable {
+    private let errors: [Error]
+    private let lock = NSLock()
+    private var index = 0
+
+    init(errors: [Error]) {
+        self.errors = errors
+    }
+
+    func performRatchet(task: SessionModels.TaskType, session: PQSSession) async throws {
+        switch task {
+        case .streamMessage:
+            let error: Error = {
+                lock.lock()
+                defer { lock.unlock() }
+                let i = min(index, errors.count - 1)
+                index += 1
+                return errors[i]
+            }()
             throw error
         case .writeMessage:
             break

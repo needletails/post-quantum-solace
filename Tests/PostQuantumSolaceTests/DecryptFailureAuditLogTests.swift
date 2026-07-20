@@ -10,7 +10,7 @@ struct DecryptFailureAuditLogTests {
         defer { DecryptFailureAuditLog.configure(isEnabled: true) }
 
         DecryptFailureAuditLog.log(
-            "pqs.decryptFailure failureClass=ratchet.maxSkippedHeadersExceeded layer=pqsInbound sender=frank deviceId=11111111-1111-1111-1111-111111111111 sharedId=shared-abc action=freshSessionRepairThenDeferredResend")
+            "pqs.decryptFailure failureClass=ratchet.maxSkippedHeadersExceeded layer=pqsInbound sender=frank deviceId=11111111-1111-1111-1111-111111111111 sharedId=shared-abc action=resendRequested")
     }
 
     @Test
