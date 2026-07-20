@@ -678,6 +678,7 @@ extension TaskProcessor {
                     job: job,
                     props: props,
                     cache: cache,
+                    session: session,
                     symmetricKey: symmetricKey,
                     error: error)
             }
@@ -803,8 +804,10 @@ extension TaskProcessor {
     /// 2. Never open receive-side Automatic Session Reset / `peerRefresh` for these
     ///    classes — the **sender** inserts a new initiating session on orphanResend
     ///    when still encrypting with the orphaned SessionID.
-    /// 3. Repeats of the same failure are suppressed (cooldown); distinct ids keep
-    ///    requesting resend until the sender heals or reports unavailable.
+    /// 3. Repeats of the same failure are suppressed (cooldown) while awaiting the
+    ///    sender; when a *new* ciphertext for that sharedId still fails after a
+    ///    transport-confirmed NACK, re-arm a bounded NACK (orphan replay did not prove).
+    /// 4. Distinct ids keep requesting resend until the sender heals or reports unavailable.
     private func handleUndecryptableInboundResend(
         message: InboundTaskMessage,
         failureClass: String,
@@ -813,8 +816,23 @@ extension TaskProcessor {
         session: PQSSession,
         diagnostic: String? = nil
     ) async throws -> JobProcessingOutcome {
+        // New frame, same sharedId, prior NACK already on the wire, still undecryptable:
+        // clear cooldown/suppress so sender orphanResend can be asked again (bounded).
+        let rearmedAfterFailedReplay = await session.armPeerResendRetryAfterFailedReplay(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            failedMessageId: message.sharedMessageId)
+        if rearmedAfterFailedReplay {
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.orphanReplayStillUndecryptable failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=rearmNack")
+        }
+
         // While another recovery episode is open (e.g. hard ratchet repair), coalesce.
-        if await session.hasOpenReestablishmentEpisode(
+        // Skip coalesce when we just re-armed after a failed orphan replay — that sharedId
+        // still needs a sender NACK, not deferral.
+        if !rearmedAfterFailedReplay,
+           await session.hasOpenReestablishmentEpisode(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId)
         {
@@ -883,10 +901,60 @@ extension TaskProcessor {
             return .deleted
         }
 
+        // Transport may already be non-viable (VPN/core recycle). Park the inbound job
+        // for resumeJobQueue on viability restore — do not delete or mark failure yet,
+        // or the NACK is lost until another copy of the ciphertext arrives.
+        if !session.isViable {
+            auditInboundDecryptFailure(
+                message: message,
+                failureClass: failureClass,
+                error: diagnostic,
+                action: "resendParkedNonViable",
+                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.resendParkedNonViable failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
+            return .paused
+        }
+
         let laneSaturated = await session.noteUndecryptableLaneFailure(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId,
             sharedId: message.sharedMessageId)
+        // After saturation, once at least one NACK has reached the wire for this
+        // peer-device, open the existing reestablishment episode so further distinct
+        // sharedIds coalesce via deferPeerResendUntilReestablished. Sender orphanResend
+        // still owns heal — this does not emit peerRefresh / receive ASR.
+        if !rearmedAfterFailedReplay,
+           laneSaturated,
+           await session.hasTransportedPeerResendRequest(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId)
+        {
+            _ = await session.tryBeginReestablishmentEpisode(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId)
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.undecryptableLaneSaturated sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId) awaitingSenderOrphanResend=true")
+            auditInboundDecryptFailure(
+                message: message,
+                failureClass: failureClass,
+                error: diagnostic,
+                action: "coalescedPendingPeerRecovery",
+                metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
+            await session.deferPeerResendUntilReestablished(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                failedMessageId: message.sharedMessageId,
+                failureClass: failureClass)
+            await session.markInboundFailure(message, failureClass: failureClass)
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=undecryptableLaneSaturated")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+
         let didRequestResend = await requestPeerResendIfAllowed(
             message: message,
             failureClass: failureClass,
@@ -908,29 +976,69 @@ extension TaskProcessor {
         return .deleted
     }
 
+    private func isConnectionNonViableError(_ error: Error) -> Bool {
+        if let sessionError = error as? PQSSession.SessionErrors,
+           sessionError == .connectionIsNonViable {
+            return true
+        }
+        let description = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+        return description.localizedCaseInsensitiveContains("non-viable")
+    }
+
+    private func shouldLogOutboundTransportRetry(message: String) -> Bool {
+        let now = Date()
+        if message == lastOutboundTransportRetryLogMessage,
+           now.timeIntervalSince(lastOutboundTransportRetryLogAt) < outboundTransportRetryLogCooldown {
+            suppressedOutboundTransportRetryLogCount += 1
+            return false
+        }
+        if suppressedOutboundTransportRetryLogCount > 0 {
+            logger.log(
+                level: .warning,
+                message: "Deferred outbound transport retry suppressed=\(suppressedOutboundTransportRetryLogCount) priorDuplicates")
+            suppressedOutboundTransportRetryLogCount = 0
+        }
+        lastOutboundTransportRetryLogAt = now
+        lastOutboundTransportRetryLogMessage = message
+        return true
+    }
+
     private func deferPendingOutboundTransportRetry(
         job: JobModel,
         props: JobModel.UnwrappedProps,
         cache: SessionCache,
+        session: PQSSession,
         symmetricKey: SymmetricKey,
         error: Error
     ) async throws -> JobProcessingOutcome {
         var updatedProps = props
         updatedProps.attempts += 1
-        updatedProps.delayedUntil = Date().addingTimeInterval(min(0.10 * Double(updatedProps.attempts), 1.0))
+        // Transport can throw non-viable while `session.isViable` is still true during
+        // VPN/core recycle. Park for event-driven resumeJobQueue (IRC viability restored)
+        // instead of short timer requeues that flood warnings.
+        let parkForViability = !session.isViable || isConnectionNonViableError(error)
+        if parkForViability {
+            updatedProps.delayedUntil = nil
+        } else {
+            updatedProps.delayedUntil = Date().addingTimeInterval(min(0.10 * Double(updatedProps.attempts), 1.0))
+        }
         _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
         try await cache.updateJob(job)
-        try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
+        if !parkForViability {
+            try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
+        }
+        let logMessage: String
         if let recoveryLog = recoveryTransportSendFailureLog(
             props: props,
             attempt: updatedProps.attempts,
             error: error)
         {
-            logger.log(level: .warning, message: .init(stringLiteral: recoveryLog))
+            logMessage = recoveryLog
         } else {
-            logger.log(
-                level: .warning,
-                message: "Deferred outbound transport retry for pending signed frame attempt=\(updatedProps.attempts): \(error)")
+            logMessage = "Deferred outbound transport retry for pending signed frame attempt=\(updatedProps.attempts): \(error)"
+        }
+        if shouldLogOutboundTransportRetry(message: logMessage) {
+            logger.log(level: .warning, message: .init(stringLiteral: logMessage))
         }
         return .paused
     }
@@ -1035,6 +1143,12 @@ extension TaskProcessor {
         failureClass: String,
         session: PQSSession
     ) async -> Bool {
+        guard session.isViable else {
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.resendRequestSkipped reason=nonViable failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId)")
+            return false
+        }
         let submissionCount = await session.resendRequestSubmissionCount(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId,

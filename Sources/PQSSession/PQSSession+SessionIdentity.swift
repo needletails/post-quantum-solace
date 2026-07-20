@@ -291,14 +291,6 @@ public extension PQSSession {
         let symmetricKey = try await getDatabaseSymmetricKey()
         let existing = try await getSessionIdentities(with: secretName)
 
-        let configuration = try await transportDelegate.findConfiguration(for: secretName)
-        try validateUserConfigurationSignatures(configuration)
-        let verifiedDevices = try verifiedDevicesWithUsableKeyMaterial(
-            in: configuration,
-            secretName: secretName,
-            source: "remote")
-        let verifiedIds = Set(verifiedDevices.map(\.deviceId))
-
         let localActiveDeviceIds = await Set(existing.asyncCompactMap { identity -> UUID? in
             guard let props = await identity.props(symmetricKey: symmetricKey) else { return nil }
             guard props.secretName == secretName else { return nil }
@@ -307,11 +299,37 @@ public extension PQSSession {
             }
             return props.deviceId
         })
+
+        var verifiedIds: Set<UUID>
+        if let cached = lastVerifiedDeviceIdsBySecretName[secretName], !cached.isEmpty {
+            verifiedIds = cached
+        } else {
+            let configuration = try await transportDelegate.findConfiguration(for: secretName)
+            try validateUserConfigurationSignatures(configuration)
+            let verifiedDevices = try verifiedDevicesWithUsableKeyMaterial(
+                in: configuration,
+                secretName: secretName,
+                source: "remote")
+            verifiedIds = Set(verifiedDevices.map(\.deviceId))
+            lastVerifiedDeviceIdsBySecretName[secretName] = verifiedIds
+        }
+
         let hasDevicesAbsentFromVerified = !localActiveDeviceIds.isSubset(of: verifiedIds)
         let missingVerifiedDevices = !verifiedIds.isSubset(of: localActiveDeviceIds)
         let forceRefresh = existing.isEmpty
             || hasDevicesAbsentFromVerified
             || missingVerifiedDevices
+
+        if forceRefresh {
+            let configuration = try await transportDelegate.findConfiguration(for: secretName)
+            try validateUserConfigurationSignatures(configuration)
+            let verifiedDevices = try verifiedDevicesWithUsableKeyMaterial(
+                in: configuration,
+                secretName: secretName,
+                source: "remote")
+            verifiedIds = Set(verifiedDevices.map(\.deviceId))
+            lastVerifiedDeviceIdsBySecretName[secretName] = verifiedIds
+        }
 
         let refreshed = try await refreshIdentities(
             secretName: secretName,
@@ -320,20 +338,18 @@ public extension PQSSession {
             sendOneTimeIdentities: false)
 
         var byDevice: [UUID: SessionIdentity] = [:]
-        for identity in refreshed {
-            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
-            guard props.secretName == secretName else { continue }
-            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else {
+        for deviceId in verifiedIds {
+            guard let identity = await taskProcessor.outboundSessionIdentity(
+                secretName: secretName,
+                deviceId: deviceId,
+                in: refreshed,
+                symmetricKey: symmetricKey,
+                session: self,
+                preferredDevice: nil
+            ) else {
                 continue
             }
-            guard verifiedIds.contains(props.deviceId) else { continue }
-            if let existingIdentity = byDevice[props.deviceId],
-               let existingProps = await existingIdentity.props(symmetricKey: symmetricKey),
-               existingProps.state != nil,
-               props.state == nil {
-                continue
-            }
-            byDevice[props.deviceId] = identity
+            byDevice[deviceId] = identity
         }
         let result = Array(byDevice.values)
         logger.log(
@@ -1160,6 +1176,67 @@ public extension PQSSession {
         return ranked.map(\.identity)
     }
 
+    /// Ensures one state-less Active exists for inbound try-all on this device.
+    ///
+    /// Inbound decrypt tries sessions for this peer device. Sender orphan remint
+    /// encrypts on a new initiating SessionIdentity; receiver PQXDH
+    /// (`recipientInitialization` → `setState`) only runs when `state == nil`.
+    /// Call this only when the peer device has no blank Active yet — the slot
+    /// is part of the try-all set, not a post-failure matching recovery mint.
+    /// Do not demote siblings here; activate after proven decrypt.
+    internal func ensureInboundInitiatingSessionIdentity(
+        secretName: String,
+        deviceId: UUID,
+        longTermPublicKey: Data,
+        signingPublicKey: Data,
+        oneTimePublicKey: CurvePublicKey?,
+        mlKEMPublicKey: MLKEMPublicKey,
+        deviceNameHint: String?
+    ) async throws -> SessionIdentity {
+        guard let cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let allIdentities = try await cache.fetchSessionIdentities()
+        var usedContextIds = Set<Int>()
+        for identity in allIdentities {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            usedContextIds.insert(props.sessionContextId)
+        }
+        var sessionContextId: Int
+        repeat {
+            sessionContextId = Int.random(in: 1 ..< Int.max)
+        } while usedContextIds.contains(sessionContextId)
+
+        let rawName: String
+        if let deviceNameHint, !deviceNameHint.isEmpty,
+           !deviceNameHint.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) {
+            rawName = deviceNameHint
+        } else {
+            rawName = try await determineDeviceName()
+        }
+
+        let identity = try await SessionIdentity(
+            id: UUID(),
+            props: .init(
+                secretName: secretName,
+                deviceId: deviceId,
+                sessionContextId: sessionContextId,
+                longTermPublicKey: longTermPublicKey,
+                signingPublicKey: signingPublicKey,
+                mlKEMPublicKey: mlKEMPublicKey,
+                oneTimePublicKey: oneTimePublicKey,
+                state: nil,
+                deviceName: rawName,
+                isMasterDevice: false
+            ),
+            symmetricKey: symmetricKey
+        )
+        try await cache.createSessionIdentity(identity)
+        sessionIdentities.remove(secretName)
+        return identity
+    }
+
     /// Inbound decrypt: after inbound decrypt succeeds, make `proven` the sole
     /// active session for that peer device.
     ///
@@ -1197,15 +1274,31 @@ public extension PQSSession {
             else {
                 continue
             }
+            // Proven decrypt becomes the sole active for this peer device.
+            // Remint encrypt passes `recipientIdentity` explicitly — the orphan row
+            // must not remain a second active (that captured general outbound).
+            let demotingOrphan = isOrphanResendInitiatingSession(
+                secretName: props.secretName,
+                deviceId: props.deviceId,
+                sessionId: identity.id)
             if try await demoteActiveSessionIdentityToInactive(identity) {
                 demotedSiblingCount += 1
+                if demotingOrphan {
+                    clearOrphanResendInitiatingSession(
+                        secretName: props.secretName,
+                        deviceId: props.deviceId)
+                }
             }
         }
         if demotedSiblingCount > 0 {
-            removeIdentity(with: provenProps.secretName)
+            // Do not call `removeIdentity` / `clearPeerTransientState`: that drops
+            // recovery state for the whole secretName beyond this device.
+            sessionIdentities.remove(provenProps.secretName)
             DecryptFailureAuditLog.log(
                 "pqs.recovery.laneActivatedAfterDecrypt peer=\(provenProps.secretName) deviceId=\(provenProps.deviceId.uuidString) demotedSiblings=\(demotedSiblingCount)")
         }
+        // When `proven` is itself the orphan remint row, keep the mark — orphan
+        // resend may still reuse that initiating SessionID until MessageRecord settles.
         return proven
     }
 
@@ -1332,8 +1425,18 @@ public extension PQSSession {
             else {
                 continue
             }
+            // Promoting a proven archive makes it the sole active for this peer device.
+            let demotingOrphan = isOrphanResendInitiatingSession(
+                secretName: props.secretName,
+                deviceId: props.deviceId,
+                sessionId: identity.id)
             if try await demoteActiveSessionIdentityToInactive(identity) {
                 demotedActiveCount += 1
+                if demotingOrphan {
+                    clearOrphanResendInitiatingSession(
+                        secretName: props.secretName,
+                        deviceId: props.deviceId)
+                }
             }
         }
 
@@ -1359,7 +1462,9 @@ public extension PQSSession {
             symmetricKey: symmetricKey,
             props: restoredProps)
         try await cache.updateSessionIdentity(archived)
-        removeIdentity(with: archivedProps.secretName)
+        // Do not call `removeIdentity` / `clearPeerTransientState`: that drops
+        // in-flight orphan-resend marks for the whole secretName.
+        sessionIdentities.remove(archivedProps.secretName)
         logger.log(
             level: .info,
             message: "Promoted cryptographically proven archived SessionIdentity for \(archivedProps.secretName) (\(archivedProps.deviceId)); demotedActive=\(demotedActiveCount)")
@@ -1403,10 +1508,11 @@ public extension PQSSession {
         // Config lookup succeeded — clear any dependency block for this lane so a
         // subsequent decrypt failure may emit peerRefresh again.
         clearRecoveryEmitBlocked(sender: secretName, deviceId: deviceId)
-        // A non-orphanReset replaces the intentional orphan-resend initiating mark; orphanResend
-        // callers re-mark the returned row after this returns.
+        // A non-orphanReset replaces the intentional orphan-resend initiating mark and
+        // recovery-session history; orphanResend callers re-mark the returned row after
+        // this returns.
         if reason != "orphanResend" {
-            clearOrphanResendInitiatingSession(secretName: secretName, deviceId: deviceId)
+            clearOrphanResendRecoveryState(secretName: secretName, deviceId: deviceId)
         }
 
         try validateUserConfigurationSignatures(configuration)
@@ -1580,6 +1686,7 @@ public extension PQSSession {
                 in: configuration,
                 secretName: secretName,
                 source: "remote")
+            lastVerifiedDeviceIdsBySecretName[secretName] = Set(verifiedDevices.map(\.deviceId))
             var collected = [UserDeviceConfiguration]()
             var oneTimeNotifiedDeviceIds = Set<UUID>()
             // Create a set of existing device IDs from the existing identities for quick lookup

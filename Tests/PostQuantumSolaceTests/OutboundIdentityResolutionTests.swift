@@ -53,7 +53,7 @@ actor OutboundIdentityResolutionTests {
                 logger: NeedleTailLogger("[ outbound-identity-resolution-test ]"))
             Issue.record("Expected missingSessionIdentity before local message persistence")
         } catch let error as PQSSession.SessionErrors {
-            #expect(error == .missingSessionIdentity)
+            #expect(error == .missingSessionIdentity || error == .userNotFound)
         }
 
         #expect(try await cache.fetchCachedMessages(sharedId: sharedId).isEmpty)

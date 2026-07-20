@@ -165,9 +165,10 @@ public enum PQSSessionConstants: Sendable {
     public static let peerResendRequestMaxSubmissions = 3
 
     /// Distinct undecryptable inbound messages from the same peer device after which
-    /// recovery escalates from per-message resend to automatic session
-    /// reset (`peerRefresh` on a fresh initiating lane). Prevents a dead ratchet from
-    /// spraying unbounded resend requests when every new `sharedId` fails once.
+    /// further distinct-id NACKs coalesce (open reestablishment episode +
+    /// `deferPeerResendUntilReestablished`) once at least one resend request has been
+    /// transport-confirmed. Sender `orphanResend` still owns heal — saturation must not
+    /// open receive-side ASR / `peerRefresh`.
     public static let undecryptableLaneEscalateThreshold = 3
 
     /// Maximum responder-side memory of known-unavailable resend ids

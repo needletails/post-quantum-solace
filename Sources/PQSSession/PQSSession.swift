@@ -354,20 +354,25 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         "\(automaticRotationPeerKey(sender: sender, deviceId: deviceId))|\(flow.rawValue)"
     }
 
-    /// SessionID of the initiating session created for an orphan-resend
-    /// wave. Used to reuse one new session across MessageRecords (active already
-    /// differs from orphaned MessageRecord SessionIDs). Cleared when the wave's
-    /// pending replay jobs drain, or when the peer lane is wiped / replaced.
+    /// SessionID of the initiating session created for an orphan-resend wave.
+    /// Reused across MessageRecords for that peer device. Cleared on wipe /
+    /// non-`orphanResend` reset — not when the local replay queue drains, and
+    /// not on generic inbound activate/promote (control frames falsely settled).
     var orphanResendInitiatingSessionByPeer: [String: UUID] = [:]
+
+    /// Last orphan-resend recovery session id for a peer device. Survives mark clear
+    /// so a post-MessageRecord ledger match cannot remint the same recovery lane.
+    /// Cleared with peer wipe / non-`orphanResend` reset.
+    var orphanResendRecoverySessionByPeer: [String: UUID] = [:]
 
     func markOrphanResendInitiatingSession(
         secretName: String,
         deviceId: UUID,
         sessionId: UUID
     ) {
-        orphanResendInitiatingSessionByPeer[
-            automaticRotationPeerKey(sender: secretName, deviceId: deviceId)
-        ] = sessionId
+        let key = automaticRotationPeerKey(sender: secretName, deviceId: deviceId)
+        orphanResendInitiatingSessionByPeer[key] = sessionId
+        orphanResendRecoverySessionByPeer[key] = sessionId
         // Orphan replays must be allowed to encrypt on the new initiating row even
         // if a prior outbound repair attempt armed the peer cooldown.
         clearOutboundReconciliationCooldown(secretName: secretName, deviceId: deviceId)
@@ -379,9 +384,22 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         ]
     }
 
+    func orphanResendRecoverySessionId(secretName: String, deviceId: UUID) -> UUID? {
+        orphanResendRecoverySessionByPeer[
+            automaticRotationPeerKey(sender: secretName, deviceId: deviceId)
+        ]
+    }
+
     func clearOrphanResendInitiatingSession(secretName: String, deviceId: UUID) {
         orphanResendInitiatingSessionByPeer.removeValue(
             forKey: automaticRotationPeerKey(sender: secretName, deviceId: deviceId))
+    }
+
+    /// Clears the sticky mark and recovery-session history (wipe / non-orphan reset).
+    func clearOrphanResendRecoveryState(secretName: String, deviceId: UUID) {
+        let key = automaticRotationPeerKey(sender: secretName, deviceId: deviceId)
+        orphanResendInitiatingSessionByPeer.removeValue(forKey: key)
+        orphanResendRecoverySessionByPeer.removeValue(forKey: key)
     }
 
     func isOrphanResendInitiatingSession(
@@ -390,6 +408,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         sessionId: UUID
     ) -> Bool {
         orphanResendInitiatingSessionId(secretName: secretName, deviceId: deviceId) == sessionId
+    }
+
+    func isOrphanResendRecoverySession(
+        secretName: String,
+        deviceId: UUID,
+        sessionId: UUID
+    ) -> Bool {
+        orphanResendRecoverySessionId(secretName: secretName, deviceId: deviceId) == sessionId
     }
 
     /// Unified inbound-failure policy table.
@@ -464,6 +490,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Outbound device-send ledger: which local SessionIdentity encrypted each
     /// `(sharedId, recipientDeviceId)`. Hot path is in-memory; mirrored to the store.
     var outboundDeviceSendRecordsByKey: [String: OutboundDeviceSendRecord] = [:]
+
+    /// Last server-verified device id set per peer secret name. Populated by successful
+    /// `findConfiguration` during identity refresh / chat fan-out; used to avoid blocking
+    /// network configuration fetch on warm sends when local lanes already match.
+    var lastVerifiedDeviceIdsBySecretName: [String: Set<UUID>] = [:]
 
     /// Maximum lifetime of a single-flight reestablishment episode before a new
     /// leader is allowed. Bounds stuck recovery without timer-based retry loops.
@@ -867,6 +898,41 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         return true
     }
+
+    /// A fresh ciphertext for a sharedId that already had a transport-confirmed
+    /// NACK still failed decrypt — the prior sender `orphanResend` did not prove.
+    /// Clear send-cooldown and failure-class suppress so we can re-request within
+    /// ``PQSSessionConstants.peerResendRequestMaxSubmissions``. Event-driven (failed
+    /// decrypt of a new frame), not a timer retry. No receive-side ASR.
+    @discardableResult
+    func armPeerResendRetryAfterFailedReplay(
+        sender: String,
+        deviceId: UUID,
+        failedMessageId: String,
+        now: Date = Date()
+    ) -> Bool {
+        let attempts = resendRequestSubmissionCount(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: failedMessageId,
+            now: now)
+        guard attempts > 0, attempts < PQSSessionConstants.peerResendRequestMaxSubmissions else {
+            return false
+        }
+        let requestKey = peerResendRequestKey(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: failedMessageId)
+        lastResendRequestAtByPeer.removeValue(forKey: requestKey)
+        _ = takeInboundFailureClasses(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: failedMessageId,
+            now: now)
+        DecryptFailureAuditLog.log(
+            "pqs.recovery.orphanReplayStillUndecryptable sharedId=\(failedMessageId) sender=\(sender) deviceId=\(deviceId.uuidString) priorAttempts=\(attempts) action=rearmNack")
+        return true
+    }
     
     /// Marks a resend/refresh control request as sent (queued) for this failed message.
     /// Only arms the request cooldown; attempts toward
@@ -898,6 +964,21 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         pruneResendRequestAttempts(now: now)
         let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
         return resendRequestAttemptsByKey[requestKey]?.attempts ?? 0
+    }
+
+    /// `true` when any resend-request for this peer device has been transport-confirmed.
+    /// Used to open a coalesce episode after undecryptable-lane saturation without minting
+    /// a receive-side repair session.
+    func hasTransportedPeerResendRequest(
+        sender: String,
+        deviceId: UUID,
+        now: Date = Date()
+    ) -> Bool {
+        pruneResendRequestAttempts(now: now)
+        let prefix = "\(sender)|\(deviceId.uuidString)|"
+        return resendRequestAttemptsByKey.contains { key, entry in
+            key.hasPrefix(prefix) && entry.attempts > 0
+        }
     }
 
     private func pruneResendRequestAttempts(now: Date) {
@@ -1349,6 +1430,9 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         let orphanPrefix = "\(secretName)|"
         orphanResendInitiatingSessionByPeer = orphanResendInitiatingSessionByPeer.filter {
+            !$0.key.hasPrefix(orphanPrefix)
+        }
+        orphanResendRecoverySessionByPeer = orphanResendRecoverySessionByPeer.filter {
             !$0.key.hasPrefix(orphanPrefix)
         }
     }

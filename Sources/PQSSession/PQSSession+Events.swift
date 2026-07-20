@@ -217,25 +217,10 @@ public extension PQSSession {
             sentDate: Date(),
             destructionTime: nil)
         
-        let symmetricKey = try await getDatabaseSymmetricKey()
-        var selected: (identity: SessionIdentity, sessionContextId: Int)?
-        for identity in try await cache?.fetchSessionIdentities() ?? [] {
-            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
-            guard props.secretName == senderName,
-                  props.deviceId == senderDeviceId,
-                  !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
-            else { continue }
-            if selected == nil || props.sessionContextId > selected!.sessionContextId {
-                selected = (identity, props.sessionContextId)
-            }
-        }
-
-        guard let identity = selected?.identity else {
-            logger.log(
-                level: .warning,
-                message: "pqs.recovery.resendRequestFailed reason=missingIdentity sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(sharedMessageIds.count)")
-            throw SessionErrors.invalidDeviceIdentity
-        }
+        let identity = try await taskProcessor.resolveControlDeliverySessionIdentity(
+            secretName: senderName,
+            deviceId: senderDeviceId,
+            session: self)
         
         let task = EncryptableTask(
             task: .writeMessage(OutboundTaskMessage(

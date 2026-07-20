@@ -204,6 +204,12 @@ public actor TaskProcessor {
     let pendingOutboundTransportTTL: TimeInterval = 60 * 10
     let pendingOutboundTransportLimit = 256
 
+    /// Rate-limit repeated outbound transport-retry warnings (esp. non-viable reconnect storms).
+    var lastOutboundTransportRetryLogAt: Date = .distantPast
+    var lastOutboundTransportRetryLogMessage: String = ""
+    var suppressedOutboundTransportRetryLogCount: Int = 0
+    let outboundTransportRetryLogCooldown: TimeInterval = 5
+
     /// Replay jobs queued to service a peer's resend request, keyed by shared id.
     /// A resend replay that dies before transport is invisible to the requester (it
     /// just never receives the frame), so every terminal outcome of these jobs is
