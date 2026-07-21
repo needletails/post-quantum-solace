@@ -277,7 +277,9 @@ extension TaskProcessor {
             // on orphanResend. Receive-side ASR here leaves another state-less active
             // that cannot decrypt the peer's already-sent non-initiating frames.
             switch props.task.task {
+                
             case .streamMessage(let message):
+                // If we return any value defer the job to be processed at the right time.
                 if let deferred = try await tryDeferInboundDuringContactBootstrap(
                     message: message,
                     error: ratchetError,
@@ -288,6 +290,8 @@ extension TaskProcessor {
                     symmetricKey: symmetricKey) {
                     return deferred
                 }
+                
+                // The job could not be processed, try and request resend if at all possible
                 return try await handleUndecryptableInboundResend(
                     message: message,
                     failureClass: "ratchet.stateUninitialized",
@@ -307,8 +311,8 @@ extension TaskProcessor {
         } catch let ratchetError as RatchetError where isFreshSessionRepairError(ratchetError) {
             switch props.task.task {
             case .streamMessage(let message):
-                // Orphan-resend: these classes mean no usable matching session for the
-                // frame. Request resend; do not open receive-side ASR / peerRefresh.
+                
+                // If we return any value defer the job to be processed at the right time.
                 if let deferred = try await tryDeferInboundDuringContactBootstrap(
                     message: message,
                     error: ratchetError,
@@ -319,6 +323,8 @@ extension TaskProcessor {
                     symmetricKey: symmetricKey) {
                     return deferred
                 }
+                
+                // The job could not be processed, try and request resend if at all possible
                 return try await handleUndecryptableInboundResend(
                     message: message,
                     failureClass: freshSessionFailureClass(ratchetError),
@@ -338,6 +344,8 @@ extension TaskProcessor {
         } catch let ratchetError as RatchetError where ratchetError == .decryptionFailed {
             switch props.task.task {
             case .streamMessage(let message):
+                
+                // If we return any value defer the job to be processed at the right time.
                 if let deferred = try await tryDeferInboundDuringContactBootstrap(
                     message: message,
                     error: ratchetError,
@@ -348,6 +356,8 @@ extension TaskProcessor {
                     symmetricKey: symmetricKey) {
                     return deferred
                 }
+                
+                // The job could not be processed, try and request resend if at all possible
                 return try await handleUndecryptableInboundResend(
                     message: message,
                     failureClass: "ratchet.decryptionFailed",
@@ -363,7 +373,8 @@ extension TaskProcessor {
         } catch let ratchetError as RatchetError where isInboundSessionDesyncError(ratchetError) {
             switch props.task.task {
             case .streamMessage(let message):
-                // After all sessions failed, drop + retry request (orphan-resend).
+                
+                // If we return any value defer the job to be processed at the right time.
                 if let deferred = try await tryDeferInboundDuringContactBootstrap(
                     message: message,
                     error: ratchetError,
@@ -374,6 +385,8 @@ extension TaskProcessor {
                     symmetricKey: symmetricKey) {
                     return deferred
                 }
+                
+                // The job could not be processed, try and request resend if at all possible
                 return try await handleUndecryptableInboundResend(
                     message: message,
                     failureClass: inboundSessionDesyncFailureClass(ratchetError),
@@ -389,6 +402,8 @@ extension TaskProcessor {
         } catch let ratchetError as RatchetError where ratchetError == .expiredKey {
             switch props.task.task {
             case .streamMessage(let message):
+                
+                /// This will occur when the `skippedMessageKeys`'s  `key.remoteOneTimePublicKey` is not equivalent to the heder `OTK`
                 let failureClass = "ratchet.expiredKey"
                 if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
                     auditInboundDecryptFailure(
@@ -416,7 +431,10 @@ extension TaskProcessor {
         } catch let ratchetError as RatchetError where ratchetError == .missingOneTimeKey {
             switch props.task.task {
             case .streamMessage(let message):
+                
                 let failureClass = "ratchet.missingOneTimeKey"
+                
+                // Checks if the contact is has been removed locally
                 if await session.shouldSuppressInboundRecoveryFromSender(message.senderSecretName) {
                     auditInboundDecryptFailure(
                         message: message,
@@ -429,6 +447,8 @@ extension TaskProcessor {
                     try await cache.deleteJob(job)
                     return .deleted
                 }
+                
+                // Checks if the message Failed inbound messages whose replay should be requested only after the peer/device has completed the reestablishment round.
                 if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
                     auditInboundDecryptFailure(
                         message: message,
@@ -445,8 +465,7 @@ extension TaskProcessor {
                 if await session.isAwaitingSenderOrphanResend(
                     sender: message.senderSecretName,
                     deviceId: message.senderDeviceId,
-                    messageId: message.sharedMessageId)
-                {
+                    messageId: message.sharedMessageId) {
                     auditInboundDecryptFailure(
                         message: message,
                         failureClass: failureClass,
@@ -492,6 +511,8 @@ extension TaskProcessor {
                     level: .warning,
                     message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=replaceOTKBatchThenPeerRefresh")
 
+                // If we make it to this point we will try and reestablish session and refresh OTK(s)
+                
                 _ = await session.tryBeginReestablishmentEpisode(
                     sender: message.senderSecretName,
                     deviceId: message.senderDeviceId)
@@ -585,6 +606,8 @@ extension TaskProcessor {
         } catch let cryptoError as CryptoKitError {
             switch props.task.task {
             case .streamMessage(let message):
+                
+                // If we return any value defer the job to be processed at the right time.
                 if let deferred = try await tryDeferInboundUntilPeerRatchetReady(
                     message: message,
                     job: job,
@@ -595,8 +618,12 @@ extension TaskProcessor {
                     failureClass: "crypto.bodyDecryptionFailed") {
                     return deferred
                 }
+                
+                
                 // Body AEAD auth failure: same orphan-resend policy as
                 // `ratchet.decryptionFailed` (sender orphanResend heals).
+                //
+                // The job could not be processed, try and request resend if at all possible
                 return try await handleUndecryptableInboundResend(
                     message: message,
                     failureClass: "crypto.bodyDecryptionFailed",
@@ -612,8 +639,11 @@ extension TaskProcessor {
         } catch let sessionError as PQSSession.SessionErrors where sessionError == .sessionDecryptionError {
             switch props.task.task {
             case .streamMessage(let message):
+                
                 // Payload/context decode failure after ratchet decrypt: same
                 // Same undecryptable policy as CryptoKit / decryptionFailed.
+                //
+                // The job could not be processed, try and request resend if at all possible
                 return try await handleUndecryptableInboundResend(
                     message: message,
                     failureClass: "payload.sessionDecryptionError",
@@ -628,6 +658,8 @@ extension TaskProcessor {
         } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
             switch props.task.task {
             case .streamMessage(let message):
+                
+                // This will cause quarantining of the contact's sessionIdentity and send a trust message
                 return try await handlePeerSigningKeyOutOfSync(
                     message: message,
                     job: job,
@@ -646,6 +678,7 @@ extension TaskProcessor {
             switch props.task.task {
             case .streamMessage:
                 do {
+                    // This is for our linked devices, if the signing key changes on a device we need to trust it and reestablish the session
                     _ = try await session.emitSessionReestablishment(
                         kind: .linkedDeviceCompromiseObserved,
                         recipient: .personalMessage,
@@ -661,6 +694,8 @@ extension TaskProcessor {
         } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
             switch props.task.task {
             case .streamMessage(let message):
+                
+                // If we have an invalid signature we are potentially compromised we need to reestablish the session
                 return try await handleInvalidSignature(
                     message: message,
                     job: job,
@@ -672,6 +707,8 @@ extension TaskProcessor {
                 try await cache.deleteJob(job)
             }
         } catch {
+            
+            // If we are throwing an error for some other reason... On write we delay the message sending for retry before considering it a loss and deleting
             if case .writeMessage(let message) = props.task.task,
                pendingOutboundTransportBySharedId[message.sharedId] != nil {
                 return try await deferPendingOutboundTransportRetry(
@@ -685,8 +722,11 @@ extension TaskProcessor {
             if case .writeMessage(let message) = props.task.task {
                 await noteResendReplayDropped(sharedId: message.sharedId, reason: "unhandledError=\(error)")
             }
-            logger.log(level: .error, message: "Unhandled error during job processing: \(error)")
+            
+            // If we are throwing an error for some other reason... On stream we just delete the job
+            logger.log(level: .error, message: "Unhandled error during job processing: \(error). Deleting job...")
             try await cache.deleteJob(job)
+            logger.log(level: .info, message: "Deleted Job")
         }
         return .failed
     }
@@ -739,12 +779,15 @@ extension TaskProcessor {
         symmetricKey: SymmetricKey,
         failureClass: String
     ) async throws -> JobProcessingOutcome? {
+        
+        // Here we are checking if the persisted cache has a session identity that is not marked as archived and has state because we must have an active session identity created before proceeding.
         guard await session.isAwaitingInboundPeerRatchetHandshake(
             secretName: message.senderSecretName,
             deviceId: message.senderDeviceId) else {
             return nil
         }
 
+        // Only try {maxAttempts} for this given job
         let maxAttempts = 24
         guard props.attempts < maxAttempts else { return nil }
 
@@ -756,13 +799,17 @@ extension TaskProcessor {
         updatedProps.attempts += 1
         _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
         try await cache.updateJob(job)
+        
+        // If we are running the consumer proceed
         if await !jobConsumer.deque.isEmpty {
             await jobConsumer.feedConsumer(job, priority: .background)
             return .deferredToBack
         }
+        // Consumer is not running let's wait for it to start
         return .paused
     }
 
+    /// This method allows us to wait for the peer ratchet to be active before proceeding with decryption under certain fail case scenarios. If it is not ready we wait (n) times until ready before trying decryption.
     private func tryDeferInboundDuringContactBootstrap(
         message: InboundTaskMessage,
         error: RatchetError,

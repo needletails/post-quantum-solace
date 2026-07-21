@@ -744,8 +744,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             sender: inbound.senderSecretName,
             deviceId: inbound.senderDeviceId,
             messageId: inbound.sharedMessageId,
-            failureClass: failureClass
-        )
+            failureClass: failureClass)
         guard let expiry = inboundFailurePolicyUntil[key] else {
             return false
         }
