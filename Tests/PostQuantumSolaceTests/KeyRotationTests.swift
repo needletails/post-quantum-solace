@@ -176,29 +176,54 @@ actor KeyRotationTests {
         try await cache.updateLocalSessionContext(encrypted)
     }
     
-    private func createPeerIdentity(secretName: String, suffix: Int) async throws {
-        let curve = crypto.generateCurve25519PrivateKey()
-        let signing = crypto.generateCurve25519SigningPrivateKey()
-        let mlkemPrivate = try crypto.generateMLKem1024PrivateKey()
-        let mlkemPublic = try MLKEMPublicKey(id: UUID(), mlkemPrivate.publicKey.rawRepresentation)
-        let deviceId = UUID()
-        let device = UserDeviceConfiguration(
-            deviceId: deviceId,
-            signingPublicKey: signing.publicKey.rawRepresentation,
-            longTermPublicKey: curve.publicKey.rawRepresentation,
-            finalMLKEMPublicKey: mlkemPublic,
-            deviceName: "peer-\(suffix)",
-            hmacData: Data(repeating: UInt8(suffix + 1), count: 32),
-            isMasterDevice: suffix == 0
+    /// Creates a peer account with `deviceCount` devices. Publishes one account-signed
+    /// `UserConfiguration` to the mock server (rotation fan-out resolves recipients from
+    /// server-verified devices) and creates a matching local `SessionIdentity` per device
+    /// so outbound encrypt lanes already exist.
+    private func createPeerAccount(secretName: String, deviceCount: Int) async throws {
+        let accountSigning = crypto.generateCurve25519SigningPrivateKey()
+        var devices: [UserDeviceConfiguration] = []
+        var signedDevices: [UserConfiguration.SignedDeviceConfiguration] = []
+        for suffix in 0 ..< deviceCount {
+            let curve = crypto.generateCurve25519PrivateKey()
+            let deviceSigning = crypto.generateCurve25519SigningPrivateKey()
+            let mlkemPrivate = try crypto.generateMLKem1024PrivateKey()
+            let mlkemPublic = try MLKEMPublicKey(id: UUID(), mlkemPrivate.publicKey.rawRepresentation)
+            let device = UserDeviceConfiguration(
+                deviceId: UUID(),
+                signingPublicKey: deviceSigning.publicKey.rawRepresentation,
+                longTermPublicKey: curve.publicKey.rawRepresentation,
+                finalMLKEMPublicKey: mlkemPublic,
+                deviceName: "peer-\(suffix)",
+                hmacData: Data(repeating: UInt8(suffix + 1), count: 32),
+                isMasterDevice: suffix == 0
+            )
+            devices.append(device)
+            signedDevices.append(
+                try UserConfiguration.SignedDeviceConfiguration(device: device, signingKey: accountSigning)
+            )
+        }
+        let configuration = UserConfiguration(
+            signingPublicKey: accountSigning.publicKey.rawRepresentation,
+            signedDevices: signedDevices,
+            signedOneTimePublicKeys: [],
+            signedMLKEMOneTimePublicKeys: []
         )
-        _ = try await session.createEncryptableSessionIdentityModel(
-            with: device,
-            oneTimePublicKey: nil,
-            mlKEMPublicKey: mlkemPublic,
-            for: secretName,
-            associatedWith: deviceId,
-            new: Int.random(in: 1 ..< Int.max)
+        await store.upsertUserConfiguration(
+            secretName: secretName,
+            deviceId: devices[0].deviceId,
+            config: configuration
         )
+        for device in devices {
+            _ = try await session.createEncryptableSessionIdentityModel(
+                with: device,
+                oneTimePublicKey: nil,
+                mlKEMPublicKey: device.finalMLKEMPublicKey,
+                for: secretName,
+                associatedWith: device.deviceId,
+                new: Int.random(in: 1 ..< Int.max)
+            )
+        }
     }
     
     private func makeReSignedConfiguration(
@@ -514,8 +539,7 @@ actor KeyRotationTests {
     func testRotationReestablishmentDedupesNicknameSendsPerContact() async throws {
         let (transport, _) = try await setupRotatableSession()
         let peerSecret = "dedupe-peer"
-        try await createPeerIdentity(secretName: peerSecret, suffix: 0)
-        try await createPeerIdentity(secretName: peerSecret, suffix: 1)
+        try await createPeerAccount(secretName: peerSecret, deviceCount: 2)
         
         let stream = AsyncStream<ReceivedMessage> { continuation in
             transport.continuation = continuation

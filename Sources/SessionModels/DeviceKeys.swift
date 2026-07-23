@@ -55,6 +55,7 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
         case mlKEMOneTimePrivateKeys = "e" // Post-Quantum private keys
         case finalMLKEMPrivateKey = "f" // Final Post-Quantum private key
         case rotateKeysDate = "g" // Date to rotate the keys
+        case deviceAuthMLDSA = "h" // ML-DSA-65 device JWT signing state
     }
 
     /// Unique identifier for the device.
@@ -111,6 +112,14 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     /// and signing keys that are used repeatedly.
     public var rotateKeysDate: Date?
 
+    /// ML-DSA-65 device JWT signing state (seed + activation marker).
+    ///
+    /// Optional so session contexts persisted before the PQ JWT migration
+    /// decode unchanged; the enrollment flow populates it lazily after the
+    /// device authenticates. Mutate only through
+    /// `updateDeviceAuthMLDSA(_:)`.
+    public private(set) var deviceAuthMLDSA: DeviceAuthMLDSAState?
+
     /// Initializes a new instance of `DeviceKeys` with all required cryptographic material.
     ///
     /// This initializer creates a complete set of device keys for secure communication.
@@ -164,5 +173,38 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     /// guard on `currentDevice.isMasterDevice` (the rotation function does so today).
     public mutating func rotateAccountSigningKey(_ data: Data) {
         signingPrivateKey = data
+    }
+
+    /// Replaces the ML-DSA-65 device JWT signing state. Pass `nil` to discard
+    /// the key material (e.g. when the server reports the key was superseded).
+    public mutating func updateDeviceAuthMLDSA(_ state: DeviceAuthMLDSAState?) {
+        deviceAuthMLDSA = state
+    }
+}
+
+/// Client-side state for the ML-DSA-65 device JWT key: the 32-byte FIPS 204
+/// seed the private key is derived from, and the server-confirmed `kid` once
+/// activation completes. Tokens are minted with this key only after
+/// `activatedKid` is set — until then the device keeps using HS256.
+public struct DeviceAuthMLDSAState: Codable, Sendable, Equatable {
+    enum CodingKeys: String, CodingKey {
+        case seed = "a"
+        case activatedKid = "b"
+    }
+
+    /// FIPS 204 ML-DSA-65 private key seed (32 bytes).
+    public let seed: Data
+
+    /// The `kid` the server activated for this key; nil while enrollment is
+    /// pending or incomplete.
+    public private(set) var activatedKid: String?
+
+    public init(seed: Data, activatedKid: String? = nil) {
+        self.seed = seed
+        self.activatedKid = activatedKid
+    }
+
+    public mutating func markActivated(kid: String) {
+        activatedKid = kid
     }
 }

@@ -65,9 +65,7 @@ extension TaskProcessor {
         if let job {
             try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
         } else {
-            for job in try await cache.fetchJobs() {
-                try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
-            }
+            try await loadFromCache(cache: cache, symmetricKey: symmetricKey)
         }
         
         if let session {
@@ -157,6 +155,12 @@ extension TaskProcessor {
                 switch result {
                 case let .success(job):
                     do {
+                        // Track the in-flight job so a concurrent bulk reload
+                        // (`loadTasks(nil, ...)`) cannot re-enqueue it from cache
+                        // between dequeue and cache-row deletion — that window is
+                        // exactly a reconnect drain racing an executing send.
+                        inFlightJobIds.insert(job.id)
+                        defer { inFlightJobIds.remove(job.id) }
                         let outcome = try await process(
                             job,
                             cache: cache,
@@ -186,11 +190,36 @@ extension TaskProcessor {
     
     // MARK: - Cache loading
     
+    /// Sole cache→consumer bulk loader. Reconnect can trigger reloads from more
+    /// than one place at once (host `resumeJobQueue`, the viability-transition
+    /// auto-drain, and the processing loop's own refill); `process` never
+    /// re-checks cache existence before running a job, so a duplicate enqueue
+    /// would send the same frame twice. Serializing the whole
+    /// snapshot-fetch-enqueue span means every reload computes its skip set
+    /// against a quiescent view: a job is either still enqueued (skipped),
+    /// executing (`inFlightJobIds`, skipped), or completed (cache row deleted,
+    /// never fetched).
     private func loadFromCache(
         cache: SessionCache,
         symmetricKey: SymmetricKey
     ) async throws {
-        for job in try await cache.fetchJobs() {
+        while isBulkReloadingJobs {
+            await withCheckedContinuation { continuation in
+                bulkReloadWaiters.append(continuation)
+            }
+        }
+        isBulkReloadingJobs = true
+        defer {
+            isBulkReloadingJobs = false
+            let waiters = bulkReloadWaiters
+            bulkReloadWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+        let enqueuedJobIds = Set(await jobConsumer.deque.map { $0.item.id })
+        let skippedJobIds = enqueuedJobIds.union(inFlightJobIds)
+        for job in try await cache.fetchJobs() where !skippedJobIds.contains(job.id) {
             try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
         }
     }
@@ -720,6 +749,18 @@ extension TaskProcessor {
                     error: error)
             }
             if case .writeMessage(let message) = props.task.task {
+                // No remembered signed frame, but the failure is connectivity, not
+                // content: the connection died mid-write (or viability flipped after
+                // this job was dequeued). Deleting here would silently lose a message
+                // composed while going offline. Park it instead — the job stays in
+                // cache and the viability-transition drain replays it on reconnect,
+                // re-encrypting from scratch.
+                if !session.isViable || isConnectionNonViableError(error) {
+                    logger.log(
+                        level: .info,
+                        message: "pqs.outbound.parkedForViability sharedId=\(message.sharedId) recipient=\(message.message.recipient) error=\(error)")
+                    return .paused
+                }
                 await noteResendReplayDropped(sharedId: message.sharedId, reason: "unhandledError=\(error)")
             }
             
@@ -863,6 +904,22 @@ extension TaskProcessor {
         session: PQSSession,
         diagnostic: String? = nil
     ) async throws -> JobProcessingOutcome {
+        // Terminal tuples stay terminal: once this sharedId was surfaced to the
+        // host as unrecoverable, redelivered copies of the same poison frame
+        // (offline queues redeliver un-ACKed frames on every reconnect) must
+        // not reopen a NACK round or re-notify the host. A copy that *decrypts*
+        // never reaches this failure path, so a late orphan replay still heals.
+        if await session.isInboundContentUnrecoverable(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            sharedId: message.sharedMessageId)
+        {
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.redeliveryDropped reason=terminalContentUnrecoverable failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
+            try await cache.deleteJob(job)
+            return .deleted
+        }
+
         // New frame, same sharedId, prior NACK already on the wire, still undecryptable:
         // clear cooldown/suppress so sender orphanResend can be asked again (bounded).
         let rearmedAfterFailedReplay = await session.armPeerResendRetryAfterFailedReplay(
@@ -920,12 +977,18 @@ extension TaskProcessor {
                     action: "contentUnrecoverable",
                     suppressed: true,
                     metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
-                await session.sessionDelegate?.inboundContentUnrecoverable(
-                    senderSecretName: message.senderSecretName,
-                    senderDeviceId: message.senderDeviceId,
-                    sharedMessageId: message.sharedMessageId)
+                let newlyTerminal = await session.markInboundContentUnrecoverable(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId,
+                    sharedId: message.sharedMessageId)
+                if newlyTerminal {
+                    DecryptFailureAuditLog.log(
+                        "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
+                    await session.sessionDelegate?.inboundContentUnrecoverable(
+                        senderSecretName: message.senderSecretName,
+                        senderDeviceId: message.senderDeviceId,
+                        sharedMessageId: message.sharedMessageId)
+                }
                 logger.log(
                     level: .warning,
                     message: "pqs.recovery.resendRequestExhausted failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) attempts=\(submissionCount)")
@@ -1074,6 +1137,21 @@ extension TaskProcessor {
         if !parkForViability {
             try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
         }
+        // A NACK that has not reached the wire must not leave its failed ids
+        // suppressed: submission attempts are only counted on transported frames,
+        // and the sender cannot orphan-resend until the request transports. Clear
+        // the failure-class suppress so the tuple stays retryable; the armed
+        // request cooldown still bounds duplicate NACKs while this job retries.
+        if case .writeMessage(let outboundTask) = props.task.task,
+           let pending = pendingOutboundTransportBySharedId[outboundTask.sharedId],
+           case .requestMessageResend(let request) = pending.metadata.transportEvent {
+            for failedId in request.failedSharedMessageIds {
+                _ = await session.takeInboundFailureClasses(
+                    sender: pending.metadata.secretName,
+                    deviceId: pending.metadata.deviceId,
+                    messageId: failedId)
+            }
+        }
         let logMessage: String
         if let recoveryLog = recoveryTransportSendFailureLog(
             props: props,
@@ -1210,12 +1288,18 @@ extension TaskProcessor {
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.resendRequestExhausted failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) attempts=\(submissionCount)")
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
-            await session.sessionDelegate?.inboundContentUnrecoverable(
-                senderSecretName: message.senderSecretName,
-                senderDeviceId: message.senderDeviceId,
-                sharedMessageId: message.sharedMessageId)
+            let newlyTerminal = await session.markInboundContentUnrecoverable(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                sharedId: message.sharedMessageId)
+            if newlyTerminal {
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
+                await session.sessionDelegate?.inboundContentUnrecoverable(
+                    senderSecretName: message.senderSecretName,
+                    senderDeviceId: message.senderDeviceId,
+                    sharedMessageId: message.sharedMessageId)
+            }
             return false
         }
 

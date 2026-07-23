@@ -351,6 +351,26 @@ public extension PQSSession {
             }
             byDevice[deviceId] = identity
         }
+        if byDevice.isEmpty, !verifiedIds.isEmpty {
+            // The refreshed snapshot can go stale mid-flight: a concurrent lane
+            // reset demotes the row this list contains while inserting its
+            // replacement (the store itself always keeps ≥1 active row per lane
+            // during a reset). Re-read the store once and re-select on live rows.
+            let live = try await getSessionIdentities(with: secretName)
+            for deviceId in verifiedIds {
+                guard let identity = await taskProcessor.outboundSessionIdentity(
+                    secretName: secretName,
+                    deviceId: deviceId,
+                    in: live,
+                    symmetricKey: symmetricKey,
+                    session: self,
+                    preferredDevice: nil
+                ) else {
+                    continue
+                }
+                byDevice[deviceId] = identity
+            }
+        }
         let result = Array(byDevice.values)
         logger.log(
             level: .info,
@@ -1585,6 +1605,23 @@ public extension PQSSession {
             configuration: configuration,
             fetchOneTimeKeys: sendOneTimeIdentities)
 
+        var sessionContextId: Int
+        repeat {
+            sessionContextId = Int.random(in: 1 ..< Int.max)
+        } while generatedSessionContextIds.contains(sessionContextId)
+
+        // Insert the replacement BEFORE demoting the previous actives: the store
+        // must never hold zero active rows for a live device lane, or a concurrent
+        // outbound fan-out resolves no lane and surfaces `.missingSessionIdentity`
+        // to the host. A failed insert also leaves the old lane intact this way.
+        let identity = try await createEncryptableSessionIdentityModel(
+            with: device,
+            oneTimePublicKey: curve,
+            mlKEMPublicKey: mlKEM,
+            for: secretName,
+            associatedWith: device.deviceId,
+            new: sessionContextId)
+
         // Device record: previous current becomes inactive (demote in place).
         // Do not copy+delete — that minted a second inactive UUID and destroyed the
         // original row id outbound ledgers may still reference.
@@ -1594,19 +1631,6 @@ public extension PQSSession {
                 demotedActiveCount += 1
             }
         }
-
-        var sessionContextId: Int
-        repeat {
-            sessionContextId = Int.random(in: 1 ..< Int.max)
-        } while generatedSessionContextIds.contains(sessionContextId)
-
-        let identity = try await createEncryptableSessionIdentityModel(
-            with: device,
-            oneTimePublicKey: curve,
-            mlKEMPublicKey: mlKEM,
-            for: secretName,
-            associatedWith: device.deviceId,
-            new: sessionContextId)
 
         removeIdentity(with: secretName)
         await cleanupInactiveSessionSnapshots(

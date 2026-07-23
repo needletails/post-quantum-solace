@@ -1151,13 +1151,14 @@ actor EndToEndTests {
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
 
+        let bobStore = createRecipientStore()
         try await createSenderMaxSkipSession(
             store: createSenderStore(),
             transport: aliceTransport,
             sessionDelegate: sd
         )
         try await createRecipientMaxSkipSession(
-            store: createRecipientStore(),
+            store: bobStore,
             transport: bobTransport,
             sessionDelegate: rsd
         )
@@ -1230,9 +1231,14 @@ actor EndToEndTests {
 
         let failed = try #require(await probe.failedSharedId)
 
-        // maxSkipped now uses fresh-session repair: defer resend until peerRefresh completes.
-        // Do not require an immediate requestMessageResend control frame.
+        // Orphan-resend contract: the receiver drops the frame and requests a bounded
+        // resend; the *sender* heals the lane and replays the same sharedId. Transient
+        // deferral/episode state may resolve before polling observes it, so accept
+        // end-to-end recovery of the failed sharedId as the strongest success signal.
         let sawDeferredRepair = await waitUntil {
+            if await bobStore.getAllMessages().contains(where: { $0.sharedId == failed }) {
+                return true
+            }
             if await self._recipientMaxSkipSession.hasPendingResendAfterReestablishment(
                 sender: "alice",
                 deviceId: aliceDeviceId,
@@ -1248,7 +1254,7 @@ actor EndToEndTests {
         }
         #expect(
             sawDeferredRepair,
-            "Expected maxSkipped to open repair / defer resend for failed shared id \(failed)")
+            "Expected maxSkipped to recover failed shared id \(failed) via sender orphan-resend (or defer resend while repair is pending)")
         #expect(
             await bobTransport.publishRotatedKeysCallCount == 0,
             "maxSkipped repair must not rotate local identity keys")
@@ -1326,13 +1332,14 @@ actor EndToEndTests {
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
 
+        let bobStore = createRecipientStore()
         try await createSenderMaxSkipSession(
             store: createSenderStore(),
             transport: aliceTransport,
             sessionDelegate: sd
         )
         try await createRecipientMaxSkipSession(
-            store: createRecipientStore(),
+            store: bobStore,
             transport: bobTransport,
             sessionDelegate: rsd
         )
@@ -1392,12 +1399,18 @@ actor EndToEndTests {
 
         #expect(await waitUntil { await probe.failedSharedId != nil }, "Expected running processor to observe a failed shared id")
         let failed = try #require(await probe.failedSharedId)
+        // Orphan-resend contract: the policy must target the actual failed sharedId —
+        // proven either by a transient pending-resend entry for that exact id or by
+        // end-to-end recovery of that exact id via the sender's replay.
         #expect(await waitUntil {
-            await self._recipientMaxSkipSession.hasPendingResendAfterReestablishment(
+            if await bobStore.getAllMessages().contains(where: { $0.sharedId == failed }) {
+                return true
+            }
+            return await self._recipientMaxSkipSession.hasPendingResendAfterReestablishment(
                 sender: "alice",
                 deviceId: aliceDeviceId,
                 failedMessageId: failed)
-        }, "Running processor should defer resend for the actual failed shared id, not a neighbor frame")
+        }, "Running processor should apply inbound failure policy to the actual failed shared id, not a neighbor frame")
         #expect(
             await bobTransport.publishRotatedKeysCallCount == 0,
             "Inbound failure policy must not rotate keys")
@@ -3687,7 +3700,128 @@ actor EndToEndTests {
         
         await shutdownSessions()
     }
-    
+
+    @Test("Duplicate decrypts and redelivered frames persist exactly one row per shared id")
+    func testDuplicateDeliveryPersistsSingleMessageRow() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        actor FrameRecorder {
+            var frames: [ReceivedMessage] = []
+            func record(_ frame: ReceivedMessage) { frames.append(frame) }
+            func all() -> [ReceivedMessage] { frames }
+        }
+        let bobInboundRecorder = FrameRecorder()
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 8,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(until: .now + .milliseconds(50))
+            }
+            return false
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        aliceTask = Task {
+            for await received in aliceStream {
+                if received.sender == self.sMockUserData.ssn { continue }
+                try? await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
+            }
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                if received.sender == self.rMockUserData.rsn { continue }
+                await bobInboundRecorder.record(received)
+                try? await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received)
+            }
+        }
+        try await Task.sleep(until: .now + .milliseconds(100))
+
+        // Establish the lane with a normal message first.
+        try await _senderSession.writeTextMessage(
+            recipient: .nickname("bob"),
+            text: "establish lane")
+
+        // Duplicate-decrypt case: the sender replays the same logical message
+        // (same shared id) as a fresh ciphertext — production hits this when a
+        // resend request is serviced more than once. Both copies decrypt; only
+        // one row may be persisted.
+        let duplicatedSharedId = UUID().uuidString
+        for _ in 0..<2 {
+            try await _senderSession.writeTextMessage(
+                recipient: .nickname("bob"),
+                text: "replayed message body",
+                sharedIdOverride: duplicatedSharedId)
+            try await Task.sleep(until: .now + .milliseconds(100))
+        }
+
+        let persistedDuplicate = await waitUntil {
+            let rows = await recipientStore.getAllMessages()
+            return rows.contains(where: { $0.sharedId == duplicatedSharedId })
+        }
+        #expect(persistedDuplicate, "Replayed shared id should decrypt and persist")
+        // Let the second copy finish processing before counting.
+        try await Task.sleep(until: .now + .seconds(1))
+
+        var rows = await recipientStore.getAllMessages()
+        var duplicateRows = rows.filter { $0.sharedId == duplicatedSharedId }
+        #expect(
+            duplicateRows.count == 1,
+            "Same shared id decrypted twice must persist exactly one row, got \(duplicateRows.count)")
+
+        // Redelivery case: the server redelivers already-processed frames on
+        // reconnect. Re-inject every frame Bob has already consumed and verify
+        // the ingress guard drops them without minting rows or throwing.
+        let baselineCount = rows.count
+        for received in await bobInboundRecorder.all() {
+            try? await receiveIgnoringRecoverableErrors(_recipientSession, received: received)
+        }
+        try await Task.sleep(until: .now + .seconds(1))
+
+        rows = await recipientStore.getAllMessages()
+        duplicateRows = rows.filter { $0.sharedId == duplicatedSharedId }
+        #expect(
+            rows.count == baselineCount,
+            "Redelivered frames must not create new rows (baseline \(baselineCount), got \(rows.count))")
+        #expect(duplicateRows.count == 1, "Redelivery must not duplicate the replayed shared id")
+
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await aliceTask?.value
+        _ = await bobTask?.value
+    }
+
     @Test("Device Synchronization Issues - Simulate Clock Drift and Processing Delays")
     func testDeviceSynchronizationIssues() async throws {
         // Setup two devices with their own sessions
@@ -4385,6 +4519,10 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .seconds(2))
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
+        // Drain in-flight receives before the deferred shutdown nils the caches,
+        // or a receive mid-flight throws `.databaseNotInitialized`.
+        _ = await aliceTask?.value
+        _ = await bobTask?.value
     }
     
     @Test("Bidirectional Conversation With Mid-Conversation Key Rotation")
@@ -4466,6 +4604,10 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .seconds(1))
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
+        // Drain in-flight receives before the deferred shutdown nils the caches,
+        // or a receive mid-flight throws `.databaseNotInitialized`.
+        _ = await aliceTask?.value
+        _ = await bobTask?.value
     }
     
     @Test("Alice Rotates Keys Then Sends Message - Bob Verifies Successfully")
@@ -6041,6 +6183,10 @@ actor EndToEndTests {
                         }
                     } catch PQSSession.SessionErrors.databaseNotInitialized {
                         break
+                    } catch PQSSession.SessionErrors.sessionNotInitialized {
+                        // Deferred shutdown can outrun this loop under full-suite
+                        // load; a torn-down session is teardown, not a failure.
+                        break
                     }
                 }
             }
@@ -6062,6 +6208,10 @@ actor EndToEndTests {
                             break
                         }
                     } catch PQSSession.SessionErrors.databaseNotInitialized {
+                        break
+                    } catch PQSSession.SessionErrors.sessionNotInitialized {
+                        // Deferred shutdown can outrun this loop under full-suite
+                        // load; a torn-down session is teardown, not a failure.
                         break
                     }
                 }
@@ -6226,9 +6376,10 @@ actor EndToEndTests {
     
     @Test("maxSkipped emits repair without SDK rotation")
     func testMaxSkippedEmitsRepairWithoutSDKRotation() async throws {
-        // Contract test for production behavior:
+        // Contract test for production behavior (orphan-resend policy):
         // - A late message causes `maxSkippedHeadersExceeded`
-        // - SDK opens a single-flight repair episode and defers resend
+        // - SDK requests a bounded resend (NACK); the *sender* heals the lane and
+        //   replays the failed content — no receive-side peerRefresh for these classes
         // - SDK does not rotate local account/device identity material
 
         var bobTask: Task<Void, Never>?
@@ -6253,20 +6404,26 @@ actor EndToEndTests {
 
         actor Counters {
             var peerRefreshes = 0
+            var resendRequests = 0
             func saw(_ event: TransportEvent?) {
                 if case .sessionReestablishment(let envelope) = event,
                    envelope.kind == .peerRefresh {
                     peerRefreshes += 1
                 }
+                if case .requestMessageResend = event {
+                    resendRequests += 1
+                }
             }
             func getPeerRefreshes() -> Int { peerRefreshes }
+            func getResendRequests() -> Int { resendRequests }
         }
         let counters = Counters()
 
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
+        let bobStore = createRecipientStore()
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
+        try await createRecipientMaxSkipSession(store: bobStore, transport: bobTransport, sessionDelegate: rsd)
 
         aliceRepairTask = Task {
             for await received in aliceRepairStream {
@@ -6314,6 +6471,7 @@ actor EndToEndTests {
 
         try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(200))
+        let baselineMessageCount = await bobStore.getAllMessages().count
 
         actor Dropper {
             var remaining: Int
@@ -6337,6 +6495,9 @@ actor EndToEndTests {
             try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "msg \(i)")
         }
 
+        // Orphan-resend contract: the receiver NACKs the failed shared id or briefly
+        // holds an episode/pending-resend while the sender heals. Any of these states
+        // proves the repair path engaged.
         #expect(await waitUntil {
             if await self._recipientMaxSkipSession.hasOpenReestablishmentEpisode(
                 sender: "alice",
@@ -6348,17 +6509,14 @@ actor EndToEndTests {
                 deviceId: aliceDeviceId) {
                 return true
             }
-            return await counters.getPeerRefreshes() >= 1
-        }, "Expected maxSkipped to open single-flight repair / defer resend")
+            return await counters.getResendRequests() >= 1
+        }, "Expected maxSkipped to request resend / defer repair")
 
         #expect(await waitUntil {
-            await counters.getPeerRefreshes() >= 1
-        }, "maxSkipped repair must emit peerRefresh after SessionIdentity reset (must not retry-only)")
+            await bobStore.getAllMessages().count > baselineMessageCount
+        }, "maxSkipped recovery must deliver failed content via sender orphan-resend (must not retry-only)")
 
-        let peerRefreshCount = await counters.getPeerRefreshes()
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
-        #expect(peerRefreshCount >= 1, "Expected at least one peerRefresh after maxSkipped, got \(peerRefreshCount)")
-        #expect(peerRefreshCount <= 1, "Single-flight repair must coalesce peerRefresh (got \(peerRefreshCount))")
         #expect(rotationCount == 0, "Expected maxSkipped repair to avoid key rotation, got \(rotationCount)")
     }
 

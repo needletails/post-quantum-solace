@@ -76,6 +76,42 @@ struct SessionReestablishmentCoalescingTests {
         #expect(roundTrip == envelope)
     }
 
+    @Test("Terminal inbound outcome ledger marks once, suppresses repeats, and clears on recovery")
+    func terminalInboundOutcomeLedger() async throws {
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let sender = "poisonPeer"
+        let deviceId = UUID()
+        let sharedId = UUID().uuidString
+
+        #expect(await !session.isInboundContentUnrecoverable(
+            sender: sender, deviceId: deviceId, sharedId: sharedId))
+
+        // First mark reports "newly terminal" so the host is notified exactly once.
+        #expect(await session.markInboundContentUnrecoverable(
+            sender: sender, deviceId: deviceId, sharedId: sharedId))
+        // Redelivered copies re-mark without a fresh notification.
+        #expect(await !session.markInboundContentUnrecoverable(
+            sender: sender, deviceId: deviceId, sharedId: sharedId))
+        #expect(await session.isInboundContentUnrecoverable(
+            sender: sender, deviceId: deviceId, sharedId: sharedId))
+
+        // Other tuples are unaffected.
+        #expect(await !session.isInboundContentUnrecoverable(
+            sender: sender, deviceId: UUID(), sharedId: sharedId))
+        #expect(await !session.isInboundContentUnrecoverable(
+            sender: sender, deviceId: deviceId, sharedId: UUID().uuidString))
+
+        // A late replay that decrypts lifts the terminal mark.
+        await session.clearInboundTerminalOutcome(
+            sender: sender, deviceId: deviceId, sharedId: sharedId)
+        #expect(await !session.isInboundContentUnrecoverable(
+            sender: sender, deviceId: deviceId, sharedId: sharedId))
+        // And the tuple can be marked terminal again afterwards.
+        #expect(await session.markInboundContentUnrecoverable(
+            sender: sender, deviceId: deviceId, sharedId: sharedId))
+    }
+
     @Test("TransportEvent.messageResendUnavailable round-trips and caps at 64 ids")
     func messageResendUnavailableRoundTripAndCap() throws {
         let respondingDeviceId = UUID()
@@ -168,6 +204,10 @@ struct SessionReestablishmentCoalescingTests {
     @Test("Episode TTL expiry fires reestablishmentEpisodeDidEnd on the host")
     func episodeTTLExpiryFiresReestablishmentEpisodeDidEnd() async throws {
         let session = PQSSession()
+        // Host notifications are only delivered on a viable session
+        // (scheduleBackgroundWork drops work otherwise); mark this bare
+        // test session viable so the delegate contract can be observed.
+        session.isViable = true
         defer { Task { await session.shutdown() } }
         let probe = EpisodeEndProbe()
         await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
@@ -199,6 +239,7 @@ struct SessionReestablishmentCoalescingTests {
     @Test("Pending resend TTL expiry notifies the host that content is unrecoverable")
     func pendingResendTTLExpiryNotifiesHostContentUnrecoverable() async throws {
         let session = PQSSession()
+        session.isViable = true
         defer { Task { await session.shutdown() } }
         let probe = EpisodeEndProbe()
         await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))

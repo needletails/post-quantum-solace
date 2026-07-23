@@ -506,7 +506,7 @@ struct FriendshipFlowSourceTests {
 
         // Documented receive-side ASR: missingOneTimeKey coalesces into one episode.
         let otkCatch = try #require(sequenceSource.range(of: "ratchetError == .missingOneTimeKey"))
-        let otkBlock = String(sequenceSource[otkCatch.lowerBound...].prefix(4_500))
+        let otkBlock = String(sequenceSource[otkCatch.lowerBound...].prefix(5_500))
         #expect(otkBlock.contains("hasOpenReestablishmentEpisode"))
         #expect(otkBlock.contains("pendingPeerRefresh") || otkBlock.contains("coalescedPendingPeerRecovery"))
         #expect(otkBlock.contains("replaceOTKBatchThenPeerRefresh"))
@@ -735,7 +735,7 @@ struct FriendshipFlowSourceTests {
             named: "private func emitResendUnavailableNotice",
             in: ratchetSource)
         #expect(emitBody.contains("orphanResendInitiatingSessionId("))
-        #expect(emitBody.contains("mintResendUnavailableInitiatingIdentity("))
+        #expect(emitBody.contains("resolveResendUnavailableDeliveryIdentity("))
         #expect(emitBody.contains("resendUnavailableSameAccountNoRemint"))
         #expect(emitBody.contains("resendUnavailableUsingOrphanInitiating"))
         #expect(emitBody.contains("resendUnavailableOrphanMarkStaleUsingFallback"))
@@ -755,14 +755,33 @@ struct FriendshipFlowSourceTests {
         let staleAudit = try #require(
             orphanMarkBranch.range(of: "resendUnavailableOrphanMarkStaleUsingFallback"))
         #expect(orphanMarkBranch[..<staleAudit.lowerBound].contains("deliveryIdentity = fallbackIdentity"))
-        #expect(!orphanMarkBranch[..<staleAudit.lowerBound].contains("mintResendUnavailableInitiatingIdentity("))
+        #expect(!orphanMarkBranch[..<staleAudit.lowerBound].contains("resolveResendUnavailableDeliveryIdentity("))
 
-        let mintBody = try PQSFriendshipSource.functionBody(
-            named: "private func mintResendUnavailableInitiatingIdentity",
+        // Retry-request discard rule: an unanswerable resend request must never
+        // tear down session state. The NACK rides the existing active; a mint is
+        // allowed only when no active exists (reset with no actives demotes nothing),
+        // and the NACK row must never capture general outbound via a preferred stamp.
+        let deliveryBody = try PQSFriendshipSource.functionBody(
+            named: "private func resolveResendUnavailableDeliveryIdentity",
             in: ratchetSource)
-        #expect(mintBody.contains("reason: \"resendUnavailable\""))
-        #expect(mintBody.contains("sendOneTimeIdentities: false"))
-        #expect(!mintBody.contains("markOrphanResendInitiatingSession("))
+        #expect(deliveryBody.contains("outboundSessionIdentity("))
+        #expect(deliveryBody.contains("resendUnavailableUsingActive"))
+        #expect(deliveryBody.contains("reason: \"resendUnavailable\""))
+        #expect(deliveryBody.contains("sendOneTimeIdentities: false"))
+        #expect(!deliveryBody.contains("preferredSessionIdentityIdByPeerDevice"))
+        #expect(!deliveryBody.contains("markOrphanResendInitiatingSession("))
+        // Active reuse must be checked before any reset: the existing-active return
+        // precedes resetSessionIdentityForFreshSession in the body.
+        let activeReturn = try #require(deliveryBody.range(of: "return active"))
+        let resetCall = try #require(deliveryBody.range(of: "resetSessionIdentityForFreshSession("))
+        #expect(activeReturn.lowerBound < resetCall.lowerBound)
+
+        // Idempotence: repeat requests for known-unavailable ids re-notify from
+        // memory without re-running the DB pass; the first NACK's minted row is an
+        // active, so delivery resolution reuses it instead of minting again.
+        #expect(ratchetSource.contains("isKnownUnavailableResend("))
+        #expect(ratchetSource.contains("resendReplayShortCircuited"))
+        #expect(ratchetSource.contains("markResendUnavailable("))
 
         // Anti-cascade: unavailable notices are recent-replayable.
         let replayableBody = try PQSFriendshipSource.functionBody(
@@ -842,7 +861,15 @@ struct FriendshipFlowSourceTests {
         #expect(streamBody.contains("kind: \"stateLess\""))
         #expect(streamBody.contains("ensureInboundInitiatingSessionIdentity("))
         #expect(streamBody.contains("inboundInitiatingSlotEnsured"))
-        #expect(streamBody.contains("preferredIsBlank"))
+        // Ensure gate: a stale blank must not block minting the matching blank for
+        // a new initiating frame. Dedupe is on the frame header's key material,
+        // not on "any blank exists" / "preferred is blank".
+        #expect(streamBody.contains("blankForHeaderExists"))
+        #expect(streamBody.contains("inboundInitiatingSlotEnsureSkipped reason=blankForHeaderExists"))
+        #expect(streamBody.contains("header.remoteLongTermPublicKey"))
+        #expect(streamBody.contains("header.remoteOneTimePublicKey?.id"))
+        #expect(!streamBody.contains("stateLessAlternates.isEmpty"))
+        #expect(!streamBody.contains("preferredIsBlank"))
         #expect(!streamBody.contains("tryDecryptWithMatchingInitiatingSession("))
         // Orphan remint consumes OTK so receiver blank PQXDH can salt-match.
         #expect(ratchetSource.contains("reason: \"orphanResend\""))
@@ -1072,7 +1099,11 @@ struct FriendshipFlowSourceTests {
             named: "func resolveControlDeliverySessionIdentity(",
             in: ratchetSource)
         #expect(controlBody.contains("outboundSessionIdentity("))
-        #expect(controlBody.contains("mintResendUnavailableInitiatingIdentity("))
+        // No-active fallback mints exactly once (reset with no actives demotes
+        // nothing); the old path reset and then minted again on top of it.
+        #expect(controlBody.contains("reason: \"resendRequestControlDelivery\""))
+        #expect(!controlBody.contains("resolveResendUnavailableDeliveryIdentity("))
+        #expect(controlBody.components(separatedBy: "resetSessionIdentityForFreshSession(").count - 1 == 1)
         #expect(!controlBody.contains("markOrphanResendInitiatingSession("))
     }
 

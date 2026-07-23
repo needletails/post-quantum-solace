@@ -273,6 +273,21 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     ) async throws {
         self.session = session
         await ratchetManager.setDelegate(self)
+        // Strict OTK enforcement stays OFF: PQS recovery replays the first encrypted
+        // outbound frame (transport failure / lane repair), which requires the initial
+        // one-time key to remain resolvable until the handshake is confirmed in both
+        // directions. Enforcement consumes the OTK on first decrypt and fails fast on
+        // replays, stalling rotation/repair flows. Enabling it needs a deferred
+        // consumption design (consume once the reverse handshake lands), not a flag flip.
+        // TODO: Design deferred OTK consumption so strict enforcement can be enabled:
+        // consume the local one-time prekey only after the reverse handshake confirms
+        // (peer's first authenticated reply lands), then delete it via the delegate.
+            // Until then the private OTK is retained longer than the Double Ratchet
+            // specification's ideal, which
+        // slightly extends the window in which a later device compromise could decrypt
+        // a recorded initial handshake frame. Wire confidentiality is unaffected and
+        // server-side single-use of published OTKs still holds.
+        await ratchetManager.setEnforceOTKConsistency(false)
         switch task {
         case let .writeMessage(outboundTask):
             try await handleWriteMessage(
@@ -732,27 +747,14 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             return match
         }
 
-        let fallback: SessionIdentity
-        if let anyActive = await identities.asyncFirst(where: { identity in
-            guard let props = await identity.props(symmetricKey: symmetricKey) else { return false }
-            return props.secretName == secretName
-                && props.deviceId == deviceId
-                && !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
-        }) {
-            fallback = anyActive
-        } else {
-            fallback = try await session.resetSessionIdentityForFreshSession(
-                secretName: secretName,
-                deviceId: deviceId,
-                sendOneTimeIdentities: false,
-                reason: "resendRequestControlDelivery")
-        }
-
-        return await mintResendUnavailableInitiatingIdentity(
-            fallback: fallback,
-            requesterName: secretName,
-            requesterDeviceId: deviceId,
-            session: session)
+        // No active lane exists for this peer device (outbound selection returned
+        // nil twice): mint one initiating row. With no actives the reset demotes
+        // nothing; control frames must not tear down live sessions.
+        return try await session.resetSessionIdentityForFreshSession(
+            secretName: secretName,
+            deviceId: deviceId,
+            sendOneTimeIdentities: false,
+            reason: "resendRequestControlDelivery")
     }
 
     private func peerDeviceIdentityPreferenceKey(
@@ -1073,7 +1075,24 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         inboundTask: InboundTaskMessage,
         session: PQSSession
     ) async throws {
-        
+        // Redelivery ingress guard: offline queues redeliver un-ACKed frames on
+        // every reconnect. If this sender tuple's message is already persisted
+        // (original or orphan replay decrypted earlier — survives relaunch),
+        // a second copy adds nothing and must not burn trial decrypts or mint
+        // a duplicate chat row. Returning cleanly lets the transport ACK the
+        // frame so the server-side queue finally clears it.
+        if let existing = try await session.cache?.fetchMessageIfExists(sharedId: inboundTask.sharedMessageId) {
+            let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
+            if let existingProps = await existing.props(symmetricKey: databaseSymmetricKey),
+               existingProps.senderSecretName == inboundTask.senderSecretName,
+               existingProps.senderDeviceId == inboundTask.senderDeviceId
+            {
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.redeliveryDropped reason=alreadyPersisted sharedId=\(inboundTask.sharedMessageId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                return
+            }
+        }
+
         let verificationResult = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
         
         do {
@@ -1125,6 +1144,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     deviceId: inboundTask.senderDeviceId)
 
                 var fallbackData: Data?
+                // Per-candidate failure classes for the rollback audit; without this the
+                // try-all loop swallows every error and only the preferred error surfaces.
+                var attemptFailures: [String] = [
+                    "preferred:\(preferredSessionIdentity.id.uuidString.prefix(8)):\(preferredError)"
+                ]
                 let statefulAndArchived =
                     statefulAlternates.map { (identity: $0, isArchived: false, kind: "active") }
                     + archivedIdentities.map { (identity: $0, isArchived: true, kind: "archived") }
@@ -1148,6 +1172,8 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         fallbackData = data
                         break
                     } catch {
+                        attemptFailures.append(
+                            "\(candidate.kind):\(fallbackIdentity.id.uuidString.prefix(8)):\(error)")
                         try? await restoreSessionIdentityData(
                             fallbackIdentity,
                             data: fallbackDataBeforeAttempt,
@@ -1157,55 +1183,84 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     }
                 }
 
-                // No blank in the device record yet: ensure one initiating slot and
-                // continue try-all. Prefer not to mint before archives have a chance.
-                // If preferred was already blank and failed, do not mint a second.
-                if fallbackData == nil, stateLessAlternates.isEmpty {
-                    let preferredIsBlank =
-                        (await preferredSessionIdentity.props(symmetricKey: databaseSymmetricKey))?.state == nil
-                    if !preferredIsBlank,
-                       let preferredProps = await preferredSessionIdentity.props(
+                // Every existing row failed. The receiver must always be able to
+                // build the matching session from the initiating frame itself, so
+                // ensure a blank from this frame's header even when stale blanks
+                // exist — a blank minted from older key material can never PQXDH
+                // this frame and must not block recovery. Dedupe on the header's
+                // key material (remote LTK + OTK id): if a blank for this exact
+                // header already exists (it just failed in try-all above), a fresh
+                // one would fail identically, so redelivered copies don't mint storms.
+                if fallbackData == nil {
+                    if let preferredProps = await preferredSessionIdentity.props(
                         symmetricKey: databaseSymmetricKey)
                     {
                         let header = verificationResult.ratchetMessage.header
-                        do {
-                            let ensured = try await session.ensureInboundInitiatingSessionIdentity(
-                                secretName: inboundTask.senderSecretName,
-                                deviceId: inboundTask.senderDeviceId,
-                                longTermPublicKey: header.remoteLongTermPublicKey,
-                                signingPublicKey: preferredProps.signingPublicKey,
-                                oneTimePublicKey: header.remoteOneTimePublicKey,
-                                mlKEMPublicKey: header.remoteMLKEMPublicKey,
-                                deviceNameHint: preferredProps.deviceName)
-                            DecryptFailureAuditLog.log(
-                                "pqs.recovery.inboundInitiatingSlotEnsured peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) sessionId=\(ensured.id.uuidString)")
-                            let ensuredDataBeforeAttempt = ensured.data
-                            do {
-                                try await initializeRecipient(
-                                    sessionIdentity: ensured,
-                                    session: session,
-                                    ratchetMessage: verificationResult.ratchetMessage)
-                                let data = try await ratchetManager.ratchetDecrypt(
-                                    verificationResult.ratchetMessage,
-                                    sessionId: ensured.id)
-                                logger.log(
-                                    level: .info,
-                                    message: "stateLess identity fallback succeeded for \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId))")
-                                decryptionSessionIdentity = ensured
-                                fallbackData = data
-                            } catch {
-                                try? await restoreSessionIdentityData(
-                                    ensured,
-                                    data: ensuredDataBeforeAttempt,
-                                    session: session,
-                                    reason: "inbound identity fallback attempt failed")
+                        var blankRows = stateLessAlternates
+                        if preferredProps.state == nil {
+                            blankRows.append(preferredSessionIdentity)
+                        }
+                        // Archived blanks count too: a prior ensured blank demoted by a
+                        // sibling's activation is still in the try-all set above, so a
+                        // fresh mint for the same header would fail identically. Without
+                        // this, every activate-then-fail cycle mints a new blank whose
+                        // archival evicts a real stateful snapshot at the retention cap.
+                        let archivedBlanks = await archivedIdentities.asyncFilter { identity in
+                            (await identity.props(symmetricKey: databaseSymmetricKey))?.state == nil
+                        }
+                        blankRows.append(contentsOf: archivedBlanks)
+                        let blankForHeaderExists = await blankRows.asyncFirst(where: { identity in
+                            guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else {
+                                return false
                             }
-                        } catch {
-                            logger.log(
-                                level: .warning,
-                                message: "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) error=\(error)")
+                            return props.longTermPublicKey == header.remoteLongTermPublicKey
+                                && props.oneTimePublicKey?.id == header.remoteOneTimePublicKey?.id
+                        }) != nil
+                        if blankForHeaderExists {
                             DecryptFailureAuditLog.log(
-                                "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) error=\(error)")
+                                "pqs.recovery.inboundInitiatingSlotEnsureSkipped reason=blankForHeaderExists peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                        } else {
+                            do {
+                                let ensured = try await session.ensureInboundInitiatingSessionIdentity(
+                                    secretName: inboundTask.senderSecretName,
+                                    deviceId: inboundTask.senderDeviceId,
+                                    longTermPublicKey: header.remoteLongTermPublicKey,
+                                    signingPublicKey: preferredProps.signingPublicKey,
+                                    oneTimePublicKey: header.remoteOneTimePublicKey,
+                                    mlKEMPublicKey: header.remoteMLKEMPublicKey,
+                                    deviceNameHint: preferredProps.deviceName)
+                                DecryptFailureAuditLog.log(
+                                    "pqs.recovery.inboundInitiatingSlotEnsured peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) sessionId=\(ensured.id.uuidString)")
+                                let ensuredDataBeforeAttempt = ensured.data
+                                do {
+                                    try await initializeRecipient(
+                                        sessionIdentity: ensured,
+                                        session: session,
+                                        ratchetMessage: verificationResult.ratchetMessage)
+                                    let data = try await ratchetManager.ratchetDecrypt(
+                                        verificationResult.ratchetMessage,
+                                        sessionId: ensured.id)
+                                    logger.log(
+                                        level: .info,
+                                        message: "stateLess identity fallback succeeded for \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId))")
+                                    decryptionSessionIdentity = ensured
+                                    fallbackData = data
+                                } catch {
+                                    attemptFailures.append(
+                                        "ensured:\(ensured.id.uuidString.prefix(8)):\(error)")
+                                    try? await restoreSessionIdentityData(
+                                        ensured,
+                                        data: ensuredDataBeforeAttempt,
+                                        session: session,
+                                        reason: "inbound identity fallback attempt failed")
+                                }
+                            } catch {
+                                logger.log(
+                                    level: .warning,
+                                    message: "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) error=\(error)")
+                                DecryptFailureAuditLog.log(
+                                    "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) error=\(error)")
+                            }
                         }
                     }
                 }
@@ -1218,7 +1273,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         session: session,
                         reason: "active and archived inbound decrypt attempts failed")
                     DecryptFailureAuditLog.log(
-                        "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                        "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) attempts=[\(attemptFailures.joined(separator: "; "))]")
                     throw preferredError
                 }
                 decryptedData = data
@@ -1818,6 +1873,14 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                             level: .info,
                             message: "pqs.recovery.resendUnavailableReceived sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId) respondingDeviceId=\(notice.respondingDeviceId) unavailableCount=\(notice.unavailableSharedMessageIds.count) clearedPendingCount=\(clearedIds.count) ids=\(notice.unavailableSharedMessageIds.joined(separator: ","))")
                         for sharedId in notice.unavailableSharedMessageIds {
+                            // First terminal resolution only: redelivered notices (the
+                            // responder re-sends them per repeated NACK) must not
+                            // re-notify the host for the same loss.
+                            let newlyTerminal = await session.markInboundContentUnrecoverable(
+                                sender: inboundTask.senderSecretName,
+                                deviceId: inboundTask.senderDeviceId,
+                                sharedId: sharedId)
+                            guard newlyTerminal else { continue }
                             DecryptFailureAuditLog.log(
                                 "pqs.recovery.contentUnrecoverable sharedId=\(sharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) reason=peerHasNoReplay")
                             await session.sessionDelegate?.inboundContentUnrecoverable(
@@ -1858,6 +1921,12 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     DecryptFailureAuditLog.log(
                         "pqs.recovery.recovered sharedId=\(inboundTask.sharedMessageId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) priorFailureClasses=\(recoveredFailureClasses.joined(separator: ","))")
                 }
+                // A late orphan replay can land after the tuple was written off as
+                // unrecoverable; the content is back, so lift the terminal mark.
+                await session.clearInboundTerminalOutcome(
+                    sender: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId,
+                    sharedId: inboundTask.sharedMessageId)
                 // Proven decrypt heals the lane: clear distinct-failure escalate bookkeeping.
                 await session.clearUndecryptableLaneFailures(
                     sender: inboundTask.senderSecretName,
@@ -1922,6 +1991,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         reason: String
     ) async throws {
         identity.data = data
+        // The ratchet manager persists working mutations during an attempt, so its
+        // in-memory configuration now diverges from the restored row. Evict it so the
+        // next attempt rebuilds from the committed row (blank rows re-run the PQXDH
+        // bootstrap from the incoming header instead of reusing poisoned state).
+        await ratchetManager.evictSessionConfiguration(identity.id)
         guard let cache = await session.cache else { return }
 
         do {
@@ -2211,8 +2285,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     }
 
     /// Tells the requesting device that these ids have no replay source anywhere so it
-    /// stops re-requesting them. Delivered on an initiating session when Whisper on the
-    /// current active is already dead (product NACK; not orphan-resend MessageRecord replace).
+    /// stops re-requesting them. Delivered on the requester device's existing active
+    /// lane — an unanswerable retry request must never reset session state. An
+    /// initiating row is minted only when no active session exists for that device.
     /// Send failures are non-fatal: the requester-side attempt
     /// cap (`PQSSessionConstants.peerResendRequestMaxSubmissions`) still bounds the loop
     /// when the notice is lost.
@@ -2278,7 +2353,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     "pqs.recovery.resendUnavailableOrphanMarkStaleUsingFallback requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(fallbackIdentity.id.uuidString) unavailableCount=\(unavailableIds.count)")
             }
         } else {
-            deliveryIdentity = await mintResendUnavailableInitiatingIdentity(
+            deliveryIdentity = await resolveResendUnavailableDeliveryIdentity(
                 fallback: fallbackIdentity,
                 requesterName: requesterName,
                 requesterDeviceId: requesterDeviceId,
@@ -2366,25 +2441,42 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         }
     }
 
-    /// Product initiating session for decryptable unavailable NACKs. Distinct from orphan-resend
-    /// `orphanResend` — does not mark orphanResend or rewrite MessageRecord ledgers.
-    private func mintResendUnavailableInitiatingIdentity(
+    /// Delivery identity for unavailable NACKs. A retry request we cannot service
+    /// must never tear down session state (discard, don't reset): deliver the notice
+    /// on the requester device's existing active lane. Mint an initiating row only
+    /// when that peer device has no active session at all — with no actives the
+    /// reset demotes nothing (`laneReset ... demotedActive=0`). Never stamp a
+    /// preferred lane here; general outbound must not be captured by a NACK row.
+    private func resolveResendUnavailableDeliveryIdentity(
         fallback: SessionIdentity,
         requesterName: String,
         requesterDeviceId: UUID,
         session: PQSSession
     ) async -> SessionIdentity {
         do {
+            let symmetricKey = try await session.getDatabaseSymmetricKey()
+            let identities = try await session.cache?.fetchSessionIdentities() ?? []
+            let preferredDevice = await currentDeviceConfiguration(
+                secretName: requesterName,
+                deviceId: requesterDeviceId,
+                session: session)
+            if let active = await outboundSessionIdentity(
+                secretName: requesterName,
+                deviceId: requesterDeviceId,
+                in: identities,
+                symmetricKey: symmetricKey,
+                session: session,
+                preferredDevice: preferredDevice
+            ) {
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.resendUnavailableUsingActive requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(active.id.uuidString)")
+                return active
+            }
             let identity = try await session.resetSessionIdentityForFreshSession(
                 secretName: requesterName,
                 deviceId: requesterDeviceId,
                 sendOneTimeIdentities: false,
                 reason: "resendUnavailable")
-            preferredSessionIdentityIdByPeerDevice[
-                peerDeviceIdentityPreferenceKey(
-                    secretName: requesterName,
-                    deviceId: requesterDeviceId)
-            ] = identity.id
             DecryptFailureAuditLog.log(
                 "pqs.recovery.resendUnavailableInitiating requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) newSessionId=\(identity.id.uuidString)")
             return identity
@@ -2681,18 +2773,24 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         message: "pqs.recovery.pendingResendExhausted sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId) failureClass=\(pending.failureClass) attempts=\(attempts)")
                     DecryptFailureAuditLog.log(
                         "pqs.recovery.pendingResendExhausted sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) failureClass=\(pending.failureClass) attempts=\(attempts)")
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.contentUnrecoverable sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(attempts)")
                     // Terminal on the requester: stop asking and quarantine so poison
                     // redelivery cannot reopen recovery for this sharedId.
                     await session.clearPendingResends(
                         sender: pending.senderName,
                         deviceId: pending.senderDeviceId,
                         messageIds: [pending.failedSharedMessageId])
-                    await session.sessionDelegate?.inboundContentUnrecoverable(
-                        senderSecretName: pending.senderName,
-                        senderDeviceId: pending.senderDeviceId,
-                        sharedMessageId: pending.failedSharedMessageId)
+                    let newlyTerminal = await session.markInboundContentUnrecoverable(
+                        sender: pending.senderName,
+                        deviceId: pending.senderDeviceId,
+                        sharedId: pending.failedSharedMessageId)
+                    if newlyTerminal {
+                        DecryptFailureAuditLog.log(
+                            "pqs.recovery.contentUnrecoverable sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(attempts)")
+                        await session.sessionDelegate?.inboundContentUnrecoverable(
+                            senderSecretName: pending.senderName,
+                            senderDeviceId: pending.senderDeviceId,
+                            sharedMessageId: pending.failedSharedMessageId)
+                    }
                     continue
                 }
 
@@ -2989,6 +3087,23 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     {
         guard let cache = await session.cache else { throw PQSSession.SessionErrors.databaseNotInitialized }
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
+
+        // Duplicate-persist guard: the same logical message can decrypt twice
+        // (an orphan replay landing after the original, or a redelivery racing
+        // the ingress guard). One sharedId from one sender tuple is one chat
+        // row — persisting again would mint a second row with a fresh UUID and
+        // notify the host twice. The sender-tuple match keeps this from ever
+        // colliding with a *different* sender's frame or with our own outbound
+        // record for the same conversation.
+        if let existing = try await cache.fetchMessageIfExists(sharedId: inboundTask.sharedMessageId),
+           let existingProps = await existing.props(symmetricKey: databaseSymmetricKey),
+           existingProps.senderSecretName == inboundTask.senderSecretName,
+           existingProps.senderDeviceId == inboundTask.senderDeviceId
+        {
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.duplicateInboundPersistSkipped sharedId=\(inboundTask.sharedMessageId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+            return
+        }
         
         switch decodedMessage.recipient {
         case let .nickname(recipient):

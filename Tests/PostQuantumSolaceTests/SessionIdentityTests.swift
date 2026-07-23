@@ -786,7 +786,16 @@ actor SessionIdentityTests {
             #expect(replacementProps.longTermPublicKey == rotatedDevice.longTermPublicKey)
             #expect(replacementProps.signingPublicKey == rotatedDevice.signingPublicKey)
             #expect(replacementProps.state == nil)
-            #expect(!store.identities.contains(where: { $0.id == originalIdentity.id }))
+            // Demote-in-place contract: the original row id is retained as an inactive
+            // snapshot (outbound ledgers may still reference it) rather than deleted;
+            // only the replacement row remains active for this device.
+            let originalRow = store.identities.first(where: { $0.id == originalIdentity.id })
+            #expect(originalRow != nil)
+            if let originalProps = await originalRow?.props(symmetricKey: symmetricKey) {
+                #expect(originalProps.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix))
+            } else {
+                Issue.record("Expected demoted original identity to decode")
+            }
 
             await session.shutdown()
         } catch {

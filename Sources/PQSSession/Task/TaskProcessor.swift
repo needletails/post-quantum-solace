@@ -138,6 +138,20 @@ public actor TaskProcessor {
     /// instead of busy-spinning. Cleared as jobs become due or the loop restarts.
     var deferredDelayedJobIds: Set<UUID> = []
 
+    /// Serialization for bulk job reloads (`loadFromCache`). Reconnect can trigger
+    /// the reload from more than one place (host `resumeJobQueue`, the
+    /// viability-transition auto-drain, the processing loop's refill); overlapping
+    /// bulk reloads could enqueue the same persisted job twice, and duplicate
+    /// enqueues send duplicate frames. Later reloads wait rather than skip so a
+    /// caller's drain request is never silently dropped if the active reload throws.
+    var isBulkReloadingJobs = false
+    var bulkReloadWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Jobs currently executing in the processing loop. A job's cache row is only
+    /// deleted after it completes, so a bulk reload racing an executing job would
+    /// otherwise re-enqueue (and re-send) it from cache during that window.
+    var inFlightJobIds: Set<UUID> = []
+
     /// Delegate responsible for transport-level session communication.
     /// Handles the actual sending and receiving of encrypted messages over the network.
     var delegate: (any SessionTransport)?

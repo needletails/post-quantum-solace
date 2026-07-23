@@ -175,6 +175,14 @@ public enum PQSSessionConstants: Sendable {
     /// (`requestingDeviceId|sharedId`) before oldest entries are evicted.
     public static let unavailableResendMemoryMaxEntries = 256
 
+    /// How long a terminally unrecoverable inbound tuple
+    /// (`sender|deviceId|sharedId`) is remembered so redelivered copies of the
+    /// same frame are swallowed on decrypt failure instead of reopening
+    /// recovery (fresh NACK round + duplicate host notification). Offline
+    /// queues can redeliver across many reconnects, so this is deliberately
+    /// much longer than the failure-policy cooldowns.
+    public static let terminalInboundOutcomeTTLSeconds: TimeInterval = 60 * 60 * 24 * 7
+
     // MARK: - Schema versioning
 
     /// Current schema version for persisted session state.

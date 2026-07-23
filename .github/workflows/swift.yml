@@ -60,6 +60,24 @@ jobs:
             exit 1
           fi
 
+      - name: Require Swift 6.3+ (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SWIFT_VERSION_LINE=$(swift --version 2>&1 | head -n 1)
+          echo "$SWIFT_VERSION_LINE"
+          if [[ ! "$SWIFT_VERSION_LINE" =~ Swift\ version\ ([0-9]+)\.([0-9]+) ]]; then
+            echo "Unable to parse Swift version from: $SWIFT_VERSION_LINE" >&2
+            exit 1
+          fi
+          SWIFT_MAJOR="${BASH_REMATCH[1]}"
+          SWIFT_MINOR="${BASH_REMATCH[2]}"
+          if (( SWIFT_MAJOR < 6 )) || { (( SWIFT_MAJOR == 6 )) && (( SWIFT_MINOR < 3 )); }; then
+            echo "Swift 6.3+ is required (swift-tools-version: 6.3). Found: $SWIFT_VERSION_LINE" >&2
+            exit 1
+          fi
+
       - name: Swift version (macOS)
         if: ${{ runner.os == 'macOS' }}
         run: |
@@ -72,7 +90,7 @@ jobs:
           sudo apt-get update
           sudo apt-get -y install libcurl4-openssl-dev
 
-      - name: Install Swift 6.2.1 with Swiftly (Linux)
+      - name: Install Swift 6.3.0 with Swiftly (Linux)
         if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
@@ -81,12 +99,12 @@ jobs:
           tar zxf swiftly-$(uname -m).tar.gz
           ./swiftly init --quiet-shell-followup
           source ~/.local/share/swiftly/env.sh
-          swiftly install --use 6.2.1
+          swiftly install --use 6.3.0
 
           echo "Looking for Swift in toolchains directory..."
           ls -la "$HOME/.local/share/swiftly/toolchains/" || true
 
-          SWIFT_PATH=$(find "$HOME/.local/share/swiftly/toolchains/6.2.1" -name "swift" -type f 2>/dev/null | head -1)
+          SWIFT_PATH=$(find "$HOME/.local/share/swiftly/toolchains/6.3.0" -name "swift" -type f 2>/dev/null | head -1)
           if [ -n "$SWIFT_PATH" ]; then
             SWIFT_PATH=$(dirname "$SWIFT_PATH")
           else

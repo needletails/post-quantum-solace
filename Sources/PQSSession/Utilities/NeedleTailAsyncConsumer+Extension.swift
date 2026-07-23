@@ -68,6 +68,15 @@ extension NeedleTailAsyncConsumer {
             throw PQSSession.SessionErrors.propsError
         }
 
+        // Enqueue dedupe: a persisted job can be offered from more than one path
+        // at once (direct `feedTask` racing a reconnect bulk reload). The deque
+        // check here is atomic within the consumer actor, so the same JobModel
+        // can never sit in the deque twice — a duplicate enqueue would run the
+        // job twice and send the same frame twice.
+        if deque.contains(where: { ($0.item as? JobModel)?.id == job.id }) {
+            return
+        }
+
         // Honor EncryptableTask.priority so user ciphertext (.urgent) is not
         // head-of-line blocked behind repair/control (.background) work.
         await feedConsumer(typedJob, priority: props.task.priority)

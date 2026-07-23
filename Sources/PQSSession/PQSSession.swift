@@ -156,8 +156,25 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// with all required delegates and cryptographic keys. It becomes `false`
     /// when the session is shut down or encounters critical errors.
     ///
+    /// Setting this from `false` to `true` also drains the persisted job queue
+    /// (`resumeJobQueue()`): messages composed while offline are parked as
+    /// persisted jobs, and this transition is the event that makes them
+    /// transmittable again. Hosts may still call `resumeJobQueue()` themselves;
+    /// the reload is single-flight and skips already-enqueued jobs, so the two
+    /// triggers cannot double-send.
+    ///
     /// - Important: Always check this property before performing cryptographic operations.
-    public nonisolated(unsafe) var isViable: Bool = false
+    public nonisolated(unsafe) var isViable: Bool = false {
+        didSet {
+            guard isViable, !oldValue else { return }
+            Task { [weak self] in
+                guard let self else { return }
+                // Before startSession the cache is nil and this throws
+                // databaseNotInitialized — nothing is parked yet, safe to ignore.
+                try? await self.resumeJobQueue()
+            }
+        }
+    }
 
     /// The shared singleton instance of `PQSSession`.
     ///
@@ -455,6 +472,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// notice is lost. Key format matches ``peerResendRequestKey(sender:deviceId:failedMessageId:)``.
     var resendRequestAttemptsByKey: [String: (attempts: Int, lastAt: Date)] = [:]
 
+    /// Terminal inbound outcomes: tuples whose content was already declared
+    /// unrecoverable to the host. Redelivered copies of these frames are
+    /// swallowed on decrypt failure instead of reopening a NACK round and
+    /// re-notifying the host. A frame for a marked tuple that *does* decrypt
+    /// (late orphan replay) still recovers normally — this ledger is only
+    /// consulted on failure. Key format: "<sender>|<deviceUUID>|<sharedId>".
+    var terminalInboundOutcomeAt: [String: Date] = [:]
+
     struct PendingResendAfterReestablishment: Sendable, Equatable {
         let senderName: String
         let senderDeviceId: UUID
@@ -698,6 +723,51 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         cleanupInboundFailurePolicy(now: now)
         let key = inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: messageId)
         inboundFailurePolicyUntil[key] = now.addingTimeInterval(inboundFailurePolicyTTL)
+    }
+
+    /// Marks an inbound tuple as terminally unrecoverable. Returns `true` only
+    /// the first time the tuple is marked so callers notify the host exactly
+    /// once per loss instead of once per redelivered copy.
+    @discardableResult
+    func markInboundContentUnrecoverable(
+        sender: String,
+        deviceId: UUID,
+        sharedId: String,
+        now: Date = Date()
+    ) -> Bool {
+        pruneRecoveryTimestamps(
+            &terminalInboundOutcomeAt,
+            ttl: PQSSessionConstants.terminalInboundOutcomeTTLSeconds,
+            now: now)
+        let key = inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: sharedId)
+        if terminalInboundOutcomeAt[key] != nil {
+            return false
+        }
+        terminalInboundOutcomeAt[key] = now
+        return true
+    }
+
+    /// True when this tuple already reached a terminal unrecoverable outcome.
+    /// Consulted on decrypt failure so redelivered poison copies are swallowed
+    /// without a fresh NACK round; never consulted before decrypt, so a late
+    /// orphan replay that decrypts still recovers the content.
+    func isInboundContentUnrecoverable(
+        sender: String,
+        deviceId: UUID,
+        sharedId: String,
+        now: Date = Date()
+    ) -> Bool {
+        let key = inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: sharedId)
+        guard let markedAt = terminalInboundOutcomeAt[key] else {
+            return false
+        }
+        return now.timeIntervalSince(markedAt) < PQSSessionConstants.terminalInboundOutcomeTTLSeconds
+    }
+
+    /// Clears the terminal mark after content is recovered (late replay landed).
+    func clearInboundTerminalOutcome(sender: String, deviceId: UUID, sharedId: String) {
+        let key = inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: sharedId)
+        terminalInboundOutcomeAt.removeValue(forKey: key)
     }
     
     /// True when this sharedId already entered orphan-resend (discard + request resend) and is
