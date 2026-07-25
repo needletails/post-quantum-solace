@@ -201,6 +201,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     private(set) var eventDelegate: (any SessionEvents)?
     private var refreshOTKeysTask: Task<Bool, Never>?
     private var refreshMLKEMOTKeysTask: Task<Bool, Never>?
+    private var otkBatchReplacementPairTask: Task<Bool, Never>?
 
     /// Session-lifetime root that owns background child work (OTK recovery, host
     /// notifies). Cancelled on `shutdown()` so fire-and-forget work cannot outlive
@@ -222,6 +223,23 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             guard !Task.isCancelled else { return }
             let viable = await self.isViable
             guard viable else { return }
+            await operation()
+        }
+    }
+
+    /// Schedules transport-protocol work that must survive viability flaps.
+    ///
+    /// `inboundCiphertextAccepted` tells the transport to delete a consumed
+    /// offline spool copy. If that signal is dropped because `isViable`
+    /// momentarily reads false (startup drain, connectivity flap), the copy
+    /// stays queued server-side and is redelivered — and a spooled ciphertext
+    /// replayed after its ratchet step was consumed can only fail decryption,
+    /// seeding a poison/redelivery loop. Shutdown cancellation still applies.
+    func scheduleTransportProtocolWork(_ operation: @escaping @Sendable () async -> Void) {
+        ensureSessionWorkTreeRunning()
+        guard let continuation = backgroundWorkContinuation else { return }
+        continuation.yield {
+            guard !Task.isCancelled else { return }
             await operation()
         }
     }
@@ -496,6 +514,15 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// While an episode is open, additional decrypt failures for that peer device
     /// coalesce into deferred resend instead of starting another identity reset.
     var openReestablishmentEpisodes: [String: Date] = [:]
+
+    /// Episodes (same keys) opened for failure classes whose spooled offline
+    /// ciphertext can never decrypt regardless of how the lane heals —
+    /// `missingOneTimeKey` means the referenced one-time key is consumed, so
+    /// every frame of that dead session epoch is permanently undecryptable.
+    /// Transport hold-and-replay is pointless for these: held copies would be
+    /// redelivered on every backlog wave forever. Each frame should instead be
+    /// attempted once and purged through the bounded durable-resend claim.
+    var deadSessionCiphertextEpisodes: Set<String> = []
 
     /// Expected response intent for each concrete peer-device recovery lane.
     /// A response cannot close another device's or an older recovery episode.
@@ -882,9 +909,12 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// Clears lane-level undecryptable tracking after a heal or session reset.
-    func clearUndecryptableLaneFailures(sender: String, deviceId: UUID) {
+    func clearUndecryptableLaneFailures(sender: String, deviceId: UUID) async {
         undecryptableLaneFailureIdsByPeer.removeValue(
             forKey: reestablishmentEpisodeKey(sender: sender, deviceId: deviceId))
+        await taskProcessor.clearArchivedInboundFallbackExhausted(
+            sender: sender,
+            deviceId: deviceId)
     }
 
     private func cleanupUndecryptableLaneFailures(now: Date) {
@@ -968,16 +998,48 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         return true
     }
 
+    /// Fingerprint of the inbound frame that last spent a transport-confirmed NACK
+    /// for `(sender|device|sharedId)`. Same fingerprint → await sender; different → rearm.
+    var lastNackFrameFingerprintByKey: [String: Data] = [:]
+
+    /// SHA256-ready raw fingerprint of an undecryptable inbound frame (signed payload).
+    static func nackFrameFingerprint(for message: InboundTaskMessage) -> Data {
+        message.message.signed?.data ?? Data(message.sharedMessageId.utf8)
+    }
+
+    /// Remember the frame fingerprint when a NACK is queued/submitted so rearm can
+    /// distinguish backlog redelivery from new sender orphan material.
+    func rememberNackFrameFingerprint(
+        sender: String,
+        deviceId: UUID,
+        failedMessageId: String,
+        fingerprint: Data
+    ) {
+        let requestKey = peerResendRequestKey(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: failedMessageId)
+        lastNackFrameFingerprintByKey[requestKey] = fingerprint
+        if lastNackFrameFingerprintByKey.count > PQSSessionConstants.recoveryTrackingMaxEntries {
+            let overflow = lastNackFrameFingerprintByKey.count
+                - PQSSessionConstants.recoveryTrackingMaxEntries
+            for key in lastNackFrameFingerprintByKey.keys.prefix(overflow) {
+                lastNackFrameFingerprintByKey.removeValue(forKey: key)
+            }
+        }
+    }
+
     /// A fresh ciphertext for a sharedId that already had a transport-confirmed
     /// NACK still failed decrypt — the prior sender `orphanResend` did not prove.
     /// Clear send-cooldown and failure-class suppress so we can re-request within
     /// ``PQSSessionConstants.peerResendRequestMaxSubmissions``. Event-driven (failed
-    /// decrypt of a new frame), not a timer retry. No receive-side ASR.
+    /// decrypt of *new* sender material), not a timer retry. No receive-side ASR.
     @discardableResult
     func armPeerResendRetryAfterFailedReplay(
         sender: String,
         deviceId: UUID,
         failedMessageId: String,
+        currentFingerprint: Data,
         now: Date = Date()
     ) -> Bool {
         let attempts = resendRequestSubmissionCount(
@@ -985,13 +1047,18 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             deviceId: deviceId,
             failedMessageId: failedMessageId,
             now: now)
-        guard attempts > 0, attempts < PQSSessionConstants.peerResendRequestMaxSubmissions else {
-            return false
-        }
         let requestKey = peerResendRequestKey(
             sender: sender,
             deviceId: deviceId,
             failedMessageId: failedMessageId)
+        let priorFingerprint = lastNackFrameFingerprintByKey[requestKey]
+        guard OrphanReplayRearmPolicy.shouldRearm(
+            priorFingerprint: priorFingerprint,
+            currentFingerprint: currentFingerprint,
+            attempts: attempts)
+        else {
+            return false
+        }
         lastResendRequestAtByPeer.removeValue(forKey: requestKey)
         _ = takeInboundFailureClasses(
             sender: sender,
@@ -1130,7 +1197,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             createdAt: now)
         guard notifyDelegate else { return }
         let delegate = sessionDelegate
-        scheduleBackgroundWork {
+        // Protocol signal: drives the transport's bounded claim-and-purge of the
+        // undecryptable spool copy. Dropping it on a viability flap leaves the
+        // copy immortal server-side (redelivered every backlog wave).
+        scheduleTransportProtocolWork {
             await delegate?.inboundRecoveryDeferred(
                 senderSecretName: sender,
                 senderDeviceId: deviceId,
@@ -1176,6 +1246,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         for key in expiredKeys {
             expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
+            deadSessionCiphertextEpisodes.remove(key)
         }
         // TTL expiry is a terminal lifecycle event, same as an explicit end. Hosts
         // latch state on open episodes (e.g. NudgeKit defers its offline backlog
@@ -1193,7 +1264,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         guard !expiredPeers.isEmpty else { return }
         let delegate = sessionDelegate
-        scheduleBackgroundWork {
+        // Protocol signal: the transport releases held offline ciphertext on it.
+        scheduleTransportProtocolWork {
             for peer in expiredPeers {
                 await delegate?.reestablishmentEpisodeDidEnd(
                     senderSecretName: peer.sender,
@@ -1219,17 +1291,43 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         return !openReestablishmentEpisodes.isEmpty
     }
 
-    /// Opens a single-flight episode. Returns `true` when this caller is the leader
-    /// (should attempt reset + peerRefresh). Returns `false` when an episode is
-    /// already open and the caller must only coalesce deferred resend.
-    @discardableResult
-    func tryBeginReestablishmentEpisode(
+    /// `true` when an open episode for this peer device should make transport
+    /// hold offline ciphertext replay (held frames may decrypt once the lane
+    /// heals, e.g. after a sender orphan-resend). Episodes opened for
+    /// dead-session classes (`missingOneTimeKey`) return `false`: their spooled
+    /// frames can never decrypt, so holding them only builds an immortal
+    /// redelivery queue — they must flow to the bounded attempt-and-purge path.
+    public func shouldHoldOfflineCiphertextDuringRecovery(
         sender: String,
         deviceId: UUID,
         now: Date = Date()
     ) -> Bool {
         cleanupOpenReestablishmentEpisodes(now: now)
         let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
+        guard openReestablishmentEpisodes[key] != nil else { return false }
+        return !deadSessionCiphertextEpisodes.contains(key)
+    }
+
+    /// Opens a single-flight episode. Returns `true` when this caller is the leader
+    /// (should attempt reset + peerRefresh). Returns `false` when an episode is
+    /// already open and the caller must only coalesce deferred resend.
+    ///
+    /// `heldOfflineFramesCanHeal: false` marks the episode as covering a dead
+    /// session epoch (see `deadSessionCiphertextEpisodes`). The mark also
+    /// applies when the episode is already open: a `missingOneTimeKey` failure
+    /// proves the epoch is dead no matter which class opened the episode first.
+    @discardableResult
+    func tryBeginReestablishmentEpisode(
+        sender: String,
+        deviceId: UUID,
+        heldOfflineFramesCanHeal: Bool = true,
+        now: Date = Date()
+    ) -> Bool {
+        cleanupOpenReestablishmentEpisodes(now: now)
+        let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
+        if !heldOfflineFramesCanHeal {
+            deadSessionCiphertextEpisodes.insert(key)
+        }
         if openReestablishmentEpisodes[key] != nil {
             return false
         }
@@ -1237,16 +1335,18 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         return true
     }
 
-    func endReestablishmentEpisode(sender: String, deviceId: UUID) {
+    func endReestablishmentEpisode(sender: String, deviceId: UUID) async {
         let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
         let wasOpen = openReestablishmentEpisodes.removeValue(forKey: key) != nil
         expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
-        clearUndecryptableLaneFailures(sender: sender, deviceId: deviceId)
+        deadSessionCiphertextEpisodes.remove(key)
+        await clearUndecryptableLaneFailures(sender: sender, deviceId: deviceId)
         guard wasOpen else { return }
         DecryptFailureAuditLog.log(
             "pqs.recovery.episodeEnded sender=\(sender) deviceId=\(deviceId.uuidString)")
         let delegate = sessionDelegate
-        scheduleBackgroundWork {
+        // Protocol signal: the transport releases held offline ciphertext on it.
+        scheduleTransportProtocolWork {
             await delegate?.reestablishmentEpisodeDidEnd(
                 senderSecretName: sender,
                 senderDeviceId: deviceId)
@@ -1444,7 +1544,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 let senderName = pending.senderName
                 let senderDeviceId = pending.senderDeviceId
                 let sharedMessageId = pending.failedSharedMessageId
-                scheduleBackgroundWork {
+                // Protocol signal: drives the transport's terminal purge of the
+                // spool copy. Dropping it on a viability flap leaves the copy
+                // immortal server-side.
+                scheduleTransportProtocolWork {
                     await delegate?.inboundContentUnrecoverable(
                         senderSecretName: senderName,
                         senderDeviceId: senderDeviceId,
@@ -2652,7 +2755,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         if !staleKeys.isEmpty {
             let delegate = sessionDelegate
             let keys = Array(staleKeys)
-            scheduleBackgroundWork {
+            // Protocol signal: the transport releases held offline ciphertext on it.
+            scheduleTransportProtocolWork {
                 for key in keys {
                     let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
                     guard parts.count == 2, let deviceId = UUID(uuidString: parts[1]) else { continue }
@@ -3175,6 +3279,33 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             return false
         }
         return await refreshMLKEMOTKeysTask?.value ?? false
+    }
+
+    /// Replaces both published one-time-key batches (Curve25519 + ML-KEM) as a
+    /// single-flight pair for inbound-recovery paths.
+    ///
+    /// Concurrent recovery episodes (multiple senders failing in the same backlog
+    /// wave) must not each run their own delete/upload cycle: the server serializes
+    /// writes to the user-configuration row and rejects overlapping cycles with a
+    /// conflict (observed as HTTP 409 "concurrent user update" aborting recovery
+    /// mid-flight). Joining the in-flight replacement is semantically equivalent —
+    /// any completed replacement publishes a full fresh batch that satisfies every
+    /// waiting episode.
+    func replacePublishedOneTimeKeyBatchesForRecovery() async -> Bool {
+        if let existing = otkBatchReplacementPairTask {
+            return await existing.value
+        }
+        let pair = Task<Bool, Never> { [weak self] in
+            guard let self else { return false }
+            let curveReplaced = await refreshOneTimeKeysTask(policy: .replacePublishedBatch)
+            guard !Task.isCancelled else { return false }
+            let mlKEMReplaced = await refreshMLKEMOneTimeKeysTask(policy: .replacePublishedBatch)
+            return curveReplaced && mlKEMReplaced
+        }
+        otkBatchReplacementPairTask = pair
+        let result = await pair.value
+        otkBatchReplacementPairTask = nil
+        return result
     }
 
     /// - Parameter policy: Controls whether the device only tops up when low, always tops up to the
@@ -3820,6 +3951,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         refreshOTKeysTask = nil
         refreshMLKEMOTKeysTask?.cancel()
         refreshMLKEMOTKeysTask = nil
+        otkBatchReplacementPairTask?.cancel()
+        otkBatchReplacementPairTask = nil
         await taskProcessor.cancelBackgroundKeyTasks()
         do {
             try await taskProcessor.ratchetManager.shutdown()

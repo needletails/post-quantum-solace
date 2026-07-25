@@ -284,6 +284,12 @@ public extension PQSSession {
     /// Refreshes when the local set is empty, contains devices absent from the verified
     /// snapshot, or is missing a verified device. Encrypt prepares initiating sessions
     /// for state-less rows — this helper does not run a second prep engine.
+    ///
+    /// Offline-first (`queueOutboundDespiteConfigurationLookupFailure` /
+    /// `offlineOutboundPersist`): when local lanes already exist, a live
+    /// `findConfiguration` failure (or non-viable transport) must not abort
+    /// compose — use the last verified snapshot / local active device ids so
+    /// `createEncryptableTask` can persist and drain on resume.
     func sessionIdentitiesForChatFanout(secretName: String) async throws -> [SessionIdentity] {
         guard let transportDelegate else {
             throw PQSSession.SessionErrors.transportNotInitialized
@@ -300,35 +306,81 @@ public extension PQSSession {
             return props.deviceId
         })
 
-        var verifiedIds: Set<UUID>
-        if let cached = lastVerifiedDeviceIdsBySecretName[secretName], !cached.isEmpty {
-            verifiedIds = cached
-        } else {
+        func localLaneFallbackVerifiedIds() -> Set<UUID> {
+            if let cached = lastVerifiedDeviceIdsBySecretName[secretName], !cached.isEmpty {
+                return cached
+            }
+            return localActiveDeviceIds
+        }
+
+        func fetchVerifiedIdsFromRemote() async throws -> Set<UUID> {
             let configuration = try await transportDelegate.findConfiguration(for: secretName)
             try validateUserConfigurationSignatures(configuration)
             let verifiedDevices = try verifiedDevicesWithUsableKeyMaterial(
                 in: configuration,
                 secretName: secretName,
                 source: "remote")
-            verifiedIds = Set(verifiedDevices.map(\.deviceId))
-            lastVerifiedDeviceIdsBySecretName[secretName] = verifiedIds
+            let ids = Set(verifiedDevices.map(\.deviceId))
+            lastVerifiedDeviceIdsBySecretName[secretName] = ids
+            return ids
+        }
+
+        // Non-viable: never block compose on live config — local lanes are enough
+        // to persist and park until `resumeJobQueue`.
+        let offlineOutboundPersist = !isViable
+
+        var verifiedIds: Set<UUID>
+        var usedConfigurationLookupFallback = false
+        if offlineOutboundPersist {
+            verifiedIds = localLaneFallbackVerifiedIds()
+            if verifiedIds.isEmpty {
+                throw PQSSession.SessionErrors.cannotFindUserConfiguration
+            }
+            usedConfigurationLookupFallback = true
+        } else if let cached = lastVerifiedDeviceIdsBySecretName[secretName], !cached.isEmpty {
+            verifiedIds = cached
+        } else {
+            do {
+                verifiedIds = try await fetchVerifiedIdsFromRemote()
+            } catch {
+                verifiedIds = localLaneFallbackVerifiedIds()
+                guard !verifiedIds.isEmpty else { throw error }
+                usedConfigurationLookupFallback = true
+                logger.log(
+                    level: .warning,
+                    message: "queueOutboundDespiteConfigurationLookupFailure secretName=\(secretName) error=\(error) localDevices=\(verifiedIds.count)")
+            }
         }
 
         let hasDevicesAbsentFromVerified = !localActiveDeviceIds.isSubset(of: verifiedIds)
         let missingVerifiedDevices = !verifiedIds.isSubset(of: localActiveDeviceIds)
-        let forceRefresh = existing.isEmpty
-            || hasDevicesAbsentFromVerified
-            || missingVerifiedDevices
+        // Warm baseline: local lanes + last verified snapshot already exist. Do not
+        // block compose on live findConfiguration — membership drift is reconciled
+        // on the next successful config fetch, not on every DM send (dogfood N1).
+        let hasWarmLocalLanes = !localActiveDeviceIds.isEmpty
+            && !(lastVerifiedDeviceIdsBySecretName[secretName] ?? []).isEmpty
+        var forceRefresh = !offlineOutboundPersist
+            && !usedConfigurationLookupFallback
+            && !hasWarmLocalLanes
+            && (existing.isEmpty
+                || hasDevicesAbsentFromVerified
+                || missingVerifiedDevices)
 
         if forceRefresh {
-            let configuration = try await transportDelegate.findConfiguration(for: secretName)
-            try validateUserConfigurationSignatures(configuration)
-            let verifiedDevices = try verifiedDevicesWithUsableKeyMaterial(
-                in: configuration,
-                secretName: secretName,
-                source: "remote")
-            verifiedIds = Set(verifiedDevices.map(\.deviceId))
-            lastVerifiedDeviceIdsBySecretName[secretName] = verifiedIds
+            do {
+                verifiedIds = try await fetchVerifiedIdsFromRemote()
+            } catch {
+                // Keep local/cached membership; still encrypt to known lanes.
+                forceRefresh = false
+                if verifiedIds.isEmpty {
+                    verifiedIds = localActiveDeviceIds
+                }
+                guard !verifiedIds.isEmpty else { throw error }
+                usedConfigurationLookupFallback = true
+                logger.log(
+                    level: .warning,
+                    message: "queueOutboundDespiteConfigurationLookupFailure secretName=\(secretName) phase=forceRefresh error=\(error) localDevices=\(verifiedIds.count)")
+            }
         }
 
         let refreshed = try await refreshIdentities(
@@ -1297,6 +1349,15 @@ public extension PQSSession {
             // Proven decrypt becomes the sole active for this peer device.
             // Remint encrypt passes `recipientIdentity` explicitly — the orphan row
             // must not remain a second active (that captured general outbound).
+            // Keep a live recovery lane while the wave is open (control/metadata
+            // decrypt must not tear orphan recovery).
+            if isOrphanResendRecoverySession(
+                secretName: props.secretName,
+                deviceId: props.deviceId,
+                sessionId: identity.id
+            ), identity.id != proven.id {
+                continue
+            }
             let demotingOrphan = isOrphanResendInitiatingSession(
                 secretName: props.secretName,
                 deviceId: props.deviceId,
@@ -1362,7 +1423,60 @@ public extension PQSSession {
             symmetricKey: symmetricKey,
             props: demotedProps)
         try await cache.updateSessionIdentity(identity)
+        // New archive material: re-arm one archive fallback for this peer-device
+        // (dogfood C2f — exhaustion must not stick across archive-set changes).
+        await taskProcessor.clearArchivedInboundFallbackExhausted(
+            sender: props.secretName,
+            deviceId: props.deviceId)
         return true
+    }
+
+    /// Demote a specific prove-failed active (initialized or state-less) so it cannot
+    /// win `bestSessionIdentity` / preferred selection. Used after inbound try-all
+    /// failure and sender orphan remint when MessageRecord named a dead lane.
+    @discardableResult
+    internal func demoteProveFailedActive(
+        sessionId: UUID,
+        secretName: String,
+        deviceId: UUID
+    ) async throws -> Bool {
+        guard let cache else {
+            throw PQSSession.SessionErrors.databaseNotInitialized
+        }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let allIdentities = try await cache.fetchSessionIdentities()
+        guard let identity = allIdentities.first(where: { $0.id == sessionId }) else {
+            return false
+        }
+        guard let props = await identity.props(symmetricKey: symmetricKey),
+              props.secretName == secretName,
+              props.deviceId == deviceId,
+              !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+        else {
+            return false
+        }
+        // Do not demote an in-flight orphan-resend initiating or recovery session.
+        if isOrphanResendInitiatingSession(
+            secretName: secretName,
+            deviceId: deviceId,
+            sessionId: identity.id
+        ) || isOrphanResendRecoverySession(
+            secretName: secretName,
+            deviceId: deviceId,
+            sessionId: identity.id
+        ) {
+            return false
+        }
+        let demoted = try await demoteActiveSessionIdentityToInactive(identity)
+        if demoted {
+            sessionIdentities.remove(secretName)
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.proveFailedActiveDemoted peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(sessionId.uuidString)")
+            logger.log(
+                level: .warning,
+                message: "Demoted prove-failed active SessionIdentity \(sessionId) for \(secretName) (\(deviceId))")
+        }
+        return demoted
     }
 
     /// Recovery allows a state-less initiating active after orphan-resend insert. A *zombie*
@@ -1389,8 +1503,12 @@ public extension PQSSession {
             else {
                 continue
             }
-            // Do not demote an in-flight orphan-resend initiating session.
+            // Do not demote an in-flight orphan-resend initiating or recovery session.
             if isOrphanResendInitiatingSession(
+                secretName: secretName,
+                deviceId: deviceId,
+                sessionId: identity.id
+            ) || isOrphanResendRecoverySession(
                 secretName: secretName,
                 deviceId: deviceId,
                 sessionId: identity.id
@@ -1446,6 +1564,14 @@ public extension PQSSession {
                 continue
             }
             // Promoting a proven archive makes it the sole active for this peer device.
+            // Keep a live recovery lane while the wave is open.
+            if isOrphanResendRecoverySession(
+                secretName: props.secretName,
+                deviceId: props.deviceId,
+                sessionId: identity.id
+            ), identity.id != archived.id {
+                continue
+            }
             let demotingOrphan = isOrphanResendInitiatingSession(
                 secretName: props.secretName,
                 deviceId: props.deviceId,
@@ -1511,7 +1637,8 @@ public extension PQSSession {
         secretName: String,
         deviceId: UUID,
         sendOneTimeIdentities: Bool = true,
-        reason: String = "unspecified"
+        reason: String = "unspecified",
+        demotePriorActives: Bool = true
     ) async throws -> SessionIdentity {
         guard let cache else {
             throw PQSSession.SessionErrors.databaseNotInitialized
@@ -1530,8 +1657,9 @@ public extension PQSSession {
         clearRecoveryEmitBlocked(sender: secretName, deviceId: deviceId)
         // A non-orphanReset replaces the intentional orphan-resend initiating mark and
         // recovery-session history; orphanResend callers re-mark the returned row after
-        // this returns.
-        if reason != "orphanResend" {
+        // this returns. NACK control delivery must not wipe recovery history either —
+        // same-account outbound still binds to orphanResendRecoverySessionByPeer.
+        if reason != "orphanResend", reason != "resendRequestControlDelivery" {
             clearOrphanResendRecoveryState(secretName: secretName, deviceId: deviceId)
         }
 
@@ -1625,10 +1753,14 @@ public extension PQSSession {
         // Device record: previous current becomes inactive (demote in place).
         // Do not copy+delete — that minted a second inactive UUID and destroyed the
         // original row id outbound ledgers may still reference.
+        // Surgical control insert (`demotePriorActives == false`) keeps live
+        // recovery / honest actives — NACK escape must not demote-all.
         var demotedActiveCount = 0
-        for match in activeMatches {
-            if try await demoteActiveSessionIdentityToInactive(match.identity) {
-                demotedActiveCount += 1
+        if demotePriorActives {
+            for match in activeMatches {
+                if try await demoteActiveSessionIdentityToInactive(match.identity) {
+                    demotedActiveCount += 1
+                }
             }
         }
 
@@ -1641,12 +1773,17 @@ public extension PQSSession {
 
         logger.log(
             level: .info,
-            message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
+            message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities) demotePrior=\(demotePriorActives)")
         // Lane teardown in the same audit file as the decrypt failures: a proven
         // inbound lane failing right after one of these entries identifies the
         // caller that clobbered it.
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.laneReset outcome=reset reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
+        if demotePriorActives {
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.laneReset outcome=reset reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
+        } else {
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.laneReset outcome=surgicalControlInsert reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
+        }
 
         return identity
     }

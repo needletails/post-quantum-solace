@@ -1011,6 +1011,89 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    /// Dogfood observation: archive try-all must not HOL-block fresher active-lane
+    /// frames. Production defers archive work to `.background` and enqueues user
+    /// inbound as `.urgent` — urgent must complete before remaining background jobs.
+    @Test("dogfood C2: fresh active-lane inbound is not HOL-blocked by poison archive try-all")
+    func dogfoodC2_freshActiveInboundNotHOLBlockedByArchiveTryAll() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let probe = InboundCompletionOrderProbe()
+        let startGate = InboundStartGate()
+        let poisonCount = 4
+        let poisonDelayMs: UInt64 = 80
+        let freshId = "fresh-active-lane"
+        let delegate = MockTaskDelegateSimulatingArchiveTryAllHOL(
+            poisonPrefix: "poison-archive-",
+            freshId: freshId,
+            poisonDelayMilliseconds: poisonDelayMs,
+            probe: probe,
+            startGate: startGate)
+        await session.taskProcessor.setTaskDelegate(delegate)
+
+        let peerName = "bob_archive_hol"
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
+
+        // First feedTask awaits the full processing drain. Hold the first job on
+        // startGate so later feedTasks hit isRunning and only enqueue (urgent
+        // prepends ahead of remaining background work).
+        let firstPoison = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: "poison-archive-0")
+        let draining = Task {
+            try await self.session.taskProcessor.feedTask(
+                EncryptableTask(task: .streamMessage(firstPoison), priority: .background),
+                session: self.session)
+        }
+
+        #expect(
+            await startGate.waitUntilHeld(timeout: 2),
+            "Processor should hold the first background job while the rest enqueue")
+
+        for i in 1..<poisonCount {
+            let poison = try makeTestInboundTaskMessage(
+                senderSecretName: peerName,
+                senderDeviceId: peerDeviceId,
+                sharedMessageId: "poison-archive-\(i)")
+            try await session.taskProcessor.feedTask(
+                EncryptableTask(task: .streamMessage(poison), priority: .background),
+                session: session)
+        }
+        let fresh = try makeTestInboundTaskMessage(
+            senderSecretName: peerName,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: freshId)
+        try await session.taskProcessor.feedTask(
+            EncryptableTask(task: .streamMessage(fresh), priority: .urgent),
+            session: session)
+        await startGate.release()
+        try await draining.value
+
+        let freshDone = try await waitUntil(timeout: 3) {
+            await probe.completedIds().contains(freshId)
+        }
+        #expect(freshDone, "Fresh active-lane inbound must complete")
+
+        let order = await probe.completedIds()
+        let freshIndex = order.firstIndex(of: freshId)
+        #expect(
+            freshIndex != nil && freshIndex! <= 1,
+            """
+            BUG: fresh active-lane message waited behind poison archive try-all. \
+            completionOrder=\(order) freshIndex=\(String(describing: freshIndex)). \
+            Urgent inbound must jump ahead of deferred archive (.background) jobs.
+            """)
+
+        await session.shutdown()
+    }
+
     @Test("Poisoned stateUninitialized after try-all requests resend; no receive-side ASR")
     func testPoisonedStateUninitializedRequestsSenderOrphanResendNotASR() async throws {
         // Dogfood (echo←nudge): preferred row is state-less / all sessions fail decrypt →
@@ -3134,6 +3217,96 @@ final class MockTaskDelegateWithStreamError: TaskSequenceDelegate, @unchecked Se
         case .writeMessage:
             break
         }
+    }
+}
+
+/// Simulates dogfood HOL: poison jobs spend `poisonDelayMilliseconds` in archive
+/// try-all then fail; the fresh active-lane job succeeds immediately.
+final class MockTaskDelegateSimulatingArchiveTryAllHOL: TaskSequenceDelegate, @unchecked Sendable {
+    private let poisonPrefix: String
+    private let freshId: String
+    private let poisonDelayMilliseconds: UInt64
+    private let probe: InboundCompletionOrderProbe
+    private let startGate: InboundStartGate
+
+    init(
+        poisonPrefix: String,
+        freshId: String,
+        poisonDelayMilliseconds: UInt64,
+        probe: InboundCompletionOrderProbe,
+        startGate: InboundStartGate
+    ) {
+        self.poisonPrefix = poisonPrefix
+        self.freshId = freshId
+        self.poisonDelayMilliseconds = poisonDelayMilliseconds
+        self.probe = probe
+        self.startGate = startGate
+    }
+
+    func performRatchet(task: SessionModels.TaskType, session: PQSSession) async throws {
+        await startGate.hold()
+        switch task {
+        case .streamMessage(let inbound):
+            if inbound.sharedMessageId.hasPrefix(poisonPrefix) {
+                try await Task.sleep(for: .milliseconds(poisonDelayMilliseconds))
+                await probe.mark(inbound.sharedMessageId)
+                throw RatchetError.stateUninitialized
+            }
+            if inbound.sharedMessageId == freshId {
+                await probe.mark(freshId)
+                return
+            }
+        case .writeMessage:
+            break
+        }
+    }
+}
+
+actor InboundCompletionOrderProbe {
+    private var ids: [String] = []
+
+    func mark(_ id: String) {
+        ids.append(id)
+    }
+
+    func completedIds() -> [String] {
+        ids
+    }
+}
+
+actor InboundStartGate {
+    private var released = false
+    private var held = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func hold() async {
+        if released { return }
+        held = true
+        await withCheckedContinuation { continuation in
+            if released {
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+            }
+        }
+    }
+
+    func release() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending {
+            waiter.resume()
+        }
+    }
+
+    func waitUntilHeld(timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if held { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return held
     }
 }
 

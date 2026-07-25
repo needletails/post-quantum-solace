@@ -112,6 +112,41 @@ struct SessionReestablishmentCoalescingTests {
             sender: sender, deviceId: deviceId, sharedId: sharedId))
     }
 
+    @Test("Transport-protocol work runs while the session is not viable")
+    func transportProtocolWorkBypassesViabilityGate() async throws {
+        // `inboundCiphertextAccepted` (offline spool deletion) rides this path.
+        // If it were viability-gated, an ACK earned during a startup drain or
+        // connectivity flap would be silently dropped, the server would keep
+        // the spool copy, and the redelivered ciphertext — whose ratchet step
+        // was already consumed — could only fail decryption forever.
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        session.isViable = false
+
+        actor Flag {
+            var value = false
+            func set() { value = true }
+        }
+        let transportWorkRan = Flag()
+        let gatedWorkRan = Flag()
+
+        await session.scheduleTransportProtocolWork {
+            await transportWorkRan.set()
+        }
+        await session.scheduleBackgroundWork {
+            await gatedWorkRan.set()
+        }
+
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if await transportWorkRan.value { break }
+            try await Task.sleep(until: .now + .milliseconds(20))
+        }
+        #expect(await transportWorkRan.value, "Protocol acknowledgment must run while non-viable")
+        // The gated path had ample time to run alongside; it must have stayed gated.
+        #expect(await !gatedWorkRan.value, "Viability-gated work must not run while non-viable")
+    }
+
     @Test("TransportEvent.messageResendUnavailable round-trips and caps at 64 ids")
     func messageResendUnavailableRoundTripAndCap() throws {
         let respondingDeviceId = UUID()
@@ -198,6 +233,59 @@ struct SessionReestablishmentCoalescingTests {
         #expect(!(await session.hasActiveLocalPeerRefreshRequest(
             sender: "alice",
             deviceId: peerDeviceId)))
+        await session.shutdown()
+    }
+
+    @Test("Dead-session episode does not hold offline ciphertext; healable episode does")
+    func deadSessionEpisodeDoesNotHoldOfflineCiphertext() async {
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let deadPeer = UUID()
+        let healablePeer = UUID()
+
+        // missingOneTimeKey-style open: frames of the dead epoch can never
+        // decrypt, so transport must not hold-and-replay them.
+        #expect(await session.tryBeginReestablishmentEpisode(
+            sender: "alice",
+            deviceId: deadPeer,
+            heldOfflineFramesCanHeal: false))
+        #expect(await session.hasOpenReestablishmentEpisode(
+            sender: "alice",
+            deviceId: deadPeer))
+        #expect(!(await session.shouldHoldOfflineCiphertextDuringRecovery(
+            sender: "alice",
+            deviceId: deadPeer)))
+
+        // Default open (e.g. awaiting sender orphan-resend): held frames may
+        // decrypt after the lane heals, so transport should hold.
+        #expect(await session.tryBeginReestablishmentEpisode(
+            sender: "alice",
+            deviceId: healablePeer))
+        #expect(await session.shouldHoldOfflineCiphertextDuringRecovery(
+            sender: "alice",
+            deviceId: healablePeer))
+
+        // A missingOneTimeKey failure while a healable episode is already open
+        // proves the epoch is dead: the mark upgrades in place.
+        #expect(!(await session.tryBeginReestablishmentEpisode(
+            sender: "alice",
+            deviceId: healablePeer,
+            heldOfflineFramesCanHeal: false)))
+        #expect(!(await session.shouldHoldOfflineCiphertextDuringRecovery(
+            sender: "alice",
+            deviceId: healablePeer)))
+
+        // Ending the episode clears both the episode and the dead-session mark.
+        await session.endReestablishmentEpisode(sender: "alice", deviceId: deadPeer)
+        #expect(!(await session.shouldHoldOfflineCiphertextDuringRecovery(
+            sender: "alice",
+            deviceId: deadPeer)))
+        #expect(await session.tryBeginReestablishmentEpisode(
+            sender: "alice",
+            deviceId: deadPeer))
+        #expect(await session.shouldHoldOfflineCiphertextDuringRecovery(
+            sender: "alice",
+            deviceId: deadPeer))
         await session.shutdown()
     }
 

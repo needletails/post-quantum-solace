@@ -541,10 +541,16 @@ extension TaskProcessor {
                     message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=replaceOTKBatchThenPeerRefresh")
 
                 // If we make it to this point we will try and reestablish session and refresh OTK(s)
-                
+
+                // missingOneTimeKey proves the sender's session epoch is dead: the
+                // referenced one-time key is consumed, so every spooled frame of
+                // that epoch is permanently undecryptable. Transport must not
+                // hold-and-replay offline frames behind this episode — they can
+                // only heal via sender re-encryption, never by re-decrypting.
                 _ = await session.tryBeginReestablishmentEpisode(
                     sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId)
+                    deviceId: message.senderDeviceId,
+                    heldOfflineFramesCanHeal: false)
                 await session.deferPeerResendUntilReestablished(
                     sender: message.senderSecretName,
                     deviceId: message.senderDeviceId,
@@ -564,26 +570,49 @@ extension TaskProcessor {
                 // job queue: an offline-backlog flood would otherwise stall every queued
                 // outbound send behind this recovery. The recovery episode state above
                 // is already recorded, so subsequent failures coalesce against it while
-                // this continuation runs. Ordering inside the continuation is preserved:
-                // peerRefresh is only emitted once fresh keys are on the server.
+                // this continuation runs.
+                //
+                // This is protocol recovery, not deferrable host work: it must ride the
+                // ungated work path. A viability flap (startup drain, listener restart)
+                // silently dropping this continuation strands the episode open with no
+                // peerRefresh on the wire — the peer keeps re-encrypting against dead
+                // keys until the episode TTL expires.
                 let logger = logger
                 let senderSecretName = message.senderSecretName
                 let senderDeviceId = message.senderDeviceId
                 let sharedMessageId = message.sharedMessageId
-                await session.scheduleBackgroundWork { [self] in
-                    let curveReplaced = await session.refreshOneTimeKeysTask(policy: .replacePublishedBatch)
+                await session.scheduleTransportProtocolWork { [self] in
+                    // Single-flight pair: concurrent episodes join one replacement
+                    // instead of racing delete/upload cycles against the same
+                    // server config row (HTTP 409 "concurrent user update").
+                    let batchesReplaced = await session.replacePublishedOneTimeKeyBatchesForRecovery()
                     guard !Task.isCancelled else { return }
-                    let mlKEMReplaced = await session.refreshMLKEMOneTimeKeysTask(policy: .replacePublishedBatch)
-                    guard !Task.isCancelled else { return }
-                    guard curveReplaced && mlKEMReplaced else {
+                    if !batchesReplaced {
+                        // Non-terminal: replacement throws before any local mutation
+                        // and retained privates keep every previously published key
+                        // decryptable, so the server batch stays serviceable. The
+                        // peerRefresh below is the only signal that makes the sender
+                        // re-encrypt — aborting here strands the episode open with no
+                        // heal path (subsequent failures coalesce instead of
+                        // re-emitting) until TTL expiry.
                         logger.log(
-                            level: .error,
-                            message: "pqs.recovery.failed failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId) sharedId=\(sharedMessageId) reason=otkBatchReplacementFailed")
-                        await session.endReestablishmentEpisode(
-                            sender: senderSecretName,
-                            deviceId: senderDeviceId)
-                        return
+                            level: .warning,
+                            message: "pqs.recovery.otkBatchReplacementIncomplete failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId) sharedId=\(sharedMessageId) proceeding=peerRefresh")
                     }
+
+                    // Bilateral one-time-key churn is symmetric: the peer failing on
+                    // us with missingOneTimeKey means our own initiating lane toward
+                    // that device is very likely pinned to a key the peer has since
+                    // evicted — and every frame we send, including the peerRefresh
+                    // emitted below, rides that dead pin. Reset the lane from this
+                    // local evidence (no frame needs to cross the broken pair) so the
+                    // emit below is the first frame on a lane the peer can decrypt.
+                    await resetUnansweredInitiatingLane(
+                        peerSecretName: senderSecretName,
+                        peerDeviceId: senderDeviceId,
+                        trigger: "missingOneTimeKeyEpisode",
+                        session: session)
+                    guard !Task.isCancelled else { return }
 
                     let mySecretName = await session.sessionContext?.sessionUser.secretName
                     let isSelf = senderSecretName == mySecretName
@@ -595,7 +624,7 @@ extension TaskProcessor {
                             try await session.validatePeerAccountSigningKeyAgainstRemote(
                                 secretName: senderSecretName)
                         }
-                        _ = try await session.emitSessionReestablishment(
+                        let emitted = try await session.emitSessionReestablishment(
                             kind: .peerRefresh,
                             recipient: isSelf ? .personalMessage : .nickname(senderSecretName),
                             scope: isSelf
@@ -604,6 +633,11 @@ extension TaskProcessor {
                                     secretName: senderSecretName,
                                     deviceId: senderDeviceId),
                             forceReemit: true)
+                        // Audit-level so device captures show whether the heal
+                        // signal reached the wire; the info logger is filtered
+                        // out on devices, which left this step invisible.
+                        DecryptFailureAuditLog.log(
+                            "pqs.recovery.reestablishmentEmitOutcome kind=peerRefresh outcome=\(emitted ? "queued" : "suppressed") failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) sharedId=\(sharedMessageId)")
                         logger.log(
                             level: .info,
                             message: "pqs.recovery.reestablishmentQueued kind=peerRefresh failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId) sharedId=\(sharedMessageId)")
@@ -735,6 +769,10 @@ extension TaskProcessor {
                 await noteResendReplayDropped(sharedId: message.sharedId, reason: "invalidSignature")
                 try await cache.deleteJob(job)
             }
+        } catch is CancellationError {
+            // Shutdown/cancellation is not a decrypt outcome: the job stays in
+            // cache for the next drain and the spool copy must not be purged.
+            return .failed
         } catch {
             
             // If we are throwing an error for some other reason... On write we delay the message sending for retry before considering it a loss and deleting
@@ -766,6 +804,28 @@ extension TaskProcessor {
             
             // If we are throwing an error for some other reason... On stream we just delete the job
             logger.log(level: .error, message: "Unhandled error during job processing: \(error). Deleting job...")
+            // Stream jobs: the transport deferred the offline spool delete to a
+            // decrypt outcome that will now never come. Deleting only the job
+            // leaves the server copy immortal — it redelivers on every backlog
+            // wave forever (the self-echo consent flood failure shape). Notify
+            // the host so it purges the copy and claims the one bounded durable
+            // resend; persistable content is then re-encrypted by the sender,
+            // and unreplayable frames end terminal instead of eternal.
+            if let inbound = inboundTask(from: props.task.task) {
+                let delegate = await session.sessionDelegate
+                let senderSecretName = inbound.senderSecretName
+                let senderDeviceId = inbound.senderDeviceId
+                let sharedMessageId = inbound.sharedMessageId
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
+                await session.scheduleTransportProtocolWork {
+                    await delegate?.inboundRecoveryDeferred(
+                        senderSecretName: senderSecretName,
+                        senderDeviceId: senderDeviceId,
+                        failedSharedMessageId: sharedMessageId,
+                        failureClass: "inbound.unhandledError")
+                }
+            }
             try await cache.deleteJob(job)
             logger.log(level: .info, message: "Deleted Job")
         }
@@ -920,17 +980,62 @@ extension TaskProcessor {
             return .deleted
         }
 
-        // New frame, same sharedId, prior NACK already on the wire, still undecryptable:
-        // clear cooldown/suppress so sender orphanResend can be asked again (bounded).
+        // New *sender material*, same sharedId, prior NACK already on the wire, still
+        // undecryptable: clear cooldown/suppress so sender orphanResend can be asked
+        // again (bounded). Same ciphertext redelivery must not rearm (cap burn).
+        let frameFingerprint = PQSSession.nackFrameFingerprint(for: message)
+        let preferenceKey = peerDeviceIdentityPreferenceKey(
+            secretName: message.senderSecretName,
+            deviceId: message.senderDeviceId)
+        let proveFailedPreferredId = preferredSessionIdentityIdByPeerDevice[preferenceKey]
+        let preferredFailedInTryAll = proveFailedPreferredId != nil
         let rearmedAfterFailedReplay = await session.armPeerResendRetryAfterFailedReplay(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId,
-            failedMessageId: message.sharedMessageId)
-        if rearmedAfterFailedReplay {
-            logger.log(
-                level: .info,
-                message: "pqs.recovery.orphanReplayStillUndecryptable failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=rearmNack")
+            failedMessageId: message.sharedMessageId,
+            currentFingerprint: frameFingerprint)
+        var preferredCleared = false
+        if rearmedAfterFailedReplay || preferredFailedInTryAll {
+            if rearmedAfterFailedReplay {
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.orphanReplayStillUndecryptable failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=rearmNack")
+            }
+            // Stuck preferred pin on a dead lane — clear pin, demote that active, and
+            // demote zombie blanks so NACK control / next initiating frame can land.
+            if preferredFailedInTryAll || rearmedAfterFailedReplay {
+                clearPreferredSessionIdentity(
+                    secretName: message.senderSecretName,
+                    deviceId: message.senderDeviceId)
+                preferredCleared = true
+            }
+            if let proveFailedPreferredId {
+                _ = try? await session.demoteProveFailedActive(
+                    sessionId: proveFailedPreferredId,
+                    secretName: message.senderSecretName,
+                    deviceId: message.senderDeviceId)
+            }
+            _ = try? await session.demoteZombieStateLessActives(
+                secretName: message.senderSecretName,
+                deviceId: message.senderDeviceId)
+            if preferredCleared {
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.orphanReplayPreferredCleared sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId)")
+            }
         }
+        // Escape poison preferred by clearing pin + riding outbound/orphan (same as
+        // unavailable NACKs). Never force-mint solely because priorSubmissions == 0.
+        let liveInitiatingId = await session.orphanResendInitiatingSessionId(
+            secretName: message.senderSecretName,
+            deviceId: message.senderDeviceId)
+        let liveRecoveryId = await session.orphanResendRecoverySessionId(
+            secretName: message.senderSecretName,
+            deviceId: message.senderDeviceId)
+        let liveOrphanOrRecovery = liveInitiatingId != nil || liveRecoveryId != nil
+        let forceFreshControlLane = ControlDeliveryLanePolicy.shouldMintFreshControlLane(
+            preferredFailedInTryAll: preferredFailedInTryAll,
+            preferredCleared: preferredCleared || rearmedAfterFailedReplay,
+            liveOrphanOrRecovery: liveOrphanOrRecovery)
 
         // While another recovery episode is open (e.g. hard ratchet repair), coalesce.
         // Skip coalesce when we just re-armed after a failed orphan replay — that sharedId
@@ -1065,10 +1170,16 @@ extension TaskProcessor {
             return .deleted
         }
 
+        // bodyDecryptionFailed / sibling undecryptable classes request a sender
+        // orphan-resend. Do not remint the local unanswered pin here — that fed
+        // archive dirt on every NACK wave. Dead pins heal via missingOneTimeKey /
+        // inbound peerRefresh evidence; content heals via sender orphanResend.
         let didRequestResend = await requestPeerResendIfAllowed(
             message: message,
             failureClass: failureClass,
-            session: session)
+            session: session,
+            forceFreshControlLane: forceFreshControlLane,
+            frameFingerprint: frameFingerprint)
         var action = didRequestResend ? "resendRequested" : "resendSkipped"
         if laneSaturated {
             action = didRequestResend ? "resendRequested.lane" : "resendSkipped.lane"
@@ -1087,12 +1198,31 @@ extension TaskProcessor {
     }
 
     private func isConnectionNonViableError(_ error: Error) -> Bool {
-        if let sessionError = error as? PQSSession.SessionErrors,
-           sessionError == .connectionIsNonViable {
-            return true
+        if let sessionError = error as? PQSSession.SessionErrors {
+            switch sessionError {
+            case .connectionIsNonViable, .cannotFindUserConfiguration:
+                // Config/lookup failures are connectivity-shaped: park outbound
+                // jobs for resumeJobQueue instead of deleting the user's compose.
+                return true
+            default:
+                break
+            }
+        }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut, .notConnectedToInternet, .networkConnectionLost,
+                 .cannotConnectToHost, .dnsLookupFailed, .internationalRoamingOff,
+                 .dataNotAllowed:
+                return true
+            default:
+                break
+            }
         }
         let description = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
-        return description.localizedCaseInsensitiveContains("non-viable")
+        if description.localizedCaseInsensitiveContains("non-viable") { return true }
+        if description.localizedCaseInsensitiveContains("timed out") { return true }
+        if description.localizedCaseInsensitiveContains("NSURLErrorDomain") { return true }
+        return false
     }
 
     private func shouldLogOutboundTransportRetry(message: String) -> Bool {
@@ -1266,7 +1396,9 @@ extension TaskProcessor {
     private func requestPeerResendIfAllowed(
         message: InboundTaskMessage,
         failureClass: String,
-        session: PQSSession
+        session: PQSSession,
+        forceFreshControlLane: Bool = false,
+        frameFingerprint: Data? = nil
     ) async -> Bool {
         guard session.isViable else {
             logger.log(
@@ -1318,11 +1450,18 @@ extension TaskProcessor {
             try await session.requestMessageResend(
                 sharedMessageId: message.sharedMessageId,
                 senderName: message.senderSecretName,
-                senderDeviceId: message.senderDeviceId)
+                senderDeviceId: message.senderDeviceId,
+                forceFreshControlLane: forceFreshControlLane)
             await session.markPeerResendRequestSent(
                 sender: message.senderSecretName,
                 deviceId: message.senderDeviceId,
                 failedMessageId: message.sharedMessageId)
+            let fingerprint = frameFingerprint ?? PQSSession.nackFrameFingerprint(for: message)
+            await session.rememberNackFrameFingerprint(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                failedMessageId: message.sharedMessageId,
+                fingerprint: fingerprint)
             logger.log(
                 level: .info,
                 message: "pqs.recovery.resendRequestSubmitted failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId)")

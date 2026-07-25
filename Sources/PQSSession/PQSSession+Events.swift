@@ -188,14 +188,25 @@ public extension PQSSession {
         }
     }
   
-    func requestMessageResend(sharedMessageId: String, senderName: String, senderDeviceId: UUID) async throws {
+    func requestMessageResend(
+        sharedMessageId: String,
+        senderName: String,
+        senderDeviceId: UUID,
+        forceFreshControlLane: Bool = false
+    ) async throws {
         try await requestMessageResend(
             sharedMessageIds: [sharedMessageId],
             senderName: senderName,
-            senderDeviceId: senderDeviceId)
+            senderDeviceId: senderDeviceId,
+            forceFreshControlLane: forceFreshControlLane)
     }
 
-    func requestMessageResend(sharedMessageIds: [String], senderName: String, senderDeviceId: UUID) async throws {
+    func requestMessageResend(
+        sharedMessageIds: [String],
+        senderName: String,
+        senderDeviceId: UUID,
+        forceFreshControlLane: Bool = false
+    ) async throws {
         let sharedMessageIds = sharedMessageIds.filter { !$0.isEmpty }
         guard !sharedMessageIds.isEmpty else { return }
 
@@ -209,6 +220,7 @@ public extension PQSSession {
         let info = TransportEvent.requestMessageResend(packet)
         let encoded = try BinaryEncoder().encode(info)
         let isSelf = senderName == context.sessionUser.secretName
+        // Recipient label only; device scope is enforced by feedDeviceScopedControlWrite.
         let message = CryptoMessage(
             text: "",
             metadata: .init(),
@@ -216,27 +228,17 @@ public extension PQSSession {
             transportInfo: encoded,
             sentDate: Date(),
             destructionTime: nil)
-        
-        let identity = try await taskProcessor.resolveControlDeliverySessionIdentity(
+
+        try await taskProcessor.feedDeviceScopedControlWrite(
+            message: message,
             secretName: senderName,
             deviceId: senderDeviceId,
-            session: self)
-        
-        let task = EncryptableTask(
-            task: .writeMessage(OutboundTaskMessage(
-                message: message,
-                recipientIdentity: identity,
-                localId: UUID(),
-                sharedId: UUID().uuidString,
-                isPersistedOutbound: false
-            )),
-            priority: .urgent
-        )
-    
-        try await taskProcessor.feedTask(task, session: self)
+            sharedId: UUID().uuidString,
+            session: self,
+            forceFreshInitiating: forceFreshControlLane)
         logger.log(
             level: .info,
-            message: "pqs.recovery.resendRequestSubmitted sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(sharedMessageIds.count) ids=\(sharedMessageIds.joined(separator: ","))")
+            message: "pqs.recovery.resendRequestSubmitted sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(sharedMessageIds.count) ids=\(sharedMessageIds.joined(separator: ",")) forceFresh=\(forceFreshControlLane)")
     }
 
     @discardableResult

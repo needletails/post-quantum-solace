@@ -7482,7 +7482,7 @@ actor EndToEndTests {
         bobTransport.continuation?.finish()
     }
     
-    private func createFriendship(
+    func createFriendship(
         aliceSession: PQSSession,
         sd: SessionDelegate,
         bobSession: PQSSession,
@@ -10358,6 +10358,15 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     /// Used to simulate rotation publish failures.
     var publishRotatedKeysError: Error?
 
+    /// If set, `findConfiguration` throws this error after optional hang (dogfood API timeout).
+    var findConfigurationError: Error?
+
+    /// If set, awaited before every `findConfiguration` lookup (never-resume = hang).
+    var findConfigurationHang: (@Sendable () async -> Void)?
+
+    /// Optional filter: hang/throw only for these secret names. `nil` = all names.
+    var findConfigurationFaultSecretNames: Set<String>?
+
     /// If set, OTK curve uploads will throw on the first N calls then succeed.
     /// Thread-safe via OTKErrorInjector actor.
     private let otkErrorInjector = OTKErrorInjector()
@@ -10367,12 +10376,16 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     var otkUploadAttemptCount: Int {
         get async { await otkErrorInjector.attemptCount }
     }
-
+    
     // Track updateOneTimeKeys calls for testing (thread-safe)
     private let callTracker = CallTracker()
 
     // Track publishRotatedKeys calls for testing (thread-safe)
     private let rotationTracker = RotationTracker()
+
+    // Track findConfiguration calls for dogfood hang/cache tests (thread-safe)
+    private let findConfigurationTracker = CallTracker()
+
     var publishRotatedKeysCallCount: Int {
         get async { await rotationTracker.callCount }
     }
@@ -10384,9 +10397,18 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     var updateOneTimeKeysCalls: [(secretName: String, deviceId: String, keyCount: Int)] {
         get async { await callTracker.calls }
     }
+
+    var findConfigurationCallCount: Int {
+        get async { await findConfigurationTracker.callCount }
+    }
+
+    var findConfigurationCalls: [(secretName: String, deviceId: String, keyCount: Int)] {
+        get async { await findConfigurationTracker.calls }
+    }
     
     func resetCallTracking() async {
         await callTracker.reset()
+        await findConfigurationTracker.reset()
     }
     
     init(session: PQSSession, store: TransportStore) {
@@ -10436,7 +10458,17 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     }
     
     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
-        try await store.findConfiguration(for: secretName)
+        await findConfigurationTracker.record(secretName: secretName, deviceId: "", keyCount: 0)
+        let shouldFault = findConfigurationFaultSecretNames?.contains(secretName) ?? true
+        if shouldFault {
+            if let findConfigurationHang {
+                await findConfigurationHang()
+            }
+            if let findConfigurationError {
+                throw findConfigurationError
+            }
+        }
+        return try await store.findConfiguration(for: secretName)
     }
     
     func findUserConfiguration(secretName: String) async throws -> UserConfiguration {

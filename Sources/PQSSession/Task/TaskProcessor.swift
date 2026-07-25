@@ -152,6 +152,21 @@ public actor TaskProcessor {
     /// otherwise re-enqueue (and re-send) it from cache during that window.
     var inFlightJobIds: Set<UUID> = []
 
+    /// SharedIds whose next inbound decrypt pass should include archived SessionIdentity
+    /// rows. Populated by `deferArchivedInboundFallback` after `activeFirstInboundPass`
+    /// fails, so archive try-all runs as a `.background` job and cannot HOL-block
+    /// fresher `.urgent` active-lane ciphertext.
+    var archivedInboundFallbackPasses: Set<String> = []
+
+    /// SharedIds that already completed one archive try-all (pass or fail). Blocks
+    /// re-defer storms on spool redelivery (dogfood CHILD_DEVICE_2: same sharedId
+    /// deferred thousands of times). Cleared on heal / new archive for that peer.
+    var archivedInboundFallbackExhausted: Set<String> = []
+
+    /// Maps exhausted sharedId → peer episode key (`secretName|deviceId`) so heal
+    /// events can clear exhaustion for a peer-device without timers.
+    var archivedInboundFallbackExhaustedPeerKey: [String: String] = [:]
+
     /// Delegate responsible for transport-level session communication.
     /// Handles the actual sending and receiving of encrypted messages over the network.
     var delegate: (any SessionTransport)?
@@ -217,6 +232,18 @@ public actor TaskProcessor {
     var pendingOutboundTransportBySharedId: [String: PendingOutboundTransport] = [:]
     let pendingOutboundTransportTTL: TimeInterval = 60 * 10
     let pendingOutboundTransportLimit = 256
+
+    /// Last successfully transported orphan-resend ciphertext per
+    /// `(requesterDeviceId|sharedId)`. Used when MessageRecord already names the
+    /// recovery SessionID so rearmNack retransports instead of reminting (dogfood C3).
+    var orphanResendTransportByServiceKey: [String: PendingOutboundTransport] = [:]
+    /// Retransports completed for a settled orphan MessageRecord (serviceKey).
+    /// First rearm → retransport; after ≥1, peer NACK may trigger one escape remint.
+    var orphanResendRetransportCountByServiceKey: [String: Int] = [:]
+    /// Escape-hatch remints after retransport prove-fail (capped by policy, default 1).
+    var orphanResendRemintsAfterProveFailByServiceKey: [String: Int] = [:]
+    let orphanResendTransportTTL: TimeInterval = 60 * 30
+    let orphanResendTransportLimit = 256
 
     /// Rate-limit repeated outbound transport-retry warnings (esp. non-viable reconnect storms).
     var lastOutboundTransportRetryLogAt: Date = .distantPast
@@ -422,6 +449,9 @@ public actor TaskProcessor {
                     sendOneTimeIdentities: sendOneTimeIdentities,
                     forceRefresh: forceIdentityRefresh)
             } else {
+                // offlineOutboundPersist / queueOutboundDespiteConfigurationLookupFailure:
+                // chat fan-out falls back to local lanes when live findConfiguration fails
+                // so compose can persist and drain on resume (offline-first).
                 identities = try await session.sessionIdentitiesForChatFanout(secretName: nickname)
                 logger.log(
                     level: .info,
@@ -786,10 +816,10 @@ public actor TaskProcessor {
     /// - Returns: An array of `SessionIdentity` objects for the sender's devices.
     /// - Throws: Errors from identity refresh, typically network or cryptographic errors.
     private func gatherPersonalIdentities(session: PQSSession, sender: String, logger: NeedleTailLogger) async throws -> [SessionIdentity] {
-        var identities = try await session.refreshIdentities(secretName: sender)
-        if identities.isEmpty {
-            identities = try await session.refreshIdentities(secretName: sender, forceRefresh: true)
-        }
+        // Local lanes only. Never forceRefresh / findConfiguration here: sibling sync
+        // is best-effort and must not HOL-block a peer DM that already resolved
+        // (dogfood N1 — hang on find-configuration/alice after bob fan-out succeeded).
+        let identities = try await session.refreshIdentities(secretName: sender)
         logger.log(level: .info, message: "Gathered \(identities.count) Personal Session Identities")
         return identities
     }
@@ -1141,8 +1171,10 @@ public actor TaskProcessor {
     /// - Throws: Errors from task scheduling or job queue management.
     ///   Decryption errors are handled by the job processor.
     public func inboundTask(_ message: InboundTaskMessage, session: PQSSession) async throws {
+        // User ciphertext is urgent so deferred archive try-all (.background) cannot
+        // head-of-line block fresher active-lane frames (dogfood C2).
         try await feedTask(
-            EncryptableTask(task: .streamMessage(message)),
+            EncryptableTask(task: .streamMessage(message), priority: .urgent),
             session: session
         )
     }

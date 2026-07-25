@@ -109,7 +109,9 @@ public enum PQSSessionConstants: Sendable {
     /// Maximum number of inactive ratchet states to retain **per (secretName, deviceId)**.
     ///
     /// Bounds storage while keeping enough history for promote-on-decrypt
-    /// after multi-device / offline lag.
+    /// after multi-device / offline lag (~40 inactive states, FIFO tail drop).
+    /// Dirty dogfood devices: remove-contact both sides
+    /// (`wipePeerRelationshipState`) or reinstall, then re-friend.
     public static let inactiveSessionMaxCountPerDevice = 40
 
     /// Maximum age (in seconds) to retain inactive ratchet states.

@@ -18,7 +18,10 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/needletails/binary-codable.git", from: "1.0.5"),
-        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "3.1.0"),
+        // TODO: Before release, revert to the versioned dependency once the
+        // RatchetState.receivedMessagesCount accessor ships in a tagged DRK release.
+        // .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "3.2.0"),
+        .package(path: "../double-ratchet-kit"),
         .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.5"),
         .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.5")
     ],
