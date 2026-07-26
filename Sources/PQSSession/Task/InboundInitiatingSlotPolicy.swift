@@ -18,4 +18,14 @@ public enum InboundInitiatingSlotPolicy: Sendable {
     public static func shouldEnsureInboundBlank(blankForHeaderExists: Bool) -> Bool {
         !blankForHeaderExists
     }
+
+    /// Active-first does not walk archives, but `blankForHeaderExists` counts archived
+    /// blanks. When the header match is archived, try that blank before ensure-skip.
+    public static func shouldTryArchivedHeaderMatchBeforeEnsureSkip(
+        blankForHeaderExists: Bool,
+        matchedIsArchived: Bool,
+        includeArchivedFallback: Bool
+    ) -> Bool {
+        blankForHeaderExists && matchedIsArchived && !includeArchivedFallback
+    }
 }

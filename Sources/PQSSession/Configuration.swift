@@ -83,4 +83,3 @@ public struct SessionConfiguration: Sendable {
         self.eventDelegate = eventDelegate
     }
 }
-

@@ -112,6 +112,34 @@ struct SessionReestablishmentCoalescingTests {
             sender: sender, deviceId: deviceId, sharedId: sharedId))
     }
 
+    @Test("Pending resend TTL expiry marks inbound content unrecoverable")
+    func pendingResendTTLExpiryMarksInboundContentUnrecoverable() async throws {
+        // Dogfood frank/Android: pendingResendExpired notified the host but did
+        // not set terminalInboundOutcomeAt, so spool redelivery re-NACKed forever.
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let sender = "ttlPeer"
+        let deviceId = UUID()
+        let sharedId = "ttl-shared-pending-resend"
+        let seededAt = Date().addingTimeInterval(-(await session.inboundFailurePolicyTTL + 1))
+        await session.deferPeerResendUntilReestablished(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: sharedId,
+            failureClass: "crypto.bodyDecryptionFailed",
+            now: seededAt,
+            notifyDelegate: false)
+        // Any cleanup entry point with "now" past TTL must terminalize.
+        #expect(await !session.hasPendingResendAfterReestablishment(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: sharedId))
+        #expect(
+            await session.isInboundContentUnrecoverable(
+                sender: sender, deviceId: deviceId, sharedId: sharedId),
+            "BUG: pending-resend TTL must markInboundContentUnrecoverable so poison redelivery is swallowed")
+    }
+
     @Test("Transport-protocol work runs while the session is not viable")
     func transportProtocolWorkBypassesViabilityGate() async throws {
         // `inboundCiphertextAccepted` (offline spool deletion) rides this path.

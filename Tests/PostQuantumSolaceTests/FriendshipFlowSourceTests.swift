@@ -216,6 +216,16 @@ struct FriendshipFlowSourceTests {
         #expect(identitySource.contains("func sessionIdentitiesForChatFanout"))
         #expect(processor.contains("sessionIdentitiesForChatFanout(secretName:"))
         #expect(processor.contains("pqs.send.deviceSkipped"))
+        #expect(processor.contains("pqs.send.attempt"))
+        #expect(processor.contains("pqs.send.deviceQueued"))
+        let ratchet = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
+        #expect(ratchet.contains("pqs.send.deviceTransportOk"))
+        #expect(ratchet.contains("pqs.recv.persisted"))
+        let auditLog = try PQSFriendshipSource.read("Sources/PQSSession/DecryptFailureAuditLog.swift")
+        #expect(auditLog.contains("DEBUG || PQS_DECRYPT_FAILURE_AUDIT"))
+        let packageSwift = try PQSFriendshipSource.read("Package.swift")
+        #expect(packageSwift.contains("PQS_STRIP_DECRYPT_FAILURE_AUDIT"))
+        #expect(packageSwift.contains("PQS_DECRYPT_FAILURE_AUDIT"))
         // Friendship / OTK bootstrap must not use the chat fan-out helper.
         let nicknameCase = try #require(processor.range(of: "case .nickname(let nickname):"))
         let afterNickname = processor[nicknameCase.lowerBound...]
@@ -557,12 +567,18 @@ struct FriendshipFlowSourceTests {
 
         // Documented receive-side ASR: missingOneTimeKey coalesces into one episode.
         let otkCatch = try #require(sequenceSource.range(of: "ratchetError == .missingOneTimeKey"))
-        let otkBlock = String(sequenceSource[otkCatch.lowerBound...].prefix(5_500))
+        // Window includes dead-epoch terminal mark after markInboundFailure (~7.3k).
+        let otkBlock = String(sequenceSource[otkCatch.lowerBound...].prefix(8_500))
         #expect(otkBlock.contains("hasOpenReestablishmentEpisode"))
         #expect(otkBlock.contains("pendingPeerRefresh") || otkBlock.contains("coalescedPendingPeerRecovery"))
         #expect(otkBlock.contains("replaceOTKBatchThenPeerRefresh"))
         #expect(!otkBlock.contains("hasRecentInboundPeerRefreshBootstrap"))
         #expect(!otkBlock.contains("responderBootstrapHold"))
+        // Dead-epoch frames never heal by re-decrypt; terminalize so spool
+        // redelivery cannot restart the OTK/peerRefresh storm.
+        #expect(otkBlock.contains("markInboundContentUnrecoverable("))
+        #expect(otkBlock.contains("missingOneTimeKeyDeadEpoch")
+            || otkBlock.contains("reason=missingOneTimeKeyDeadEpoch"))
 
         // Outbound encrypt failure repairs even during an open episode;
         // do not silent-delete user jobs because peerRefresh is in flight.
@@ -726,6 +742,13 @@ struct FriendshipFlowSourceTests {
             sequenceSource.range(of: "trigger: \"missingOneTimeKeyEpisode\""))
         let afterEpisodeReset = sequenceSource[episodeTrigger.upperBound...]
         #expect(afterEpisodeReset.contains("emitSessionReestablishment("))
+        // Same-account sibling OTK: remint even when the outbound lane is answered
+        // so peerRefresh cannot ride a poison pin the sibling cannot decrypt
+        // (dogfood echo primary↔linked: NACKs never land, blankForHeader sticks).
+        #expect(sequenceSource.contains("shouldForceRemintEvenIfAnswered"))
+        #expect(sequenceSource.contains("forceRemintEvenIfAnswered:"))
+        #expect(resetBody.contains("forceRemintEvenIfAnswered"))
+        #expect(resetBody.contains("forceAnswered="))
 
         // Undecryptable inbound: orphan-resend NACK only — no local unanswered remint
         // (that fed dirty archive try-all storms in dogfood).
@@ -789,6 +812,11 @@ struct FriendshipFlowSourceTests {
         // TTL expiry is terminal content loss for the sharedId; the host must be
         // told (same contract as the attempt-cap path) so the UI can mark it failed.
         #expect(pendingCleanup.contains("inboundContentUnrecoverable("))
+        // Dogfood frank/Android: host notify alone is not enough — redelivery must
+        // hit isInboundContentUnrecoverable without a fresh NACK round.
+        #expect(pendingCleanup.contains("markInboundContentUnrecoverable("))
+        #expect(pendingCleanup.contains("contentUnrecoverable")
+            || pendingCleanup.contains("reason=pendingResendTTL"))
 
         let ratchetSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
         #expect(ratchetSource.contains("pqs.recovery.recovered"))
@@ -972,6 +1000,14 @@ struct FriendshipFlowSourceTests {
         #expect(ratchetSource.contains("activateSessionIdentityAfterInboundDecrypt("))
         #expect(ratchetSource.contains("laneSelectedAfterInboundDecrypt"))
         #expect(ratchetSource.contains("pqs.recovery.laneRolledBack reason="))
+        // Dogfood demote cascade: try-all failure must NOT seed the preference map.
+        let rolledBack = try #require(
+            ratchetSource.range(of: "pqs.recovery.laneRolledBack reason="))
+        let afterRollback = ratchetSource[rolledBack.upperBound...]
+        let throwPreferred = try #require(afterRollback.range(of: "throw preferredError"))
+        #expect(
+            !String(afterRollback[..<throwPreferred.lowerBound])
+                .contains("preferredSessionIdentityIdByPeerDevice["))
         #expect(!ratchetSource.contains("lanePromoteDeferredOpenRepair"))
         #expect(!ratchetSource.contains("lanePromotedAfterArchivedDecrypt"))
         #expect(!ratchetSource.contains("laneDroppedLosingActive"))
@@ -1273,8 +1309,9 @@ struct FriendshipFlowSourceTests {
             named: "func resolveControlDeliverySessionIdentity(",
             in: ratchetSource)
         #expect(controlBody.contains("outboundSessionIdentity("))
-        // Ride outbound first (forceFresh only clears preferred); surgical insert
-        // when no usable active — never demote-all.
+        // Cross-account rides outbound first; same-account requires surgical mint
+        // (poison actives still encrypt). Single insert site — never demote-all.
+        #expect(controlBody.contains("shouldRequireSurgicalFreshLane"))
         #expect(controlBody.contains("reason: \"resendRequestControlDelivery\""))
         #expect(controlBody.contains("forceFreshInitiating"))
         #expect(controlBody.contains("demotePriorActives: false"))
@@ -1283,6 +1320,8 @@ struct FriendshipFlowSourceTests {
             controlBody.components(separatedBy: "resetSessionIdentityForFreshSession(").count - 1
         #expect(resetCount == 1, "BUG: expected single surgical control insert, got \(resetCount)")
         #expect(!controlBody.contains("markOrphanResendInitiatingSession("))
+        // Preference-on-fail demote cascade must stay gone.
+        #expect(!controlBody.contains("preferredSessionIdentityIdByPeerDevice["))
 
         #expect(ratchetSource.contains("func feedDeviceScopedControlWrite("))
         #expect(ratchetSource.contains("recipientIdentity: SessionIdentity"))
@@ -1382,6 +1421,19 @@ struct FriendshipFlowSourceTests {
             ratchetSource.contains("exhaustedAfterArchivePassCompleted")
                 || ratchetSource.contains("archivedInboundFallbackExhausted.insert"),
             "Archive pass completion must mark sharedId exhausted")
+        // C2g: reminted CT (new fingerprint, same sharedId) re-arms archive fallback.
+        #expect(
+            ratchetSource.contains("shouldClearExhaustionForNewFingerprint")
+                && ratchetSource.contains("archiveFallbackRearmed reason=newFingerprint"),
+            "BUG: archive exhaustion must clear on new inbound fingerprint (dogfood 9ABB remint)")
+        #expect(
+            processorSource.contains("archivedInboundFallbackExhaustedFingerprintBySharedId"),
+            "BUG: exhaustion fingerprint map missing — remint cannot re-arm Active→Archives")
+        // Header-matched archived blank tried on active-first before ensure-skip.
+        #expect(
+            ratchetSource.contains("archivedHeaderMatch")
+                && ratchetSource.contains("shouldTryArchivedHeaderMatchBeforeEnsureSkip"),
+            "BUG: demoted header-matched blank never tried on active-first (ensure skip trap)")
     }
 
     @Test("warm chat fan-out avoids blocking findConfiguration when cache suffices")
@@ -1426,24 +1478,24 @@ struct FriendshipFlowSourceTests {
         #expect(ratchetSource.contains("orphanResendRearmed"))
         #expect(sessionSource.contains("isOrphanResendRecoverySession("))
         #expect(ratchetSource.contains("outboundSessionIdentity("))
-        // Sticky reuse while state-less; MessageRecord==recovery → retransport (no remint).
+        // Sticky reuse while state-less; settled recovery NACK → bounded escape then retransport.
         // Mid-wave continues the same recovery ratchet (no PerSharedIdInitiating remint).
         #expect(ratchetSource.contains("protectedProps.state == nil"))
         #expect(!ratchetSource.contains("orphanResendPerSharedIdInitiating"))
         #expect(ratchetSource.contains("reuseRecoveryWave")
             || ratchetSource.contains("recoverySessionIsLiveActive"))
         #expect(ratchetSource.contains("reason=stateLess"))
-        // Dogfood C3 (2FA48892): remint must consult OrphanResendRemintPolicy so a
-        // settled MessageRecord/recovery SessionID cannot mint again on first rearmNack.
+        // Dogfood C3: remint must consult OrphanResendRemintPolicy (settled escape capped;
+        // post-escape retransport, not unbounded remint thrash).
         #expect(ratchetSource.contains("OrphanResendRemintPolicy.decision"))
         #expect(
             ratchetSource.contains("retransportAlreadyServiced")
                 || ratchetSource.contains("orphanResendRetransport"),
-            "BUG: orphan remint path does not retransport after MessageRecord=recovery")
+            "BUG: orphan remint path does not retransport after escape remint spent")
         #expect(
             ratchetSource.contains("orphanResendRecoverySessionId("),
             "BUG: recovery SessionID map is never consulted on remint (dead gate)")
-        // P3 in-place heal: after retransport prove-fail, one escape remint — not blank bypass.
+        // P3 in-place heal: settled NACK → one escape remint — not blank bypass.
         #expect(ratchetSource.contains("mintFreshAfterRetransportProveFailed")
             || ratchetSource.contains("orphanResendRemintAfterProveFail"))
         #expect(ratchetSource.contains("InboundInitiatingSlotPolicy.shouldEnsureInboundBlank"))

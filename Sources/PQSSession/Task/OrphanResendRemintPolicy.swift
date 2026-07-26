@@ -2,12 +2,16 @@
 //  OrphanResendRemintPolicy.swift
 //  post-quantum-solace
 //
-//  Orphan-resend remint gate (dogfood: same sharedId reminted on every rearmNack —
-//  2FA48892 → three newSessionIds). MessageRecord already names the recovery
-//  SessionID after the first mint+encrypt; further NACKs must not mint again until
-//  a retransport has been attempted and the peer still cannot prove decrypt —
-//  then at most one fresh mint (new OTK header) escapes the receiver's
-//  blankForHeaderExists trap.
+//  Orphan-resend remint gate. After MessageRecord settles on the recovery
+//  SessionID, a peer NACK means that recovery ciphertext already failed to
+//  decrypt (typically blankForHeaderExists). Retransporting the identical
+//  signed payload cannot clear that trap and cannot change nackFrameFingerprint,
+//  so the requester never rearms — escape remint would never run.
+//
+//  Settled ladder (hard-capped):
+//  1. remint budget remaining → one escape remint (new OTK header)
+//  2. remint spent + priorRetransportCount == 0 → retransport the reminted CT
+//  3. remint spent + priorRetransportCount >= 1 → exhaustedUnrecoverable
 //
 //  One recovery SessionID per peer-device wave: unrecovered sharedIds re-encrypt on
 //  the same ratchet (msg0 then msg1+). Do not mintFresh solely because MessageRecord
@@ -26,18 +30,18 @@ public enum OrphanResendRemintPolicy: Sendable {
         /// Live recovery SessionID for this peer-device wave — continue ratchet
         /// (msg1+) for unrecovered sharedIds; do not mint a competing blank.
         case reuseRecoveryWave
-        /// MessageRecord already points at this peer's orphan recovery SessionID —
-        /// do not remint; retransport the prior orphan ciphertext.
+        /// Escape remint already spent; MessageRecord settled on recovery —
+        /// retransport the reminted orphan ciphertext once (not another remint).
         case retransportAlreadyServiced
-        /// Retransport already tried; peer still NACKs — mint once with a new header
-        /// (new OTK) so receiver blankForHeaderExists can clear. Hard-capped.
+        /// Settled recovery still poisoned — mint once with a new header (new OTK)
+        /// so receiver blankForHeaderExists can clear. Hard-capped.
         case mintFreshAfterRetransportProveFailed
         /// Escape remint already spent and a further retransport still cannot prove —
         /// stop servicing this sharedId (emit unavailable). Not another remint/retransport.
         case exhaustedUnrecoverable
     }
 
-    /// Default cap: one escape-hatch remint after retransport prove-fail (not C3 thrash).
+    /// Default cap: one escape-hatch remint for settled recovery prove-fail (not C3 thrash).
     public static let defaultMaxRemintsAfterRetransportProveFail = 1
 
     /// Decide remint vs reuse vs retransport for one `(sharedId, requesterDevice)` replay.
@@ -52,7 +56,7 @@ public enum OrphanResendRemintPolicy: Sendable {
     ///   - recoverySessionIsLiveActive: recovery SessionID names a live active row
     ///     (state-less or advanced) for this peer device.
     ///   - priorRetransportCount: how many times this sharedId was retransported after
-    ///     MessageRecord settled on recovery (0 = first rearm → retransport).
+    ///     escape remint (0 = first post-escape delivery → retransport reminted CT).
     ///   - remintsAfterRetransportProveFail: escape-hatch mints already used for this id.
     ///   - maxRemintsAfterRetransportProveFail: hard cap (default 1).
     public static func decision(
@@ -65,18 +69,17 @@ public enum OrphanResendRemintPolicy: Sendable {
         remintsAfterRetransportProveFail: Int = 0,
         maxRemintsAfterRetransportProveFail: Int = defaultMaxRemintsAfterRetransportProveFail
     ) -> Decision {
-        // After the first successful orphan mint+encrypt, MessageRecord is updated to
-        // the recovery SessionID. First rearm → retransport (C3). After ≥1 retransport
-        // the peer still cannot prove → at most one fresh mint (new OTK header).
+        // Settled MessageRecord == recovery: peer NACK is already prove-fail for that
+        // CT (identical retransport cannot rearm). Escape remint first while budget
+        // remains; then one retransport of the reminted CT; then terminal.
         if let messageRecordSessionId,
            let recoverySessionId,
            messageRecordSessionId == recoverySessionId
         {
+            if remintsAfterRetransportProveFail < maxRemintsAfterRetransportProveFail {
+                return .mintFreshAfterRetransportProveFailed
+            }
             if priorRetransportCount >= 1 {
-                if remintsAfterRetransportProveFail < maxRemintsAfterRetransportProveFail {
-                    return .mintFreshAfterRetransportProveFailed
-                }
-                // Remint spent + retransport of reminted CT still prove-failed.
                 return .exhaustedUnrecoverable
             }
             return .retransportAlreadyServiced
@@ -95,10 +98,10 @@ public enum OrphanResendRemintPolicy: Sendable {
         return .mintFresh
     }
 
-    /// Escape remint: MessageRecord already settled on the recovery SessionID, one
-    /// retransport has been attempted, and the remint budget remains. Used to order
-    /// escape candidates ahead of sibling `reuseRecoveryWave` encrypts so they do
-    /// not advance a blankForHeaderExists-poisoned recovery row first.
+    /// Escape remint: MessageRecord already settled on the recovery SessionID and the
+    /// remint budget remains. Used to order escape candidates ahead of sibling
+    /// `reuseRecoveryWave` encrypts so they do not advance a blankForHeaderExists-
+    /// poisoned recovery row first.
     public static func needsEscapeRemintAfterRetransportProveFail(
         messageRecordSessionId: UUID?,
         recoverySessionId: UUID?,

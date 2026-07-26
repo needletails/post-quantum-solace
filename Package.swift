@@ -1,7 +1,19 @@
 // swift-tools-version: 6.3
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
+import Foundation
 import PackageDescription
+
+// DecryptFailureAuditLog file trails (recovery + send/recv path).
+// Local / staging dogfood: defined (Release dogfood keeps audits).
+// Public App Store / customer Release: export PQS_STRIP_DECRYPT_FAILURE_AUDIT=1.
+private let stripDecryptFailureAudit =
+    ProcessInfo.processInfo.environment["PQS_STRIP_DECRYPT_FAILURE_AUDIT"] == "1"
+
+private var pqsSessionSwiftSettings: [SwiftSetting] {
+    guard !stripDecryptFailureAudit else { return [] }
+    return [.define("PQS_DECRYPT_FAILURE_AUDIT")]
+}
 
 let package = Package(
     name: "post-quantum-solace",
@@ -33,7 +45,8 @@ let package = Package(
                 .product(name: "BinaryCodable", package: "binary-codable"),
                 .product(name: "DoubleRatchetKit", package: "double-ratchet-kit"),
                 .product(name: "NeedleTailLogger", package: "needletail-logger")
-            ]
+            ],
+            swiftSettings: pqsSessionSwiftSettings
         ),
         .target(name: "SessionEvents", dependencies: [
             "SessionModels",

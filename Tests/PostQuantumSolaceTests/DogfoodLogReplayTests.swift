@@ -681,13 +681,59 @@ struct DogfoodRecoveryStormPolicyTests {
                 exhausted: exhausted,
                 pendingPass: []))
     }
+
+    @Test("dogfood C2g: new fingerprint clears exhaustion and re-arms one archive defer")
+    func dogfoodC2g_newFingerprintReArmsArchiveDefer() {
+        let sharedId = "9ABB24B1-AB85-4927-887D-97794A6C5830"
+        let priorFingerprint = Data("offline-poison-ct".utf8)
+        let remintFingerprint = Data("orphan-remint-ct".utf8)
+        var exhausted: Set = [sharedId]
+        var exhaustedFingerprint: Data? = priorFingerprint
+
+        #expect(
+            !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
+                sharedId: sharedId,
+                exhausted: exhausted,
+                pendingPass: []))
+        #expect(
+            !InboundRecoveryStormPolicy.shouldClearExhaustionForNewFingerprint(
+                sharedId: sharedId,
+                exhausted: exhausted,
+                exhaustedFingerprint: exhaustedFingerprint,
+                currentFingerprint: priorFingerprint),
+            "same fingerprint must not clear exhaustion (C2 storm gate)")
+
+        #expect(
+            InboundRecoveryStormPolicy.shouldClearExhaustionForNewFingerprint(
+                sharedId: sharedId,
+                exhausted: exhausted,
+                exhaustedFingerprint: exhaustedFingerprint,
+                currentFingerprint: remintFingerprint),
+            "BUG: reminted CT (same sharedId) must re-arm archive fallback")
+        exhausted.remove(sharedId)
+        exhaustedFingerprint = nil
+        #expect(
+            InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
+                sharedId: sharedId,
+                exhausted: exhausted,
+                pendingPass: []))
+
+        // Missing recorded fingerprint still re-arms once (legacy exhaust entry).
+        exhausted = [sharedId]
+        #expect(
+            InboundRecoveryStormPolicy.shouldClearExhaustionForNewFingerprint(
+                sharedId: sharedId,
+                exhausted: exhausted,
+                exhaustedFingerprint: nil,
+                currentFingerprint: remintFingerprint))
+    }
 }
 
 // MARK: - C3: same sharedId must not remint on every rearmNack (CHILD_DEVICE 2FA48892)
 
 @Suite("Dogfood C3 orphan remint thrash policy")
 struct DogfoodOrphanRemintThrashPolicyTests {
-    @Test("dogfood C3a: first orphan NACK mints; after MessageRecord=recovery, rearm does not remint")
+    @Test("dogfood C3a: settled recovery NACK escape-remints once; spent budget retransports")
     func dogfoodC3a_sameSharedIdRemintsAtMostOnceAcrossRearms() {
         let recoverySession = UUID()
         var messageRecordSessionId: UUID? = nil
@@ -720,8 +766,8 @@ struct DogfoodOrphanRemintThrashPolicyTests {
         markIsStateLess = false
         messageRecordSessionId = recoverySession
 
-        // Wave 2 / first rearmNack: must retransport (C3 — not remint).
-        // Escape-hatch remint only after priorRetransportCount ≥ 1 (see OrphanInPlaceHealTests P3).
+        // Wave 2 / first rearmNack on settled recovery: escape remint once (new OTK).
+        // Identical-CT retransport cannot rearm; budget still caps mint thrash (C3).
         let firstRearm = OrphanResendRemintPolicy.decision(
             messageRecordSessionId: messageRecordSessionId,
             recoverySessionId: recoverySessionId,
@@ -730,12 +776,24 @@ struct DogfoodOrphanRemintThrashPolicyTests {
             priorRetransportCount: 0,
             remintsAfterRetransportProveFail: 0)
         #expect(
-            firstRearm == .retransportAlreadyServiced,
-            "BUG (CHILD_DEVICE 2FA48892): first rearm reminted instead of retransport, got \(firstRearm)")
-        #expect(mintCount == 1)
+            firstRearm == .mintFreshAfterRetransportProveFailed,
+            "BUG: settled recovery NACK must escape-remint, got \(firstRearm)")
+        mintCount += 1
+        #expect(mintCount == 2)
+
+        // Spent budget: next settled NACK retransports reminted CT (not another remint).
+        let postEscape = OrphanResendRemintPolicy.decision(
+            messageRecordSessionId: messageRecordSessionId,
+            recoverySessionId: recoverySessionId,
+            initiatingMarkSessionId: initiatingMark,
+            markIsStateLess: markIsStateLess,
+            priorRetransportCount: 0,
+            remintsAfterRetransportProveFail: 1)
+        #expect(postEscape == .retransportAlreadyServiced)
+        #expect(mintCount == 2)
     }
 
-    @Test("dogfood C3b: MessageRecord matching recovery forces retransport even when mark advanced")
+    @Test("dogfood C3b: MessageRecord matching recovery escape-remints once when budget remains")
     func dogfoodC3b_messageRecordRecoveryBeatsAdvancedSticky() {
         let sessionId = UUID()
         let decision = OrphanResendRemintPolicy.decision(
@@ -744,8 +802,8 @@ struct DogfoodOrphanRemintThrashPolicyTests {
             initiatingMarkSessionId: sessionId,
             markIsStateLess: false)
         #expect(
-            decision == .retransportAlreadyServiced,
-            "BUG: advanced sticky still reminted after MessageRecord named recovery session")
+            decision == .mintFreshAfterRetransportProveFailed,
+            "BUG: settled recovery with budget must escape-remint, got \(decision)")
     }
 
     @Test("dogfood C3c: live recovery reuses wave for unrelated MessageRecord")

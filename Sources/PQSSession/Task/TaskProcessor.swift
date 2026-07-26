@@ -160,12 +160,17 @@ public actor TaskProcessor {
 
     /// SharedIds that already completed one archive try-all (pass or fail). Blocks
     /// re-defer storms on spool redelivery (dogfood CHILD_DEVICE_2: same sharedId
-    /// deferred thousands of times). Cleared on heal / new archive for that peer.
+    /// deferred thousands of times). Cleared on heal / new archive for that peer,
+    /// or when inbound fingerprint changes (orphan remint, same sharedId).
     var archivedInboundFallbackExhausted: Set<String> = []
 
     /// Maps exhausted sharedId → peer episode key (`secretName|deviceId`) so heal
     /// events can clear exhaustion for a peer-device without timers.
     var archivedInboundFallbackExhaustedPeerKey: [String: String] = [:]
+
+    /// Fingerprint of the ciphertext that spent the archive pass for each exhausted
+    /// sharedId (`PQSSession.nackFrameFingerprint`). Different fingerprint → re-arm.
+    var archivedInboundFallbackExhaustedFingerprintBySharedId: [String: Data] = [:]
 
     /// Delegate responsible for transport-level session communication.
     /// Handles the actual sending and receiving of encrypted messages over the network.
@@ -1057,6 +1062,11 @@ public actor TaskProcessor {
                 logger.log(level: .error, message: "Obtained encryptable message props failed for initial message")
             }
         }
+
+        let fanoutSharedId = encryptableMessage?.sharedId ?? sharedIdOverride ?? "ephemeral"
+        DecryptFailureAuditLog.log(
+            "pqs.send.attempt sharedId=\(fanoutSharedId) recipient=\(message.recipient.auditRecipientTag) deviceCount=\(sessionIdentities.count) persist=\(shouldPersist) members=\(recipients.sorted().joined(separator: ","))",
+            level: .info)
         
         for identity in sessionIdentities {
             do {
@@ -1071,6 +1081,9 @@ public actor TaskProcessor {
 
                 guard let identityProps = await identity.props(symmetricKey: symmetricKey) else {
                     logger.log(level: .warning, message: "Skipping outbound task for unreadable recipient identity \(identity.id)")
+                    DecryptFailureAuditLog.log(
+                        "pqs.send.deviceSkipped sharedId=\(fanoutSharedId) sessionIdentityId=\(identity.id.uuidString) reason=unreadableIdentity",
+                        level: .info)
                     continue
                 }
 
@@ -1085,12 +1098,14 @@ public actor TaskProcessor {
                     return .background
                 }()
 
+                let queuedSharedId: String
                 if shouldPersist {
                     guard let encryptableMessage else { return }
                     guard let messageProps = persistedMessageProps else {
                         throw PQSSession.SessionErrors.propsError
                     }
                     logger.log(level: .debug, message: "Obtained encryptable message props for recipient \(identity)")
+                    queuedSharedId = encryptableMessage.sharedId
 
                     task = EncryptableTask(
                         task: .writeMessage(OutboundTaskMessage(
@@ -1118,17 +1133,21 @@ public actor TaskProcessor {
                         logger.log(level: .debug, message: "Updated Communication Model with Shared ID: \(String(describing: props?.sharedId))")
                     }
 
+                    queuedSharedId = sharedIdOverride ?? UUID().uuidString
                     task = EncryptableTask(
                         task: .writeMessage(OutboundTaskMessage(
                             message: message,
                             recipientIdentity: identity,
                             localId: UUID(),
-                            sharedId: sharedIdOverride ?? UUID().uuidString,
+                            sharedId: queuedSharedId,
                             isPersistedOutbound: false
                         )),
                         priority: taskPriority
                     )
                 }
+                DecryptFailureAuditLog.log(
+                    "pqs.send.deviceQueued sharedId=\(queuedSharedId) recipientSecret=\(identityProps.secretName) recipientDeviceId=\(identityProps.deviceId.uuidString) sessionIdentityId=\(identity.id.uuidString) self=\(isSelfRecipient) priority=\(String(describing: taskPriority))",
+                    level: .info)
                 try await feedTask(task, session: session)
             } catch {
                 // One device's prep/encrypt failure must not abort fan-out to others.
@@ -1136,7 +1155,7 @@ public actor TaskProcessor {
                     level: .warning,
                     message: "pqs.send.deviceSkipped recipientDevice=\(identity.id) error=\(error)")
                 DecryptFailureAuditLog.log(
-                    "pqs.send.deviceSkipped sessionIdentityId=\(identity.id.uuidString) error=\(String(describing: error))")
+                    "pqs.send.deviceSkipped sharedId=\(fanoutSharedId) sessionIdentityId=\(identity.id.uuidString) error=\(String(describing: error))")
             }
         }
     }

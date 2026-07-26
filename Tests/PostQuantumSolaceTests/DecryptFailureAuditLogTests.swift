@@ -5,6 +5,13 @@ import Testing
 @Suite(.serialized)
 struct DecryptFailureAuditLogTests {
     @Test
+    func enabledByDefaultWhenCompileFlagPresent() {
+        DecryptFailureAuditLog.configure(isEnabled: true)
+        defer { DecryptFailureAuditLog.configure(isEnabled: true) }
+        #expect(DecryptFailureAuditLog.isEnabled == true)
+    }
+
+    @Test
     func logAcceptsPlainTextRecoveryLine() {
         DecryptFailureAuditLog.configure(isEnabled: true)
         defer { DecryptFailureAuditLog.configure(isEnabled: true) }
@@ -20,5 +27,19 @@ struct DecryptFailureAuditLogTests {
 
         DecryptFailureAuditLog.log("pqs.decryptFailure failureClass=disabled-check")
         #expect(DecryptFailureAuditLog.isEnabled == false)
+    }
+
+    @Test
+    func disabledAuditDoesNotEvaluateAutoclosure() {
+        DecryptFailureAuditLog.configure(isEnabled: false)
+        defer { DecryptFailureAuditLog.configure(isEnabled: true) }
+
+        var evaluated = false
+        func expensiveLine() -> String {
+            evaluated = true
+            return "pqs.send.attempt should-not-build"
+        }
+        DecryptFailureAuditLog.log(expensiveLine())
+        #expect(evaluated == false)
     }
 }

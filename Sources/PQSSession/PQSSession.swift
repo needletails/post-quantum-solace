@@ -1536,6 +1536,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         // production forensics can distinguish "healed" from "gave up", and tell the
         // host — same terminal contract as the attempt-cap path — so the UI can mark
         // the message failed instead of leaving it pending forever.
+        // Also mark the local terminal ledger: host notify alone left redelivered
+        // spool copies free to NACK again (dogfood frank/Android: contentUnrecoverable=0).
         if !expired.isEmpty {
             let delegate = sessionDelegate
             for pending in expired {
@@ -1544,6 +1546,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 let senderName = pending.senderName
                 let senderDeviceId = pending.senderDeviceId
                 let sharedMessageId = pending.failedSharedMessageId
+                let newlyTerminal = markInboundContentUnrecoverable(
+                    sender: senderName,
+                    deviceId: senderDeviceId,
+                    sharedId: sharedMessageId,
+                    now: now)
+                guard newlyTerminal else { continue }
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.contentUnrecoverable sharedId=\(sharedMessageId) sender=\(senderName) deviceId=\(senderDeviceId.uuidString) reason=pendingResendTTL")
                 // Protocol signal: drives the transport's terminal purge of the
                 // spool copy. Dropping it on a viability flap leaves the copy
                 // immortal server-side.

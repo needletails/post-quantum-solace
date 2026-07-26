@@ -31,4 +31,19 @@ public enum ControlDeliveryLanePolicy: Sendable {
         }
         return preferredFailedInTryAll || preferredCleared
     }
+
+    /// Same-account control must not "ride" an existing outbound match: poison
+    /// actives still encrypt locally, so NACKs leave the device (`resendRequestTransported`)
+    /// but never decrypt on the sibling (`resendRequestReceived` absent). Surgical
+    /// mint with `demotePriorActives: false` — never demote-all, never preference-on-fail.
+    /// When orphan/recovery already owns the heal lane, ride that lane instead.
+    public static func shouldRequireSurgicalFreshLane(
+        isSameAccount: Bool,
+        liveOrphanOrRecovery: Bool
+    ) -> Bool {
+        if liveOrphanOrRecovery {
+            return false
+        }
+        return isSameAccount
+    }
 }

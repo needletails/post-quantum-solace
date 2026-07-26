@@ -3,7 +3,7 @@
 //  post-quantum-solace
 //
 //  TDD: in-place heal without remove-contact — blankForHeaderExists trap + bounded
-//  post-retransport remint, without reviving C3 remint thrash.
+//  escape remint on settled NACK, without reviving C3 remint thrash.
 //
 
 import Foundation
@@ -24,60 +24,78 @@ struct OrphanInPlaceHealTests {
                 == true)
     }
 
-    // MARK: - P3: after retransport prove-fail, one remint then retransport/terminal
+    @Test("P1b: archived header match tried on active-first; ensure still skipped")
+    func p1b_archivedHeaderMatchBeforeEnsureSkip() {
+        #expect(
+            InboundInitiatingSlotPolicy.shouldTryArchivedHeaderMatchBeforeEnsureSkip(
+                blankForHeaderExists: true,
+                matchedIsArchived: true,
+                includeArchivedFallback: false))
+        // After trying the archived blank, ensure remains blocked (no twin mint).
+        #expect(
+            InboundInitiatingSlotPolicy.shouldEnsureInboundBlank(blankForHeaderExists: true)
+                == false)
+        #expect(
+            !InboundInitiatingSlotPolicy.shouldTryArchivedHeaderMatchBeforeEnsureSkip(
+                blankForHeaderExists: true,
+                matchedIsArchived: false,
+                includeArchivedFallback: false),
+            "active blank already in try-all — no duplicate archivedHeaderMatch")
+        #expect(
+            !InboundInitiatingSlotPolicy.shouldTryArchivedHeaderMatchBeforeEnsureSkip(
+                blankForHeaderExists: true,
+                matchedIsArchived: true,
+                includeArchivedFallback: true),
+            "background archive pass already walks archives")
+        #expect(
+            !InboundInitiatingSlotPolicy.shouldTryArchivedHeaderMatchBeforeEnsureSkip(
+                blankForHeaderExists: false,
+                matchedIsArchived: true,
+                includeArchivedFallback: false))
+    }
 
-    @Test("P3: retransport → remint once → retransport → exhaustedUnrecoverable")
+    // MARK: - P3: settled NACK → escape remint once → retransport → terminal
+
+    @Test("P3: escape remint once → retransport → exhaustedUnrecoverable")
     func p3_boundedRemintAfterRetransportProveFail() {
         let recovery = UUID()
-        var priorRetransportCount = 0
         var remitsAfterProveFail = 0
         var mintCount = 0
 
-        // Settled MessageRecord == recovery (post first orphan encrypt).
+        // Settled MessageRecord == recovery: first NACK is prove-fail → escape remint.
         let firstRearm = OrphanResendRemintPolicy.decision(
             messageRecordSessionId: recovery,
             recoverySessionId: recovery,
             initiatingMarkSessionId: recovery,
             markIsStateLess: false,
-            priorRetransportCount: priorRetransportCount,
-            remintsAfterRetransportProveFail: remitsAfterProveFail)
-        #expect(firstRearm == .retransportAlreadyServiced)
-        priorRetransportCount += 1
-
-        let secondRearm = OrphanResendRemintPolicy.decision(
-            messageRecordSessionId: recovery,
-            recoverySessionId: recovery,
-            initiatingMarkSessionId: recovery,
-            markIsStateLess: false,
-            priorRetransportCount: priorRetransportCount,
+            priorRetransportCount: 0,
             remintsAfterRetransportProveFail: remitsAfterProveFail)
         #expect(
-            secondRearm == .mintFreshAfterRetransportProveFailed,
-            "BUG: after retransport prove-fail, expected one escape-hatch remint (new OTK header)")
+            firstRearm == .mintFreshAfterRetransportProveFailed,
+            "BUG: settled recovery NACK must escape-remint (identical CT cannot rearm)")
         mintCount += 1
         remitsAfterProveFail += 1
         let newRecovery = UUID()
 
         // Post-remint: prior reset to 0 — reminted CT still gets one retransport.
-        let thirdRearm = OrphanResendRemintPolicy.decision(
+        let secondRearm = OrphanResendRemintPolicy.decision(
             messageRecordSessionId: newRecovery,
             recoverySessionId: newRecovery,
             initiatingMarkSessionId: newRecovery,
             markIsStateLess: false,
             priorRetransportCount: 0,
             remintsAfterRetransportProveFail: remitsAfterProveFail)
-        #expect(thirdRearm == .retransportAlreadyServiced)
-        priorRetransportCount = 1
+        #expect(secondRearm == .retransportAlreadyServiced)
 
-        let fourthRearm = OrphanResendRemintPolicy.decision(
+        let thirdRearm = OrphanResendRemintPolicy.decision(
             messageRecordSessionId: newRecovery,
             recoverySessionId: newRecovery,
             initiatingMarkSessionId: newRecovery,
             markIsStateLess: false,
-            priorRetransportCount: priorRetransportCount,
+            priorRetransportCount: 1,
             remintsAfterRetransportProveFail: remitsAfterProveFail)
         #expect(
-            fourthRearm == .exhaustedUnrecoverable,
+            thirdRearm == .exhaustedUnrecoverable,
             "BUG: after escape remint + retransport prove-fail, must terminalize (not infinite retransport)")
         #expect(mintCount == 1)
     }
@@ -95,27 +113,46 @@ struct OrphanInPlaceHealTests {
         #expect(decision == .retransportAlreadyServiced)
     }
 
-    @Test("P3b: without prior retransport, settled MessageRecord never remints (C3)")
-    func p3b_noRemintBeforeRetransport() {
+    @Test("P3b: settled + budget remints once; spent budget does not remint again")
+    func p3b_settledBudgetRemintsOnceOnly() {
         let recovery = UUID()
-        for _ in 0..<3 {
-            let decision = OrphanResendRemintPolicy.decision(
+        let withBudget = OrphanResendRemintPolicy.decision(
+            messageRecordSessionId: recovery,
+            recoverySessionId: recovery,
+            initiatingMarkSessionId: recovery,
+            markIsStateLess: false,
+            priorRetransportCount: 0,
+            remintsAfterRetransportProveFail: 0)
+        #expect(withBudget == .mintFreshAfterRetransportProveFailed)
+
+        for prior in 0..<3 {
+            let spent = OrphanResendRemintPolicy.decision(
                 messageRecordSessionId: recovery,
                 recoverySessionId: recovery,
                 initiatingMarkSessionId: recovery,
                 markIsStateLess: false,
-                priorRetransportCount: 0,
-                remintsAfterRetransportProveFail: 0)
-            #expect(decision == .retransportAlreadyServiced)
-            #expect(decision != .exhaustedUnrecoverable)
+                priorRetransportCount: prior,
+                remintsAfterRetransportProveFail: 1)
+            if prior == 0 {
+                #expect(spent == .retransportAlreadyServiced)
+            } else {
+                #expect(spent == .exhaustedUnrecoverable)
+            }
+            #expect(spent != .mintFreshAfterRetransportProveFailed)
         }
     }
 
     // MARK: - P5: escape-first ordering helper
 
-    @Test("P5: needsEscapeRemint helper matches settled prior>=1 remint budget")
+    @Test("P5: needsEscapeRemint helper matches settled + remint budget")
     func p5_needsEscapeRemintHelper() {
         let recovery = UUID()
+        #expect(
+            OrphanResendRemintPolicy.needsEscapeRemintAfterRetransportProveFail(
+                messageRecordSessionId: recovery,
+                recoverySessionId: recovery,
+                priorRetransportCount: 0,
+                remintsAfterRetransportProveFail: 0))
         #expect(
             OrphanResendRemintPolicy.needsEscapeRemintAfterRetransportProveFail(
                 messageRecordSessionId: recovery,
@@ -127,12 +164,6 @@ struct OrphanInPlaceHealTests {
                 messageRecordSessionId: recovery,
                 recoverySessionId: recovery,
                 priorRetransportCount: 0,
-                remintsAfterRetransportProveFail: 0))
-        #expect(
-            !OrphanResendRemintPolicy.needsEscapeRemintAfterRetransportProveFail(
-                messageRecordSessionId: recovery,
-                recoverySessionId: recovery,
-                priorRetransportCount: 1,
                 remintsAfterRetransportProveFail: 1))
         // Unsettled historical MessageRecord must not force wave remint.
         #expect(
@@ -190,6 +221,10 @@ struct OrphanInPlaceHealTests {
             "BUG: owner-without-plaintext path must consult remint counters (dogfood C8E1)")
         // Must not delete the dedupe gate.
         #expect(!ratchet.contains("blankForHeaderExists = false"))
+        // Demoted header-matched blank must be tried before ensure-skip (not bypass).
+        #expect(ratchet.contains("archivedHeaderMatch"))
+        #expect(ratchet.contains("headerMatchedArchivedBlank"))
+        #expect(ratchet.contains("shouldTryArchivedHeaderMatchBeforeEnsureSkip"))
         // Exhausted path must not remint / reset the recovery lane.
         guard let exhaustedRange = ratchet.range(of: "case .exhaustedUnrecoverable") else {
             Issue.record("missing exhaustedUnrecoverable switch case")

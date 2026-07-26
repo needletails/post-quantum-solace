@@ -92,6 +92,38 @@ struct NackLaneHealPolicyTests {
             hasNonOrphanInitialized: true)
         #expect(decision == .preferOrphanRecovery)
     }
+
+    @Test("same-account missingOneTimeKey episode forces remint even if answered")
+    func sameAccountOTKEpisodeForcesAnsweredRemint() {
+        #expect(
+            UnansweredInitiatingLanePolicy.shouldForceRemintEvenIfAnswered(
+                isSameAccount: true,
+                trigger: "missingOneTimeKeyEpisode"))
+        #expect(
+            !UnansweredInitiatingLanePolicy.shouldForceRemintEvenIfAnswered(
+                isSameAccount: false,
+                trigger: "missingOneTimeKeyEpisode"))
+        #expect(
+            !UnansweredInitiatingLanePolicy.shouldForceRemintEvenIfAnswered(
+                isSameAccount: true,
+                trigger: "peerRefreshRequest"))
+    }
+
+    @Test("same-account NACK requires surgical fresh unless orphan/recovery owns heal")
+    func sameAccountNackRequiresSurgicalFreshUnlessHealLane() {
+        #expect(
+            ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+                isSameAccount: true,
+                liveOrphanOrRecovery: false))
+        #expect(
+            !ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+                isSameAccount: true,
+                liveOrphanOrRecovery: true))
+        #expect(
+            !ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+                isSameAccount: false,
+                liveOrphanOrRecovery: false))
+    }
 }
 
 @Suite("NACK lane heal source contracts")
@@ -129,5 +161,15 @@ struct NackLaneHealSourceTests {
         #expect(ratchet.contains("resendRequestControlDelivery"))
         #expect(ratchet.contains("blankForHeaderExists"))
         #expect(!ratchet.contains("blankForHeaderExists = false"))
+        // Must NOT seed preference from try-all failure (demote cascade under
+        // blankForHeader storms). Preference stays success-only.
+        let rolledBack = try #require(ratchet.range(of: "pqs.recovery.laneRolledBack reason="))
+        let afterRollback = ratchet[rolledBack.upperBound...]
+        let throwPreferred = try #require(afterRollback.range(of: "throw preferredError"))
+        let recordWindow = String(afterRollback[..<throwPreferred.lowerBound])
+        #expect(!recordWindow.contains("preferredSessionIdentityIdByPeerDevice["))
+        #expect(sequence.contains("UnansweredInitiatingLanePolicy.shouldForceRemintEvenIfAnswered"))
+        #expect(ratchet.contains("shouldRequireSurgicalFreshLane"))
+        #expect(ratchet.contains("surgicalRequired="))
     }
 }

@@ -780,10 +780,11 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     }
 
     /// Control-plane delivery identity for resend requests and similar urgent frames.
-    /// Uses ``outboundSessionIdentity`` (orphan initiating → recovery → preferred →
-    /// bundle match) — same as unavailable notices. When `forceFreshInitiating`
-    /// escapes a prove-failed preferred, clear the pin and ride outbound; mint a
-    /// surgical state-less blank only if no usable active remains (no demote-all).
+    /// Cross-account: ride ``outboundSessionIdentity`` (orphan → recovery → preferred);
+    /// surgical insert only when no usable active remains. Same-account: always
+    /// surgical mint unless orphan/recovery already owns the heal lane — poison
+    /// actives still encrypt, so riding them leaves NACKs undeliverable.
+    /// Never demote-all; never write preference on try-all failure.
     func resolveControlDeliverySessionIdentity(
         secretName: String,
         deviceId: UUID,
@@ -794,39 +795,53 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             clearPreferredSessionIdentity(secretName: secretName, deviceId: deviceId)
         }
 
-        let symmetricKey = try await session.getDatabaseSymmetricKey()
-        var identities = try await session.cache?.fetchSessionIdentities() ?? []
-        let preferredDevice = await currentDeviceConfiguration(
-            secretName: secretName,
-            deviceId: deviceId,
-            session: session)
+        let localSecretName = await session.sessionContext?.sessionUser.secretName
+        let isSameAccount = localSecretName == secretName
+        let liveInitiating = await session.orphanResendInitiatingSessionId(
+            secretName: secretName, deviceId: deviceId) != nil
+        let liveRecovery = await session.orphanResendRecoverySessionId(
+            secretName: secretName, deviceId: deviceId) != nil
+        let liveOrphanOrRecovery = liveInitiating || liveRecovery
+        let requireSurgical = ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+            isSameAccount: isSameAccount,
+            liveOrphanOrRecovery: liveOrphanOrRecovery)
 
-        if let match = await outboundSessionIdentity(
-            secretName: secretName,
-            deviceId: deviceId,
-            in: identities,
-            symmetricKey: symmetricKey,
-            session: session,
-            preferredDevice: preferredDevice
-        ) {
-            return match
+        if !requireSurgical {
+            let symmetricKey = try await session.getDatabaseSymmetricKey()
+            var identities = try await session.cache?.fetchSessionIdentities() ?? []
+            let preferredDevice = await currentDeviceConfiguration(
+                secretName: secretName,
+                deviceId: deviceId,
+                session: session)
+
+            if let match = await outboundSessionIdentity(
+                secretName: secretName,
+                deviceId: deviceId,
+                in: identities,
+                symmetricKey: symmetricKey,
+                session: session,
+                preferredDevice: preferredDevice
+            ) {
+                return match
+            }
+
+            _ = try await session.refreshIdentities(secretName: secretName, forceRefresh: true)
+            identities = try await session.cache?.fetchSessionIdentities() ?? []
+            if let match = await outboundSessionIdentity(
+                secretName: secretName,
+                deviceId: deviceId,
+                in: identities,
+                symmetricKey: symmetricKey,
+                session: session,
+                preferredDevice: preferredDevice
+            ) {
+                return match
+            }
         }
 
-        _ = try await session.refreshIdentities(secretName: secretName, forceRefresh: true)
-        identities = try await session.cache?.fetchSessionIdentities() ?? []
-        if let match = await outboundSessionIdentity(
-            secretName: secretName,
-            deviceId: deviceId,
-            in: identities,
-            symmetricKey: symmetricKey,
-            session: session,
-            preferredDevice: preferredDevice
-        ) {
-            return match
-        }
-
-        // No usable active: surgical insert without demoting other peer-device rows
-        // (recovery / honest actives must survive NACK escape).
+        // Surgical insert without demoting other peer-device rows (recovery / honest
+        // actives must survive NACK escape). Same-account hits this even when a
+        // poison active would still "match" outbound selection.
         let fresh = try await session.resetSessionIdentityForFreshSession(
             secretName: secretName,
             deviceId: deviceId,
@@ -835,7 +850,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             demotePriorActives: false)
         clearPreferredSessionIdentity(secretName: secretName, deviceId: deviceId)
         DecryptFailureAuditLog.log(
-            "pqs.recovery.controlDeliveryFreshLane peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(fresh.id.uuidString)")
+            "pqs.recovery.controlDeliveryFreshLane peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(fresh.id.uuidString) sameAccount=\(isSameAccount) surgicalRequired=\(requireSurgical)")
         return fresh
     }
 
@@ -859,10 +874,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     /// never advanced our session; answered lanes are never touched. The repair
     /// mint (`sendOneTimeIdentities: false`) rides long-term + final ML-KEM keys
     /// only, so it cannot re-enter the missingOneTimeKey failure.
+    ///
+    /// - Parameter forceRemintEvenIfAnswered: same-account `missingOneTimeKeyEpisode`
+    ///   only (`UnansweredInitiatingLanePolicy`). Cross-account answered lanes stay
+    ///   untouched so we do not remint on every undecryptable NACK.
     func resetUnansweredInitiatingLane(
         peerSecretName: String,
         peerDeviceId: UUID,
         trigger: String,
+        forceRemintEvenIfAnswered: Bool = false,
         session: PQSSession
     ) async {
         do {
@@ -871,7 +891,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             else { return }
             let symmetricKey = try await session.getDatabaseSymmetricKey()
             let identities = try await session.getSessionIdentities(with: peerSecretName)
-            var hasUnansweredInitializedLane = false
+            var shouldRemint = false
             for identity in identities {
                 guard let props = await identity.props(symmetricKey: symmetricKey),
                       props.deviceId == peerDeviceId,
@@ -880,13 +900,18 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 else { continue }
                 if state.receivedMessagesCount > 0 {
                     // The peer has decrypted us on this session before, so the
-                    // handshake is not the failure. Leave the lane alone; other
-                    // recovery classes own desyncs on answered sessions.
+                    // handshake is not the failure — unless same-account OTK
+                    // evidence forces remint so peerRefresh cannot ride the
+                    // answered poison pin (dogfood echo primary↔linked deadlock).
+                    if forceRemintEvenIfAnswered {
+                        shouldRemint = true
+                        break
+                    }
                     return
                 }
-                hasUnansweredInitializedLane = true
+                shouldRemint = true
             }
-            guard hasUnansweredInitializedLane else { return }
+            guard shouldRemint else { return }
             _ = try await session.resetSessionIdentityForFreshSession(
                 secretName: peerSecretName,
                 deviceId: peerDeviceId,
@@ -894,7 +919,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 reason: "unansweredInitiatorReset")
             clearPreferredSessionIdentity(secretName: peerSecretName, deviceId: peerDeviceId)
             DecryptFailureAuditLog.log(
-                "pqs.recovery.unansweredInitiatorLaneReset trigger=\(trigger) peer=\(peerSecretName) deviceId=\(peerDeviceId.uuidString)")
+                "pqs.recovery.unansweredInitiatorLaneReset trigger=\(trigger) peer=\(peerSecretName) deviceId=\(peerDeviceId.uuidString) forceAnswered=\(forceRemintEvenIfAnswered)")
         } catch PQSSession.SessionErrors.invalidDeviceIdentity {
             // The device is absent from the peer's current verified config
             // (re-registered install). There is no live lane to heal.
@@ -940,8 +965,8 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             deviceId: deviceId)
     }
 
-    /// One escape-hatch initiating session (new OTK header) after retransport
-    /// prove-fail — clears the receiver `blankForHeaderExists` trap.
+    /// One escape-hatch initiating session (new OTK header) when settled recovery
+    /// still fails to prove (peer NACK) — clears the receiver `blankForHeaderExists` trap.
     private func performOrphanEscapeRemint(
         serviceKey: String,
         remintsAfterProveFail: Int,
@@ -1164,6 +1189,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 mlKEMOneTimeKeyId: results.localMLKEMPrivateKey.id.uuidString)
         }
         try await session.transportDelegate?.sendMessage(signedMessage, metadata: transportMetadata)
+        DecryptFailureAuditLog.log(
+            "pqs.send.deviceTransportOk sharedId=\(outboundTask.sharedId) recipientSecret=\(props.secretName) recipientDeviceId=\(props.deviceId.uuidString) sessionIdentityId=\(sessionIdentity.id.uuidString) recipient=\(outboundTask.message.recipient.auditRecipientTag) persisted=\(outboundTask.isPersistedOutbound)",
+            level: .info)
         // Outbound device-send ledger: record which local session encrypted this sharedId
         // to this recipient device so orphan resend can insert a new initiating session.
         await session.recordOutboundDeviceSend(
@@ -1422,15 +1450,41 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     }
                 }
 
+                let inboundHeader = verificationResult.ratchetMessage.header
+                let archivedBlanks = await archivedIdentities.asyncFilter { identity in
+                    (await identity.props(symmetricKey: databaseSymmetricKey))?.state == nil
+                }
+                // Active-first never walks full archives, but blankForHeaderExists
+                // counts archived blanks. Include the single header-matched archived
+                // blank in the active pass so demoted blanks are not invisible until
+                // a (possibly exhausted) archive defer.
+                let headerMatchedArchivedBlank = await archivedBlanks.asyncFirst(where: { identity in
+                    guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else {
+                        return false
+                    }
+                    return props.longTermPublicKey == inboundHeader.remoteLongTermPublicKey
+                        && props.oneTimePublicKey?.id == inboundHeader.remoteOneTimePublicKey?.id
+                })
+
                 if includeArchivedFallback {
                     // Background pass: archives only (actives already failed).
                     await tryDecryptCandidates(
                         archivedIdentities.map { (identity: $0, kind: "archived") })
                 } else {
-                    // activeFirstInboundPass — decryptInboundActiveOnly candidates.
-                    await tryDecryptCandidates(
+                    // activeFirstInboundPass — decryptInboundActiveOnly candidates,
+                    // plus header-matched archived blank when policy allows.
+                    var activeFirstCandidates =
                         statefulAlternates.map { (identity: $0, kind: "active") }
-                        + stateLessAlternates.map { (identity: $0, kind: "stateLess") })
+                        + stateLessAlternates.map { (identity: $0, kind: "stateLess") }
+                    if let matched = headerMatchedArchivedBlank,
+                       InboundInitiatingSlotPolicy.shouldTryArchivedHeaderMatchBeforeEnsureSkip(
+                           blankForHeaderExists: true,
+                           matchedIsArchived: true,
+                           includeArchivedFallback: false)
+                    {
+                        activeFirstCandidates.append((identity: matched, kind: "archivedHeaderMatch"))
+                    }
+                    await tryDecryptCandidates(activeFirstCandidates)
                 }
 
                 // Every existing row failed. The receiver must always be able to
@@ -1445,7 +1499,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     if let preferredProps = await preferredSessionIdentity.props(
                         symmetricKey: databaseSymmetricKey)
                     {
-                        let header = verificationResult.ratchetMessage.header
+                        let header = inboundHeader
                         var blankRows = stateLessAlternates
                         if preferredProps.state == nil {
                             blankRows.append(preferredSessionIdentity)
@@ -1455,9 +1509,6 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         // fresh mint for the same header would fail identically. Without
                         // this, every activate-then-fail cycle mints a new blank whose
                         // archival evicts a real stateful snapshot at the retention cap.
-                        let archivedBlanks = await archivedIdentities.asyncFilter { identity in
-                            (await identity.props(symmetricKey: databaseSymmetricKey))?.state == nil
-                        }
                         blankRows.append(contentsOf: archivedBlanks)
                         let blankForHeaderExists = await blankRows.asyncFirst(where: { identity in
                             guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else {
@@ -1518,11 +1569,13 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 }
 
                 guard let data = fallbackData else {
+                    let frameFingerprint = PQSSession.nackFrameFingerprint(for: inboundTask)
                     if shouldMarkArchivePassExhausted {
                         markArchivedInboundFallbackExhausted(
                             sharedId: inboundTask.sharedMessageId,
                             sender: inboundTask.senderSecretName,
-                            deviceId: inboundTask.senderDeviceId)
+                            deviceId: inboundTask.senderDeviceId,
+                            fingerprint: frameFingerprint)
                     }
                     // Active-first miss with archives remaining: defer archive try-all
                     // to a background job so urgent inbound can proceed.
@@ -1539,13 +1592,19 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         reason: "active and archived inbound decrypt attempts failed")
                     DecryptFailureAuditLog.log(
                         "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) attempts=[\(attemptFailures.joined(separator: "; "))]")
+                    // Do NOT write the failed try-first id into the preference map here.
+                    // Dogfood 2026-07-25: that armed preferredFailedInTryAll on every
+                    // poison redelivery → demoteProveFailedActive walked unique session
+                    // ids (nudge primary: 92 demotes / 4k blankForHeader skips against
+                    // linked). Preference stays success-only; demote remains rearm-gated.
                     throw preferredError
                 }
                 if shouldMarkArchivePassExhausted {
                     markArchivedInboundFallbackExhausted(
                         sharedId: inboundTask.sharedMessageId,
                         sender: inboundTask.senderSecretName,
-                        deviceId: inboundTask.senderDeviceId)
+                        deviceId: inboundTask.senderDeviceId,
+                        fingerprint: PQSSession.nackFrameFingerprint(for: inboundTask))
                 }
                 decryptedData = data
             }
@@ -2187,8 +2246,8 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                 }
 
                             case .mintFreshAfterRetransportProveFailed:
-                                // Escape blankForHeaderExists trap: new OTK header after
-                                // retransport prove-fail. Cap tracked per serviceKey (P3).
+                                // Escape blankForHeaderExists trap: new OTK header on settled
+                                // recovery NACK (identical-CT retransport cannot rearm). Cap per serviceKey (P3).
                                 do {
                                     replayIdentity = try await performOrphanEscapeRemint(
                                         serviceKey: serviceKeyForPolicy,
@@ -2594,6 +2653,20 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         session: PQSSession
     ) async {
         let sharedId = inboundTask.sharedMessageId
+        let currentFingerprint = PQSSession.nackFrameFingerprint(for: inboundTask)
+        if InboundRecoveryStormPolicy.shouldClearExhaustionForNewFingerprint(
+            sharedId: sharedId,
+            exhausted: archivedInboundFallbackExhausted,
+            exhaustedFingerprint:
+                archivedInboundFallbackExhaustedFingerprintBySharedId[sharedId],
+            currentFingerprint: currentFingerprint
+        ) {
+            archivedInboundFallbackExhausted.remove(sharedId)
+            archivedInboundFallbackExhaustedPeerKey.removeValue(forKey: sharedId)
+            archivedInboundFallbackExhaustedFingerprintBySharedId.removeValue(forKey: sharedId)
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.archiveFallbackRearmed reason=newFingerprint sharedId=\(sharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+        }
         guard InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
             sharedId: sharedId,
             exhausted: archivedInboundFallbackExhausted,
@@ -2623,13 +2696,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     private func markArchivedInboundFallbackExhausted(
         sharedId: String,
         sender: String,
-        deviceId: UUID
+        deviceId: UUID,
+        fingerprint: Data
     ) {
         archivedInboundFallbackExhausted = InboundRecoveryStormPolicy.exhaustedAfterArchivePassCompleted(
             current: archivedInboundFallbackExhausted,
             sharedId: sharedId)
         archivedInboundFallbackExhaustedPeerKey[sharedId] =
             "\(sender)|\(deviceId.uuidString)"
+        archivedInboundFallbackExhaustedFingerprintBySharedId[sharedId] = fingerprint
     }
 
     func clearArchivedInboundFallbackExhausted(sender: String, deviceId: UUID) {
@@ -2639,6 +2714,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         for sharedId in sharedIds {
             archivedInboundFallbackExhausted.remove(sharedId)
             archivedInboundFallbackExhaustedPeerKey.removeValue(forKey: sharedId)
+            archivedInboundFallbackExhaustedFingerprintBySharedId.removeValue(forKey: sharedId)
         }
     }
 
@@ -3869,6 +3945,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             
             try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
             logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
+            DecryptFailureAuditLog.log(
+                "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
+                level: .info)
             
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
@@ -3937,6 +4016,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             
             try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
             logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
+            DecryptFailureAuditLog.log(
+                "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
+                level: .info)
             
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
@@ -4008,6 +4090,9 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 await session.receiverDelegate?.updatedCommunication(communicationModel, members: members)
             }
             logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
+            DecryptFailureAuditLog.log(
+                "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(sender) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
+                level: .info)
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)
         case .broadcast:

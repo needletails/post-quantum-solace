@@ -95,8 +95,8 @@ struct DemotePromoteThrashPolicyTests {
         #expect(decision == .mintFresh)
     }
 
-    @Test("P1: MessageRecord==recovery still retransports first")
-    func messageRecordRecoveryStillRetransports() {
+    @Test("P1: MessageRecord==recovery escape-remints first while budget remains")
+    func messageRecordRecoveryEscapeRemintsFirst() {
         let id = UUID()
         let decision = OrphanResendRemintPolicy.decision(
             messageRecordSessionId: id,
@@ -105,7 +105,7 @@ struct DemotePromoteThrashPolicyTests {
             markIsStateLess: false,
             recoverySessionIsLiveActive: true,
             priorRetransportCount: 0)
-        #expect(decision == .retransportAlreadyServiced)
+        #expect(decision == .mintFreshAfterRetransportProveFailed)
     }
 }
 
@@ -133,8 +133,9 @@ struct DemotePromoteThrashSourceTests {
         let controlBody = try functionBody(
             named: "func resolveControlDeliverySessionIdentity",
             in: ratchet)
-        // Ride outbound even on forceFresh escape; demote-all reset is not the default.
+        // Cross-account rides outbound; same-account surgical mint — never demote-all.
         #expect(controlBody.contains("outboundSessionIdentity("))
+        #expect(controlBody.contains("shouldRequireSurgicalFreshLane"))
         #expect(
             controlBody.contains("demotePriorActives: false")
                 || controlBody.contains("preserveExistingActives")
@@ -143,6 +144,13 @@ struct DemotePromoteThrashSourceTests {
             "BUG: forceFresh still uses demote-all reset without surgical insert")
         #expect(!sequence.contains("preferredFailedInTryAll || priorSubmissions == 0"))
         #expect(sequence.contains("liveOrphanOrRecovery"))
+        // Must not reintroduce preference-on-fail (demote cascade).
+        let rolledBack = try #require(ratchet.range(of: "pqs.recovery.laneRolledBack reason="))
+        let afterRollback = ratchet[rolledBack.upperBound...]
+        let throwPreferred = try #require(afterRollback.range(of: "throw preferredError"))
+        #expect(
+            !String(afterRollback[..<throwPreferred.lowerBound])
+                .contains("preferredSessionIdentityIdByPeerDevice["))
     }
 
     @Test("P0: personal refresh shields orphan mark OR recovery OR repair blank")

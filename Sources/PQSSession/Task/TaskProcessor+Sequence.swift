@@ -564,6 +564,20 @@ extension TaskProcessor {
                 // redelivery of the same frame is suppressed instead of repeating the OTK
                 // batch replacement and the cooldown-bypassing peerRefresh re-emit.
                 await session.markInboundFailure(message, failureClass: failureClass)
+                // Dead-epoch frames never heal by re-decrypt. Terminalize this sharedId
+                // so spool redelivery is swallowed without another OTK/peerRefresh storm.
+                let newlyTerminal = await session.markInboundContentUnrecoverable(
+                    sender: message.senderSecretName,
+                    deviceId: message.senderDeviceId,
+                    sharedId: message.sharedMessageId)
+                if newlyTerminal {
+                    DecryptFailureAuditLog.log(
+                        "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=missingOneTimeKeyDeadEpoch")
+                    await session.sessionDelegate?.inboundContentUnrecoverable(
+                        senderSecretName: message.senderSecretName,
+                        senderDeviceId: message.senderDeviceId,
+                        sharedMessageId: message.sharedMessageId)
+                }
 
                 // The published-batch replacement (key generation + two uploads with
                 // retry backoff) and the subsequent peerRefresh emit must not block the
@@ -607,15 +621,18 @@ extension TaskProcessor {
                     // emitted below, rides that dead pin. Reset the lane from this
                     // local evidence (no frame needs to cross the broken pair) so the
                     // emit below is the first frame on a lane the peer can decrypt.
+                    let mySecretName = await session.sessionContext?.sessionUser.secretName
+                    let isSelf = senderSecretName == mySecretName
                     await resetUnansweredInitiatingLane(
                         peerSecretName: senderSecretName,
                         peerDeviceId: senderDeviceId,
                         trigger: "missingOneTimeKeyEpisode",
+                        forceRemintEvenIfAnswered:
+                            UnansweredInitiatingLanePolicy.shouldForceRemintEvenIfAnswered(
+                                isSameAccount: isSelf,
+                                trigger: "missingOneTimeKeyEpisode"),
                         session: session)
                     guard !Task.isCancelled else { return }
-
-                    let mySecretName = await session.sessionContext?.sessionUser.secretName
-                    let isSelf = senderSecretName == mySecretName
 
                     do {
                         // Documented receive-side ASR must not emit peerRefresh toward a
@@ -987,6 +1004,8 @@ extension TaskProcessor {
         let preferenceKey = peerDeviceIdentityPreferenceKey(
             secretName: message.senderSecretName,
             deviceId: message.senderDeviceId)
+        // Preference map is success-only (never written on try-all failure — that
+        // dogfood cascade demoted unique session ids under blankForHeader storms).
         let proveFailedPreferredId = preferredSessionIdentityIdByPeerDevice[preferenceKey]
         let preferredFailedInTryAll = proveFailedPreferredId != nil
         let rearmedAfterFailedReplay = await session.armPeerResendRetryAfterFailedReplay(

@@ -501,4 +501,18 @@ public enum MessageRecipient: Codable, Sendable, Equatable {
             fatalError("Invalid Recipient Type \(self)")
         }
     }
+
+    /// Safe tag for dogfood audit lines (never fatals).
+    public var auditRecipientTag: String {
+        switch self {
+        case .personalMessage:
+            "personalMessage"
+        case .nickname(let name):
+            "nickname:\(name)"
+        case .channel(let name):
+            "channel:\(name)"
+        case .broadcast:
+            "broadcast"
+        }
+    }
 }
