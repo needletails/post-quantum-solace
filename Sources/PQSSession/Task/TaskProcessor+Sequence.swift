@@ -44,7 +44,25 @@ extension TaskProcessor {
         let seq = incrementId()
         let symmetricKey = try await session.getDatabaseSymmetricKey()
         let job = try createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
+        // Always persist first. Offline / non-viable compose must survive until
+        // `resumeJobQueue` after IRC registration — never depend on in-memory dequeue.
         try await cache.createJob(job)
+
+        if !session.isViable {
+            if case .writeMessage(let outbound) = task.task {
+                logger.log(
+                    level: .info,
+                    message: "pqs.outbound.jobPersistedNonViable sharedId=\(outbound.sharedId) recipient=\(outbound.message.recipient) jobId=\(job.id)")
+            } else {
+                logger.log(
+                    level: .info,
+                    message: "pqs.outbound.jobPersistedNonViable jobId=\(job.id)")
+            }
+            // Do not enqueue into a live consumer while non-viable: a concurrent drain
+            // can dequeue+delete on a false transport success, or race shutdown.
+            // Event-driven resumeJobQueue reloads from cache when messaging is viable again.
+            return
+        }
         
         // Important: `feedTask` can be called while the processor is already running.
         // Persisting to cache alone is not enough because the active processing loop consumes
@@ -268,6 +286,11 @@ extension TaskProcessor {
         
         guard session.isViable else {
             // Leave the job in cache; we will reload it once the session becomes viable again.
+            if case .writeMessage(let message) = props.task.task {
+                logger.log(
+                    level: .info,
+                    message: "pqs.outbound.parkedForViability sharedId=\(message.sharedId) recipient=\(message.message.recipient) error=sessionNotViable")
+            }
             return .paused
         }
 
@@ -1230,8 +1253,9 @@ extension TaskProcessor {
         if let urlError = error as? URLError {
             switch urlError.code {
             case .timedOut, .notConnectedToInternet, .networkConnectionLost,
-                 .cannotConnectToHost, .dnsLookupFailed, .internationalRoamingOff,
-                 .dataNotAllowed:
+                 .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+                 .internationalRoamingOff, .dataNotAllowed, .secureConnectionFailed,
+                 .cannotLoadFromNetwork:
                 return true
             default:
                 break
@@ -1239,6 +1263,8 @@ extension TaskProcessor {
         }
         let description = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
         if description.localizedCaseInsensitiveContains("non-viable") { return true }
+        if description.localizedCaseInsensitiveContains("writer not set") { return true }
+        if description.localizedCaseInsensitiveContains("writernotset") { return true }
         if description.localizedCaseInsensitiveContains("timed out") { return true }
         if description.localizedCaseInsensitiveContains("NSURLErrorDomain") { return true }
         return false

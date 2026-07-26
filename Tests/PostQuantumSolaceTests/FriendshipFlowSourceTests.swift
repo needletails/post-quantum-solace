@@ -1556,6 +1556,27 @@ struct FriendshipFlowSourceTests {
         #expect(undecryptableBody.contains("return .paused"))
     }
 
+    @Test("non-viable feedTask persists job without live enqueue")
+    func nonViableFeedTaskPersistsJobWithoutLiveEnqueue() throws {
+        let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
+        let feedBody = try PQSFriendshipSource.functionBody(
+            named: "public func feedTask",
+            in: sequenceSource)
+        #expect(feedBody.contains("createJob(job)"))
+        #expect(feedBody.contains("if !session.isViable"))
+        #expect(feedBody.contains("pqs.outbound.jobPersistedNonViable"))
+        // Persist-only path must return before loadAndOrganizeTasks while non-viable.
+        let nonViableGuard = try #require(feedBody.range(of: "if !session.isViable"))
+        let loadTasks = try #require(feedBody.range(of: "loadAndOrganizeTasks(job, symmetricKey: symmetricKey)"))
+        #expect(nonViableGuard.lowerBound < loadTasks.lowerBound)
+
+        let nonViableErrorBody = try PQSFriendshipSource.functionBody(
+            named: "private func isConnectionNonViableError",
+            in: sequenceSource)
+        #expect(nonViableErrorBody.contains("writer not set"))
+        #expect(nonViableErrorBody.contains("secureConnectionFailed"))
+    }
+
     @Test("failed orphan replay re-arms bounded NACK; personal refresh cannot stomp orphan lane")
     func failedOrphanReplayRearmsBoundedNackAndProtectsPersonalRefresh() throws {
         let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
