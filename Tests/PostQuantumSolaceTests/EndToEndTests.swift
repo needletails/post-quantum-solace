@@ -199,7 +199,7 @@ actor EndToEndTests {
         await _senderSession.setPQSSessionDelegate(conformer: sessionDelegate)
         await _senderSession.setReceiverDelegate(conformer: senderReceiver)
         
-        _senderSession.isViable = true
+        await _senderSession.setViability(true)
         await self.store.setPublishableName(sMockUserData.ssn)
         if createSession {
             _senderSession = try await _senderSession.createSession(
@@ -219,7 +219,7 @@ actor EndToEndTests {
         await _senderMaxSkipSession.setPQSSessionDelegate(conformer: sessionDelegate)
         await _senderMaxSkipSession.setReceiverDelegate(conformer: senderMaxSkipReceiver)
         
-        _senderMaxSkipSession.isViable = true
+        await _senderMaxSkipSession.setViability(true)
         await self.store.setPublishableName(sMockUserData.ssn)
         if createSession {
             _senderMaxSkipSession = try await _senderMaxSkipSession.createSession(
@@ -237,7 +237,7 @@ actor EndToEndTests {
         useProvidedTransport: Bool = false
     ) async throws {
         await store.setLocalSalt("testChildSalt1")
-        _senderChildSession1.isViable = true
+        await _senderChildSession1.setViability(true)
         await self.store.setPublishableName(sMockUserData.ssn)
         _senderChildSession1.linkDelegate = senderChild1LinkDelegate
         
@@ -272,7 +272,7 @@ actor EndToEndTests {
     ) async throws {
         await store.setLocalSalt("testChildSalt2")
         await _senderChildSession2.setLogLevel(.trace)
-        _senderChildSession2.isViable = true
+        await _senderChildSession2.setViability(true)
         await self.store.setPublishableName(sMockUserData.ssn)
         _senderChildSession2.linkDelegate = senderChild2LinkDelegate
         let bundle = try await _senderChildSession2.createDeviceCryptographicBundle(isMaster: false)
@@ -306,7 +306,7 @@ actor EndToEndTests {
         await _recipientSession.setTransportDelegate(conformer: transport)
         await _recipientSession.setPQSSessionDelegate(conformer: sessionDelegate)
         
-        _recipientSession.isViable = true
+        await _recipientSession.setViability(true)
         await _recipientSession.setReceiverDelegate(conformer: recipientReceiver)
         await self.store.setPublishableName(rMockUserData.rsn)
         if createSession {
@@ -326,7 +326,7 @@ actor EndToEndTests {
         await _recipientMaxSkipSession.setTransportDelegate(conformer: transport)
         await _recipientMaxSkipSession.setPQSSessionDelegate(conformer: sessionDelegate)
         
-        _recipientMaxSkipSession.isViable = true
+        await _recipientMaxSkipSession.setViability(true)
         await _recipientMaxSkipSession.setReceiverDelegate(conformer: recipientMaxSkipReceiver)
         await self.store.setPublishableName(rMockUserData.rsn)
         if createSession {
@@ -345,7 +345,7 @@ actor EndToEndTests {
         useProvidedTransport: Bool = false
     ) async throws {
         await store.setLocalSalt("testChildSalt1")
-        _recipientChildSession1.isViable = true
+        await _recipientChildSession1.setViability(true)
         await self.store.setPublishableName(rMockUserData.rsn)
         _recipientChildSession1.linkDelegate = recipientChild1LinkDelegate
         let bundle = try await _recipientChildSession1.createDeviceCryptographicBundle(
@@ -375,7 +375,7 @@ actor EndToEndTests {
     
     func linkRecipientChildSession2(store: MockIdentityStore, transport: _MockTransportDelegate) async throws {
         await store.setLocalSalt("testChildSalt2")
-        _recipientChildSession2.isViable = true
+        await _recipientChildSession2.setViability(true)
         await self.store.setPublishableName(rMockUserData.rsn)
         _recipientChildSession2.linkDelegate = recipientChild2LinkDelegate
         let bundle = try await _recipientChildSession2.createDeviceCryptographicBundle(
@@ -444,12 +444,35 @@ actor EndToEndTests {
         _ session: PQSSession,
         received: ReceivedMessage
     ) async throws -> Bool {
+        // Strict §4.1 OOB retry/unavailable ride authenticated transport, not DR.
+        // Service them before any signature/ratchet path (placeholder ciphertext is empty).
+        if case .requestMessageResend(let request) = received.transportEvent {
+            _ = try await session.handleOutOfBandResendRequest(
+                from: received.sender,
+                deviceId: received.deviceId,
+                failedSharedMessageIds: request.failedSharedMessageIds)
+            return true
+        }
+        if case .messageResendUnavailable(let notice) = received.transportEvent {
+            _ = await session.clearPendingResends(
+                sender: received.sender,
+                deviceId: received.deviceId,
+                messageIds: notice.unavailableSharedMessageIds)
+            for sharedId in notice.unavailableSharedMessageIds {
+                _ = await session.markInboundContentUnrecoverable(
+                    sender: received.sender,
+                    deviceId: received.deviceId,
+                    sharedId: sharedId)
+            }
+            return true
+        }
         do {
             try await session.receiveMessage(
                 message: received.message,
                 sender: received.sender,
                 deviceId: received.deviceId,
-                messageId: received.messageId
+                messageId: received.messageId,
+                logicalMessageId: received.logicalMessageId
             )
             return true
         } catch let ratchetError as RatchetError where [
@@ -513,7 +536,7 @@ actor EndToEndTests {
         await joeSession.setTransportDelegate(conformer: joeTransport)
         await joeSession.setPQSSessionDelegate(conformer: joeDelegate)
         await joeSession.setReceiverDelegate(conformer: joeReceiver)
-        joeSession.isViable = true
+        await joeSession.setViability(true)
         await self.store.setPublishableName("joe")
         joeSession = try await joeSession.createSession(secretName: "joe", appPassword: "123") {}
         await joeSession.setAppPassword("123")
@@ -917,9 +940,11 @@ actor EndToEndTests {
     @Test("Shared ID override is preserved on outbound replay send")
     func testSharedIdOverridePreservedOnOutboundReplaySend() async throws {
         actor OutboundProbe {
-            private var ids: [String] = []
-            func append(_ id: String) { ids.append(id) }
-            func first() -> String? { ids.first }
+            private var ids: [(envelope: String, logical: String?)] = []
+            func append(envelope: String, logical: String?) {
+                ids.append((envelope, logical))
+            }
+            func first() -> (envelope: String, logical: String?)? { ids.first }
             func count() -> Int { ids.count }
         }
         
@@ -966,7 +991,9 @@ actor EndToEndTests {
         bobTask = Task {
             for await received in bobStream {
                 if received.sender == "alice", received.transportEvent == nil {
-                    await probe.append(received.messageId)
+                    await probe.append(
+                        envelope: received.messageId,
+                        logical: received.logicalMessageId)
                     return
                 }
             }
@@ -979,7 +1006,9 @@ actor EndToEndTests {
         )
         
         #expect(await waitForOutbound(), "Expected outbound frame to be delivered to recipient transport")
-        #expect(await probe.first() == replaySharedId, "Wire metadata shared id should preserve override value")
+        let observed = await probe.first()
+        #expect(observed?.logical == replaySharedId)
+        #expect(observed?.envelope != replaySharedId)
         
         let persisted = await senderStore.getAllMessages()
         #expect(persisted.contains(where: { $0.sharedId == replaySharedId }), "Sender persistence should retain replay shared id")
@@ -1073,12 +1102,14 @@ actor EndToEndTests {
     @Test("MaxSkipped defers resend for the failed shared id without key rotation")
     func testMaxSkippedResendRequestAndReplaySharedIdEndToEnd() async throws {
         actor FlowProbe {
-            var failedSharedId: String?
+            var failedEnvelopeMessageId: String?
+            var failedLogicalSharedId: String?
             var didHitMaxSkipped = false
             var sawPeerRefresh = false
 
-            func markFailed(_ id: String) {
-                failedSharedId = id
+            func markFailed(envelopeMessageId: String, logicalSharedId: String?) {
+                failedEnvelopeMessageId = envelopeMessageId
+                failedLogicalSharedId = logicalSharedId
                 didHitMaxSkipped = true
             }
             func markPeerRefresh() { sawPeerRefresh = true }
@@ -1182,7 +1213,9 @@ actor EndToEndTests {
                 if received.transportEvent == nil,
                    await gate.isFailingDeliveryCandidate(),
                    !(await probe.didHitMaxSkipped) {
-                    await probe.markFailed(received.messageId)
+                    await probe.markFailed(
+                        envelopeMessageId: received.messageId,
+                        logicalSharedId: received.logicalMessageId)
                 }
                 _ = try? await self.receiveIgnoringRecoverableErrors(
                     self._recipientMaxSkipSession,
@@ -1229,20 +1262,21 @@ actor EndToEndTests {
         }
         #expect(sawMaxSkipped, "Expected recipient to identify the first failing shared id after the dropped gap")
 
-        let failed = try #require(await probe.failedSharedId)
+        let failedEnvelope = try #require(await probe.failedEnvelopeMessageId)
+        let failedLogical = try #require(await probe.failedLogicalSharedId)
 
         // Orphan-resend contract: the receiver drops the frame and requests a bounded
         // resend; the *sender* heals the lane and replays the same sharedId. Transient
         // deferral/episode state may resolve before polling observes it, so accept
         // end-to-end recovery of the failed sharedId as the strongest success signal.
         let sawDeferredRepair = await waitUntil {
-            if await bobStore.getAllMessages().contains(where: { $0.sharedId == failed }) {
+            if await bobStore.getAllMessages().contains(where: { $0.sharedId == failedLogical }) {
                 return true
             }
             if await self._recipientMaxSkipSession.hasPendingResendAfterReestablishment(
                 sender: "alice",
                 deviceId: aliceDeviceId,
-                failedMessageId: failed) {
+                failedMessageId: failedEnvelope) {
                 return true
             }
             if await self._recipientMaxSkipSession.hasOpenReestablishmentEpisode(
@@ -1254,7 +1288,7 @@ actor EndToEndTests {
         }
         #expect(
             sawDeferredRepair,
-            "Expected maxSkipped to recover failed shared id \(failed) via sender orphan-resend (or defer resend while repair is pending)")
+            "Expected maxSkipped to recover failed envelope \(failedEnvelope) / logical id \(failedLogical)")
         #expect(
             await bobTransport.publishRotatedKeysCallCount == 0,
             "maxSkipped repair must not rotate local identity keys")
@@ -1263,8 +1297,12 @@ actor EndToEndTests {
     @Test("Running processor defers inbound failure policy to the correct shared id")
     func testRunningProcessorAppliesInboundFailurePolicyToCorrectSharedId() async throws {
         actor Probe {
-            var failedSharedId: String?
-            func markFailed(_ id: String) { failedSharedId = id }
+            var failedEnvelopeMessageId: String?
+            var failedLogicalSharedId: String?
+            func markFailed(envelopeMessageId: String, logicalSharedId: String?) {
+                failedEnvelopeMessageId = envelopeMessageId
+                failedLogicalSharedId = logicalSharedId
+            }
         }
 
         actor DropGate {
@@ -1357,8 +1395,10 @@ actor EndToEndTests {
             for await received in bobStream {
                 if received.transportEvent == nil,
                    await gate.isFailingDeliveryCandidate(),
-                   await probe.failedSharedId == nil {
-                    await probe.markFailed(received.messageId)
+                   await probe.failedEnvelopeMessageId == nil {
+                    await probe.markFailed(
+                        envelopeMessageId: received.messageId,
+                        logicalSharedId: received.logicalMessageId)
                 }
                 _ = try? await self.receiveIgnoringRecoverableErrors(
                     self._recipientMaxSkipSession,
@@ -1397,20 +1437,23 @@ actor EndToEndTests {
             )
         }
 
-        #expect(await waitUntil { await probe.failedSharedId != nil }, "Expected running processor to observe a failed shared id")
-        let failed = try #require(await probe.failedSharedId)
+        #expect(
+            await waitUntil { await probe.failedEnvelopeMessageId != nil },
+            "Expected running processor to observe a failed envelope id")
+        let failedEnvelope = try #require(await probe.failedEnvelopeMessageId)
+        let failedLogical = try #require(await probe.failedLogicalSharedId)
         // Orphan-resend contract: the policy must target the actual failed sharedId —
         // proven either by a transient pending-resend entry for that exact id or by
         // end-to-end recovery of that exact id via the sender's replay.
         #expect(await waitUntil {
-            if await bobStore.getAllMessages().contains(where: { $0.sharedId == failed }) {
+            if await bobStore.getAllMessages().contains(where: { $0.sharedId == failedLogical }) {
                 return true
             }
             return await self._recipientMaxSkipSession.hasPendingResendAfterReestablishment(
                 sender: "alice",
                 deviceId: aliceDeviceId,
-                failedMessageId: failed)
-        }, "Running processor should apply inbound failure policy to the actual failed shared id, not a neighbor frame")
+                failedMessageId: failedEnvelope)
+        }, "Running processor should apply inbound failure policy to the actual failed envelope, not a neighbor frame")
         #expect(
             await bobTransport.publishRotatedKeysCallCount == 0,
             "Inbound failure policy must not rotate keys")
@@ -1959,20 +2002,20 @@ actor EndToEndTests {
 
         actor PacketReplayProbe {
             private var failedPacket: Data?
-            private var deliveredPacket: Data?
+            private var deliveredPackets = [Data]()
 
             func markFailed(_ data: Data?) {
                 failedPacket = data
             }
 
             func markDelivered(_ data: Data?) {
-                if deliveredPacket == nil {
-                    deliveredPacket = data
-                }
+                guard let data else { return }
+                deliveredPackets.append(data)
             }
 
             func replayedSamePacket() -> Bool {
-                failedPacket != nil && failedPacket == deliveredPacket
+                guard let failedPacket else { return false }
+                return deliveredPackets.contains(failedPacket)
             }
         }
 
@@ -2049,6 +2092,9 @@ actor EndToEndTests {
             bobSession: _recipientSession,
             rsd: rsd
         )
+        // A transport failure parks the exact prepared frame until a concrete
+        // registration/writer-ready event resumes the durable queue.
+        try await _senderSession.resumeJobQueue()
 
         #expect(await failureGate.failures == 1, "Transport should fail exactly once after encryption")
         #expect(await packetProbe.replayedSamePacket(), "Retry must replay the same signed ratchet frame instead of re-encrypting")
@@ -2165,6 +2211,9 @@ actor EndToEndTests {
             kind: .peerRefresh,
             recipient: .nickname("bob"),
             scope: .peer(secretName: "bob"))
+        // Model the next writer-ready event; recovery must replay the prepared
+        // control frame byte-for-byte rather than timer-retrying it.
+        try await _senderSession.resumeJobQueue()
 
         #expect(await failureGate.failures == 1, "Transport should fail exactly once for peerRefresh")
         #expect(
@@ -2489,7 +2538,8 @@ actor EndToEndTests {
                 message: received.message,
                 sender: received.sender,
                 deviceId: received.deviceId,
-                messageId: received.messageId)
+                messageId: received.messageId,
+                logicalMessageId: received.logicalMessageId)
         }
 
         let senderParentStream = AsyncStream<ReceivedMessage> {
@@ -2543,11 +2593,16 @@ actor EndToEndTests {
             peerDeviceId: senderParentId)
         await childProcessor.setTaskDelegate(peerRefreshFailureDelegate)
 
-        try await createFriendship(
-            aliceSession: _senderSession,
-            sd: senderDelegate,
-            bobSession: _recipientSession,
-            rsd: recipientDelegate)
+        // The NudgeKit contact-sync path refreshes the local account's sibling
+        // lanes before emitting contact metadata. Model that same event boundary
+        // explicitly in this lower-level PQS test.
+        _ = try await _senderChildSession1.refreshIdentities(
+            secretName: sMockUserData.ssn,
+            forceRefresh: true)
+        _ = try await _senderChildSession1.emitSessionReestablishment(
+            kind: .peerRefresh,
+            recipient: .personalMessage,
+            scope: .personalDevice(deviceId: senderParentId))
 
         #expect(
             await waitUntil { await peerRefreshFailureDelegate.gate.failures == 1 },
@@ -2559,6 +2614,12 @@ actor EndToEndTests {
                     deviceId: senderParentId))
             },
             "The retried peerRefresh response should close the child-to-parent repair episode")
+
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: senderDelegate,
+            bobSession: _recipientSession,
+            rsd: recipientDelegate)
 
         _ = try await _senderChildSession1.refreshIdentities(
             secretName: rMockUserData.rsn,
@@ -2920,7 +2981,8 @@ actor EndToEndTests {
                         message: received.message,
                         sender: received.sender,
                         deviceId: received.deviceId,
-                        messageId: received.messageId)
+                        messageId: received.messageId,
+                        logicalMessageId: received.logicalMessageId)
                 } catch PQSSession.SessionErrors.databaseNotInitialized {
                     return
                 } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
@@ -2959,7 +3021,8 @@ actor EndToEndTests {
                         message: received.message,
                         sender: received.sender,
                         deviceId: received.deviceId,
-                        messageId: received.messageId)
+                        messageId: received.messageId,
+                        logicalMessageId: received.logicalMessageId)
                 } catch PQSSession.SessionErrors.databaseNotInitialized {
                     return
                 } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
@@ -3570,71 +3633,106 @@ actor EndToEndTests {
         await shutdownSessions()
     }
     
-    @Test("Session State Synchronization Issues - Simulate State Corruption")
+    @Test(
+        "Session State Synchronization Issues - Simulate State Corruption",
+        .timeLimit(.minutes(1)))
     func testSessionStateSynchronizationIssues() async throws {
-        // Setup two devices with their own sessions
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-        
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+
+        defer {
+            aliceTransport.continuation?.finish()
+            bobTransport.continuation?.finish()
+            aliceTask?.cancel()
+            bobTask?.cancel()
+            Task { await self.shutdownSessions() }
+        }
+
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-        
+
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-        
+
+        aliceTask = Task {
+            for await received in aliceStream {
+                if received.sender == self.sMockUserData.ssn { continue }
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._senderSession,
+                    received: received)
+            }
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                if received.sender == self.rMockUserData.rsn { continue }
+                _ = try? await self.receiveIgnoringRecoverableErrors(
+                    self._recipientSession,
+                    received: received)
+            }
+        }
+
         try await createFriendship(
             aliceSession: _senderSession,
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-        
-        // Send initial messages to establish session
-        for i in 1...3 {
-            try await _senderSession.writeTextMessage(
-                recipient: .nickname("bob"),
-                text: "Initial message \(i)")
-            try await Task.sleep(until: .now + .milliseconds(50))
+
+        func waitForMessage(_ sharedId: String, timeout: TimeInterval = 10) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeout)
+            while Date() < deadline {
+                if await recipientStore.getAllMessages().contains(where: {
+                    $0.sharedId == sharedId
+                }) {
+                    return true
+                }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return false
         }
-        
-        // Simulate session state corruption by clearing and recreating session state
-        // This simulates what might happen if session state is lost or corrupted
+
+        let beforeRestart = UUID().uuidString
+        try await _senderSession.writeTextMessage(
+            recipient: .nickname("bob"),
+            text: "before restart",
+            sharedIdOverride: beforeRestart)
+        #expect(
+            await waitForMessage(beforeRestart),
+            "Bob should decrypt and persist the pre-shutdown message")
+
+        // Full runtime teardown persists ratchet state but permanently closes the
+        // current ratchet manager. `startSession` must replace runtime components.
         await shutdownSessions()
-        
-        // Wait a moment for cleanup to complete
-        try await Task.sleep(until: .now + .milliseconds(100))
-        
+
         try await createSenderSession(store: senderStore, createSession: false, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, createSession: false, transport: bobTransport, sessionDelegate: rsd)
-        
-        
-        // Try to send messages with potentially corrupted state
-        var authenticationFailures = 0
-        var successfulMessages = 0
-        
-        for i in 4...10 {
-            do {
-                try await _senderSession.writeTextMessage(
-                    recipient: .nickname("bob"),
-                    text: "State corruption test \(i)")
-                successfulMessages += 1
-            } catch {
-                if error.localizedDescription.contains("AUTHENTICATIONFAILURE") ||
-                    error.localizedDescription.contains("authenticationFailure") ||
-                    error.localizedDescription.contains("invalidKeyId") {
-                    authenticationFailures += 1
-                }
-            }
-            
-            // Small delay between messages
-            try await Task.sleep(until: .now + .milliseconds(10))
-        }
-        
-        print("Session State Synchronization Test Results:")
-        print("- Successful messages: \(successfulMessages)")
-        print("- Authentication failures: \(authenticationFailures)")
-        
+
+        #expect(await _senderSession.lifecyclePhase == .running)
+        #expect(await _recipientSession.lifecyclePhase == .running)
+
+        let afterRestart = UUID().uuidString
+        try await _senderSession.writeTextMessage(
+            recipient: .nickname("bob"),
+            text: "after restart",
+            sharedIdOverride: afterRestart)
+        #expect(
+            await waitForMessage(afterRestart),
+            "Bob should decrypt and persist the post-restart message")
+
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await aliceTask?.value
+        _ = await bobTask?.value
         await shutdownSessions()
     }
     
@@ -4584,7 +4682,7 @@ actor EndToEndTests {
             try await Task.sleep(until: .now + .milliseconds(15))
         }
         
-        try await self._senderSession.rotateKeysOnPotentialCompromise()
+        try await self._senderSession.rotateCurrentDeviceKeys()
         
         for i in 6...10 {
             try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice post-rotate #\(i)")
@@ -4593,7 +4691,7 @@ actor EndToEndTests {
         }
         
 //         Rotate keys mid‑conversation on Bob
-        try await _recipientSession.rotateKeysOnPotentialCompromise()
+        try await _recipientSession.rotateCurrentDeviceKeys()
         
         for i in 11...15 {
             try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice steady #\(i)")
@@ -6267,7 +6365,8 @@ actor EndToEndTests {
                             message: received.message,
                             sender: received.sender,
                             deviceId: received.deviceId,
-                            messageId: received.messageId)
+                            messageId: received.messageId,
+                            logicalMessageId: received.logicalMessageId)
                     }
                     
                     if currentMessage == 13 {
@@ -7441,7 +7540,8 @@ actor EndToEndTests {
                         message: received.message,
                         sender: received.sender,
                         deviceId: received.deviceId,
-                        messageId: received.messageId)
+                        messageId: received.messageId,
+                        logicalMessageId: received.logicalMessageId)
                     
                     if messageCount == 1 {
                         try await _senderMaxSkipSession.rotateKeysOnPotentialCompromise()
@@ -7468,7 +7568,8 @@ actor EndToEndTests {
                         message: received.message,
                         sender: received.sender,
                         deviceId: received.deviceId,
-                        messageId: received.messageId)
+                        messageId: received.messageId,
+                        logicalMessageId: received.logicalMessageId)
                 }
             }
         }
@@ -7552,7 +7653,8 @@ actor EndToEndTests {
                         message: received.message,
                         sender: received.sender,
                         deviceId: received.deviceId,
-                        messageId: received.messageId)
+                        messageId: received.messageId,
+                        logicalMessageId: received.logicalMessageId)
                     bobMessageCount += 1
                     
                     if bobMessageCount == 2 {
@@ -7602,7 +7704,8 @@ actor EndToEndTests {
                         message: received.message,
                         sender: received.sender,
                         deviceId: received.deviceId,
-                        messageId: received.messageId)
+                        messageId: received.messageId,
+                        logicalMessageId: received.logicalMessageId)
                     aliceMessageCount += 1
                     
                     if aliceMessageCount == 2 {
@@ -8487,78 +8590,86 @@ actor EndToEndTests {
     func testRequestMessageResendReplaysRecentNonPersistentControl() async throws {
         actor ReplayProbe {
             private var expectedIntentId: UUID?
-            private var droppedSharedId: String?
-            private var replayCountsBySharedId: [String: Int] = [:]
+            private var droppedEnvelopeMessageId: String?
+            private var droppedLogicalSharedId: String?
+            private var replayCountsByLogicalSharedId: [String: Int] = [:]
 
             func expect(intentId: UUID) {
                 expectedIntentId = intentId
             }
 
             func shouldDropFirstMatchingControl(_ received: ReceivedMessage) -> Bool {
-                guard droppedSharedId == nil else { return false }
+                guard droppedEnvelopeMessageId == nil else { return false }
                 guard received.sender == "alice", received.recipient == "bob" else { return false }
                 guard case .sessionReestablishment(let envelope)? = received.transportEvent else { return false }
                 guard envelope.kind == .peerRefresh, envelope.isResponse else { return false }
                 guard envelope.intentId == expectedIntentId else { return false }
-                droppedSharedId = received.messageId
+                guard let logicalSharedId = received.logicalMessageId else { return false }
+                droppedEnvelopeMessageId = received.messageId
+                droppedLogicalSharedId = logicalSharedId
                 return true
             }
 
             func markReplayIfNeeded(_ received: ReceivedMessage) {
-                guard let droppedSharedId else { return }
-                guard received.messageId == droppedSharedId else { return }
+                guard let droppedEnvelopeMessageId, let droppedLogicalSharedId else { return }
+                guard received.messageId != droppedEnvelopeMessageId else { return }
+                guard received.logicalMessageId == droppedLogicalSharedId else { return }
                 guard case .sessionReestablishment = received.transportEvent else { return }
-                replayCountsBySharedId[received.messageId, default: 0] += 1
+                replayCountsByLogicalSharedId[droppedLogicalSharedId, default: 0] += 1
             }
 
-            func droppedId() -> String? {
-                droppedSharedId
+            func droppedEnvelopeId() -> String? {
+                droppedEnvelopeMessageId
             }
 
-            func sawReplay(for sharedId: String) -> Bool {
-                replayCount(for: sharedId) > 0
+            func droppedLogicalId() -> String? {
+                droppedLogicalSharedId
             }
 
-            func replayCount(for sharedId: String) -> Int {
-                replayCountsBySharedId[sharedId, default: 0]
+            func replayCount(for logicalSharedId: String) -> Int {
+                replayCountsByLogicalSharedId[logicalSharedId, default: 0]
             }
         }
 
         actor LinkedReplayProbe {
             private var expectedTargetDeviceId: UUID?
-            private var droppedSharedId: String?
-            private var replayCountsBySharedId: [String: Int] = [:]
+            private var droppedEnvelopeMessageId: String?
+            private var droppedLogicalSharedId: String?
+            private var replayCountsByLogicalSharedId: [String: Int] = [:]
 
             func expect(targetDeviceId: UUID) {
                 expectedTargetDeviceId = targetDeviceId
             }
 
             func shouldDropFirstMatchingControl(_ received: ReceivedMessage) -> Bool {
-                guard droppedSharedId == nil else { return false }
+                guard droppedEnvelopeMessageId == nil else { return false }
                 guard received.sender == "alice", received.recipient == "bob" else { return false }
                 guard case .linkedDeviceReprovisioning(let bundle)? = received.transportEvent else { return false }
                 guard bundle.targetDeviceId == expectedTargetDeviceId else { return false }
-                droppedSharedId = received.messageId
+                guard let logicalSharedId = received.logicalMessageId else { return false }
+                droppedEnvelopeMessageId = received.messageId
+                droppedLogicalSharedId = logicalSharedId
                 return true
             }
 
             func markReplayIfNeeded(_ received: ReceivedMessage) {
-                guard let droppedSharedId else { return }
-                guard received.messageId == droppedSharedId else { return }
+                guard let droppedEnvelopeMessageId, let droppedLogicalSharedId else { return }
+                guard received.messageId != droppedEnvelopeMessageId else { return }
+                guard received.logicalMessageId == droppedLogicalSharedId else { return }
                 guard case .linkedDeviceReprovisioning = received.transportEvent else { return }
-                replayCountsBySharedId[received.messageId, default: 0] += 1
+                replayCountsByLogicalSharedId[droppedLogicalSharedId, default: 0] += 1
             }
 
-            func droppedId() -> String? {
-                droppedSharedId
+            func droppedEnvelopeId() -> String? {
+                droppedEnvelopeMessageId
             }
 
-            func sawReplay(for sharedId: String) -> Bool {
-                replayCount(for: sharedId) > 0
+            func droppedLogicalId() -> String? {
+                droppedLogicalSharedId
             }
 
-            func replayCount(for sharedId: String) -> Int {
-                replayCountsBySharedId[sharedId, default: 0]
+            func replayCount(for logicalSharedId: String) -> Int {
+                replayCountsByLogicalSharedId[logicalSharedId, default: 0]
             }
         }
 
@@ -8650,9 +8761,12 @@ actor EndToEndTests {
             respondingTo: originalPeerRefresh)
 
         let droppedOriginal = await waitUntil {
-            await probe.droppedId() != nil
+            await probe.droppedEnvelopeId() != nil
         }
-        guard droppedOriginal, let droppedSharedId = await probe.droppedId() else {
+        guard droppedOriginal,
+              let droppedEnvelopeMessageId = await probe.droppedEnvelopeId(),
+              let droppedLogicalSharedId = await probe.droppedLogicalId()
+        else {
             Issue.record("Expected the original non-persistent peerRefresh response to be dropped")
             return
         }
@@ -8663,22 +8777,24 @@ actor EndToEndTests {
         }
 
         try await _recipientSession.requestMessageResend(
-            sharedMessageId: droppedSharedId,
+            sharedMessageId: droppedEnvelopeMessageId,
             senderName: "alice",
             senderDeviceId: aliceDeviceId)
 
         #expect(
-            await waitUntil { await probe.sawReplay(for: droppedSharedId) },
-            "requestMessageResend should replay a recent non-persistent recovery control by shared id")
+            await waitUntil { await probe.replayCount(for: droppedLogicalSharedId) > 0 },
+            "requestMessageResend should replay the logical control under a fresh envelope MessageID")
 
-        let peerRefreshReplayCount = await probe.replayCount(for: droppedSharedId)
+        let peerRefreshReplayCount = await probe.replayCount(for: droppedLogicalSharedId)
         try await _recipientSession.requestMessageResend(
-            sharedMessageId: droppedSharedId,
+            sharedMessageId: droppedEnvelopeMessageId,
             senderName: "alice",
             senderDeviceId: aliceDeviceId)
 
         #expect(
-            await waitUntil { await probe.replayCount(for: droppedSharedId) > peerRefreshReplayCount },
+            await waitUntil {
+                await probe.replayCount(for: droppedLogicalSharedId) > peerRefreshReplayCount
+            },
             "non-persistent recovery controls should allow bounded repeated replay while the peer is still repairing")
 
         guard let aliceContext = await _senderSession.sessionContext,
@@ -8703,30 +8819,37 @@ actor EndToEndTests {
             transportInfo: reprovisioningMetadata)
 
         let droppedLinkedControl = await waitUntil {
-            await linkedProbe.droppedId() != nil
+            await linkedProbe.droppedEnvelopeId() != nil
         }
-        guard droppedLinkedControl, let droppedLinkedSharedId = await linkedProbe.droppedId() else {
+        guard droppedLinkedControl,
+              let droppedLinkedEnvelopeMessageId = await linkedProbe.droppedEnvelopeId(),
+              let droppedLinkedLogicalSharedId = await linkedProbe.droppedLogicalId()
+        else {
             Issue.record("Expected the original non-persistent linked-device reprovisioning control to be dropped")
             return
         }
 
         try await _recipientSession.requestMessageResend(
-            sharedMessageId: droppedLinkedSharedId,
+            sharedMessageId: droppedLinkedEnvelopeMessageId,
             senderName: "alice",
             senderDeviceId: aliceDeviceId)
 
         #expect(
-            await waitUntil { await linkedProbe.sawReplay(for: droppedLinkedSharedId) },
-            "requestMessageResend should replay a recent non-persistent linked-device control by shared id")
+            await waitUntil {
+                await linkedProbe.replayCount(for: droppedLinkedLogicalSharedId) > 0
+            },
+            "requestMessageResend should replay the linked control under a fresh envelope MessageID")
 
-        let linkedReplayCount = await linkedProbe.replayCount(for: droppedLinkedSharedId)
+        let linkedReplayCount = await linkedProbe.replayCount(for: droppedLinkedLogicalSharedId)
         try await _recipientSession.requestMessageResend(
-            sharedMessageId: droppedLinkedSharedId,
+            sharedMessageId: droppedLinkedEnvelopeMessageId,
             senderName: "alice",
             senderDeviceId: aliceDeviceId)
 
         #expect(
-            await waitUntil { await linkedProbe.replayCount(for: droppedLinkedSharedId) > linkedReplayCount },
+            await waitUntil {
+                await linkedProbe.replayCount(for: droppedLinkedLogicalSharedId) > linkedReplayCount
+            },
             "linked-device reprovisioning replay should also allow bounded repeated replay while the peer is still repairing")
     }
 
@@ -8875,23 +8998,79 @@ actor EndToEndTests {
         try await _recipientSession.createInactiveSessionSnapshot(
             for: sMockUserData.ssn,
             policy: .archive)
+        #expect(
+            await _recipientSession.refreshOneTimeKeysTask(policy: .replaceCurrentDeviceBatch),
+            "Reconciliation fixture must retire the old Curve one-time-key batch")
+        #expect(
+            await _recipientSession.refreshMLKEMOneTimeKeysTask(policy: .replaceCurrentDeviceBatch),
+            "Reconciliation fixture must retire the old ML-KEM one-time-key batch")
 
-        // 2. Clear the active ratchet state (set state=nil) for alice's identity
+        // 2. Give Bob's active receive lane an initialized-but-incompatible state.
+        // A nil state may legitimately bootstrap this frame directly, bypassing the
+        // archive path the test is intended to exercise.
+        let aliceCache = await _senderSession.cache!
+        let aliceSymKey = try await _senderSession.getDatabaseSymmetricKey()
+        var incompatibleStateCandidate: RatchetState?
+        for identity in try await aliceCache.fetchSessionIdentities() {
+            guard let props = await identity.props(symmetricKey: aliceSymKey) else { continue }
+            guard props.secretName == rMockUserData.rsn else { continue }
+            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+            if let state = props.state {
+                incompatibleStateCandidate = state
+                break
+            }
+        }
+        let incompatibleState = try #require(incompatibleStateCandidate)
+
         let bobCache = await _recipientSession.cache!
         let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
+        func canonicalStateData(_ state: RatchetState?) throws -> Data {
+            func normalized(_ value: Any) throws -> Any {
+                if let dictionary = value as? [String: Any] {
+                    return try dictionary.mapValues { try normalized($0) }
+                }
+                if let array = value as? [Any] {
+                    let values = try array.map { try normalized($0) }
+                    let keyed = try values.map { value in
+                        let data = try JSONSerialization.data(
+                            withJSONObject: value,
+                            options: [.sortedKeys, .fragmentsAllowed])
+                        return (data.base64EncodedString(), value)
+                    }
+                    return keyed.sorted { $0.0 < $1.0 }.map(\.1)
+                }
+                return value
+            }
+
+            let encoded = try JSONEncoder().encode(state)
+            let object = try JSONSerialization.jsonObject(
+                with: encoded,
+                options: [.fragmentsAllowed])
+            return try JSONSerialization.data(
+                withJSONObject: normalized(object),
+                options: [.sortedKeys, .fragmentsAllowed])
+        }
         var clearedActiveIdentityIds = Set<UUID>()
+        var failedActiveBaselineState = [UUID: Data]()
         for identity in try await bobCache.fetchSessionIdentities() {
             guard var props = await identity.props(symmetricKey: bobSymKey) else { continue }
             guard props.secretName == sMockUserData.ssn else { continue }
             guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
             guard props.state != nil else { continue }
-            props.state = nil
+            props.state = incompatibleState
             try await identity.updateIdentityProps(symmetricKey: bobSymKey, props: props)
             try await bobCache.updateSessionIdentity(identity)
             clearedActiveIdentityIds.insert(identity.id)
+            failedActiveBaselineState[identity.id] = try canonicalStateData(props.state)
         }
-        // Clear memoization so next access re-reads from cache.
-        await _recipientSession.removeIdentity(with: sMockUserData.ssn)
+        let recipientProcessor = await _recipientSession.taskProcessor
+        let recipientRatchetManager = await recipientProcessor.ratchetManager
+        for identityId in clearedActiveIdentityIds {
+            await recipientRatchetManager.evictSessionConfiguration(identityId)
+        }
+        // Clear only memoized selection so the next access re-reads from cache.
+        // Account-wide removal would destroy the archive this test is proving.
+        await _recipientSession.invalidateSessionIdentityCache(secretName: sMockUserData.ssn)
 
         // Now replay the captured old message into Bob's receive stream.
         guard let oldMessage = await probe.getCaptured() else {
@@ -8913,14 +9092,14 @@ actor EndToEndTests {
             "Old message encrypted with previous keys should be decrypted from the archived snapshot"
         )
 
-        // Assert only against the active rows we cleared. Archive fallback promotes
-        // the proven archived row (deleting these cleared actives); any surviving
-        // cleared id must still have nil state.
+        // Assert only against the failed active rows. Archive fallback promotes
+        // the proven archived row (deleting these actives); any surviving failed
+        // row must retain its exact pre-attempt encrypted state.
         var activeStateWasMutated = false
         for identity in try await bobCache.fetchSessionIdentities() {
             guard clearedActiveIdentityIds.contains(identity.id) else { continue }
             guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
-            if props.state != nil {
+            if try canonicalStateData(props.state) != failedActiveBaselineState[identity.id] {
                 activeStateWasMutated = true
             }
         }
@@ -9026,15 +9205,8 @@ actor EndToEndTests {
 
         try await Task.sleep(for: .milliseconds(400))
 
-        for _ in 0..<20 {
-            if await senderStore.createdMessages.count == senderMessageCountBeforeRefresh + 1 {
-                break
-            }
-            try await Task.sleep(for: .milliseconds(100))
-        }
-
         #expect(
-            await senderStore.createdMessages.count == senderMessageCountBeforeRefresh + 1,
+            await senderStore.createdMessages.count == senderMessageCountBeforeRefresh,
             "refreshOneTimeKeys control should not persist as a user message"
         )
         #expect(
@@ -9236,7 +9408,8 @@ actor EndToEndTests {
                             message: received.message,
                             sender: received.sender,
                             deviceId: received.deviceId,
-                            messageId: received.messageId)
+                            messageId: received.messageId,
+                            logicalMessageId: received.logicalMessageId)
                         if received.transportEvent == nil, await probe.isCaptured(received) {
                             await probe.markDecrypted()
                         }
@@ -9425,7 +9598,8 @@ actor EndToEndTests {
                             message: received.message,
                             sender: received.sender,
                             deviceId: received.deviceId,
-                            messageId: received.messageId)
+                            messageId: received.messageId,
+                            logicalMessageId: received.logicalMessageId)
                         if received.transportEvent == nil {
                             await probe.markDecrypted()
                         }
@@ -9951,6 +10125,7 @@ struct ReceivedMessage {
     let deviceId: UUID
     let recipientDeviceId: UUID?
     let messageId: String
+    let logicalMessageId: String?
     let transportEvent: TransportEvent?
 
     init(
@@ -9960,6 +10135,7 @@ struct ReceivedMessage {
         deviceId: UUID,
         recipientDeviceId: UUID? = nil,
         messageId: String,
+        logicalMessageId: String? = nil,
         transportEvent: TransportEvent?
     ) {
         self.message = message
@@ -9968,6 +10144,7 @@ struct ReceivedMessage {
         self.deviceId = deviceId
         self.recipientDeviceId = recipientDeviceId
         self.messageId = messageId
+        self.logicalMessageId = logicalMessageId
         self.transportEvent = transportEvent
     }
 }
@@ -10431,6 +10608,80 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
         
     }
     
+    private let oobResendTracker = CallTracker()
+
+    var outOfBandResendRequestCount: Int {
+        get async { await oobResendTracker.callCount }
+    }
+
+    func sendOutOfBandResendRequest(
+        failedEnvelopeMessageIds: [String],
+        to secretName: String,
+        deviceId: UUID,
+        requestingDeviceId: UUID
+    ) async throws {
+        await oobResendTracker.record(
+            secretName: secretName,
+            deviceId: deviceId.uuidString,
+            keyCount: failedEnvelopeMessageIds.count)
+        guard let sessionContext = await session.sessionContext else { return }
+        let request = FailedMessageResendRequest(
+            failedSharedMessageIds: failedEnvelopeMessageIds,
+            requestingDeviceId: requestingDeviceId)
+        try await deliverOutOfBandControl(
+            to: secretName,
+            recipientDeviceId: deviceId,
+            messageId: failedEnvelopeMessageIds.first ?? "",
+            transportEvent: .requestMessageResend(request),
+            senderContext: sessionContext)
+    }
+
+    func sendOutOfBandResendUnavailable(
+        unavailableEnvelopeMessageIds: [String],
+        to secretName: String,
+        deviceId: UUID,
+        respondingDeviceId: UUID
+    ) async throws {
+        guard let sessionContext = await session.sessionContext else { return }
+        let notice = MessageResendUnavailableNotice(
+            unavailableSharedMessageIds: unavailableEnvelopeMessageIds,
+            respondingDeviceId: respondingDeviceId)
+        try await deliverOutOfBandControl(
+            to: secretName,
+            recipientDeviceId: deviceId,
+            messageId: unavailableEnvelopeMessageIds.first ?? "",
+            transportEvent: .messageResendUnavailable(notice),
+            senderContext: sessionContext)
+    }
+
+    private func deliverOutOfBandControl(
+        to secretName: String,
+        recipientDeviceId: UUID,
+        messageId: String,
+        transportEvent: TransportEvent,
+        senderContext: SessionContext
+    ) async throws {
+        let received = ReceivedMessage(
+            message: SignedRatchetMessage(),
+            sender: senderContext.sessionUser.secretName,
+            recipient: secretName,
+            deviceId: senderContext.sessionUser.deviceId,
+            recipientDeviceId: recipientDeviceId,
+            messageId: messageId,
+            transportEvent: transportEvent
+        )
+        let finalReceived: ReceivedMessage
+        if let transformOutgoing {
+            finalReceived = try await transformOutgoing(received)
+        } else {
+            finalReceived = received
+        }
+        if let shouldDeliver, await shouldDeliver(finalReceived) == false {
+            return
+        }
+        continuation?.yield(finalReceived)
+    }
+
     func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
 
         // Determine actual sender from the bound session, not from metadata
@@ -10442,7 +10693,8 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
             recipient: metadata.secretName,
             deviceId: sessionContext.sessionUser.deviceId,
             recipientDeviceId: metadata.deviceId,
-            messageId: metadata.sharedMessageId,
+            messageId: metadata.envelopeMessageId,
+            logicalMessageId: metadata.sharedMessageId,
             transportEvent: metadata.transportEvent
         )
         let finalReceived: ReceivedMessage

@@ -145,6 +145,43 @@ public enum PeerContactBootstrapPurpose: Sendable {
     case friendshipReply
 }
 
+/// Thread-safe compatibility storage for the legacy synchronous `isViable` API.
+///
+/// Each write receives a monotonically increasing revision. `PQSSession` applies only
+/// the latest revision on its actor, so Tasks spawned by rapid legacy writes cannot
+/// reorder actor side effects.
+private final class ViabilityCompatibilityBridge: @unchecked Sendable {
+    struct Update: Sendable {
+        let value: Bool
+        let revision: UInt64
+    }
+
+    private let lock = NSLock()
+    private var value = false
+    private var revision: UInt64 = 0
+
+    func currentValue() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    @discardableResult
+    func store(_ newValue: Bool) -> Update {
+        lock.lock()
+        defer { lock.unlock() }
+        revision &+= 1
+        value = newValue
+        return Update(value: newValue, revision: revision)
+    }
+
+    func isCurrent(_ update: Update) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return update.revision == revision && update.value == value
+    }
+}
+
 public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Unique identifier for the session instance.
     /// This ID is generated once and remains constant for the lifetime of the session.
@@ -152,29 +189,31 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
     /// Indicates whether the session is viable for cryptographic operations.
     ///
-    /// This property is set to `true` when the session is properly initialized
-    /// with all required delegates and cryptographic keys. It becomes `false`
-    /// when the session is shut down or encounters critical errors.
+    /// Source-compatible viability property.
     ///
-    /// Setting this from `false` to `true` also drains the persisted job queue
-    /// (`resumeJobQueue()`): messages composed while offline are parked as
-    /// persisted jobs, and this transition is the event that makes them
-    /// transmittable again. Hosts may still call `resumeJobQueue()` themselves;
-    /// the reload is single-flight and skips already-enqueued jobs, so the two
-    /// triggers cannot double-send.
-    ///
-    /// - Important: Always check this property before performing cryptographic operations.
-    public nonisolated(unsafe) var isViable: Bool = false {
-        didSet {
-            guard isViable, !oldValue else { return }
+    /// Legacy synchronous writes are stored immediately, then forwarded to the actor with
+    /// an ordered revision. New code should prefer `setViability(_:)`, which waits for the
+    /// actor-isolated transition and its queue-resume admission.
+    public nonisolated var isViable: Bool {
+        get { viabilityCompatibilityBridge.currentValue() }
+        set {
+            let update = viabilityCompatibilityBridge.store(newValue)
             Task { [weak self] in
                 guard let self else { return }
-                // Before startSession the cache is nil and this throws
-                // databaseNotInitialized — nothing is parked yet, safe to ignore.
-                try? await self.resumeJobQueue()
+                await self.applyViability(update)
             }
         }
     }
+
+    private nonisolated let viabilityCompatibilityBridge = ViabilityCompatibilityBridge()
+    private var actorViabilityState = false
+
+    /// Actor lifecycle. `shutdown()` enters `shuttingDown` before any suspension
+    /// so scheduling cannot recreate workers during teardown.
+    private(set) var lifecyclePhase: SessionLifecyclePhase = .idle
+
+    /// Coalesces concurrent false→true viability drains onto one in-flight resume.
+    private var jobQueueResumeCoalesced = false
 
     /// The shared singleton instance of `PQSSession`.
     ///
@@ -189,11 +228,13 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// This initializer is provided to support the singleton pattern.
     /// In practice, you should always use `PQSSession.shared` instead.
     public init(_ ratchetConfiguration: RatchetConfiguration? = nil) {
+        self.ratchetConfiguration = ratchetConfiguration
         taskProcessor = TaskProcessor(logger: logger, ratchetConfiguration: ratchetConfiguration)
     }
 
     private(set) var _sessionContext: SessionContext?
     private var _appPassword = ""
+    private let ratchetConfiguration: RatchetConfiguration?
     private(set) var taskProcessor: TaskProcessor
     private(set) var transportDelegate: (any SessionTransport)?
     private(set) var receiverDelegate: (any EventReceiver)?
@@ -203,22 +244,92 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     private var refreshMLKEMOTKeysTask: Task<Bool, Never>?
     private var otkBatchReplacementPairTask: Task<Bool, Never>?
 
-    /// Session-lifetime root that owns background child work (OTK recovery, host
-    /// notifies). Cancelled on `shutdown()` so fire-and-forget work cannot outlive
-    /// the session. One unstructured Task at the boundary; children are structured.
-    private var sessionWorkRoot: Task<Void, Never>?
-    private var backgroundWorkContinuation: AsyncStream<@Sendable () async -> Void>.Continuation?
+    /// Bounded FIFO coordinator for session-scoped background / protocol work.
+    private var sessionWorkCoordinator: SessionWorkCoordinator?
 
     var otkUploadCircuitOpen = false
     var otkUploadCircuitOpenedAt: Date?
     private let otkCircuitCooldownSeconds: TimeInterval = 300
 
+    /// Updates messaging/session viability. On false→true, coalesces one queue resume.
+    public func setViability(_ value: Bool) async {
+        let update = viabilityCompatibilityBridge.store(value)
+        await applyViability(update)
+    }
+
+    private func applyViability(_ update: ViabilityCompatibilityBridge.Update) async {
+        // A later legacy synchronous write supersedes an older Task that reached the actor late.
+        guard viabilityCompatibilityBridge.isCurrent(update) else { return }
+        let wasViable = actorViabilityState
+        actorViabilityState = update.value
+        guard update.value, !wasViable else { return }
+        guard !jobQueueResumeCoalesced else { return }
+        jobQueueResumeCoalesced = true
+        _ = await scheduleBackgroundWork { [weak self] in
+            guard let self else { return }
+            await self.performCoalescedJobQueueResume()
+        }
+    }
+
+    private func performCoalescedJobQueueResume() async {
+        jobQueueResumeCoalesced = false
+        guard isViable else { return }
+        // Before startSession the cache is nil and this throws
+        // databaseNotInitialized — nothing is parked yet, safe to ignore.
+        try? await resumeJobQueue()
+    }
+
+    /// Transitions `idle` → `running` and starts the work coordinator.
+    /// Called from `startSession` / `createSession` after cache prerequisites, and
+    /// lazily from scheduling APIs for bare test sessions.
+    func beginSessionLifecycleIfNeeded() async {
+        switch lifecyclePhase {
+        case .idle:
+            lifecyclePhase = .running
+            let coordinator = SessionWorkCoordinator(
+                maxWorkers: PQSSessionConstants.sessionWorkMaxWorkers,
+                maxPending: PQSSessionConstants.sessionWorkMaxPending
+            )
+            sessionWorkCoordinator = coordinator
+            await coordinator.start()
+        case .running, .shuttingDown, .shutDown:
+            break
+        }
+    }
+
+    /// Replaces runtime-only components whose shutdown contract is terminal.
+    ///
+    /// `DoubleRatchetStateManager.shutdown()` permanently closes its mutation
+    /// gate, so a persisted session restart must use a new `TaskProcessor`.
+    /// This transition is only called by explicit session creation/restoration;
+    /// ordinary scheduling after shutdown remains rejected.
+    private func reviveAfterShutdownIfNeeded() async {
+        guard lifecyclePhase == .shutDown else { return }
+
+        let replacement = TaskProcessor(
+            logger: logger,
+            ratchetConfiguration: ratchetConfiguration)
+        await replacement.setDelegate(transportDelegate)
+        taskProcessor = replacement
+        sessionWorkCoordinator = nil
+        // A false→true viability transition may occur while still shut down.
+        // Its scheduled drain is correctly rejected; clear the coalescing token
+        // so the revived runtime can own future viability wake-ups.
+        jobQueueResumeCoalesced = false
+        lifecyclePhase = .idle
+    }
+
     /// Schedules non-blocking work as a child of the session work tree.
-    /// No-ops after shutdown (continuation finished / root cancelled).
-    func scheduleBackgroundWork(_ operation: @escaping @Sendable () async -> Void) {
-        ensureSessionWorkTreeRunning()
-        guard let continuation = backgroundWorkContinuation else { return }
-        continuation.yield { [weak self] in
+    /// Rejected after shutdown closes admission. Re-checks viability at execute time.
+    @discardableResult
+    func scheduleBackgroundWork(
+        _ operation: @escaping @Sendable () async -> Void
+    ) async -> SessionWorkAdmission {
+        await beginSessionLifecycleIfNeeded()
+        guard lifecyclePhase == .running, let coordinator = sessionWorkCoordinator else {
+            return .rejected
+        }
+        return await coordinator.enqueue { [weak self] in
             guard let self else { return }
             guard !Task.isCancelled else { return }
             let viable = await self.isViable
@@ -230,47 +341,33 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Schedules transport-protocol work that must survive viability flaps.
     ///
     /// `inboundCiphertextAccepted` tells the transport to delete a consumed
-    /// offline spool copy. If that signal is dropped because `isViable`
-    /// momentarily reads false (startup drain, connectivity flap), the copy
-    /// stays queued server-side and is redelivered — and a spooled ciphertext
-    /// replayed after its ratchet step was consumed can only fail decryption,
-    /// seeding a poison/redelivery loop. Shutdown cancellation still applies.
-    func scheduleTransportProtocolWork(_ operation: @escaping @Sendable () async -> Void) {
-        ensureSessionWorkTreeRunning()
-        guard let continuation = backgroundWorkContinuation else { return }
-        continuation.yield {
+    /// offline spool copy. Never dropped while the session is running: a full
+    /// queue backpressures the producer. Shutdown closes admission.
+    @discardableResult
+    func scheduleTransportProtocolWork(
+        _ operation: @escaping @Sendable () async -> Void
+    ) async -> SessionWorkAdmission {
+        await beginSessionLifecycleIfNeeded()
+        guard lifecyclePhase == .running, let coordinator = sessionWorkCoordinator else {
+            return .rejected
+        }
+        return await coordinator.enqueue {
             guard !Task.isCancelled else { return }
             await operation()
         }
     }
 
-    private func ensureSessionWorkTreeRunning() {
-        guard sessionWorkRoot == nil else { return }
-        let (stream, continuation) = AsyncStream.makeStream(
-            of: (@Sendable () async -> Void).self,
-            bufferingPolicy: .unbounded
-        )
-        backgroundWorkContinuation = continuation
-        sessionWorkRoot = Task { [weak self] in
-            await withTaskGroup(of: Void.self) { group in
-                for await work in stream {
-                    guard !Task.isCancelled else { break }
-                    group.addTask {
-                        guard !Task.isCancelled else { return }
-                        await work()
-                    }
-                }
-                group.cancelAll()
-            }
-            _ = self
+    func sessionWorkMetrics() async -> SessionWorkMetrics {
+        if let coordinator = sessionWorkCoordinator {
+            return await coordinator.currentMetrics()
         }
+        return SessionWorkMetrics()
     }
 
-    private func cancelSessionWorkTree() {
-        backgroundWorkContinuation?.finish()
-        backgroundWorkContinuation = nil
-        sessionWorkRoot?.cancel()
-        sessionWorkRoot = nil
+    private func cancelSessionWorkTree() async {
+        let coordinator = sessionWorkCoordinator
+        sessionWorkCoordinator = nil
+        await coordinator?.shutdown()
     }
 
     /// Opens the OTK upload circuit and runs signing-key mismatch recovery inline
@@ -320,7 +417,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     var peerInboundFriendshipConfirmedPeers = Set<String>()
     var lastPeerOneTimeRefreshRequestAt: [String: Date] = [:]
     let peerOneTimeRefreshRequestCooldown: TimeInterval = 15
-    var peerOneTimeReplenishWaiters: [String: CheckedContinuation<Void, Never>] = [:]
+    struct PeerReplenishWaiterKey: Hashable, Sendable {
+        let secretName: String
+        let deviceId: UUID
+    }
+
+    /// Tokenized replenish waiters keyed by `(secretName, deviceId)`.
+    /// Timeout resumes only its token; publish ack wakes every waiter for that secret.
+    var peerOneTimeReplenishWaiters: [PeerReplenishWaiterKey: [UUID: CheckedContinuation<Void, Never>]] = [:]
     var peerOneTimeReplenishAcknowledgedPeers = Set<String>()
     let peerOneTimeReplenishWaitTimeout: TimeInterval = 4
     var addingContactData: Data?
@@ -542,6 +646,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// Outbound device-send ledger: which local SessionIdentity encrypted each
     /// `(sharedId, recipientDeviceId)`. Hot path is in-memory; mirrored to the store.
     var outboundDeviceSendRecordsByKey: [String: OutboundDeviceSendRecord] = [:]
+    /// In-memory accepted-envelope ledger (durable mirror via store when available).
+    var acceptedEnvelopeKeys: Set<String> = []
+    var acceptedEnvelopeKeyOrder: [String] = []
+    /// Default retention: 14d spool + 7d safety margin.
+    let acceptedEnvelopeRetention: TimeInterval = 60 * 60 * 24 * 21
 
     /// Last server-verified device id set per peer secret name. Populated by successful
     /// `findConfiguration` during identity refresh / chat fan-out; used to avoid blocking
@@ -835,7 +944,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// Returns whether a specific inbound failure class should be suppressed for this tuple.
-    func shouldSuppressInboundFailure(_ inbound: InboundTaskMessage, failureClass: String, now: Date = Date()) -> Bool {
+    func shouldSuppressInboundFailure(_ inbound: InboundTaskMessage, failureClass: String, now: Date = Date()) async -> Bool {
         cleanupInboundFailurePolicy(now: now)
         let key = inboundFailureKey(
             sender: inbound.senderSecretName,
@@ -845,7 +954,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         guard let expiry = inboundFailurePolicyUntil[key] else {
             return false
         }
-        if hasPendingResendAfterReestablishment(
+        if await hasPendingResendAfterReestablishment(
             sender: inbound.senderSecretName,
             deviceId: inbound.senderDeviceId,
             failedMessageId: inbound.sharedMessageId,
@@ -1186,8 +1295,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         failureClass: String,
         now: Date = Date(),
         notifyDelegate: Bool = true
-    ) {
-        cleanupPendingResendAfterReestablishment(now: now)
+    ) async {
+        await cleanupPendingResendAfterReestablishment(now: now)
         let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
         pendingResendAfterReestablishment[requestKey] = PendingResendAfterReestablishment(
             senderName: sender,
@@ -1200,7 +1309,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         // Protocol signal: drives the transport's bounded claim-and-purge of the
         // undecryptable spool copy. Dropping it on a viability flap leaves the
         // copy immortal server-side (redelivered every backlog wave).
-        scheduleTransportProtocolWork {
+        _ = await scheduleTransportProtocolWork {
             await delegate?.inboundRecoveryDeferred(
                 senderSecretName: sender,
                 senderDeviceId: deviceId,
@@ -1213,8 +1322,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         sender: String,
         deviceId: UUID,
         now: Date = Date()
-    ) -> Bool {
-        cleanupPendingResendAfterReestablishment(now: now)
+    ) async -> Bool {
+        await cleanupPendingResendAfterReestablishment(now: now)
         return pendingResendAfterReestablishment.values.contains { pending in
             pending.senderName == sender && pending.senderDeviceId == deviceId
         }
@@ -1225,8 +1334,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         deviceId: UUID,
         failedMessageId: String,
         now: Date = Date()
-    ) -> Bool {
-        cleanupPendingResendAfterReestablishment(now: now)
+    ) async -> Bool {
+        await cleanupPendingResendAfterReestablishment(now: now)
         let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
         return pendingResendAfterReestablishment[requestKey] != nil
     }
@@ -1235,7 +1344,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         "\(sender)|\(deviceId.uuidString)"
     }
 
-    func cleanupOpenReestablishmentEpisodes(now: Date = Date()) {
+    func cleanupOpenReestablishmentEpisodes(now: Date = Date()) async {
         let cutoff = now.addingTimeInterval(-reestablishmentEpisodeTTL)
         let expiredKeys = openReestablishmentEpisodes.compactMap { key, startedAt in
             startedAt <= cutoff ? key : nil
@@ -1265,7 +1374,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         guard !expiredPeers.isEmpty else { return }
         let delegate = sessionDelegate
         // Protocol signal: the transport releases held offline ciphertext on it.
-        scheduleTransportProtocolWork {
+        _ = await scheduleTransportProtocolWork {
             for peer in expiredPeers {
                 await delegate?.reestablishmentEpisodeDidEnd(
                     senderSecretName: peer.sender,
@@ -1279,15 +1388,15 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         sender: String,
         deviceId: UUID,
         now: Date = Date()
-    ) -> Bool {
-        cleanupOpenReestablishmentEpisodes(now: now)
+    ) async -> Bool {
+        await cleanupOpenReestablishmentEpisodes(now: now)
         return openReestablishmentEpisodes[reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)] != nil
     }
 
     /// `true` when any peer-device recovery episode is open. Used by transport to
     /// coalesce offline backlog requests while recovery owns inbound decrypt order.
-    public func hasAnyOpenReestablishmentEpisode(now: Date = Date()) -> Bool {
-        cleanupOpenReestablishmentEpisodes(now: now)
+    public func hasAnyOpenReestablishmentEpisode(now: Date = Date()) async -> Bool {
+        await cleanupOpenReestablishmentEpisodes(now: now)
         return !openReestablishmentEpisodes.isEmpty
     }
 
@@ -1301,8 +1410,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         sender: String,
         deviceId: UUID,
         now: Date = Date()
-    ) -> Bool {
-        cleanupOpenReestablishmentEpisodes(now: now)
+    ) async -> Bool {
+        await cleanupOpenReestablishmentEpisodes(now: now)
         let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
         guard openReestablishmentEpisodes[key] != nil else { return false }
         return !deadSessionCiphertextEpisodes.contains(key)
@@ -1322,8 +1431,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         deviceId: UUID,
         heldOfflineFramesCanHeal: Bool = true,
         now: Date = Date()
-    ) -> Bool {
-        cleanupOpenReestablishmentEpisodes(now: now)
+    ) async -> Bool {
+        await cleanupOpenReestablishmentEpisodes(now: now)
         let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
         if !heldOfflineFramesCanHeal {
             deadSessionCiphertextEpisodes.insert(key)
@@ -1346,7 +1455,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             "pqs.recovery.episodeEnded sender=\(sender) deviceId=\(deviceId.uuidString)")
         let delegate = sessionDelegate
         // Protocol signal: the transport releases held offline ciphertext on it.
-        scheduleTransportProtocolWork {
+        _ = await scheduleTransportProtocolWork {
             await delegate?.reestablishmentEpisodeDidEnd(
                 senderSecretName: sender,
                 senderDeviceId: deviceId)
@@ -1415,8 +1524,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         sender: String,
         deviceId: UUID,
         now: Date = Date()
-    ) -> Bool {
-        cleanupOpenReestablishmentEpisodes(now: now)
+    ) async -> Bool {
+        await cleanupOpenReestablishmentEpisodes(now: now)
         let key = reestablishmentEpisodeKey(sender: sender, deviceId: deviceId)
         guard openReestablishmentEpisodes[key] != nil else {
             expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
@@ -1425,23 +1534,51 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         return expectedPeerRefreshIntentByPeer[key] != nil
     }
 
-    /// Records which local SessionIdentity encrypted `sharedId` to a recipient device
-    /// (per-device outbound encrypt ledger).
+    /// Records which local SessionIdentity encrypted an envelope to a recipient device
+    /// (MessageRecord-lite). Supersedes any prior live envelope for the same
+    /// logical `(sharedId, recipientDeviceId)`.
     func recordOutboundDeviceSend(
         sharedId: String,
         recipientSecretName: String,
         recipientDeviceId: UUID,
-        sessionIdentityId: UUID
+        sessionIdentityId: UUID,
+        envelopeMessageId: String? = nil,
+        resendAttempt: Int = 0
     ) async {
+        let envelopeId = envelopeMessageId ?? sharedId
+        let logicalKey = OutboundDeviceSendRecord.logicalKey(
+            sharedId: sharedId,
+            recipientDeviceId: recipientDeviceId)
+        var priorLiveRecord = outboundDeviceSendRecordsByKey[logicalKey]
+        if priorLiveRecord == nil {
+            priorLiveRecord = await outboundDeviceSendRecord(
+                sharedId: sharedId,
+                recipientDeviceId: recipientDeviceId)
+        }
+        if let prior = priorLiveRecord,
+           prior.envelopeMessageId != envelopeId,
+           prior.supersededAt == nil {
+            let superseded = OutboundDeviceSendRecord(
+                envelopeMessageId: prior.envelopeMessageId,
+                sharedId: prior.sharedId,
+                recipientSecretName: prior.recipientSecretName,
+                recipientDeviceId: prior.recipientDeviceId,
+                sessionIdentityId: prior.sessionIdentityId,
+                resendAttempt: prior.resendAttempt,
+                createdAt: prior.createdAt,
+                supersededAt: Date())
+            outboundDeviceSendRecordsByKey[OutboundDeviceSendRecord.key(envelopeMessageId: prior.envelopeMessageId)] = superseded
+            try? await cache?.upsertOutboundDeviceSendRecord(superseded)
+        }
         let record = OutboundDeviceSendRecord(
+            envelopeMessageId: envelopeId,
             sharedId: sharedId,
             recipientSecretName: recipientSecretName,
             recipientDeviceId: recipientDeviceId,
-            sessionIdentityId: sessionIdentityId)
-        let key = OutboundDeviceSendRecord.key(
-            sharedId: sharedId,
-            recipientDeviceId: recipientDeviceId)
-        outboundDeviceSendRecordsByKey[key] = record
+            sessionIdentityId: sessionIdentityId,
+            resendAttempt: resendAttempt)
+        outboundDeviceSendRecordsByKey[logicalKey] = record
+        outboundDeviceSendRecordsByKey[OutboundDeviceSendRecord.key(envelopeMessageId: envelopeId)] = record
         if outboundDeviceSendRecordsByKey.count > PQSSessionConstants.outboundDeviceSendRecordMaxCount {
             let overflow = outboundDeviceSendRecordsByKey.count
                 - PQSSessionConstants.outboundDeviceSendRecordMaxCount
@@ -1458,28 +1595,118 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         } catch {
             logger.log(
                 level: .debug,
-                message: "pqs.send.recordPersistFailed sharedId=\(sharedId) deviceId=\(recipientDeviceId) error=\(error)")
+                message: "pqs.send.recordPersistFailed sharedId=\(sharedId) envelope=\(envelopeId) deviceId=\(recipientDeviceId) error=\(error)")
         }
+        logger.log(
+            level: .debug,
+            message: "pqs.send.envelopeRecorded logicalSharedId=\(sharedId) envelopeMessageId=\(envelopeId) deviceId=\(recipientDeviceId.uuidString)")
     }
 
     func outboundDeviceSendRecord(
         sharedId: String,
         recipientDeviceId: UUID
     ) async -> OutboundDeviceSendRecord? {
-        let key = OutboundDeviceSendRecord.key(
+        let key = OutboundDeviceSendRecord.logicalKey(
             sharedId: sharedId,
             recipientDeviceId: recipientDeviceId)
-        if let cached = outboundDeviceSendRecordsByKey[key] {
+        if let cached = outboundDeviceSendRecordsByKey[key], cached.supersededAt == nil {
             return cached
         }
         if let stored = try? await cache?.fetchOutboundDeviceSendRecord(
             sharedId: sharedId,
             recipientDeviceId: recipientDeviceId
-        ) {
+        ), stored.supersededAt == nil {
             outboundDeviceSendRecordsByKey[key] = stored
+            outboundDeviceSendRecordsByKey[OutboundDeviceSendRecord.key(envelopeMessageId: stored.envelopeMessageId)] = stored
             return stored
         }
         return nil
+    }
+
+    func outboundDeviceSendRecord(envelopeMessageId: String) async -> OutboundDeviceSendRecord? {
+        let key = OutboundDeviceSendRecord.key(envelopeMessageId: envelopeMessageId)
+        if let cached = outboundDeviceSendRecordsByKey[key] {
+            return cached
+        }
+        if let stored = try? await cache?.fetchOutboundDeviceSendRecord(
+            envelopeMessageId: envelopeMessageId
+        ) {
+            outboundDeviceSendRecordsByKey[key] = stored
+            outboundDeviceSendRecordsByKey[
+                OutboundDeviceSendRecord.logicalKey(
+                    sharedId: stored.sharedId,
+                    recipientDeviceId: stored.recipientDeviceId)] = stored
+            return stored
+        }
+        return nil
+    }
+
+    func hasAcceptedEnvelope(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        envelopeMessageId: String
+    ) async throws -> Bool {
+        let key = AcceptedEnvelopeKey(
+            senderSecretName: senderSecretName,
+            senderDeviceId: senderDeviceId,
+            envelopeMessageId: envelopeMessageId)
+        if AcceptedEnvelopeLedgerPolicy.shouldAckAndDrop(key: key, accepted: acceptedEnvelopeKeys) {
+            return true
+        }
+        guard let cache else { throw SessionErrors.databaseNotInitialized }
+        if let stored = try await cache.fetchAcceptedEnvelope(
+            senderSecretName: senderSecretName,
+            senderDeviceId: senderDeviceId,
+            envelopeMessageId: envelopeMessageId
+        ) {
+            rememberAcceptedEnvelopeKey(stored.storageKey)
+            return true
+        }
+        return false
+    }
+
+    func markEnvelopeAccepted(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        envelopeMessageId: String,
+        logicalSharedId: String
+    ) async throws {
+        guard AcceptedEnvelopeLedgerPolicy.shouldMarkAccepted(
+            decryptSucceeded: true,
+            payloadDecoded: true,
+            hostHandlingSucceeded: true
+        ) else { return }
+        let record = AcceptedEnvelopeRecord(
+            senderSecretName: senderSecretName,
+            senderDeviceId: senderDeviceId,
+            envelopeMessageId: envelopeMessageId,
+            logicalSharedId: logicalSharedId)
+        // Durability precedes the in-memory marker and transport ACK. If this
+        // write fails, the caller must not delete the spool entry.
+        guard let cache else { throw SessionErrors.databaseNotInitialized }
+        try await cache.upsertAcceptedEnvelope(record)
+        rememberAcceptedEnvelopeKey(record.storageKey)
+        DecryptFailureAuditLog.log(
+            "pqs.recovery.envelopeAccepted sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) envelope=\(envelopeMessageId) logical=\(logicalSharedId)",
+            level: .debug)
+    }
+
+    func pruneAcceptedEnvelopes(now: Date = Date()) async {
+        let cutoff = now.addingTimeInterval(-acceptedEnvelopeRetention)
+        if let pruned = try? await cache?.pruneAcceptedEnvelopes(olderThan: cutoff), pruned > 0 {
+            logger.log(level: .info, message: "pqs.recovery.acceptedEnvelopePruned count=\(pruned)")
+        }
+        acceptedEnvelopeKeys.removeAll(keepingCapacity: true)
+        acceptedEnvelopeKeyOrder.removeAll(keepingCapacity: true)
+    }
+
+    private func rememberAcceptedEnvelopeKey(_ key: String) {
+        guard acceptedEnvelopeKeys.insert(key).inserted else { return }
+        acceptedEnvelopeKeyOrder.append(key)
+        while acceptedEnvelopeKeyOrder.count > 4_096 {
+            let evicted = acceptedEnvelopeKeyOrder.removeFirst()
+            acceptedEnvelopeKeys.remove(evicted)
+        }
     }
 
     /// Terminal clear for ids the peer reported as unreplayable: drops their pending
@@ -1492,8 +1719,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         deviceId: UUID,
         messageIds: [String],
         now: Date = Date()
-    ) -> [String] {
-        cleanupPendingResendAfterReestablishment(now: now)
+    ) async -> [String] {
+        await cleanupPendingResendAfterReestablishment(now: now)
         var clearedIds: [String] = []
         for messageId in messageIds {
             let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: messageId)
@@ -1512,8 +1739,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         deviceId: UUID,
         satisfiedSharedMessageId: String? = nil,
         now: Date = Date()
-    ) -> [PendingResendAfterReestablishment] {
-        cleanupPendingResendAfterReestablishment(now: now)
+    ) async -> [PendingResendAfterReestablishment] {
+        await cleanupPendingResendAfterReestablishment(now: now)
         let matches = pendingResendAfterReestablishment.filter { _, pending in
             pending.senderName == sender && pending.senderDeviceId == deviceId
         }
@@ -1525,7 +1752,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
 
-    private func cleanupPendingResendAfterReestablishment(now: Date = Date()) {
+    private func cleanupPendingResendAfterReestablishment(now: Date = Date()) async {
         let cutoff = now.addingTimeInterval(-inboundFailurePolicyTTL)
         let expired = pendingResendAfterReestablishment.values.filter { $0.createdAt <= cutoff }
         pendingResendAfterReestablishment = pendingResendAfterReestablishment.filter { _, pending in
@@ -1557,7 +1784,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 // Protocol signal: drives the transport's terminal purge of the
                 // spool copy. Dropping it on a viability flap leaves the copy
                 // immortal server-side.
-                scheduleTransportProtocolWork {
+                _ = await scheduleTransportProtocolWork {
                     await delegate?.inboundContentUnrecoverable(
                         senderSecretName: senderName,
                         senderDeviceId: senderDeviceId,
@@ -1601,15 +1828,22 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         clearPeerTransientState(secretName: secretName)
     }
 
-    internal func clearPeerTransientState(secretName: String) {
+    /// Invalidates only the memoized identity selection for a peer.
+    ///
+    /// Device-local reset, promote, and demote operations must use this instead of
+    /// `removeIdentity(with:)`: clearing account-wide friendship and orphan-recovery
+    /// state for one device interrupts recovery already in flight on sibling devices.
+    internal func invalidateSessionIdentityCache(secretName: String) {
         sessionIdentities.remove(secretName)
+    }
+
+    internal func clearPeerTransientState(secretName: String) {
+        invalidateSessionIdentityCache(secretName: secretName)
         deliveredOneTimeNotifyPeers.remove(secretName)
         peerInboundFriendshipConfirmedPeers.remove(secretName)
         lastPeerOneTimeRefreshRequestAt.removeValue(forKey: secretName)
         peerOneTimeReplenishAcknowledgedPeers.remove(secretName)
-        if let waiter = peerOneTimeReplenishWaiters.removeValue(forKey: secretName) {
-            waiter.resume()
-        }
+        resumePeerOneTimeReplenishWaiters(secretName: secretName)
         let orphanPrefix = "\(secretName)|"
         orphanResendInitiatingSessionByPeer = orphanResendInitiatingSessionByPeer.filter {
             !$0.key.hasPrefix(orphanPrefix)
@@ -1643,12 +1877,15 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             let all = try await cache.fetchSessionIdentities()
             let now = Date().timeIntervalSince1970
 
-            var inactive: [(identity: SessionIdentity, archivedAt: TimeInterval)] = []
+            var inactive: [(identity: SessionIdentity, archivedAt: TimeInterval, hasState: Bool)] = []
             for identity in all {
                 guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
                 guard props.secretName == secretName, props.deviceId == deviceId else { continue }
                 guard isInactiveSessionIdentity(deviceName: props.deviceName) else { continue }
-                inactive.append((identity, archivedAtSeconds(fromSessionContextId: props.sessionContextId)))
+                inactive.append((
+                    identity,
+                    archivedAtSeconds(fromSessionContextId: props.sessionContextId),
+                    props.state != nil))
             }
 
             // Age bound
@@ -1658,15 +1895,25 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
             // Re-fetch and enforce count bound (newest-first by archivedAt)
             let remaining = try await cache.fetchSessionIdentities()
-            var remainingInactive: [(identity: SessionIdentity, archivedAt: TimeInterval)] = []
+            var remainingInactive: [(identity: SessionIdentity, archivedAt: TimeInterval, hasState: Bool)] = []
             for identity in remaining {
                 guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
                 guard props.secretName == secretName, props.deviceId == deviceId else { continue }
                 guard isInactiveSessionIdentity(deviceName: props.deviceName) else { continue }
-                remainingInactive.append((identity, archivedAtSeconds(fromSessionContextId: props.sessionContextId)))
+                remainingInactive.append((
+                    identity,
+                    archivedAtSeconds(fromSessionContextId: props.sessionContextId),
+                    props.state != nil))
             }
 
-            remainingInactive.sort { $0.archivedAt > $1.archivedAt }
+            // Stateful snapshots can decrypt delayed mailbox frames; state-less
+            // placeholders cannot. Preserve stateful rows before applying recency.
+            remainingInactive.sort {
+                if $0.hasState != $1.hasState {
+                    return $0.hasState && !$1.hasState
+                }
+                return $0.archivedAt > $1.archivedAt
+            }
             if remainingInactive.count > PQSSessionConstants.inactiveSessionMaxCountPerDevice {
                 for item in remainingInactive.dropFirst(PQSSessionConstants.inactiveSessionMaxCountPerDevice) {
                     try await cache.deleteSessionIdentity(item.identity.id)
@@ -1678,8 +1925,9 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
     
     
-    /// Prunes all stale inactive session snapshots across every `(secretName, deviceId)` pair.
-    /// Called at session startup to clean up archives that expired while the app was offline.
+    /// Prunes stale inactive snapshots after the host confirms that its offline
+    /// mailbox boundary has been fully processed. Never call this at startup:
+    /// delayed ciphertext may still require an archived session to decrypt.
     func cleanupAllInactiveSessionSnapshots() async {
         guard let cache else { return }
         do {
@@ -1701,6 +1949,12 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         } catch {
             logger.log(level: .warning, message: "Startup inactive session cleanup failed: \(error)")
         }
+    }
+
+    /// Host event fired only after an ordered offline replay boundary has settled.
+    public func offlineReplayDidSettle() async {
+        await pruneAcceptedEnvelopes()
+        await cleanupAllInactiveSessionSnapshots()
     }
 
     /// Keeps a record of inactive session identities for one peer.
@@ -2225,6 +2479,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         guard let cache else {
             throw SessionErrors.databaseNotInitialized
         }
+        await reviveAfterShutdownIfNeeded()
+        await beginSessionLifecycleIfNeeded()
 
         let bundle = try await createDeviceCryptographicBundle(isMaster: true)
         let sessionUser = SessionUser(
@@ -2766,7 +3022,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             let delegate = sessionDelegate
             let keys = Array(staleKeys)
             // Protocol signal: the transport releases held offline ciphertext on it.
-            scheduleTransportProtocolWork {
+            _ = await scheduleTransportProtocolWork {
                 for key in keys {
                     let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
                     guard parts.count == 2, let deviceId = UUID(uuidString: parts[1]) else { continue }
@@ -3034,6 +3290,11 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// and attempts to decrypt the local device configuration. If successful, it updates the last user
     /// configuration and returns a shared `PQSSession`.
     ///
+    /// After ``shutdown()``, successful authentication also replaces the terminal
+    /// task processor/ratchet manager and starts a new session work coordinator.
+    /// Runtime revival happens only after the persisted context decrypts, so a
+    /// wrong password cannot reopen a shut-down session.
+    ///
     /// - Parameters:
     ///   - appPassword: The application password used for encryption and session management.
     /// - Returns: A `PQSSession` object representing the started session.
@@ -3085,10 +3346,18 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             // produce divergence and should not block the user from completing a re-link.
             checkPerDeviceSigningKeyConsistency(sessionContext: sessionContext)
 
+            // Authentication succeeded. Only now revive runtime components so an
+            // invalid password cannot reopen a shut-down session.
+            await reviveAfterShutdownIfNeeded()
+            await beginSessionLifecycleIfNeeded()
             await setSessionContext(sessionContext)
-
-            // Prune archived session identities that expired while offline.
-            await cleanupAllInactiveSessionSnapshots()
+            // `shutdown()` parks the processor before delegates/cache are released.
+            // A successful context restore is the concrete restart event; if the
+            // transport is already viable, unpark and drain durable jobs now.
+            // Otherwise the next false → true viability transition owns the drain.
+            if isViable {
+                try await resumeJobQueue()
+            }
 
             return self
         } catch {
@@ -3946,23 +4215,41 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// - Resetting session state
     /// - Clearing sensitive data from memory
     ///
-    /// After shutdown, the session is no longer viable and must be reinitialized
-    /// before use. All cached data remains in persistent storage and can be restored
-    /// by calling `startSession(appPassword:)`.
+    /// After shutdown, the session is no longer viable and must be reconfigured
+    /// with its delegates before use. All cached data remains in persistent
+    /// storage. A successful ``startSession(appPassword:)`` replaces the terminal
+    /// task processor/ratchet manager, reopens the session work lifecycle, and
+    /// resumes durable jobs when transport viability permits.
     ///
     /// - Important: This method clears sensitive data from memory. Ensure all
     ///   operations are complete before calling this method.
     public func shutdown() async {
-        // Cancel background work before clearing delegates so children see
-        // isViable=false / cancellation and do not notify a torn-down host.
-        isViable = false
-        cancelSessionWorkTree()
-        refreshOTKeysTask?.cancel()
+        // Close admission before the first suspension so scheduling cannot
+        // recreate workers while teardown awaits cancellation.
+        switch lifecyclePhase {
+        case .shuttingDown, .shutDown:
+            return
+        case .idle, .running:
+            lifecyclePhase = .shuttingDown
+        }
+        _ = viabilityCompatibilityBridge.store(false)
+        actorViabilityState = false
+        jobQueueResumeCoalesced = false
+        resumeAllPeerOneTimeReplenishWaiters()
+        await cancelSessionWorkTree()
+        await taskProcessor.prepareForShutdown()
+        let curveRefreshTask = refreshOTKeysTask
+        let mlKEMRefreshTask = refreshMLKEMOTKeysTask
+        let batchReplacementTask = otkBatchReplacementPairTask
         refreshOTKeysTask = nil
-        refreshMLKEMOTKeysTask?.cancel()
         refreshMLKEMOTKeysTask = nil
-        otkBatchReplacementPairTask?.cancel()
         otkBatchReplacementPairTask = nil
+        curveRefreshTask?.cancel()
+        mlKEMRefreshTask?.cancel()
+        batchReplacementTask?.cancel()
+        _ = await curveRefreshTask?.value
+        _ = await mlKEMRefreshTask?.value
+        _ = await batchReplacementTask?.value
         await taskProcessor.cancelBackgroundKeyTasks()
         do {
             try await taskProcessor.ratchetManager.shutdown()
@@ -3973,6 +4260,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         cache = nil
         transportDelegate = nil
         receiverDelegate = nil
+        sessionDelegate = nil
+        eventDelegate = nil
         linkDelegate = nil
         _sessionContext = nil
         _appPassword = ""
@@ -3985,12 +4274,38 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         deliveredOneTimeNotifyPeers.removeAll()
         peerInboundFriendshipConfirmedPeers.removeAll()
         lastPeerOneTimeRefreshRequestAt.removeAll()
-        for (_, waiter) in peerOneTimeReplenishWaiters {
-            waiter.resume()
-        }
-        peerOneTimeReplenishWaiters.removeAll()
         peerOneTimeReplenishAcknowledgedPeers.removeAll()
+        senderControlEpisodes.removeAll()
+        senderControlEpochCounters.removeAll()
+        processedControlEvents.removeAll()
+        lastForcedIdentityRefresh.removeAll()
+        otkUploadCircuitOpen = false
+        otkUploadCircuitOpenedAt = nil
+        lastReconciliationAtByPeer.removeAll()
+        lastAutomaticRotationAtByPeer.removeAll()
+        lastAutomaticRotationAt = nil
+        lifecyclePhase = .shutDown
+    }
 
+    func resumePeerOneTimeReplenishWaiters(secretName: String) {
+        let keys = peerOneTimeReplenishWaiters.keys.filter { $0.secretName == secretName }
+        for key in keys {
+            if let bucket = peerOneTimeReplenishWaiters.removeValue(forKey: key) {
+                for (_, waiter) in bucket {
+                    waiter.resume()
+                }
+            }
+        }
+    }
+
+    private func resumeAllPeerOneTimeReplenishWaiters() {
+        let buckets = peerOneTimeReplenishWaiters
+        peerOneTimeReplenishWaiters.removeAll()
+        for (_, bucket) in buckets {
+            for (_, waiter) in bucket {
+                waiter.resume()
+            }
+        }
     }
 
     /// Returns a human-readable device name for the current platform

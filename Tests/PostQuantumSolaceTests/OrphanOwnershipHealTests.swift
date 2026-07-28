@@ -41,6 +41,16 @@ struct OrphanOwnershipHealPolicyTests {
         #expect(decision == .serviceAsContentOwner)
     }
 
+    @Test("same-account recent non-persistent replay owner services")
+    func sameAccountRecentReplayOwnerServices() {
+        let decision = OrphanResendOwnershipPolicy.decision(
+            isSameAccount: true,
+            hasRecentOutboundReplay: true,
+            hasLocalMessage: false,
+            hasOutboundDeviceSendRecord: false)
+        #expect(decision == .serviceAsContentOwner)
+    }
+
     @Test("cross-account without local content continues lookup")
     func crossAccountContinuesLookup() {
         let decision = OrphanResendOwnershipPolicy.decision(
@@ -120,7 +130,7 @@ struct OrphanOwnershipHealSourceTests {
         #expect(ratchet.contains("orphanResendDeferredNotContentOwner"))
         #expect(ratchet.contains("orphanResendRetransport"))
         #expect(ratchet.contains("feedDeviceScopedControlWrite("))
-        #expect(events.contains("feedDeviceScopedControlWrite("))
+        #expect(events.contains("sendOutOfBandResendRequest("))
         #expect(sequence.contains("orphanReplayPreferredCleared"))
         #expect(ratchet.contains("OutboundOrphanSessionSelectionPolicy.decision"))
         #expect(ratchet.contains("OrphanResendOwnershipPolicy.decision"))
@@ -130,5 +140,35 @@ struct OrphanOwnershipHealSourceTests {
         #expect(sequence.contains("proveFailedActiveDemoted")
             || ratchet.contains("proveFailedActiveDemoted")
             || sequence.contains("demoteProveFailedActive"))
+    }
+
+    @Test("inbound resend peeks recent replay before consuming one credit")
+    func inboundResendPeeksBeforeConsumingOneCredit() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let ratchet = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/PQSSession/Task/TaskProcessor+Ratchet.swift"),
+            encoding: .utf8)
+        let processor = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/PQSSession/Task/TaskProcessor.swift"),
+            encoding: .utf8)
+        let store = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/PQSSession/Task/RecentOutboundReplayStore.swift"),
+            encoding: .utf8)
+
+        #expect(processor.contains("ttl: 60 * 10"))
+        #expect(processor.contains("limit: 256"))
+        #expect(processor.contains("maxReplays: 5"))
+        #expect(store.contains("func contains("))
+        #expect(store.contains("func consume("))
+        #expect(ratchet.contains("let hasRecentReplay ="))
+        #expect(ratchet.contains("hasRecentOutboundReplay(sharedId:"))
+        #expect(ratchet.contains("if let replay = recentOutboundReplayMessage(sharedId:"))
+        #expect(ratchet.contains("hasRecentOutboundReplay: hasRecentReplay"))
     }
 }

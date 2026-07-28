@@ -99,7 +99,7 @@ actor SessionSecurityTests {
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: ReceiverDelegate(session: session))
 
-        session.isViable = true
+        await session.setViability(true)
         await store.setPublishableName(secretName)
 
         session = try await session.createSession(
@@ -122,7 +122,7 @@ actor SessionSecurityTests {
         await cacheStore.setLocalSalt("securitySalt")
         await testSession.setDatabaseDelegate(conformer: cacheStore)
         await testSession.setTransportDelegate(conformer: CreateSessionFailClosedTransport())
-        testSession.isViable = true
+        await testSession.setViability(true)
 
         do {
             _ = try await testSession.createSession(

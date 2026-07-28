@@ -213,6 +213,10 @@ public protocol PQSSessionStore: Sendable {
     /// - Throws: An error if the operation fails.
     func updateJob(_ job: JobModel) async throws
 
+    /// Atomically commits a post-encrypt ratchet checkpoint and its prepared job.
+    /// Production stores must implement this as one database transaction.
+    func updateSessionIdentity(_ session: SessionIdentity, andPreparedJob job: JobModel) async throws
+
     /// Removes a job asynchronously.
     /// - Parameter job: The `JobModel` instance to be removed.
     /// - Throws: An error if the operation fails.
@@ -258,17 +262,45 @@ public protocol PQSSessionStore: Sendable {
     /// Upserts a per-device outbound encrypt ledger entry.
     func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws
 
-    /// Fetches the send record for `(sharedId, recipientDeviceId)`, if any.
+    /// Fetches the live send record for `(sharedId, recipientDeviceId)`, if any.
     func fetchOutboundDeviceSendRecord(
         sharedId: String,
         recipientDeviceId: UUID
     ) async throws -> OutboundDeviceSendRecord?
 
+    /// Fetches a send record by envelope MessageID, if any.
+    func fetchOutboundDeviceSendRecord(
+        envelopeMessageId: String
+    ) async throws -> OutboundDeviceSendRecord?
+
     /// Deletes all send records for a shared message id (e.g. when the message is removed).
     func deleteOutboundDeviceSendRecords(sharedId: String) async throws
+
+    /// Upserts an accepted-envelope ledger entry (transport idempotency).
+    func upsertAcceptedEnvelope(_ record: AcceptedEnvelopeRecord) async throws
+
+    /// Fetches an accepted-envelope ledger entry, if any.
+    func fetchAcceptedEnvelope(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        envelopeMessageId: String
+    ) async throws -> AcceptedEnvelopeRecord?
+
+    /// Prunes accepted-envelope rows older than `olderThan`.
+    func pruneAcceptedEnvelopes(olderThan: Date) async throws -> Int
 }
 
 public extension PQSSessionStore {
+    /// Compatibility fallback for test/in-memory stores. The production SQLite
+    /// store overrides this with a single transaction.
+    func updateSessionIdentity(
+        _ session: SessionIdentity,
+        andPreparedJob job: JobModel
+    ) async throws {
+        try await updateSessionIdentity(session)
+        try await updateJob(job)
+    }
+
     /// Default bridge for stores that only implement the throwing lookup: a thrown
     /// error is treated as "no message", so probing callers do not surface expected
     /// misses as store failures. Stores should override this with a real optional
@@ -286,5 +318,23 @@ public extension PQSSessionStore {
         nil
     }
 
+    func fetchOutboundDeviceSendRecord(
+        envelopeMessageId: String
+    ) async throws -> OutboundDeviceSendRecord? {
+        nil
+    }
+
     func deleteOutboundDeviceSendRecords(sharedId: String) async throws {}
+
+    func upsertAcceptedEnvelope(_ record: AcceptedEnvelopeRecord) async throws {}
+
+    func fetchAcceptedEnvelope(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        envelopeMessageId: String
+    ) async throws -> AcceptedEnvelopeRecord? {
+        nil
+    }
+
+    func pruneAcceptedEnvelopes(olderThan: Date) async throws -> Int { 0 }
 }

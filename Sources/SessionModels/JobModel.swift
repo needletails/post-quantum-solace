@@ -109,24 +109,36 @@ public struct InboundTaskMessage: Codable & Sendable {
     public let senderDeviceId: UUID
 
     /// A shared identifier for the message that can be used across devices.
+    /// Wire / envelope MessageID (`MessagePacket.id`).
     public let sharedMessageId: String
+    /// Logical application id when distinct from the envelope; nil means legacy combined id.
+    public let logicalSharedId: String?
+
+    /// Logical id used for chat persist / delivery aggregation.
+    public var resolvedLogicalSharedId: String {
+        if let logicalSharedId, !logicalSharedId.isEmpty { return logicalSharedId }
+        return sharedMessageId
+    }
 
     /// Initializes a new instance of `InboundTaskMessage`.
     /// - Parameters:
     ///   - message: The signed ratchet message received.
     ///   - senderSecretName: The secret name of the sender.
     ///   - senderDeviceId: The unique identifier for the sender's device.
-    ///   - sharedMessageId: A shared identifier for the message.
+    ///   - sharedMessageId: Envelope MessageID from the wire packet.
+    ///   - logicalSharedId: Optional logical shared id (dual-read).
     public init(
         message: SignedRatchetMessage,
         senderSecretName: String,
         senderDeviceId: UUID,
-        sharedMessageId: String
+        sharedMessageId: String,
+        logicalSharedId: String? = nil
     ) {
         self.message = message
         self.senderSecretName = senderSecretName
         self.senderDeviceId = senderDeviceId
         self.sharedMessageId = sharedMessageId
+        self.logicalSharedId = logicalSharedId
     }
 }
 
@@ -250,6 +262,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             case delayedUntil = "d"
             case scheduledAt = "e"
             case attempts = "f"
+            case preparedOutbound = "g"
         }
 
         /// The sequence identifier for the job used for ordering and tracking.
@@ -270,6 +283,10 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         /// The number of attempts made to execute the job.
         public var attempts: Int
 
+        /// Exact signed frame and routing state committed with its post-encrypt
+        /// ratchet checkpoint. Optional for backward compatibility with queued jobs.
+        public var preparedOutbound: PreparedOutbound?
+
         /// Initializes a new instance of `UnwrappedProps`.
         /// - Parameters:
         ///   - sequenceId: The sequence identifier for the job.
@@ -284,7 +301,8 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             isBackgroundTask: Bool,
             delayedUntil: Date? = nil,
             scheduledAt: Date,
-            attempts: Int
+            attempts: Int,
+            preparedOutbound: PreparedOutbound? = nil
         ) {
             self.sequenceId = sequenceId
             self.task = task
@@ -292,6 +310,98 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             self.delayedUntil = delayedUntil
             self.scheduledAt = scheduledAt
             self.attempts = attempts
+            self.preparedOutbound = preparedOutbound
+        }
+    }
+
+    /// Durable transport checkpoint for an outbound device job.
+    ///
+    /// Retrying this value sends the same signed ciphertext and therefore never
+    /// advances the Double Ratchet a second time after an unknown transport outcome.
+    public struct PreparedOutbound: Codable, Sendable {
+        public let signedMessage: SignedRatchetMessage
+        public let secretName: String
+        public let deviceId: UUID
+        public let recipient: MessageRecipient
+        public let transportMetadata: Data?
+        public let sharedMessageId: String
+        /// envelope MessageID for this prepared envelope; defaults to sharedMessageId for legacy rows.
+        public let envelopeMessageId: String
+        public let transportEvent: TransportEvent?
+        public let sessionIdentityId: UUID
+        public let needsRemoteDeletion: Bool
+        public let curveOneTimeKeyId: String?
+        public let mlKEMOneTimeKeyId: String
+        public let createdAt: Date
+
+        public init(
+            signedMessage: SignedRatchetMessage,
+            secretName: String,
+            deviceId: UUID,
+            recipient: MessageRecipient,
+            transportMetadata: Data?,
+            sharedMessageId: String,
+            envelopeMessageId: String? = nil,
+            transportEvent: TransportEvent?,
+            sessionIdentityId: UUID,
+            needsRemoteDeletion: Bool,
+            curveOneTimeKeyId: String?,
+            mlKEMOneTimeKeyId: String,
+            createdAt: Date = Date()
+        ) {
+            self.signedMessage = signedMessage
+            self.secretName = secretName
+            self.deviceId = deviceId
+            self.recipient = recipient
+            self.transportMetadata = transportMetadata
+            self.sharedMessageId = sharedMessageId
+            self.envelopeMessageId = envelopeMessageId ?? sharedMessageId
+            self.transportEvent = transportEvent
+            self.sessionIdentityId = sessionIdentityId
+            self.needsRemoteDeletion = needsRemoteDeletion
+            self.curveOneTimeKeyId = curveOneTimeKeyId
+            self.mlKEMOneTimeKeyId = mlKEMOneTimeKeyId
+            self.createdAt = createdAt
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case signedMessage, secretName, deviceId, recipient, transportMetadata
+            case sharedMessageId, envelopeMessageId, transportEvent, sessionIdentityId
+            case needsRemoteDeletion, curveOneTimeKeyId, mlKEMOneTimeKeyId, createdAt
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            signedMessage = try c.decode(SignedRatchetMessage.self, forKey: .signedMessage)
+            secretName = try c.decode(String.self, forKey: .secretName)
+            deviceId = try c.decode(UUID.self, forKey: .deviceId)
+            recipient = try c.decode(MessageRecipient.self, forKey: .recipient)
+            transportMetadata = try c.decodeIfPresent(Data.self, forKey: .transportMetadata)
+            sharedMessageId = try c.decode(String.self, forKey: .sharedMessageId)
+            envelopeMessageId = try c.decodeIfPresent(String.self, forKey: .envelopeMessageId) ?? sharedMessageId
+            transportEvent = try c.decodeIfPresent(TransportEvent.self, forKey: .transportEvent)
+            sessionIdentityId = try c.decode(UUID.self, forKey: .sessionIdentityId)
+            needsRemoteDeletion = try c.decode(Bool.self, forKey: .needsRemoteDeletion)
+            curveOneTimeKeyId = try c.decodeIfPresent(String.self, forKey: .curveOneTimeKeyId)
+            mlKEMOneTimeKeyId = try c.decode(String.self, forKey: .mlKEMOneTimeKeyId)
+            createdAt = try c.decode(Date.self, forKey: .createdAt)
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(signedMessage, forKey: .signedMessage)
+            try c.encode(secretName, forKey: .secretName)
+            try c.encode(deviceId, forKey: .deviceId)
+            try c.encode(recipient, forKey: .recipient)
+            try c.encodeIfPresent(transportMetadata, forKey: .transportMetadata)
+            try c.encode(sharedMessageId, forKey: .sharedMessageId)
+            try c.encode(envelopeMessageId, forKey: .envelopeMessageId)
+            try c.encodeIfPresent(transportEvent, forKey: .transportEvent)
+            try c.encode(sessionIdentityId, forKey: .sessionIdentityId)
+            try c.encode(needsRemoteDeletion, forKey: .needsRemoteDeletion)
+            try c.encodeIfPresent(curveOneTimeKeyId, forKey: .curveOneTimeKeyId)
+            try c.encode(mlKEMOneTimeKeyId, forKey: .mlKEMOneTimeKeyId)
+            try c.encode(createdAt, forKey: .createdAt)
         }
     }
 

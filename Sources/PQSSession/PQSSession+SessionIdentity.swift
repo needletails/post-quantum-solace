@@ -406,8 +406,7 @@ public extension PQSSession {
         if byDevice.isEmpty, !verifiedIds.isEmpty {
             // The refreshed snapshot can go stale mid-flight: a concurrent lane
             // reset demotes the row this list contains while inserting its
-            // replacement (the store itself always keeps ≥1 active row per lane
-            // during a reset). Re-read the store once and re-select on live rows.
+            // replacement. Re-read the store once and re-select on live rows.
             let live = try await getSessionIdentities(with: secretName)
             for deviceId in verifiedIds {
                 guard let identity = await taskProcessor.outboundSessionIdentity(
@@ -421,6 +420,34 @@ public extension PQSSession {
                     continue
                 }
                 byDevice[deviceId] = identity
+            }
+        }
+        if byDevice.isEmpty, !verifiedIds.isEmpty, isViable {
+            // A prove-failed demotion can leave no active row between the initial
+            // snapshot and the live re-read. The outbound send is the concrete
+            // event that requires a lane, so perform one authoritative refresh
+            // and selection pass instead of dropping the compose or polling.
+            let repaired = try await refreshIdentities(
+                secretName: secretName,
+                createIdentity: true,
+                forceRefresh: true,
+                sendOneTimeIdentities: false)
+            for deviceId in verifiedIds {
+                guard let identity = await taskProcessor.outboundSessionIdentity(
+                    secretName: secretName,
+                    deviceId: deviceId,
+                    in: repaired,
+                    symmetricKey: symmetricKey,
+                    session: self,
+                    preferredDevice: nil
+                ) else {
+                    continue
+                }
+                byDevice[deviceId] = identity
+            }
+            if !byDevice.isEmpty {
+                DecryptFailureAuditLog.log(
+                    "pqs.recovery.outboundLaneRepairedOnDemand peer=\(secretName) repairedDevices=\(byDevice.count)")
             }
         }
         let result = Array(byDevice.values)
@@ -951,28 +978,53 @@ public extension PQSSession {
             }
         }
 
-        let timeoutTask = Task { [secretName, deviceId, waitBudget] in
+        let key = PeerReplenishWaiterKey(secretName: secretName, deviceId: deviceId)
+        let token = UUID()
+        let timeoutTask = Task { [secretName, deviceId, token, waitBudget] in
             try await Task.sleep(nanoseconds: UInt64(waitBudget * 1_000_000_000))
-            await self.cancelPeerOneTimeReplenishWait(secretName: secretName, deviceId: deviceId)
+            await self.cancelPeerOneTimeReplenishWait(
+                secretName: secretName,
+                deviceId: deviceId,
+                token: token
+            )
         }
         defer { timeoutTask.cancel() }
 
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            peerOneTimeReplenishWaiters[secretName] = continuation
+            peerOneTimeReplenishWaiters[key, default: [:]][token] = continuation
         }
 
         return (try? await peerCanSupplyCurveOneTimeKey(secretName: secretName, deviceId: deviceId)) == true
     }
 
-    internal func cancelPeerOneTimeReplenishWait(secretName: String, deviceId: UUID) async {
-        guard let waiter = peerOneTimeReplenishWaiters.removeValue(forKey: secretName) else { return }
+    internal func cancelPeerOneTimeReplenishWait(
+        secretName: String,
+        deviceId: UUID,
+        token: UUID
+    ) async {
+        let key = PeerReplenishWaiterKey(secretName: secretName, deviceId: deviceId)
+        guard var bucket = peerOneTimeReplenishWaiters[key] else { return }
+        guard let waiter = bucket.removeValue(forKey: token) else { return }
+        if bucket.isEmpty {
+            peerOneTimeReplenishWaiters.removeValue(forKey: key)
+        } else {
+            peerOneTimeReplenishWaiters[key] = bucket
+        }
         waiter.resume()
     }
 
     internal func completePeerPublishedOneTimeKeysReplenishmentWait(secretName: String) {
-        if let waiter = peerOneTimeReplenishWaiters.removeValue(forKey: secretName) {
-            waiter.resume()
-        } else {
+        let keys = peerOneTimeReplenishWaiters.keys.filter { $0.secretName == secretName }
+        var resumedAny = false
+        for key in keys {
+            if let bucket = peerOneTimeReplenishWaiters.removeValue(forKey: key) {
+                for (_, waiter) in bucket {
+                    waiter.resume()
+                    resumedAny = true
+                }
+            }
+        }
+        if !resumedAny {
             peerOneTimeReplenishAcknowledgedPeers.insert(secretName)
         }
     }
@@ -1305,7 +1357,7 @@ public extension PQSSession {
             symmetricKey: symmetricKey
         )
         try await cache.createSessionIdentity(identity)
-        sessionIdentities.remove(secretName)
+        invalidateSessionIdentityCache(secretName: secretName)
         return identity
     }
 
@@ -1374,7 +1426,7 @@ public extension PQSSession {
         if demotedSiblingCount > 0 {
             // Do not call `removeIdentity` / `clearPeerTransientState`: that drops
             // recovery state for the whole secretName beyond this device.
-            sessionIdentities.remove(provenProps.secretName)
+            invalidateSessionIdentityCache(secretName: provenProps.secretName)
             DecryptFailureAuditLog.log(
                 "pqs.recovery.laneActivatedAfterDecrypt peer=\(provenProps.secretName) deviceId=\(provenProps.deviceId.uuidString) demotedSiblings=\(demotedSiblingCount)")
         }
@@ -1469,7 +1521,7 @@ public extension PQSSession {
         }
         let demoted = try await demoteActiveSessionIdentityToInactive(identity)
         if demoted {
-            sessionIdentities.remove(secretName)
+            invalidateSessionIdentityCache(secretName: secretName)
             DecryptFailureAuditLog.log(
                 "pqs.recovery.proveFailedActiveDemoted peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(sessionId.uuidString)")
             logger.log(
@@ -1523,7 +1575,7 @@ public extension PQSSession {
             // Do not call `removeIdentity` / `clearPeerTransientState` here: that
             // clears in-flight orphan-resend `orphanResend` marks for the whole secretName.
             // Prefer the surviving initiating active on the next encrypt lookup.
-            sessionIdentities.remove(secretName)
+            invalidateSessionIdentityCache(secretName: secretName)
             DecryptFailureAuditLog.log(
                 "pqs.recovery.zombieStateLessDemoted peer=\(secretName) deviceId=\(deviceId.uuidString) demoted=\(demoted)")
             logger.log(
@@ -1610,7 +1662,7 @@ public extension PQSSession {
         try await cache.updateSessionIdentity(archived)
         // Do not call `removeIdentity` / `clearPeerTransientState`: that drops
         // in-flight orphan-resend marks for the whole secretName.
-        sessionIdentities.remove(archivedProps.secretName)
+        invalidateSessionIdentityCache(secretName: archivedProps.secretName)
         logger.log(
             level: .info,
             message: "Promoted cryptographically proven archived SessionIdentity for \(archivedProps.secretName) (\(archivedProps.deviceId)); demotedActive=\(demotedActiveCount)")
@@ -1764,7 +1816,10 @@ public extension PQSSession {
             }
         }
 
-        removeIdentity(with: secretName)
+        // The reset is scoped to one DeviceRecord. Its exact-device recovery state
+        // was handled above; invalidate only identity selection so sibling devices
+        // keep their orphan-resend ownership and friendship state.
+        invalidateSessionIdentityCache(secretName: secretName)
         await cleanupInactiveSessionSnapshots(
             cache: cache,
             symmetricKey: symmetricKey,

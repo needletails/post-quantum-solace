@@ -17,6 +17,8 @@ public enum ControlDeliveryLanePolicy: Sendable {
     ///     in this undecryptable pass.
     ///   - preferredCleared: preferred pin was cleared for this peer device on this path
     ///     (rearm / prove-fail cleanup).
+    ///   - surgicalEscapeAlreadyAttempted: this process already submitted one fresh
+    ///     control lane for the current continuous decrypt-failure episode.
     ///   - liveOrphanOrRecovery: orphan initiating mark or recovery SessionID is live for
     ///     this peer device — NACK must ride that lane, not mint a competing blank.
     /// - Returns: `true` when control delivery should clear preferred and resolve via
@@ -24,12 +26,18 @@ public enum ControlDeliveryLanePolicy: Sendable {
     public static func shouldMintFreshControlLane(
         preferredFailedInTryAll: Bool,
         preferredCleared: Bool,
+        surgicalEscapeAlreadyAttempted: Bool = false,
         liveOrphanOrRecovery: Bool = false
     ) -> Bool {
         if liveOrphanOrRecovery {
             return false
         }
-        return preferredFailedInTryAll || preferredCleared
+        // A failed orphan replay is fresh cryptographic evidence and may remint once
+        // more even if the episode already attempted its initial surgical escape.
+        if preferredCleared {
+            return true
+        }
+        return preferredFailedInTryAll && !surgicalEscapeAlreadyAttempted
     }
 
     /// Same-account control must not "ride" an existing outbound match: poison
@@ -39,11 +47,15 @@ public enum ControlDeliveryLanePolicy: Sendable {
     /// When orphan/recovery already owns the heal lane, ride that lane instead.
     public static func shouldRequireSurgicalFreshLane(
         isSameAccount: Bool,
+        forceFreshInitiating: Bool,
         liveOrphanOrRecovery: Bool
     ) -> Bool {
         if liveOrphanOrRecovery {
             return false
         }
-        return isSameAccount
+        // Same-account always needs surgical delivery. Cross-account needs the same
+        // escape when try-all proved its current outbound match cannot carry recovery
+        // control; merely clearing the preferred pin can still select that poison active.
+        return isSameAccount || forceFreshInitiating
     }
 }

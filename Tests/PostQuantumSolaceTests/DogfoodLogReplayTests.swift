@@ -60,7 +60,8 @@ extension EndToEndTests {
                     message: received.message,
                     sender: received.sender,
                     deviceId: received.deviceId,
-                    messageId: received.messageId)
+                    messageId: received.messageId,
+                    logicalMessageId: received.logicalMessageId)
             }
         }
         bobTask = Task {
@@ -69,7 +70,8 @@ extension EndToEndTests {
                     message: received.message,
                     sender: received.sender,
                     deviceId: received.deviceId,
-                    messageId: received.messageId)
+                    messageId: received.messageId,
+                    logicalMessageId: received.logicalMessageId)
             }
         }
 
@@ -260,7 +262,8 @@ extension EndToEndTests {
                     message: received.message,
                     sender: received.sender,
                     deviceId: received.deviceId,
-                    messageId: received.messageId)
+                    messageId: received.messageId,
+                    logicalMessageId: received.logicalMessageId)
             }
         }
         bobTask = Task {
@@ -269,7 +272,8 @@ extension EndToEndTests {
                     message: received.message,
                     sender: received.sender,
                     deviceId: received.deviceId,
-                    messageId: received.messageId)
+                    messageId: received.messageId,
+                    logicalMessageId: received.logicalMessageId)
             }
         }
 
@@ -297,7 +301,7 @@ extension EndToEndTests {
         // Clearing the verified-id memo forces chat fan-out onto live findConfiguration
         // (CHILD_DEVICE_2 -1001 / cannotFindUserConfiguration path).
         await _senderSession.test_removeLastVerifiedDeviceIds(for: "bob")
-        _senderSession.isViable = false
+        await _senderSession.setViability(false)
         aliceTransport.findConfigurationError = URLError(.timedOut)
         aliceTransport.findConfigurationFaultSecretNames = ["bob", "alice"]
 
@@ -337,7 +341,7 @@ extension EndToEndTests {
         aliceTransport.findConfigurationError = nil
         aliceTransport.findConfigurationHang = nil
         aliceTransport.findConfigurationFaultSecretNames = nil
-        _senderSession.isViable = true
+        await _senderSession.setViability(true)
         try await _senderSession.resumeJobQueue()
 
         func waitUntil(
@@ -517,7 +521,8 @@ extension EndToEndTests {
                     message: received.message,
                     sender: received.sender,
                     deviceId: received.deviceId,
-                    messageId: received.messageId)
+                    messageId: received.messageId,
+                    logicalMessageId: received.logicalMessageId)
                 if recipientDeviceId == senderChildId {
                     await probe.markDecrypted(received.messageId)
                 }
@@ -627,23 +632,28 @@ struct DogfoodRecoveryStormPolicyTests {
     @Test("dogfood C2b: same sharedId defers archived fallback at most once until heal")
     func dogfoodC2b_sameSharedIdDefersArchiveFallbackAtMostOnce() {
         let sharedId = "1FA1D17E-A326-43D8-8605-49AECD3543ED"
+        let token = ArchivedInboundFallbackToken(
+            senderSecretName: "alice",
+            senderDeviceId: UUID(),
+            envelopeMessageId: sharedId,
+            fingerprint: Data("offline-poison-ct".utf8))
         var exhausted = Set<String>()
         var pending = Set<String>()
         var deferCount = 0
 
         for _ in 0..<20 {
             guard InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
-                sharedId: sharedId,
+                token: token,
                 exhausted: exhausted,
                 pendingPass: pending
             ) else { continue }
             deferCount += 1
-            pending.insert(sharedId)
+            pending.insert(token.storageKey)
             // Production removes pending at archive-pass start, then marks exhausted.
-            pending.remove(sharedId)
+            pending.remove(token.storageKey)
             exhausted = InboundRecoveryStormPolicy.exhaustedAfterArchivePassCompleted(
                 current: exhausted,
-                sharedId: sharedId
+                token: token
             )
         }
 
@@ -654,11 +664,15 @@ struct DogfoodRecoveryStormPolicyTests {
 
     @Test("dogfood C2c: after archive exhaustion, redelivery does not re-defer")
     func dogfoodC2c_noArchiveDeferAfterExhaustion() {
-        let sharedId = "saturate-then-replay"
-        let exhausted: Set = [sharedId]
+        let token = ArchivedInboundFallbackToken(
+            senderSecretName: "alice",
+            senderDeviceId: UUID(),
+            envelopeMessageId: "saturate-then-replay",
+            fingerprint: Data("poison".utf8))
+        let exhausted: Set = [token.storageKey]
         #expect(
             !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
-                sharedId: sharedId,
+                token: token,
                 exhausted: exhausted,
                 pendingPass: []
             ))
@@ -666,18 +680,22 @@ struct DogfoodRecoveryStormPolicyTests {
 
     @Test("dogfood C2f: clearing exhaustion re-arms one archive defer")
     func dogfoodC2f_newArchiveAfterExhaustReArmsDefer() {
-        let sharedId = "rearm-after-new-archive"
-        var exhausted: Set = [sharedId]
+        let token = ArchivedInboundFallbackToken(
+            senderSecretName: "alice",
+            senderDeviceId: UUID(),
+            envelopeMessageId: "rearm-after-new-archive",
+            fingerprint: Data("poison".utf8))
+        var exhausted: Set = [token.storageKey]
         #expect(
             !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
-                sharedId: sharedId,
+                token: token,
                 exhausted: exhausted,
                 pendingPass: []))
         // Heal / new archive generation clears exhaustion for that ciphertext.
-        exhausted.remove(sharedId)
+        exhausted.remove(token.storageKey)
         #expect(
             InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
-                sharedId: sharedId,
+                token: token,
                 exhausted: exhausted,
                 pendingPass: []))
     }
@@ -685,47 +703,31 @@ struct DogfoodRecoveryStormPolicyTests {
     @Test("dogfood C2g: new fingerprint clears exhaustion and re-arms one archive defer")
     func dogfoodC2g_newFingerprintReArmsArchiveDefer() {
         let sharedId = "9ABB24B1-AB85-4927-887D-97794A6C5830"
-        let priorFingerprint = Data("offline-poison-ct".utf8)
-        let remintFingerprint = Data("orphan-remint-ct".utf8)
-        var exhausted: Set = [sharedId]
-        var exhaustedFingerprint: Data? = priorFingerprint
+        let deviceId = UUID()
+        let prior = ArchivedInboundFallbackToken(
+            senderSecretName: "alice",
+            senderDeviceId: deviceId,
+            envelopeMessageId: sharedId,
+            fingerprint: Data("offline-poison-ct".utf8))
+        let remint = ArchivedInboundFallbackToken(
+            senderSecretName: "alice",
+            senderDeviceId: deviceId,
+            envelopeMessageId: sharedId,
+            fingerprint: Data("orphan-remint-ct".utf8))
+        let exhausted: Set = [prior.storageKey]
 
         #expect(
             !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
-                sharedId: sharedId,
+                token: prior,
                 exhausted: exhausted,
                 pendingPass: []))
-        #expect(
-            !InboundRecoveryStormPolicy.shouldClearExhaustionForNewFingerprint(
-                sharedId: sharedId,
-                exhausted: exhausted,
-                exhaustedFingerprint: exhaustedFingerprint,
-                currentFingerprint: priorFingerprint),
-            "same fingerprint must not clear exhaustion (C2 storm gate)")
-
-        #expect(
-            InboundRecoveryStormPolicy.shouldClearExhaustionForNewFingerprint(
-                sharedId: sharedId,
-                exhausted: exhausted,
-                exhaustedFingerprint: exhaustedFingerprint,
-                currentFingerprint: remintFingerprint),
-            "BUG: reminted CT (same sharedId) must re-arm archive fallback")
-        exhausted.remove(sharedId)
-        exhaustedFingerprint = nil
         #expect(
             InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
-                sharedId: sharedId,
+                token: remint,
                 exhausted: exhausted,
-                pendingPass: []))
-
-        // Missing recorded fingerprint still re-arms once (legacy exhaust entry).
-        exhausted = [sharedId]
-        #expect(
-            InboundRecoveryStormPolicy.shouldClearExhaustionForNewFingerprint(
-                sharedId: sharedId,
-                exhausted: exhausted,
-                exhaustedFingerprint: nil,
-                currentFingerprint: remintFingerprint))
+                pendingPass: []),
+            "BUG: reminted CT token must retain an independent archive pass")
+        #expect(InboundRecoveryStormPolicy.tokensAreIndependent(prior, remint))
     }
 }
 

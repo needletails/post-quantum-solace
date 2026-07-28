@@ -37,6 +37,7 @@ The SDK is designed around three jobs:
 - <doc:AccountIdentityRecovery>
 - <doc:ControlEventCoalescing>
 - <doc:FriendshipContactBootstrap>
+- <doc:MultideviceDecryptRecovery>
 
 ### Core entry point
 

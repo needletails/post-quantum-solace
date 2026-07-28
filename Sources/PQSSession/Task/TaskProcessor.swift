@@ -131,6 +131,15 @@ public actor TaskProcessor {
     /// Used to prevent multiple concurrent job processing loops.
     var isRunning = false
 
+    /// A prepared frame failed at the transport boundary and must remain parked
+    /// until a concrete registration/writer-ready event calls `loadTasks`.
+    /// This prevents the processing-loop tail from immediately retrying without
+    /// any state transition.
+    var isPausedUntilTransportReady = false
+
+    /// Event-driven shutdown waiters resumed when the active processing loop exits.
+    var processingIdleWaiters: [CheckedContinuation<Void, Never>] = []
+
     /// Delayed (not-yet-due) jobs that were skipped ahead of once in the current
     /// processing pass so ready work behind them is not head-of-line blocked.
     /// When a job id is already recorded here and is popped again while still
@@ -152,25 +161,14 @@ public actor TaskProcessor {
     /// otherwise re-enqueue (and re-send) it from cache during that window.
     var inFlightJobIds: Set<UUID> = []
 
-    /// SharedIds whose next inbound decrypt pass should include archived SessionIdentity
-    /// rows. Populated by `deferArchivedInboundFallback` after `activeFirstInboundPass`
-    /// fails, so archive try-all runs as a `.background` job and cannot HOL-block
-    /// fresher `.urgent` active-lane ciphertext.
+    /// Archive-fallback pending tokens (`ArchivedInboundFallbackToken.storageKey`).
     var archivedInboundFallbackPasses: Set<String> = []
 
-    /// SharedIds that already completed one archive try-all (pass or fail). Blocks
-    /// re-defer storms on spool redelivery (dogfood CHILD_DEVICE_2: same sharedId
-    /// deferred thousands of times). Cleared on heal / new archive for that peer,
-    /// or when inbound fingerprint changes (orphan remint, same sharedId).
+    /// Completed archive-pass tokens. Blocks same-token re-defer storms.
     var archivedInboundFallbackExhausted: Set<String> = []
 
-    /// Maps exhausted sharedId → peer episode key (`secretName|deviceId`) so heal
-    /// events can clear exhaustion for a peer-device without timers.
+    /// Maps exhausted token → peer episode key (`secretName|deviceId`).
     var archivedInboundFallbackExhaustedPeerKey: [String: String] = [:]
-
-    /// Fingerprint of the ciphertext that spent the archive pass for each exhausted
-    /// sharedId (`PQSSession.nackFrameFingerprint`). Different fingerprint → re-arm.
-    var archivedInboundFallbackExhaustedFingerprintBySharedId: [String: Data] = [:]
 
     /// Delegate responsible for transport-level session communication.
     /// Handles the actual sending and receiving of encrypted messages over the network.
@@ -187,6 +185,40 @@ public actor TaskProcessor {
     /// the cryptographically proven row prevents alternating between divergent ratchet states.
     var preferredSessionIdentityIdByPeerDevice: [String: UUID] = [:]
 
+    /// Peer-device episodes that already submitted one surgical resend-control lane.
+    /// Try-all failure is real evidence that recovery control must not ride the selected
+    /// active, but minting once per failed sharedId recreated blank/archive storms. This
+    /// reservation is cleared only by a successful inbound decrypt (or process restart);
+    /// failed orphan replay may explicitly earn one bounded remint.
+    var surgicalControlEscapeAttemptedPeerDevices: Set<String> = []
+
+    /// Live surgical control `SessionIdentity.id` owned by the current peer-device NACK
+    /// episode. Later same-episode NACKs reuse this row instead of minting per sharedId.
+    /// Cleared with ``surgicalControlEscapeAttemptedPeerDevices`` after successful inbound
+    /// decrypt; explicit prove-fail rearm (`forceFreshInitiating`) replaces it once.
+    /// Recovery-control ownership only — not orphan-resend ownership.
+    var surgicalControlSessionIdentityIdByPeerDevice: [String: UUID] = [:]
+
+    /// Monotonic process-local generation for each peer-device NACK episode.
+    /// Successful inbound decrypt advances the generation so a surgical mint that
+    /// was already suspended on `PQSSession` cannot re-own the converged episode.
+    var surgicalControlEpisodeGenerationByPeerDevice: [String: UInt64] = [:]
+
+    struct SurgicalControlEpisodeMintCompletion {
+        let episodeGeneration: UInt64
+        let result: Result<UUID, Error>
+    }
+
+    /// Peer-devices currently awaiting ``resetSessionIdentityForFreshSession`` for a
+    /// surgical control mint. Prevents actor-reentrant concurrent resolvers from each
+    /// minting a blank while the first mint is suspended on `PQSSession`.
+    var surgicalControlEpisodeMintInFlight: Set<String> = []
+
+    /// Waiters parked until an in-flight surgical control mint finishes for a peer-device.
+    var surgicalControlEpisodeMintWaiters: [
+        String: [CheckedContinuation<SurgicalControlEpisodeMintCompletion, Never>]
+    ] = [:]
+
     /// Minimum interval between peer refresh control messages for the same peer.
     /// Keeps recovery behavior while reducing startup storms that can race with live traffic.
     let peerRefreshRequestCooldown: TimeInterval = 15
@@ -196,15 +228,10 @@ public actor TaskProcessor {
     var outboundControlRepairBypassAtBySharedId: [String: Date] = [:]
     let outboundControlRepairBypassTTL: TimeInterval = 60 * 10
 
-    struct RecentOutboundReplay: Sendable {
-        let message: CryptoMessage
-        let createdAt: Date
-        var replayCount: Int
-    }
-
     struct PendingOutboundTransport: Sendable {
         let message: SignedRatchetMessage
         let metadata: SignedRatchetMessageMetadata
+        let sessionIdentityId: UUID
         let needsRemoteDeletion: Bool
         let curveOneTimeKeyId: String?
         let mlKEMOneTimeKeyId: String
@@ -214,10 +241,10 @@ public actor TaskProcessor {
     /// Recent non-persistent SDK control payloads, keyed by shared id.
     /// Persisted user messages are replayed from the app store; this covers the
     /// Session recovery controls that intentionally do not create UI rows.
-    var recentOutboundReplayBySharedId: [String: RecentOutboundReplay] = [:]
-    let recentOutboundReplayTTL: TimeInterval = 60 * 10
-    let recentOutboundReplayLimit = 256
-    let recentOutboundReplayMaxReplays = 5
+    var recentOutboundReplayStore = RecentOutboundReplayStore<CryptoMessage>(
+        ttl: 60 * 10,
+        limit: 256,
+        maxReplays: 5)
 
     /// Last `messageResendUnavailable` notice emitted per requester device, so repeats
     /// re-send the same notice sharedId instead of minting a new UUID storm.
@@ -237,6 +264,12 @@ public actor TaskProcessor {
     var pendingOutboundTransportBySharedId: [String: PendingOutboundTransport] = [:]
     let pendingOutboundTransportTTL: TimeInterval = 60 * 10
     let pendingOutboundTransportLimit = 256
+
+    /// Jobs currently entering the ratchet, keyed by their logical shared id.
+    var processingOutboundJobBySharedId: [String: JobModel] = [:]
+    /// Outbound identities whose DRK delegate persistence is deferred until the
+    /// prepared job can be committed in the same store transaction.
+    var atomicOutboundPreparationIdentityIds = Set<UUID>()
 
     /// Last successfully transported orphan-resend ciphertext per
     /// `(requesterDeviceId|sharedId)`. Used when MessageRecord already names the

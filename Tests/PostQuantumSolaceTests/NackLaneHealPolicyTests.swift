@@ -47,6 +47,29 @@ struct NackLaneHealPolicyTests {
                 liveOrphanOrRecovery: true) == false)
     }
 
+    @Test("mint only once per continuous try-all failure episode")
+    func mintOncePerContinuousFailureEpisode() {
+        #expect(
+            ControlDeliveryLanePolicy.shouldMintFreshControlLane(
+                preferredFailedInTryAll: true,
+                preferredCleared: false,
+                surgicalEscapeAlreadyAttempted: false,
+                liveOrphanOrRecovery: false))
+        #expect(
+            !ControlDeliveryLanePolicy.shouldMintFreshControlLane(
+                preferredFailedInTryAll: true,
+                preferredCleared: false,
+                surgicalEscapeAlreadyAttempted: true,
+                liveOrphanOrRecovery: false))
+        // A cryptographically distinct failed orphan replay earns one bounded remint.
+        #expect(
+            ControlDeliveryLanePolicy.shouldMintFreshControlLane(
+                preferredFailedInTryAll: true,
+                preferredCleared: true,
+                surgicalEscapeAlreadyAttempted: true,
+                liveOrphanOrRecovery: false))
+    }
+
     @Test("same fingerprint does not rearm (await sender)")
     func sameFingerprintNoRearm() {
         let fp = Data([0x01, 0x02, 0x03])
@@ -114,15 +137,59 @@ struct NackLaneHealPolicyTests {
         #expect(
             ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
                 isSameAccount: true,
+                forceFreshInitiating: false,
                 liveOrphanOrRecovery: false))
         #expect(
             !ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
                 isSameAccount: true,
+                forceFreshInitiating: true,
                 liveOrphanOrRecovery: true))
         #expect(
             !ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
                 isSameAccount: false,
+                forceFreshInitiating: false,
                 liveOrphanOrRecovery: false))
+    }
+
+    @Test("cross-account proven poison NACK requires surgical fresh")
+    func crossAccountPoisonNackRequiresSurgicalFresh() {
+        #expect(
+            ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+                isSameAccount: false,
+                forceFreshInitiating: true,
+                liveOrphanOrRecovery: false))
+        #expect(
+            !ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+                isSameAccount: false,
+                forceFreshInitiating: true,
+                liveOrphanOrRecovery: true))
+    }
+
+    @Test("explicit outbound pin honors heal blanks not poison initialized")
+    func explicitOutboundPinHonorsHealNotPoison() {
+        // Surgical / orphan remint blank must survive StickyAdvancedRemint.
+        #expect(
+            ExplicitOutboundRecipientPinPolicy.shouldHonorExplicitRecipient(
+                isLiveActive: true,
+                isStateLess: true,
+                isOrphanOrRecoveryLane: false))
+        // Advanced recovery row still owns the heal lane.
+        #expect(
+            ExplicitOutboundRecipientPinPolicy.shouldHonorExplicitRecipient(
+                isLiveActive: true,
+                isStateLess: false,
+                isOrphanOrRecoveryLane: true))
+        // Queued poison initialized must rebind (same-account orphan ownership).
+        #expect(
+            !ExplicitOutboundRecipientPinPolicy.shouldHonorExplicitRecipient(
+                isLiveActive: true,
+                isStateLess: false,
+                isOrphanOrRecoveryLane: false))
+        #expect(
+            !ExplicitOutboundRecipientPinPolicy.shouldHonorExplicitRecipient(
+                isLiveActive: false,
+                isStateLess: true,
+                isOrphanOrRecoveryLane: false))
     }
 }
 
@@ -151,14 +218,15 @@ struct NackLaneHealSourceTests {
                 "Sources/PQSSession/PQSSession+Events.swift"),
             encoding: .utf8)
 
-        #expect(sequence.contains("ControlDeliveryLanePolicy.shouldMintFreshControlLane")
-            || events.contains("forceFreshControlLane"))
+        // Strict §4.1: retry emission is OOB; surgical lane helpers may remain
+        // for legacy decode / other controls during the mixed-fleet window.
+        #expect(events.contains("sendOutOfBandResendRequest("))
+        #expect(events.contains("resendRequestSubmittedOutOfBand"))
         #expect(sequence.contains("demoteProveFailedActive(")
             || ratchet.contains("proveFailedActiveDemoted")
             || session.contains("proveFailedActiveDemoted"))
         #expect(session.contains("OrphanReplayRearmPolicy.shouldRearm")
             || sequence.contains("OrphanReplayRearmPolicy.shouldRearm"))
-        #expect(ratchet.contains("resendRequestControlDelivery"))
         #expect(ratchet.contains("blankForHeaderExists"))
         #expect(!ratchet.contains("blankForHeaderExists = false"))
         // Must NOT seed preference from try-all failure (demote cascade under
@@ -169,7 +237,7 @@ struct NackLaneHealSourceTests {
         let recordWindow = String(afterRollback[..<throwPreferred.lowerBound])
         #expect(!recordWindow.contains("preferredSessionIdentityIdByPeerDevice["))
         #expect(sequence.contains("UnansweredInitiatingLanePolicy.shouldForceRemintEvenIfAnswered"))
-        #expect(ratchet.contains("shouldRequireSurgicalFreshLane"))
-        #expect(ratchet.contains("surgicalRequired="))
+        #expect(ratchet.contains("pinnedExplicitOutboundRecipient("))
+        #expect(ratchet.contains("ExplicitOutboundRecipientPinPolicy.shouldHonorExplicitRecipient"))
     }
 }

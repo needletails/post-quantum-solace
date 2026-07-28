@@ -84,6 +84,12 @@ public struct SignedRatchetMessage: Codable & Sendable {
         )
     }
 
+    /// Placeholder for authenticated out-of-band control that carries no Double Ratchet ciphertext.
+    /// Receivers must short-circuit on `TransportEvent` and never attempt signature/ratchet work.
+    public init(outOfBandPlaceholder: Void = ()) {
+        signed = nil
+    }
+
     /// A struct representing the signed version of the ratchet message with cryptographic
     /// verification capabilities.
     ///

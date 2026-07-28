@@ -118,8 +118,8 @@ struct DemotePromoteThrashSourceTests {
             .deletingLastPathComponent()
     }
 
-    @Test("P0: NACK rides outbound; no demote-all forceFresh; no priorSubmissions==0 force")
-    func nackRidesOutboundNoDemoteAll() throws {
+    @Test("P0: undecryptable retry is OOB; no surgical mint or demote-all")
+    func firstPoisonLaneNackIsSurgicalAndBounded() throws {
         let root = packageRoot()
         let ratchet = try String(
             contentsOf: root.appendingPathComponent(
@@ -129,21 +129,30 @@ struct DemotePromoteThrashSourceTests {
             contentsOf: root.appendingPathComponent(
                 "Sources/PQSSession/Task/TaskProcessor+Sequence.swift"),
             encoding: .utf8)
+        let events = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/PQSSession/PQSSession+Events.swift"),
+            encoding: .utf8)
 
-        let controlBody = try functionBody(
-            named: "func resolveControlDeliverySessionIdentity",
-            in: ratchet)
-        // Cross-account rides outbound; same-account surgical mint — never demote-all.
-        #expect(controlBody.contains("outboundSessionIdentity("))
-        #expect(controlBody.contains("shouldRequireSurgicalFreshLane"))
-        #expect(
-            controlBody.contains("demotePriorActives: false")
-                || controlBody.contains("preserveExistingActives")
-                || controlBody.contains("surgicalControlInsert")
-                || controlBody.contains("insertStateLessControlLane"),
-            "BUG: forceFresh still uses demote-all reset without surgical insert")
+        // Legacy control-lane resolver may still exist for other controls, but
+        // undecryptable retry must not mint/demote via surgical NACK lanes.
         #expect(!sequence.contains("preferredFailedInTryAll || priorSubmissions == 0"))
         #expect(sequence.contains("liveOrphanOrRecovery"))
+        #expect(!sequence.contains("preferredFailedInTryAll = proveFailedPreferredId != nil"))
+        #expect(!sequence.contains("preferredFailedInTryAll = pinnedPreferredId != nil"))
+        let undecryptable = try functionBody(
+            named: "private func handleUndecryptableInboundResend",
+            in: sequence)
+        #expect(undecryptable.contains("if rearmedAfterFailedReplay"))
+        // Strict §4.1: try-all failure emits OOB retry with no DR encrypt /
+        // surgical escape reservation.
+        #expect(undecryptable.contains("forceFreshControlLane: false"))
+        #expect(!undecryptable.contains("preferredFailedInTryAll: true"))
+        #expect(!undecryptable.contains("surgicalEscapeAlreadyAttempted:"))
+        #expect(!undecryptable.contains("surgicalControlEscapeAttemptedPeerDevices"))
+        #expect(events.contains("sendOutOfBandResendRequest("))
+        #expect(events.contains("resendRequestSubmittedOutOfBand"))
+        #expect(!events.contains("feedDeviceScopedControlWrite("))
         // Must not reintroduce preference-on-fail (demote cascade).
         let rolledBack = try #require(ratchet.range(of: "pqs.recovery.laneRolledBack reason="))
         let afterRollback = ratchet[rolledBack.upperBound...]

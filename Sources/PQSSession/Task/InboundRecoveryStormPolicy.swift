@@ -2,54 +2,76 @@
 //  InboundRecoveryStormPolicy.swift
 //  post-quantum-solace
 //
-//  Event-driven gates that stop dogfood recovery storms (CHILD_DEVICE_2):
-//  same sharedId archive-deferred thousands of times.
+//  Event-driven gates that stop dogfood recovery storms:
+//  same ciphertext archive-deferred thousands of times.
 //
-//  Exhaustion is per ciphertext fingerprint: reminted orphan material keeps the
-//  same sharedId but changes the signed payload — that must re-arm one archive
-//  pass (Active→Archives contract) without reopening same-fp spool storms.
+//  Exhaustion / pending passes are tokenized by
+//  (sender, device, envelopeMessageId, fingerprint) so a fresh orphan
+//  fingerprint cannot consume an older archive-only pass (T17).
 //
 
 import Foundation
 
-/// Recovery storm gates: one archive fallback per ciphertext until a heal event
-/// or a new inbound fingerprint clears exhaustion.
+/// Immutable archive-fallback pass token (transport-safe; no timers).
+public struct ArchivedInboundFallbackToken: Hashable, Sendable {
+    public let senderSecretName: String
+    public let senderDeviceId: UUID
+    public let envelopeMessageId: String
+    public let fingerprint: Data
+
+    public init(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        envelopeMessageId: String,
+        fingerprint: Data
+    ) {
+        self.senderSecretName = senderSecretName
+        self.senderDeviceId = senderDeviceId
+        self.envelopeMessageId = envelopeMessageId
+        self.fingerprint = fingerprint
+    }
+
+    /// Stable map key for pending/exhausted sets.
+    public var storageKey: String {
+        let fp = fingerprint.base64EncodedString()
+        return "\(senderSecretName)|\(senderDeviceId.uuidString)|\(envelopeMessageId)|\(fp)"
+    }
+
+    /// Peer-device prefix used when clearing all tokens for a healed peer.
+    public var peerKey: String {
+        "\(senderSecretName)|\(senderDeviceId.uuidString)"
+    }
+}
+
+/// Recovery storm gates: one archive fallback per ciphertext token until a heal
+/// event or a new inbound fingerprint opens a distinct token.
 public enum InboundRecoveryStormPolicy: Sendable {
-    /// Whether to enqueue a `.background` archive try-all for this sharedId.
+    /// Whether to enqueue a `.background` archive try-all for this token.
     public static func shouldDeferArchivedFallback(
-        sharedId: String,
+        token: ArchivedInboundFallbackToken,
         exhausted: Set<String>,
         pendingPass: Set<String>
     ) -> Bool {
-        !exhausted.contains(sharedId) && !pendingPass.contains(sharedId)
+        let key = token.storageKey
+        return !exhausted.contains(key) && !pendingPass.contains(key)
     }
 
-    /// After one completed archive pass (success or total failure), further
-    /// redeliveries of the *same* ciphertext must not re-walk archives until a
-    /// heal event or a new fingerprint clears exhaustion.
+    /// After one completed archive pass, further redeliveries of the *same*
+    /// token must not re-walk archives until a heal event.
     public static func exhaustedAfterArchivePassCompleted(
         current: Set<String>,
-        sharedId: String
+        token: ArchivedInboundFallbackToken
     ) -> Set<String> {
         var next = current
-        next.insert(sharedId)
+        next.insert(token.storageKey)
         return next
     }
 
-    /// Reminted / new orphan material: same sharedId, different signed payload.
-    /// Clear exhaustion so Active→Archives can run once for the new frame.
-    public static func shouldClearExhaustionForNewFingerprint(
-        sharedId: String,
-        exhausted: Set<String>,
-        exhaustedFingerprint: Data?,
-        currentFingerprint: Data
+    /// Token A must never clear token B's pending/exhausted state.
+    public static func tokensAreIndependent(
+        _ a: ArchivedInboundFallbackToken,
+        _ b: ArchivedInboundFallbackToken
     ) -> Bool {
-        guard exhausted.contains(sharedId) else { return false }
-        guard let exhaustedFingerprint else {
-            // Exhausted without a recorded fingerprint (legacy / peer clear race):
-            // treat unknown prior frame as stale so remint can re-arm once.
-            return true
-        }
-        return exhaustedFingerprint != currentFingerprint
+        a.storageKey != b.storageKey
     }
 }

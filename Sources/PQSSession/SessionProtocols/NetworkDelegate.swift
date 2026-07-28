@@ -19,48 +19,14 @@ import Foundation
  * A protocol that defines the interface for network connectivity management
  * in the Post-Quantum Solace session system.
  *
- * The `NetworkDelegate` protocol provides a standardized way to monitor
- * and report network connectivity status. Implementations of this protocol
- * can be used to determine whether the current network connection is viable
- * for establishing and maintaining secure post-quantum cryptographic sessions.
- *
- * ## Usage
- *
- * Conform to this protocol in your network monitoring classes to provide
- * real-time network status updates to the session management system:
- *
- * ```swift
- * class MyNetworkMonitor: NetworkDelegate {
- *     var isViable: Bool = false
- *
- *     func startMonitoring() {
- *         // Monitor network connectivity
- *         // Update isViable property based on connection status
- *     }
- * }
- * ```
- *
- * ## Thread Safety
- *
- * This protocol conforms to `Sendable`, ensuring thread-safe access
- * to network status information across concurrent operations.
+ * The synchronous `isViable` requirement is retained for source compatibility.
+ * `PQSSession` additionally exposes an actor-isolated `setViability(_:)` method,
+ * without changing this protocol's requirements for existing SDK clients.
  */
 public protocol NetworkDelegate: Sendable {
     /**
      * Indicates whether the current network connection is viable for
      * establishing and maintaining secure sessions.
-     *
-     * This property should be updated in real-time to reflect the current
-     * network connectivity status. A value of `true` indicates that the
-     * network is available and suitable for cryptographic operations,
-     * while `false` indicates network unavailability or instability.
-     *
-     * ## Implementation Notes
-     *
-     * - Set to `true` when network connectivity is established and stable
-     * - Set to `false` when network is unavailable, unstable, or disconnected
-     * - Should be updated immediately when network status changes
-     * - Access to this property must be thread-safe
      */
     var isViable: Bool { get set }
 }

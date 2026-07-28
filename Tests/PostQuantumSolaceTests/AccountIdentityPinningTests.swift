@@ -37,7 +37,7 @@ actor AccountIdentityPinningTests {
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: ReceiverDelegate(session: session))
 
-        session.isViable = true
+        await session.setViability(true)
         await store.setPublishableName(secretName)
 
         session = try await session.createSession(

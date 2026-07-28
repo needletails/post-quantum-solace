@@ -149,7 +149,7 @@ struct SessionReestablishmentCoalescingTests {
         // was already consumed — could only fail decryption forever.
         let session = PQSSession()
         defer { Task { await session.shutdown() } }
-        session.isViable = false
+        await session.setViability(false)
 
         actor Flag {
             var value = false
@@ -323,7 +323,7 @@ struct SessionReestablishmentCoalescingTests {
         // Host notifications are only delivered on a viable session
         // (scheduleBackgroundWork drops work otherwise); mark this bare
         // test session viable so the delegate contract can be observed.
-        session.isViable = true
+        await session.setViability(true)
         defer { Task { await session.shutdown() } }
         let probe = EpisodeEndProbe()
         await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
@@ -355,7 +355,7 @@ struct SessionReestablishmentCoalescingTests {
     @Test("Pending resend TTL expiry notifies the host that content is unrecoverable")
     func pendingResendTTLExpiryNotifiesHostContentUnrecoverable() async throws {
         let session = PQSSession()
-        session.isViable = true
+        await session.setViability(true)
         defer { Task { await session.shutdown() } }
         let probe = EpisodeEndProbe()
         await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
@@ -388,6 +388,48 @@ struct SessionReestablishmentCoalescingTests {
         #expect(observed.contains(where: {
             $0.0 == "alice" && $0.1 == peerDeviceId && $0.2 == sharedId
         }))
+        await session.shutdown()
+    }
+
+    /// RED→GREEN: OOB unavailable already marks terminal locally; the host must
+    /// get `inboundContentUnrecoverable` once per newly terminal id so spool
+    /// copies can be deleted (same contract as pending-resend TTL / resend cap).
+    @Test("OOB resend unavailable notifies the host that content is unrecoverable")
+    func oobResendUnavailableNotifiesHostContentUnrecoverable() async throws {
+        let session = PQSSession()
+        await session.setViability(true)
+        defer { Task { await session.shutdown() } }
+        let probe = EpisodeEndProbe()
+        await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
+
+        let peerDeviceId = UUID()
+        let envelopeIds = ["oob-dead-envelope-a", "oob-dead-envelope-b"]
+
+        await session.handleOutOfBandResendUnavailable(
+            from: "alice",
+            deviceId: peerDeviceId,
+            unavailableEnvelopeMessageIds: envelopeIds)
+
+        var observed: [(String, UUID, String)] = []
+        for _ in 0..<40 {
+            observed = await probe.unrecoverableContent()
+            if observed.count >= envelopeIds.count { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        #expect(
+            Set(observed.map(\.2)) == Set(envelopeIds),
+            "RED: handleOutOfBandResendUnavailable must notify inboundContentUnrecoverable once per newly terminal envelope so the host can delete dead spool copies.")
+        #expect(observed.allSatisfy { $0.0 == "alice" && $0.1 == peerDeviceId })
+
+        // Idempotent: repeat unavailable must not re-notify the host.
+        await session.handleOutOfBandResendUnavailable(
+            from: "alice",
+            deviceId: peerDeviceId,
+            unavailableEnvelopeMessageIds: envelopeIds)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let afterRepeat = await probe.unrecoverableContent()
+        #expect(afterRepeat.count == envelopeIds.count)
+
         await session.shutdown()
     }
 

@@ -324,8 +324,33 @@ public actor SessionCache: PQSSessionStore {
             recipientDeviceId: recipientDeviceId)
     }
 
+    public func fetchOutboundDeviceSendRecord(
+        envelopeMessageId: String
+    ) async throws -> OutboundDeviceSendRecord? {
+        try await store.fetchOutboundDeviceSendRecord(envelopeMessageId: envelopeMessageId)
+    }
+
     public func deleteOutboundDeviceSendRecords(sharedId: String) async throws {
         try await store.deleteOutboundDeviceSendRecords(sharedId: sharedId)
+    }
+
+    public func upsertAcceptedEnvelope(_ record: AcceptedEnvelopeRecord) async throws {
+        try await store.upsertAcceptedEnvelope(record)
+    }
+
+    public func fetchAcceptedEnvelope(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        envelopeMessageId: String
+    ) async throws -> AcceptedEnvelopeRecord? {
+        try await store.fetchAcceptedEnvelope(
+            senderSecretName: senderSecretName,
+            senderDeviceId: senderDeviceId,
+            envelopeMessageId: envelopeMessageId)
+    }
+
+    public func pruneAcceptedEnvelopes(olderThan: Date) async throws -> Int {
+        try await store.pruneAcceptedEnvelopes(olderThan: olderThan)
     }
 
     /// Inserts a message into the cache with proper ordering.
@@ -483,11 +508,30 @@ public actor SessionCache: PQSSessionStore {
     /// - Throws: An error if the update fails.
     public func updateJob(_ job: JobModel) async throws {
         if let index = jobs.firstIndex(where: { $0.id == job.id }) {
-            jobs[index] = job // Update the cached job
             try await store.updateJob(job) // Persist the updated job in the store
+            jobs[index] = job // Publish only after persistence succeeds
         } else {
             throw CacheErrors.jobNotFound // Handle the case where the job is not found in the cache
         }
+    }
+
+    /// Publishes the encrypted ratchet checkpoint and prepared transport payload
+    /// only after the backing store has committed both atomically.
+    public func commitPreparedOutbound(
+        sessionIdentity: SessionIdentity,
+        job: JobModel
+    ) async throws {
+        guard let identityIndex = sessionIdentities.firstIndex(where: { $0.id == sessionIdentity.id }) else {
+            throw CacheErrors.sessionIdentityNotFound
+        }
+        guard let jobIndex = jobs.firstIndex(where: { $0.id == job.id }) else {
+            throw CacheErrors.jobNotFound
+        }
+        try await store.updateSessionIdentity(
+            sessionIdentity,
+            andPreparedJob: job)
+        sessionIdentities[identityIndex] = sessionIdentity
+        jobs[jobIndex] = job
     }
 
     /// Removes a job from the cache and store.

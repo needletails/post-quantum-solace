@@ -156,7 +156,8 @@ public extension PQSSession {
         message: SignedRatchetMessage,
         sender: String,
         deviceId: UUID,
-        messageId: String
+        messageId: String,
+        logicalMessageId: String? = nil
     ) async throws {
         if isInboundFailureQuarantined(sender: sender, deviceId: deviceId, messageId: messageId) {
             logger.log(level: .info, message: "Ignoring quarantined inbound message tuple for sender=\(sender) deviceId=\(deviceId.uuidString)")
@@ -176,7 +177,8 @@ public extension PQSSession {
                 message: message,
                 senderSecretName: sender,
                 senderDeviceId: deviceId,
-                sharedMessageId: messageId)
+                sharedMessageId: messageId,
+                logicalSharedId: logicalMessageId)
             
             try await taskProcessor.inboundTask(
                 message,
@@ -214,31 +216,29 @@ public extension PQSSession {
             throw SessionErrors.sessionNotInitialized
         }
 
-        let packet = FailedMessageResendRequest(
-            failedSharedMessageIds: sharedMessageIds,
-            requestingDeviceId: context.sessionUser.deviceId)
-        let info = TransportEvent.requestMessageResend(packet)
-        let encoded = try BinaryEncoder().encode(info)
-        let isSelf = senderName == context.sessionUser.secretName
-        // Recipient label only; device scope is enforced by feedDeviceScopedControlWrite.
-        let message = CryptoMessage(
-            text: "",
-            metadata: .init(),
-            recipient: isSelf ? .personalMessage : .nickname(senderName),
-            transportInfo: encoded,
-            sentDate: Date(),
-            destructionTime: nil)
-
-        try await taskProcessor.feedDeviceScopedControlWrite(
-            message: message,
-            secretName: senderName,
+        // Strict §4.1: retry requests are out-of-band. They must not
+        // select a Double Ratchet session, mint/demote/promote a lane, or encrypt.
+        // `forceFreshControlLane` is retained for call-site compatibility and ignored.
+        _ = forceFreshControlLane
+        let requestingDeviceId = context.sessionUser.deviceId
+        // Mark sent/transported only after the authenticated OOB write succeeds so a
+        // transport failure leaves the tuple retryable (no false suppress / attempt burn).
+        try await transportDelegate?.sendOutOfBandResendRequest(
+            failedEnvelopeMessageIds: sharedMessageIds,
+            to: senderName,
             deviceId: senderDeviceId,
-            sharedId: UUID().uuidString,
-            session: self,
-            forceFreshInitiating: forceFreshControlLane)
+            requestingDeviceId: requestingDeviceId)
+        await markPeerResendRequestSent(
+            sender: senderName,
+            deviceId: senderDeviceId,
+            failedMessageId: sharedMessageIds[0])
+        await markPeerResendRequestTransported(
+            sender: senderName,
+            deviceId: senderDeviceId,
+            failedMessageIds: sharedMessageIds)
         logger.log(
             level: .info,
-            message: "pqs.recovery.resendRequestSubmitted sender=\(senderName) deviceId=\(senderDeviceId) requestedCount=\(sharedMessageIds.count) ids=\(sharedMessageIds.joined(separator: ",")) forceFresh=\(forceFreshControlLane)")
+            message: "pqs.recovery.resendRequestSubmittedOutOfBand sender=\(senderName) deviceId=\(senderDeviceId) requestingDeviceId=\(requestingDeviceId) requestedCount=\(sharedMessageIds.count) ids=\(sharedMessageIds.joined(separator: ","))")
     }
 
     @discardableResult
@@ -252,6 +252,37 @@ public extension PQSSession {
             deviceId: senderDeviceId,
             failedSharedMessageIds: failedSharedMessageIds,
             session: self)
+    }
+
+    /// Applies an authenticated transport-level terminal-unavailable notice.
+    /// The transport must verify origin/signature before invoking this method.
+    func handleOutOfBandResendUnavailable(
+        from senderName: String,
+        deviceId senderDeviceId: UUID,
+        unavailableEnvelopeMessageIds: [String]
+    ) async {
+        _ = await clearPendingResends(
+            sender: senderName,
+            deviceId: senderDeviceId,
+            messageIds: unavailableEnvelopeMessageIds)
+        let delegate = sessionDelegate
+        for messageId in unavailableEnvelopeMessageIds {
+            let newlyTerminal = markInboundContentUnrecoverable(
+                sender: senderName,
+                deviceId: senderDeviceId,
+                sharedId: messageId)
+            guard newlyTerminal else { continue }
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.contentUnrecoverable sharedId=\(messageId) sender=\(senderName) deviceId=\(senderDeviceId.uuidString) reason=oobUnavailable")
+            // Protocol signal: drives the transport's terminal purge of the
+            // spool copy. Same contract as pending-resend TTL / resend-cap.
+            _ = await scheduleTransportProtocolWork {
+                await delegate?.inboundContentUnrecoverable(
+                    senderSecretName: senderName,
+                    senderDeviceId: senderDeviceId,
+                    sharedMessageId: messageId)
+            }
+        }
     }
     
     // MARK: Outbound
@@ -317,9 +348,9 @@ public extension PQSSession {
                     shouldPersist = false
                 case .publishedOneTimeKeysReplenished:
                     shouldPersist = false
-                case .requestMessageResend(_):
-                    shouldPersist = false
-                case .messageResendUnavailable(_):
+                case .requestMessageResend, .messageResendUnavailable:
+                    // DEAD LEGACY: encrypted retry controls are not emitted. Retained so
+                    // any queued encrypted frames still avoid chat persistence.
                     shouldPersist = false
                 }
             } catch {}

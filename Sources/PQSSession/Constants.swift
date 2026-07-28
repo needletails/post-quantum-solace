@@ -185,6 +185,14 @@ public enum PQSSessionConstants: Sendable {
     /// much longer than the failure-policy cooldowns.
     public static let terminalInboundOutcomeTTLSeconds: TimeInterval = 60 * 60 * 24 * 7
 
+    // MARK: - Session work coordinator
+
+    /// Maximum concurrent session-work children (transport protocol + background).
+    public static let sessionWorkMaxWorkers = 4
+
+    /// Maximum pending session-work items before producers backpressure.
+    public static let sessionWorkMaxPending = 64
+
     // MARK: - Schema versioning
 
     /// Current schema version for persisted session state.

@@ -79,6 +79,7 @@ extension NeedleTailAsyncConsumer {
 
         // Honor EncryptableTask.priority so user ciphertext (.urgent) is not
         // head-of-line blocked behind repair/control (.background) work.
+        // Urgent enqueue is FIFO within-band so offline backlog drains oldest-first.
         await feedConsumer(typedJob, priority: props.task.priority)
     }
     

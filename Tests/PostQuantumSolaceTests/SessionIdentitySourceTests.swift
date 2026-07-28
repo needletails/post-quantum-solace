@@ -72,4 +72,43 @@ struct SessionIdentitySourceTests {
         }()
         #expect(refreshBody.contains("pruneStaleSessionIdentities"))
     }
+
+    @Test("device-local reset never performs account-wide transient cleanup")
+    func deviceLocalResetUsesCacheOnlyInvalidation() throws {
+        let source = try PQSSessionIdentitySource.read(
+            "Sources/PQSSession/PQSSession+SessionIdentity.swift")
+        let resetStart = try #require(
+            source.range(of: "internal func resetSessionIdentityForFreshSession("))
+        let resetWindow = String(source[resetStart.lowerBound...].prefix(12_000))
+        #expect(resetWindow.contains("clearOrphanResendRecoveryState("))
+        #expect(resetWindow.contains("invalidateSessionIdentityCache(secretName: secretName)"))
+        #expect(!resetWindow.contains("removeIdentity(with: secretName)"))
+    }
+
+    @Test("startup does not prune archives before mailbox settlement")
+    func archiveMaintenanceRequiresReplaySettlement() throws {
+        let source = try PQSSessionIdentitySource.read(
+            "Sources/PQSSession/PQSSession.swift")
+        let startSession = try #require(source.range(of: "public func startSession("))
+        let startWindow = String(source[startSession.lowerBound...].prefix(16_000))
+        #expect(!startWindow.contains("cleanupAllInactiveSessionSnapshots()"))
+        #expect(source.contains("public func offlineReplayDidSettle() async"))
+        #expect(source.contains("if $0.hasState != $1.hasState"))
+    }
+
+    @Test("prepared outbound commits job and ratchet checkpoint together")
+    func preparedOutboundUsesAtomicCacheCommit() throws {
+        let ratchet = try PQSSessionIdentitySource.read(
+            "Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
+        let cache = try PQSSessionIdentitySource.read(
+            "Sources/PQSSession/Cache/SessionCache.swift")
+        let sequence = try PQSSessionIdentitySource.read(
+            "Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
+        #expect(ratchet.contains("atomicOutboundPreparationIdentityIds"))
+        #expect(ratchet.contains("cache.commitPreparedOutbound("))
+        #expect(ratchet.contains("JobModel.PreparedOutbound("))
+        #expect(cache.contains("andPreparedJob: job"))
+        #expect(sequence.contains("await job.props(symmetricKey: symmetricKey) ?? props"))
+        #expect(sequence.contains("updatedProps.delayedUntil = nil"))
+    }
 }

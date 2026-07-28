@@ -61,11 +61,15 @@ public struct SignedRatchetMessageMetadata: Sendable {
     /// for message delivery, but should not be included in the message payload.
     public let transportMetadata: Data?
 
-    /// A shared identifier for message correlation and tracking.
+    /// Logical / application shared identifier (chat, media, plaintext lookup).
     ///
-    /// Used to group related messages and track message delivery across
-    /// different devices and sessions.
+    /// Stable across fan-out devices and orphan resends. Not the envelope MessageID.
     public let sharedMessageId: String
+
+    /// §4.1 MessageID: unique per encrypted send to one recipient device.
+    ///
+    /// Replaced on every resend. Wire `MessagePacket.id` uses this value.
+    public let envelopeMessageId: String
 
     /// An enum contains events that PQSSession needs to communicate with the transport
     ///
@@ -78,13 +82,16 @@ public struct SignedRatchetMessageMetadata: Sendable {
     ///   - deviceId: The unique identifier for the recipient's device
     ///   - recipient: The type of recipient for the message
     ///   - transportMetadata: Optional additional metadata for transport layer processing
-    ///   - sharedMessageId: A shared identifier for message correlation and tracking
+    ///   - sharedMessageId: Logical shared identifier (stable across devices/resends)
+    ///   - envelopeMessageId: Unique envelope MessageID for this encrypted envelope
+    ///   - transportEvent: Optional transport event
     public init(
         secretName: String,
         deviceId: UUID,
         recipient: MessageRecipient,
         transportMetadata: Data?,
         sharedMessageId: String,
+        envelopeMessageId: String? = nil,
         transportEvent: TransportEvent?
     ) {
         self.secretName = secretName
@@ -92,6 +99,7 @@ public struct SignedRatchetMessageMetadata: Sendable {
         self.recipient = recipient
         self.transportMetadata = transportMetadata
         self.sharedMessageId = sharedMessageId
+        self.envelopeMessageId = envelopeMessageId ?? sharedMessageId
         self.transportEvent = transportEvent
     }
 }
@@ -269,4 +277,38 @@ public protocol SessionTransport: Sendable {
         recipient: MessageRecipient,
         metadata: Data
     ) async throws
+
+    /// Sends an authenticated out-of-band §4.1 retry request (not Double Ratchet).
+    func sendOutOfBandResendRequest(
+        failedEnvelopeMessageIds: [String],
+        to secretName: String,
+        deviceId: UUID,
+        requestingDeviceId: UUID
+    ) async throws
+
+    /// Sends an authenticated out-of-band notice that envelopes are unrecoverable.
+    func sendOutOfBandResendUnavailable(
+        unavailableEnvelopeMessageIds: [String],
+        to secretName: String,
+        deviceId: UUID,
+        respondingDeviceId: UUID
+    ) async throws
+}
+
+public extension SessionTransport {
+    /// Default no-op for transports that do not implement authenticated OOB retry.
+    func sendOutOfBandResendRequest(
+        failedEnvelopeMessageIds: [String],
+        to secretName: String,
+        deviceId: UUID,
+        requestingDeviceId: UUID
+    ) async throws {}
+
+    /// Default no-op for transports that do not implement authenticated OOB retry.
+    func sendOutOfBandResendUnavailable(
+        unavailableEnvelopeMessageIds: [String],
+        to secretName: String,
+        deviceId: UUID,
+        respondingDeviceId: UUID
+    ) async throws {}
 }

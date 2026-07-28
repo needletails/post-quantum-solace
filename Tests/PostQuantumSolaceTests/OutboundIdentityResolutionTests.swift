@@ -23,7 +23,7 @@ actor OutboundIdentityResolutionTests {
         await session.setTransportDelegate(conformer: transport)
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: receiver)
-        session.isViable = true
+        await session.setViability(true)
         await transportStore.setPublishableName("alice")
 
         session = try await session.createSession(secretName: "alice", appPassword: "123") {}
@@ -79,7 +79,7 @@ actor OutboundIdentityResolutionTests {
         await session.setTransportDelegate(conformer: transport)
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: receiver)
-        session.isViable = true
+        await session.setViability(true)
         await transportStore.setPublishableName("alice")
 
         session = try await session.createSession(secretName: "alice", appPassword: "123") {}
@@ -130,7 +130,7 @@ actor OutboundIdentityResolutionTests {
         await session.setTransportDelegate(conformer: transport)
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: receiver)
-        session.isViable = true
+        await session.setViability(true)
         await transportStore.setPublishableName("alice")
 
         session = try await session.createSession(secretName: "alice", appPassword: "123") {}

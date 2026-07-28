@@ -147,7 +147,7 @@ extension TaskProcessor {
             id: messageId,
             communicationId: communication.id,
             sessionContextId: props.sessionContextId,
-            sharedId: inboundTask.sharedMessageId,
+            sharedId: inboundTask.resolvedLogicalSharedId,
             sequenceNumber: newMessageCount,
             props: .init(
                 id: messageId,

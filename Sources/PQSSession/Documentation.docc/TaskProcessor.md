@@ -14,8 +14,10 @@ in-flight cryptographic work proceeds on a dedicated executor.
 - Coalesces and deduplicates control events (key rotation, OTK refresh,
   identity-change probes) using the windows defined in
   ``PQSSessionConstants``.
-- Restarts itself across `start`/`shutdown` cycles via
-  ``PQSSession/resumeJobQueue()``.
+- Is terminal after its ratchet manager shuts down. A successful
+  ``PQSSession/startSession(appPassword:)`` replaces it with a fresh processor
+  and work coordinator, then ``PQSSession/resumeJobQueue()`` drains durable
+  jobs. `resumeJobQueue()` alone cannot reopen a shut-down ratchet manager.
 
 ## Friendship / OTK bootstrap (3.2.0)
 

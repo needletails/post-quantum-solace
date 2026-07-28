@@ -48,7 +48,7 @@ extension TaskProcessor {
         // `resumeJobQueue` after IRC registration — never depend on in-memory dequeue.
         try await cache.createJob(job)
 
-        if !session.isViable {
+        if !(await session.isViable) {
             if case .writeMessage(let outbound) = task.task {
                 logger.log(
                     level: .info,
@@ -69,7 +69,13 @@ extension TaskProcessor {
         // from `jobConsumer`. If we don't enqueue here, the job may not run until a future
         // cache reload happens (which can look like the task processor "stalled").
         try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
-        
+
+        // A prior writer failure owns the wake-up boundary. Keep newly persisted
+        // work queued until registration explicitly resumes the processor.
+        guard !isPausedUntilTransportReady else {
+            return
+        }
+
         try await startProcessingIfNeeded(session)
     }
     
@@ -85,8 +91,11 @@ extension TaskProcessor {
         } else {
             try await loadFromCache(cache: cache, symmetricKey: symmetricKey)
         }
-        
+
         if let session {
+            // `loadTasks(..., session:)` is the explicit event-driven resume path
+            // used after registration/writer readiness.
+            isPausedUntilTransportReady = false
             try await startProcessingIfNeeded(session)
         }
     }
@@ -101,6 +110,22 @@ extension TaskProcessor {
     
     private func stop() {
         isRunning = false
+        let waiters = processingIdleWaiters
+        processingIdleWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    /// Stops queue iteration and waits for the in-flight item to leave the
+    /// processor before session delegates and cache state are released.
+    func prepareForShutdown() async {
+        isPausedUntilTransportReady = true
+        await jobConsumer.gracefulShutdown()
+        guard isRunning else { return }
+        await withCheckedContinuation { continuation in
+            processingIdleWaiters.append(continuation)
+        }
     }
     
     // MARK: - Startup
@@ -110,19 +135,30 @@ extension TaskProcessor {
             return
         }
         
-        try await Task {
+        let loopExit = try await Task {
             defer {
                 stop()
             }
             do {
-                try await self.processingLoop(session)
+                return try await self.processingLoop(session)
             } catch {
                 self.logger.log(level: .error, message: "Processor crashed: \(error)")
                 throw error
             }
         }.value
 
-        guard session.isViable else {
+        // A paused job stays durable but must wait for a concrete future event
+        // (`feedTask`, `resumeJobQueue`, viability/writer readiness). Immediately
+        // reloading it here turns CancellationError into a tight cache/crypto loop.
+        guard loopExit == .drained else {
+            return
+        }
+
+        guard await session.isViable else {
+            return
+        }
+
+        guard !isPausedUntilTransportReady else {
             return
         }
 
@@ -134,14 +170,19 @@ extension TaskProcessor {
     }
     // MARK: - Core loop
     
-    private func processingLoop(_ session: PQSSession) async throws {
+    private enum ProcessingLoopExit: Sendable, Equatable {
+        case drained
+        case paused
+    }
+
+    private func processingLoop(_ session: PQSSession) async throws -> ProcessingLoopExit {
         guard let cache = await session.cache else {
             throw PQSSession.SessionErrors.databaseNotInitialized
         }
 
-        guard session.isViable else {
+        guard await session.isViable else {
             await jobConsumer.gracefulShutdown()
-            return
+            return .paused
         }
         
         deferredDelayedJobIds.removeAll()
@@ -152,19 +193,19 @@ extension TaskProcessor {
             try await loadFromCache(cache: cache, symmetricKey: symmetricKey)
         }
         
-        func startLoop() async throws {
+        func startLoop() async throws -> ProcessingLoopExit {
             // If the session is not viable, pause processing to avoid busy-looping and
             // repeatedly re-loading the same jobs from cache.
-            guard session.isViable else {
+            guard await session.isViable else {
                 await jobConsumer.gracefulShutdown()
-                return
+                return .paused
             }
             
             if await jobConsumer.deque.isEmpty {
                 let remaining = try await cache.fetchJobs()
                 if remaining.isEmpty {
                     await jobConsumer.gracefulShutdown()
-                    return
+                    return .drained
                 }
                 try await loadFromCache(cache: cache, symmetricKey: symmetricKey)
             }
@@ -187,11 +228,11 @@ extension TaskProcessor {
                         
                         if outcome == .paused {
                             await jobConsumer.gracefulShutdown()
-                            return
+                            return .paused
                         }
                         if await jobConsumer.deque.isEmpty {
                             await jobConsumer.gracefulShutdown()
-                            return
+                            return .drained
                         }
                     } catch {
                         await jobConsumer.gracefulShutdown()
@@ -201,9 +242,9 @@ extension TaskProcessor {
                     break
                 }
             }
-            try await startLoop()
+            return try await startLoop()
         }
-        try await startLoop()
+        return try await startLoop()
     }
     
     // MARK: - Cache loading
@@ -284,7 +325,7 @@ extension TaskProcessor {
             deferredDelayedJobIds.remove(job.id)
         }
         
-        guard session.isViable else {
+        guard await session.isViable else {
             // Leave the job in cache; we will reload it once the session becomes viable again.
             if case .writeMessage(let message) = props.task.task {
                 logger.log(
@@ -294,8 +335,23 @@ extension TaskProcessor {
             return .paused
         }
 
+        if case .writeMessage(let outboundTask) = props.task.task {
+            processingOutboundJobBySharedId[outboundTask.sharedId] = job
+        }
+        defer {
+            if case .writeMessage(let outboundTask) = props.task.task {
+                processingOutboundJobBySharedId.removeValue(forKey: outboundTask.sharedId)
+            }
+        }
+
         do {
-            if let taskDelegate {
+            if let prepared = props.preparedOutbound,
+               case .writeMessage(let outboundTask) = props.task.task {
+                try await sendPreparedOutbound(
+                    prepared,
+                    outboundTask: outboundTask,
+                    session: session)
+            } else if let taskDelegate {
                 try await taskDelegate.performRatchet(task: props.task.task, session: session)
             } else {
                 try await performRatchet(task: props.task.task, session: session)
@@ -811,8 +867,13 @@ extension TaskProcessor {
             }
         } catch is CancellationError {
             // Shutdown/cancellation is not a decrypt outcome: the job stays in
-            // cache for the next drain and the spool copy must not be purged.
-            return .failed
+            // cache for the next concrete resume event and the spool copy must
+            // not be purged. Returning paused also prevents an immediate
+            // recursive cache reload from spinning on a closed ratchet gate.
+            logger.log(
+                level: .info,
+                message: "Job processing paused after cancellation; retained durable job for explicit resume")
+            return .paused
         } catch {
             
             // If we are throwing an error for some other reason... On write we delay the message sending for retry before considering it a loss and deleting
@@ -833,7 +894,7 @@ extension TaskProcessor {
                 // composed while going offline. Park it instead — the job stays in
                 // cache and the viability-transition drain replays it on reconnect,
                 // re-encrypting from scratch.
-                if !session.isViable || isConnectionNonViableError(error) {
+                if !(await session.isViable) || isConnectionNonViableError(error) {
                     logger.log(
                         level: .info,
                         message: "pqs.outbound.parkedForViability sharedId=\(message.sharedId) recipient=\(message.message.recipient) error=\(error)")
@@ -1029,44 +1090,43 @@ extension TaskProcessor {
             deviceId: message.senderDeviceId)
         // Preference map is success-only (never written on try-all failure — that
         // dogfood cascade demoted unique session ids under blankForHeader storms).
-        let proveFailedPreferredId = preferredSessionIdentityIdByPeerDevice[preferenceKey]
-        let preferredFailedInTryAll = proveFailedPreferredId != nil
+        // Pin existence alone is NOT prove-fail: offline backlog / ephemeral frames
+        // fail on a healthy preferred. Demoting that pin on every undecryptable
+        // thrash-demotes the live lane (dogfood 745495D9 after 386AD133). Clear +
+        // demote only when orphan replay rearm proves retransported material still
+        // cannot decrypt — matching "demote remains rearm-gated".
+        let pinnedPreferredId = preferredSessionIdentityIdByPeerDevice[preferenceKey]
         let rearmedAfterFailedReplay = await session.armPeerResendRetryAfterFailedReplay(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId,
             failedMessageId: message.sharedMessageId,
             currentFingerprint: frameFingerprint)
         var preferredCleared = false
-        if rearmedAfterFailedReplay || preferredFailedInTryAll {
-            if rearmedAfterFailedReplay {
-                logger.log(
-                    level: .info,
-                    message: "pqs.recovery.orphanReplayStillUndecryptable failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=rearmNack")
-            }
-            // Stuck preferred pin on a dead lane — clear pin, demote that active, and
-            // demote zombie blanks so NACK control / next initiating frame can land.
-            if preferredFailedInTryAll || rearmedAfterFailedReplay {
-                clearPreferredSessionIdentity(
-                    secretName: message.senderSecretName,
-                    deviceId: message.senderDeviceId)
-                preferredCleared = true
-            }
-            if let proveFailedPreferredId {
+        if rearmedAfterFailedReplay {
+            logger.log(
+                level: .info,
+                message: "pqs.recovery.orphanReplayStillUndecryptable failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=rearmNack")
+            // Stuck preferred after failed owner retransport — clear pin, demote that
+            // active, and demote zombie blanks so NACK control / next initiating frame
+            // can land.
+            clearPreferredSessionIdentity(
+                secretName: message.senderSecretName,
+                deviceId: message.senderDeviceId)
+            preferredCleared = true
+            if let pinnedPreferredId {
                 _ = try? await session.demoteProveFailedActive(
-                    sessionId: proveFailedPreferredId,
+                    sessionId: pinnedPreferredId,
                     secretName: message.senderSecretName,
                     deviceId: message.senderDeviceId)
             }
             _ = try? await session.demoteZombieStateLessActives(
                 secretName: message.senderSecretName,
                 deviceId: message.senderDeviceId)
-            if preferredCleared {
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.orphanReplayPreferredCleared sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId)")
-            }
+            DecryptFailureAuditLog.log(
+                "pqs.recovery.orphanReplayPreferredCleared sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId)")
         }
-        // Escape poison preferred by clearing pin + riding outbound/orphan (same as
-        // unavailable NACKs). Never force-mint solely because priorSubmissions == 0.
+        // Resolve live heal ownership before deciding whether recovery control may
+        // mint. A live orphan/recovery lane always owns subsequent control delivery.
         let liveInitiatingId = await session.orphanResendInitiatingSessionId(
             secretName: message.senderSecretName,
             deviceId: message.senderDeviceId)
@@ -1074,10 +1134,6 @@ extension TaskProcessor {
             secretName: message.senderSecretName,
             deviceId: message.senderDeviceId)
         let liveOrphanOrRecovery = liveInitiatingId != nil || liveRecoveryId != nil
-        let forceFreshControlLane = ControlDeliveryLanePolicy.shouldMintFreshControlLane(
-            preferredFailedInTryAll: preferredFailedInTryAll,
-            preferredCleared: preferredCleared || rearmedAfterFailedReplay,
-            liveOrphanOrRecovery: liveOrphanOrRecovery)
 
         // While another recovery episode is open (e.g. hard ratchet repair), coalesce.
         // Skip coalesce when we just re-armed after a failed orphan replay — that sharedId
@@ -1161,7 +1217,7 @@ extension TaskProcessor {
         // Transport may already be non-viable (VPN/core recycle). Park the inbound job
         // for resumeJobQueue on viability restore — do not delete or mark failure yet,
         // or the NACK is lost until another copy of the ciphertext arrives.
-        if !session.isViable {
+        if !(await session.isViable) {
             auditInboundDecryptFailure(
                 message: message,
                 failureClass: failureClass,
@@ -1212,15 +1268,18 @@ extension TaskProcessor {
             return .deleted
         }
 
-        // bodyDecryptionFailed / sibling undecryptable classes request a sender
-        // orphan-resend. Do not remint the local unanswered pin here — that fed
-        // archive dirt on every NACK wave. Dead pins heal via missingOneTimeKey /
-        // inbound peerRefresh evidence; content heals via sender orphanResend.
+        // Try-all has now proved that no local receive candidate can decrypt this
+        // peer-device frame. Strict §4.1: emit an authenticated OOB retry —
+        // never select a Double Ratchet session, mint, demote, or write preference
+        // for the retry itself. Sender orphan-resend owns content heal.
+        _ = preferredCleared
+        _ = liveOrphanOrRecovery
+        _ = preferenceKey
         let didRequestResend = await requestPeerResendIfAllowed(
             message: message,
             failureClass: failureClass,
             session: session,
-            forceFreshControlLane: forceFreshControlLane,
+            forceFreshControlLane: false,
             frameFingerprint: frameFingerprint)
         var action = didRequestResend ? "resendRequested" : "resendSkipped"
         if laneSaturated {
@@ -1234,7 +1293,11 @@ extension TaskProcessor {
             error: diagnostic,
             action: action,
             metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
-        await session.markInboundFailure(message, failureClass: failureClass)
+        // Only suppress after a successful OOB write. A failed transport side effect
+        // must leave the tuple retryable for the next concrete inbound/event.
+        if didRequestResend {
+            await session.markInboundFailure(message, failureClass: failureClass)
+        }
         try await cache.deleteJob(job)
         return .deleted
     }
@@ -1296,37 +1359,21 @@ extension TaskProcessor {
         symmetricKey: SymmetricKey,
         error: Error
     ) async throws -> JobProcessingOutcome {
-        var updatedProps = props
+        // Encryption may have atomically replaced this job with a prepared payload
+        // after `process` captured `props`. Always merge retry bookkeeping into the
+        // latest durable value so a transport error cannot erase the ciphertext.
+        var updatedProps = await job.props(symmetricKey: symmetricKey) ?? props
         updatedProps.attempts += 1
-        // Transport can throw non-viable while `session.isViable` is still true during
-        // VPN/core recycle. Park for event-driven resumeJobQueue (IRC viability restored)
-        // instead of short timer requeues that flood warnings.
-        let parkForViability = !session.isViable || isConnectionNonViableError(error)
-        if parkForViability {
-            updatedProps.delayedUntil = nil
-        } else {
-            updatedProps.delayedUntil = Date().addingTimeInterval(min(0.10 * Double(updatedProps.attempts), 1.0))
-        }
+        // Every prepared transport failure waits for the next concrete registration /
+        // writer-ready event. Timer requeues can race the recycled writer and duplicate
+        // warning storms without adding a new recovery signal.
+        updatedProps.delayedUntil = nil
+        isPausedUntilTransportReady = true
         _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
         try await cache.updateJob(job)
-        if !parkForViability {
-            try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
-        }
-        // A NACK that has not reached the wire must not leave its failed ids
-        // suppressed: submission attempts are only counted on transported frames,
-        // and the sender cannot orphan-resend until the request transports. Clear
-        // the failure-class suppress so the tuple stays retryable; the armed
-        // request cooldown still bounds duplicate NACKs while this job retries.
-        if case .writeMessage(let outboundTask) = props.task.task,
-           let pending = pendingOutboundTransportBySharedId[outboundTask.sharedId],
-           case .requestMessageResend(let request) = pending.metadata.transportEvent {
-            for failedId in request.failedSharedMessageIds {
-                _ = await session.takeInboundFailureClasses(
-                    sender: pending.metadata.secretName,
-                    deviceId: pending.metadata.deviceId,
-                    messageId: failedId)
-            }
-        }
+        // DEAD LEGACY: encrypted TransportEvent.requestMessageResend no longer spends
+        // attempt counters on DR transport. OOB submit owns attempt bookkeeping.
+        // if case .writeMessage(...), case .requestMessageResend(let request) = ... { ... }
         let logMessage: String
         if let recoveryLog = recoveryTransportSendFailureLog(
             props: props,
@@ -1357,12 +1404,11 @@ extension TaskProcessor {
         switch transportEvent {
         case .sessionReestablishment(let envelope):
             return "pqs.recovery.reestablishmentSendFailed sharedId=\(outboundTask.sharedId) kind=\(envelope.kind.rawValue) response=\(envelope.isResponse) epoch=\(envelope.epoch) intent=\(envelope.intentId?.uuidString ?? "nil") retryAttempt=\(attempt) error=\(error)"
-        case .requestMessageResend(let request):
-            return "pqs.recovery.resendRequestSendFailed sharedId=\(outboundTask.sharedId) requestingDeviceId=\(request.requestingDeviceId) requestedCount=\(request.failedSharedMessageIds.count) ids=\(request.failedSharedMessageIds.joined(separator: ",")) retryAttempt=\(attempt) error=\(error)"
+        case .requestMessageResend, .messageResendUnavailable:
+            // DEAD LEGACY: encrypted retry send-failure audits. Confirm unused, then delete.
+            return nil
         case .linkedDeviceReprovisioning(let bundle):
             return "pqs.recovery.linkedDeviceReprovisioningSendFailed sharedId=\(outboundTask.sharedId) targetDeviceId=\(bundle.targetDeviceId) retryAttempt=\(attempt) error=\(error)"
-        case .messageResendUnavailable(let notice):
-            return "pqs.recovery.resendUnavailableSendFailed sharedId=\(outboundTask.sharedId) respondingDeviceId=\(notice.respondingDeviceId) unavailableCount=\(notice.unavailableSharedMessageIds.count) retryAttempt=\(attempt) error=\(error)"
         case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished:
             return nil
         }
@@ -1445,7 +1491,7 @@ extension TaskProcessor {
         forceFreshControlLane: Bool = false,
         frameFingerprint: Data? = nil
     ) async -> Bool {
-        guard session.isViable else {
+        guard await session.isViable else {
             logger.log(
                 level: .info,
                 message: "pqs.recovery.resendRequestSkipped reason=nonViable failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId)")
@@ -1824,12 +1870,12 @@ extension TaskProcessor {
         }
 
         switch event {
-        case .sessionReestablishment, .requestMessageResend:
+        case .sessionReestablishment:
             return true
-        // The unavailable notice is what terminates the requester's resend loop;
-        // dropping it during an open episode would keep the peer looping.
-        case .messageResendUnavailable:
-            return true
+        case .requestMessageResend, .messageResendUnavailable:
+            // DEAD LEGACY: encrypted retry is no longer a recovery-critical DR control.
+            // Confirm unused, then delete these arms / TransportEvent cases.
+            return false
         // OTK handshake is the gate for delete→re-add. A single failed encrypt must
         // not burn the outbound repair cooldown and leave bootstrap stranded.
         case .synchronizeOneTimeKeys:

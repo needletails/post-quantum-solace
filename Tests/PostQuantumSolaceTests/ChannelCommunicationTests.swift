@@ -42,7 +42,7 @@ actor ChannelCommunicationTests {
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: ReceiverDelegate(session: session))
 
-        session.isViable = true
+        await session.setViability(true)
         await store.setPublishableName(mockUserData.ssn)
 
         session = try await session.createSession(
