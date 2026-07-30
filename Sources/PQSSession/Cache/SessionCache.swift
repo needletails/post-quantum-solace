@@ -538,8 +538,11 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter job: The job to be removed.
     /// - Throws: An error if the removal fails.
     public func deleteJob(_ job: JobModel) async throws {
-        jobs.removeAll(where: { $0.id == job.id }) // Remove from cache
-        try await store.deleteJob(job) // Remove from the store
+        // Store first: `fetchJobs()` reloads from the store when the in-memory
+        // list is empty. Clearing memory before the store lets a concurrent
+        // fetch resurrect the row that is still being deleted.
+        try await store.deleteJob(job)
+        jobs.removeAll(where: { $0.id == job.id })
     }
 
     // MARK: - Media Job Methods

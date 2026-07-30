@@ -390,4 +390,4 @@ clear each other.
 - `AcceptedEnvelopeLedgerPolicy`
 - `InboundRecoveryStormPolicy`
 - `OrphanResendRemintPolicy`
-- `DecryptFailureAuditLog`
+- `PQSAuditLog`

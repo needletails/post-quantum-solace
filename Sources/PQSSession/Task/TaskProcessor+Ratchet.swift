@@ -622,8 +622,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             logger.log(
                 level: .info,
                 message: "pqs.recovery.orphanResendProtectsPersonalRefresh peer=\(props.secretName) deviceId=\(props.deviceId) sessionId=\(identity.id)")
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.orphanResendProtectsPersonalRefresh peer=\(props.secretName) deviceId=\(props.deviceId.uuidString) sessionId=\(identity.id.uuidString)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendProtectsPersonalRefresh peer=\(props.secretName) deviceId=\(props.deviceId.uuidString) sessionId=\(identity.id.uuidString)")
             return identity
         }
 
@@ -1000,16 +999,14 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 clearPreferredSessionIdentity(secretName: secretName, deviceId: deviceId)
                 surgicalControlSessionIdentityIdByPeerDevice[episodeKey] = fresh.id
             } else {
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.controlDeliveryFreshLaneDetached peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(fresh.id.uuidString) reason=episodeAdvanced")
+                PQSAuditLog.log(.recovery, "pqs.recovery.controlDeliveryFreshLaneDetached peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(fresh.id.uuidString) reason=episodeAdvanced")
             }
             finishSurgicalControlEpisodeMint(
                 episodeKey: episodeKey,
                 completion: SurgicalControlEpisodeMintCompletion(
                     episodeGeneration: mintEpisodeGeneration,
                     result: .success(fresh.id)))
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.controlDeliveryFreshLane peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(fresh.id.uuidString) sameAccount=\(isSameAccount) surgicalRequired=\(requireSurgical) episodeCurrent=\(episodeIsCurrent)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.controlDeliveryFreshLane peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(fresh.id.uuidString) sameAccount=\(isSameAccount) surgicalRequired=\(requireSurgical) episodeCurrent=\(episodeIsCurrent)")
             return fresh
         } catch {
             finishSurgicalControlEpisodeMint(
@@ -1104,8 +1101,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         secretName: String,
         deviceId: UUID
     ) {
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.controlDeliveryEpisodeLaneReused peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(identity.id.uuidString)")
+        PQSAuditLog.log(.recovery, "pqs.recovery.controlDeliveryEpisodeLaneReused peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(identity.id.uuidString)")
     }
 
     private func waitForSurgicalControlEpisodeMint(
@@ -1191,8 +1187,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 sendOneTimeIdentities: false,
                 reason: "unansweredInitiatorReset")
             clearPreferredSessionIdentity(secretName: peerSecretName, deviceId: peerDeviceId)
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.unansweredInitiatorLaneReset trigger=\(trigger) peer=\(peerSecretName) deviceId=\(peerDeviceId.uuidString) forceAnswered=\(forceRemintEvenIfAnswered)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.unansweredInitiatorLaneReset trigger=\(trigger) peer=\(peerSecretName) deviceId=\(peerDeviceId.uuidString) forceAnswered=\(forceRemintEvenIfAnswered)")
         } catch PQSSession.SessionErrors.invalidDeviceIdentity {
             // The device is absent from the peer's current verified config
             // (re-registered install). There is no live lane to heal.
@@ -1283,8 +1278,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             secretName: secretName,
             deviceId: deviceId,
             session: session)
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.orphanResendRemintAfterProveFail sharedId=\(sharedId) requester=\(secretName) deviceId=\(deviceId.uuidString) newSessionId=\(replayIdentity.id.uuidString)")
+        PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendRemintAfterProveFail sharedId=\(sharedId) requester=\(secretName) deviceId=\(deviceId.uuidString) newSessionId=\(replayIdentity.id.uuidString)")
         return replayIdentity
     }
 
@@ -1530,10 +1524,17 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 curveOneTimeKeyId: results.localOneTimePrivateKey?.id.uuidString,
                 mlKEMOneTimeKeyId: results.localMLKEMPrivateKey.id.uuidString)
         }
-        try await session.transportDelegate?.sendMessage(signedMessage, metadata: transportMetadata)
-        DecryptFailureAuditLog.log(
-            "pqs.send.deviceTransportOk sharedId=\(outboundTask.sharedId) envelopeMessageId=\(envelopeMessageId) recipientSecret=\(props.secretName) recipientDeviceId=\(props.deviceId.uuidString) sessionIdentityId=\(sessionIdentity.id.uuidString) recipient=\(outboundTask.message.recipient.auditRecipientTag) persisted=\(outboundTask.isPersistedOutbound)",
+        
+        guard let transportDelegate = await session.transportDelegate else {
+            PQSAuditLog.log(.send, "pqs.send.transportMissing sharedId=\(outboundTask.sharedId)", level: .error)
+            throw PQSSession.SessionErrors.transportNotInitialized
+        }
+        
+        try await transportDelegate.sendMessage(signedMessage, metadata: transportMetadata)
+        
+        PQSAuditLog.log(.send, "pqs.send.deviceTransportOk sharedId=\(outboundTask.sharedId) envelopeMessageId=\(envelopeMessageId) recipientSecret=\(props.secretName) recipientDeviceId=\(props.deviceId.uuidString) sessionIdentityId=\(sessionIdentity.id.uuidString) recipient=\(outboundTask.message.recipient.auditRecipientTag) persisted=\(outboundTask.isPersistedOutbound)",
             level: .info)
+        
         // MessageRecord-lite: envelope id + logical sharedId + encrypting SessionID.
         let priorAttempt = await session.outboundDeviceSendRecord(
             sharedId: outboundTask.sharedId,
@@ -1553,8 +1554,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             resendAttempt: isOrphanReplayForAttempt ? max(0, priorAttempt) + 1 : 0)
         let isOrphanReplay = isOrphanReplayForAttempt
         if isOrphanReplay {
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.messageRecordSessionId=\(sessionIdentity.id.uuidString) sharedId=\(outboundTask.sharedId) recipientDeviceId=\(props.deviceId.uuidString)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.messageRecordSessionId=\(sessionIdentity.id.uuidString) sharedId=\(outboundTask.sharedId) recipientDeviceId=\(props.deviceId.uuidString)")
             rememberOrphanResendTransport(
                 requestingDeviceId: props.deviceId,
                 sharedId: outboundTask.sharedId,
@@ -1668,8 +1668,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             senderDeviceId: inboundTask.senderDeviceId,
             envelopeMessageId: inboundTask.sharedMessageId
         ) {
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.redeliveryDropped reason=alreadyAccepted sharedId=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.redeliveryDropped reason=alreadyAccepted sharedId=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
             let acceptedSharedId = inboundTask.sharedMessageId
             let acceptedDelegate = await session.sessionDelegate
             await session.scheduleTransportProtocolWork {
@@ -1687,8 +1686,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                existingProps.senderSecretName == inboundTask.senderSecretName,
                existingProps.senderDeviceId == inboundTask.senderDeviceId
             {
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.redeliveryDropped reason=alreadyPersisted sharedId=\(inboundTask.sharedMessageId) logical=\(logicalLookupId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                PQSAuditLog.log(.recovery, "pqs.recovery.redeliveryDropped reason=alreadyPersisted sharedId=\(inboundTask.sharedMessageId) logical=\(logicalLookupId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
                 try await session.markEnvelopeAccepted(
                     senderSecretName: inboundTask.senderSecretName,
                     senderDeviceId: inboundTask.senderDeviceId,
@@ -1892,8 +1890,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         if !InboundInitiatingSlotPolicy.shouldEnsureInboundBlank(
                             blankForHeaderExists: blankForHeaderExists)
                         {
-                            DecryptFailureAuditLog.log(
-                                "pqs.recovery.inboundInitiatingSlotEnsureSkipped reason=blankForHeaderExists peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                            PQSAuditLog.log(.recovery, "pqs.recovery.inboundInitiatingSlotEnsureSkipped reason=blankForHeaderExists peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
                         } else {
                             do {
                                 let ensured = try await session.ensureInboundInitiatingSessionIdentity(
@@ -1904,8 +1901,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                     oneTimePublicKey: header.remoteOneTimePublicKey,
                                     mlKEMPublicKey: header.remoteMLKEMPublicKey,
                                     deviceNameHint: preferredProps.deviceName)
-                                DecryptFailureAuditLog.log(
-                                    "pqs.recovery.inboundInitiatingSlotEnsured peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) sessionId=\(ensured.id.uuidString)")
+                                PQSAuditLog.log(.recovery, "pqs.recovery.inboundInitiatingSlotEnsured peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) sessionId=\(ensured.id.uuidString)")
                                 let ensuredDataBeforeAttempt = ensured.data
                                 do {
                                     try await initializeRecipient(
@@ -1933,8 +1929,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                 logger.log(
                                     level: .warning,
                                     message: "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) error=\(error)")
-                                DecryptFailureAuditLog.log(
-                                    "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) error=\(error)")
+                                PQSAuditLog.log(.recovery, "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) error=\(error)")
                             }
                         }
                     }
@@ -1962,8 +1957,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         data: preferredSessionIdentityDataBeforeAttempt,
                         session: session,
                         reason: "active and archived inbound decrypt attempts failed")
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) attempts=[\(attemptFailures.joined(separator: "; "))]")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) attempts=[\(attemptFailures.joined(separator: "; "))]")
                     // Do NOT write the failed try-first id into the preference map here.
                     // Dogfood 2026-07-25: that armed preferredFailedInTryAll on every
                     // poison redelivery → demoteProveFailedActive walked unique session
@@ -2279,8 +2273,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     // Heal event in the same audit file as the failures: bounded to
                     // messages that previously failed, so the audit shows fail-then-heal
                     // per sharedId instead of requiring success to be inferred from quiet.
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.recovered sharedId=\(inboundTask.sharedMessageId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) priorFailureClasses=\(recoveredFailureClasses.joined(separator: ","))")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.recovered sharedId=\(inboundTask.sharedMessageId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) priorFailureClasses=\(recoveredFailureClasses.joined(separator: ","))")
                 }
                 // A late orphan replay can land after the tuple was written off as
                 // unrecoverable; the content is back, so lift the terminal mark.
@@ -2314,8 +2307,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     logger.log(
                         level: .info,
                         message: "pqs.recovery.resendDrainDeferred reason=awaitingPeerRefreshResponse sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) pendingCount=\(pending.count) sharedId=\(inboundTask.sharedMessageId)")
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.resendDrainDeferred reason=awaitingPeerRefreshResponse sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) pendingCount=\(pending.count) sharedId=\(inboundTask.sharedMessageId)")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.resendDrainDeferred reason=awaitingPeerRefreshResponse sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) pendingCount=\(pending.count) sharedId=\(inboundTask.sharedMessageId)")
                     for pendingRequest in pending {
                         await session.deferPeerResendUntilReestablished(
                             sender: pendingRequest.senderName,
@@ -2470,8 +2462,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         guard archivedInboundFallbackPasses.insert(token.storageKey).inserted else {
             return
         }
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.deferArchivedInboundFallback sharedId=\(sharedId) token=\(token.storageKey.prefix(64)) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+        PQSAuditLog.log(.recovery, "pqs.recovery.deferArchivedInboundFallback sharedId=\(sharedId) token=\(token.storageKey.prefix(64)) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
         do {
             try await feedTask(
                 EncryptableTask(
@@ -2806,8 +2797,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             requesterDeviceId: requesterDeviceId,
             servicedFromPersistedStore: servicedFromPersistedStore,
             queuedAt: now)
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.resendReplayQueued sharedId=\(sharedId) requester=\(requesterName) requesterDeviceId=\(requesterDeviceId.uuidString)")
+        PQSAuditLog.log(.recovery, "pqs.recovery.resendReplayQueued sharedId=\(sharedId) requester=\(requesterName) requesterDeviceId=\(requesterDeviceId.uuidString)")
     }
 
     /// Audits that a tracked resend replay actually reached the transport, and only
@@ -2816,8 +2806,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     /// silence — request loops with no reply and no audit trail.
     func noteResendReplayTransported(sharedId: String) async {
         guard let replay = pendingResendReplayBySharedId.removeValue(forKey: sharedId) else { return }
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.resendReplayTransported sharedId=\(sharedId) requester=\(replay.requesterName) requesterDeviceId=\(replay.requesterDeviceId.uuidString)")
+        PQSAuditLog.log(.recovery, "pqs.recovery.resendReplayTransported sharedId=\(sharedId) requester=\(replay.requesterName) requesterDeviceId=\(replay.requesterDeviceId.uuidString)")
         await clearOrphanResendWaveIfDrained(
             requesterName: replay.requesterName,
             requesterDeviceId: replay.requesterDeviceId)
@@ -2833,8 +2822,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     /// intentionally not armed — a dropped replay must not silence the next ask.
     func noteResendReplayDropped(sharedId: String, reason: String) async {
         guard let replay = pendingResendReplayBySharedId.removeValue(forKey: sharedId) else { return }
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.resendReplayDropped sharedId=\(sharedId) requester=\(replay.requesterName) requesterDeviceId=\(replay.requesterDeviceId.uuidString) reason=\(reason)")
+        PQSAuditLog.log(.recovery, "pqs.recovery.resendReplayDropped sharedId=\(sharedId) requester=\(replay.requesterName) requesterDeviceId=\(replay.requesterDeviceId.uuidString) reason=\(reason)")
         await clearOrphanResendWaveIfDrained(
             requesterName: replay.requesterName,
             requesterDeviceId: replay.requesterDeviceId)
@@ -2859,8 +2847,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         ) else {
             return
         }
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.orphanResendWaveDrained requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString)")
+        PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendWaveDrained requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString)")
     }
 
     /// Tells the requesting device that these ids have no replay source anywhere so it
@@ -2892,16 +2879,13 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             logger.log(
                 level: .info,
                 message: "pqs.recovery.resendUnavailableSentOutOfBand requester=\(requesterName) unavailableCount=\(unavailableIds.count) ids=\(unavailableIds.joined(separator: ","))")
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.resendUnavailableSentOutOfBand requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) unavailableCount=\(unavailableIds.count) ids=\(unavailableIds.joined(separator: ","))")
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.resendUnavailableSameAccountNoRemint requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(fallbackIdentity.id.uuidString) unavailableCount=\(unavailableIds.count)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.resendUnavailableSentOutOfBand requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) unavailableCount=\(unavailableIds.count) ids=\(unavailableIds.joined(separator: ","))")
+            PQSAuditLog.log(.recovery, "pqs.recovery.resendUnavailableSameAccountNoRemint requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(fallbackIdentity.id.uuidString) unavailableCount=\(unavailableIds.count)")
         } catch {
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.resendUnavailableEmitFailed requester=\(requesterName) unavailableCount=\(unavailableIds.count) error=\(error)")
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.resendUnavailableEmitFailed requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) unavailableCount=\(unavailableIds.count) error=\(error)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.resendUnavailableEmitFailed requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) unavailableCount=\(unavailableIds.count) error=\(error)")
         }
     }
 
@@ -2932,8 +2916,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 session: session,
                 preferredDevice: preferredDevice
             ) {
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.resendUnavailableUsingActive requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(active.id.uuidString)")
+                PQSAuditLog.log(.recovery, "pqs.recovery.resendUnavailableUsingActive requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(active.id.uuidString)")
                 return active
             }
             let identity = try await session.resetSessionIdentityForFreshSession(
@@ -2941,15 +2924,13 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 deviceId: requesterDeviceId,
                 sendOneTimeIdentities: false,
                 reason: "resendUnavailable")
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.resendUnavailableInitiating requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) newSessionId=\(identity.id.uuidString)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.resendUnavailableInitiating requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) newSessionId=\(identity.id.uuidString)")
             return identity
         } catch {
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.resendUnavailableInitiatingFailed requester=\(requesterName) deviceId=\(requesterDeviceId) error=\(error)")
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.resendUnavailableInitiatingFailed requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) error=\(error)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.resendUnavailableInitiatingFailed requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) error=\(error)")
             return fallback
         }
     }
@@ -2979,8 +2960,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             message: "pqs.recovery.resendRequestReceived sender=\(requesterSecretName) senderDeviceId=\(requesterWireDeviceId) requestingDeviceId=\(request.requestingDeviceId) requestedCount=\(request.failedSharedMessageIds.count) ids=\(request.failedSharedMessageIds.joined(separator: ","))")
         // Production console logs filter info; the audit file must show
         // the request arrived so a silent servicing path is attributable.
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.resendRequestReceived requester=\(requesterSecretName) requestingDeviceId=\(request.requestingDeviceId.uuidString) ids=\(request.failedSharedMessageIds.joined(separator: ","))")
+        PQSAuditLog.log(.recovery, "pqs.recovery.resendRequestReceived requester=\(requesterSecretName) requestingDeviceId=\(request.requestingDeviceId.uuidString) ids=\(request.failedSharedMessageIds.joined(separator: ","))")
         let requestedDevice = await currentDeviceConfiguration(
             secretName: requesterSecretName,
             deviceId: request.requestingDeviceId,
@@ -3166,8 +3146,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     hasLocalMessage: foundMessage != nil,
                     hasOutboundDeviceSendRecord: hasMessageRecord)
                 if ownership == .deferNotContentOwner {
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.orphanResendDeferredNotContentOwner sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendDeferredNotContentOwner sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
                     continue
                 }
                 guard let foundMessage else {
@@ -3219,8 +3198,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                 identity: recovered,
                                 retransportCached: true
                             ))
-                            DecryptFailureAuditLog.log(
-                                "pqs.recovery.orphanResendRetransport sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(recoverySessionId.uuidString)")
+                            PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendRetransport sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(recoverySessionId.uuidString)")
                             continue
                         }
                         if ownerDecision == .mintFreshAfterRetransportProveFailed {
@@ -3241,8 +3219,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                     message: "pqs.recovery.orphanResendFailed sharedId=\(failedSharedMessageId) error=\(error)")
                             }
                         } else if ownerDecision == .exhaustedUnrecoverable {
-                            DecryptFailureAuditLog.log(
-                                "pqs.recovery.orphanResendHealExhausted sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
+                            PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendHealExhausted sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
                             replayMissingCount += 1
                             unavailableIds.append(failedEnvelopeMessageId)
                             missingByReason["healExhausted", default: 0] += 1
@@ -3251,8 +3228,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                                 sharedId: failedEnvelopeMessageId)
                             continue
                         }
-                        DecryptFailureAuditLog.log(
-                            "pqs.recovery.orphanResendOwnerMissingPlaintext sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
+                        PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendOwnerMissingPlaintext sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
                         replayMissingCount += 1
                         unavailableIds.append(failedEnvelopeMessageId)
                         missingByReason["ownerMissingPlaintext", default: 0] += 1
@@ -3367,12 +3343,10 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     }
                     orphanResendRetransportCountByServiceKey[serviceKey] =
                         priorRetransportCount + 1
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.orphanResendRetransport sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(recoverySessionId?.uuidString ?? "nil")")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendRetransport sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(recoverySessionId?.uuidString ?? "nil")")
                 } else {
                     // Process restart / cache eviction: mint once more.
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.orphanResendRetransportCacheMiss sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendRetransportCacheMiss sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
                     do {
                         let priorRecordSessionId = messageRecord?.sessionIdentityId
                         replayIdentity = try await session.resetSessionIdentityForFreshSession(
@@ -3394,8 +3368,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                             secretName: requesterSecretName,
                             deviceId: request.requestingDeviceId,
                             session: session)
-                        DecryptFailureAuditLog.log(
-                            "pqs.recovery.orphanResend sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) newSessionId=\(replayIdentity.id.uuidString)")
+                        PQSAuditLog.log(.recovery, "pqs.recovery.orphanResend sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) newSessionId=\(replayIdentity.id.uuidString)")
                     } catch {
                         logger.log(
                             level: .warning,
@@ -3432,14 +3405,12 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     logger.log(
                         level: .info,
                         message: "pqs.recovery.orphanResendReused sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId) sessionId=\(protected.id)")
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.orphanResendReused sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(protected.id.uuidString)")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendReused sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(protected.id.uuidString)")
                 } else if let protectedId {
                     await session.clearOrphanResendInitiatingSession(
                         secretName: requesterSecretName,
                         deviceId: request.requestingDeviceId)
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.orphanResendStickyAdvancedRemint sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) priorSessionId=\(protectedId.uuidString)")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendStickyAdvancedRemint sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) priorSessionId=\(protectedId.uuidString)")
                 }
 
             case .reuseRecoveryWave:
@@ -3451,16 +3422,14 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     clearPreferredSessionIdentity(
                         secretName: requesterSecretName,
                         deviceId: request.requestingDeviceId)
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.orphanResendReused sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(recovered.id.uuidString) reason=reuseRecoveryWave")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendReused sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(recovered.id.uuidString) reason=reuseRecoveryWave")
                 }
 
             case .exhaustedUnrecoverable:
                 // Heal sequence done (retransport → remint → retransport
                 // prove-fail). Terminal unavailable — no further remint
                 // or retransport; keep recovery lane for other sharedIds.
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.orphanResendHealExhausted sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
+                PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendHealExhausted sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
                 replayMissingCount += 1
                 unavailableIds.append(failedEnvelopeMessageId)
                 missingByReason["healExhausted", default: 0] += 1
@@ -3475,8 +3444,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         secretName: requesterSecretName,
                         deviceId: request.requestingDeviceId)
                     if protectedId != replayIdentity.id {
-                        DecryptFailureAuditLog.log(
-                            "pqs.recovery.orphanResendStickyAdvancedRemint sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) priorSessionId=\(protectedId.uuidString)")
+                        PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendStickyAdvancedRemint sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) priorSessionId=\(protectedId.uuidString)")
                     }
                 }
                 let replayProps = await replayIdentity.props(symmetricKey: symmetricKey)
@@ -3494,8 +3462,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     logger.log(
                         level: .info,
                         message: "pqs.recovery.orphanResendRearmed sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId) sessionId=\(replayIdentity.id) reason=stateLess")
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.orphanResendRearmed sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(replayIdentity.id.uuidString) reason=stateLess")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendRearmed sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(replayIdentity.id.uuidString) reason=stateLess")
                 } else {
                     do {
                         let priorRecordSessionId = messageRecord?.sessionIdentityId
@@ -3521,8 +3488,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         logger.log(
                             level: .info,
                             message: "pqs.recovery.orphanResend sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId) newSessionId=\(replayIdentity.id)")
-                        DecryptFailureAuditLog.log(
-                            "pqs.recovery.orphanResend sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) newSessionId=\(replayIdentity.id.uuidString)")
+                        PQSAuditLog.log(.recovery, "pqs.recovery.orphanResend sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) newSessionId=\(replayIdentity.id.uuidString)")
                     } catch {
                         logger.log(
                             level: .warning,
@@ -3563,8 +3529,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         cached.message,
                         metadata: cached.metadata)
                     await noteResendReplayTransported(sharedId: pending.sharedId)
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.orphanResendRetransport sharedId=\(pending.sharedId) sessionId=\(pending.identity.id.uuidString) requesterDeviceId=\(request.requestingDeviceId.uuidString)")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendRetransport sharedId=\(pending.sharedId) sessionId=\(pending.identity.id.uuidString) requesterDeviceId=\(request.requestingDeviceId.uuidString)")
                     replayQueuedCount += 1
                     queuedIds.append(pending.requestedEnvelopeMessageId)
                     continue
@@ -3594,8 +3559,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                             cached.message,
                             metadata: cached.metadata)
                         await noteResendReplayTransported(sharedId: pending.sharedId)
-                        DecryptFailureAuditLog.log(
-                            "pqs.recovery.orphanResendRetransport sharedId=\(pending.sharedId) sessionId=\(encryptIdentity.id.uuidString) requesterDeviceId=\(request.requestingDeviceId.uuidString)")
+                        PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendRetransport sharedId=\(pending.sharedId) sessionId=\(encryptIdentity.id.uuidString) requesterDeviceId=\(request.requestingDeviceId.uuidString)")
                         replayQueuedCount += 1
                         queuedIds.append(pending.requestedEnvelopeMessageId)
                         continue
@@ -3611,8 +3575,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         isPersistedOutbound: false
                     ),
                     session: session)
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.orphanResendMessageRecordUpdated sharedId=\(pending.sharedId) sessionId=\(encryptIdentity.id.uuidString) requesterDeviceId=\(request.requestingDeviceId.uuidString)")
+                PQSAuditLog.log(.recovery, "pqs.recovery.orphanResendMessageRecordUpdated sharedId=\(pending.sharedId) sessionId=\(encryptIdentity.id.uuidString) requesterDeviceId=\(request.requestingDeviceId.uuidString)")
                 replayQueuedCount += 1
                 queuedIds.append(pending.requestedEnvelopeMessageId)
             } catch {
@@ -3634,8 +3597,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 message: "pqs.recovery.resendReplayCoalescedAll sender=\(requesterSecretName) senderDeviceId=\(requesterWireDeviceId) coalescedCount=\(replayCoalescedCount) skippedCount=\(replayMissingCount) requestedCount=\(request.failedSharedMessageIds.count)")
             // Fully coalesced servicing sends nothing back; without this
             // audit the requester's retries look unanswered for no reason.
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.resendReplayCoalescedAll requester=\(requesterSecretName) requestingDeviceId=\(request.requestingDeviceId.uuidString) coalescedCount=\(replayCoalescedCount) requestedCount=\(request.failedSharedMessageIds.count)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.resendReplayCoalescedAll requester=\(requesterSecretName) requestingDeviceId=\(request.requestingDeviceId.uuidString) coalescedCount=\(replayCoalescedCount) requestedCount=\(request.failedSharedMessageIds.count)")
         } else if replayMissingCount == 0, knownUnavailableCount > 0 {
             // Every requested id was already proven unreplayable in a
             // previous pass: re-send the notice below without re-running
@@ -3659,8 +3621,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.resendReplayFailed reason=noReplayableMessages sender=\(requesterSecretName) senderDeviceId=\(requesterWireDeviceId) skippedCount=\(replayMissingCount) requestedCount=\(request.failedSharedMessageIds.count) reasons=\(reasonsSummary)")
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.resendReplayFailed reason=noReplayableMessages requester=\(requesterSecretName) requesterDeviceId=\(requesterWireDeviceId.uuidString) requestedCount=\(request.failedSharedMessageIds.count) reasons=\(reasonsSummary) sharedIds=\(request.failedSharedMessageIds.joined(separator: ","))")
+            PQSAuditLog.log(.recovery, "pqs.recovery.resendReplayFailed reason=noReplayableMessages requester=\(requesterSecretName) requesterDeviceId=\(requesterWireDeviceId.uuidString) requestedCount=\(request.failedSharedMessageIds.count) reasons=\(reasonsSummary) sharedIds=\(request.failedSharedMessageIds.joined(separator: ","))")
         }
 
         await emitResendUnavailableNotice(
@@ -3799,8 +3760,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     logger.log(
                         level: .warning,
                         message: "pqs.recovery.pendingResendExhausted sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId) failureClass=\(pending.failureClass) attempts=\(attempts)")
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.pendingResendExhausted sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) failureClass=\(pending.failureClass) attempts=\(attempts)")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.pendingResendExhausted sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) failureClass=\(pending.failureClass) attempts=\(attempts)")
                     // Terminal on the requester: stop asking and quarantine so poison
                     // redelivery cannot reopen recovery for this sharedId.
                     await session.clearPendingResends(
@@ -3812,8 +3772,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                         deviceId: pending.senderDeviceId,
                         sharedId: pending.failedSharedMessageId)
                     if newlyTerminal {
-                        DecryptFailureAuditLog.log(
-                            "pqs.recovery.contentUnrecoverable sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(attempts)")
+                        PQSAuditLog.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(attempts)")
                         await session.sessionDelegate?.inboundContentUnrecoverable(
                             senderSecretName: pending.senderName,
                             senderDeviceId: pending.senderDeviceId,
@@ -3873,8 +3832,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 logger.log(
                     level: .info,
                     message: "pqs.recovery.resendDrainSubmitted reason=\(reason) count=\(sharedIds.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) ids=\(sharedIds.joined(separator: ","))")
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.resendDrainSubmitted reason=\(reason) count=\(sharedIds.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId.uuidString) ids=\(sharedIds.joined(separator: ","))")
+                PQSAuditLog.log(.recovery, "pqs.recovery.resendDrainSubmitted reason=\(reason) count=\(sharedIds.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId.uuidString) ids=\(sharedIds.joined(separator: ","))")
             } catch {
                 for pending in ready {
                     await session.deferPeerResendUntilReestablished(
@@ -3886,8 +3844,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 logger.log(
                     level: .warning,
                     message: "pqs.recovery.resendDrainFailed reason=\(reason) count=\(ready.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) error=\(error)")
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.resendDrainFailed reason=\(reason) count=\(ready.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId.uuidString) error=\(error)")
+                PQSAuditLog.log(.recovery, "pqs.recovery.resendDrainFailed reason=\(reason) count=\(ready.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId.uuidString) error=\(error)")
             }
         }
     }
@@ -4129,8 +4086,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
            existingProps.senderSecretName == inboundTask.senderSecretName,
            existingProps.senderDeviceId == inboundTask.senderDeviceId
         {
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.duplicateInboundPersistSkipped envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.duplicateInboundPersistSkipped envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
             return
         }
         
@@ -4197,8 +4153,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             
             try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
             logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
-            DecryptFailureAuditLog.log(
-                "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
+            PQSAuditLog.log(.recv, "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
                 level: .info)
             
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
@@ -4268,8 +4223,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             
             try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
             logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
-            DecryptFailureAuditLog.log(
-                "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
+            PQSAuditLog.log(.recv, "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
                 level: .info)
             
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
@@ -4342,8 +4296,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 await session.receiverDelegate?.updatedCommunication(communicationModel, members: members)
             }
             logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
-            DecryptFailureAuditLog.log(
-                "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(sender) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
+            PQSAuditLog.log(.recv, "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(sender) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
                 level: .info)
             /// Make sure we send the message to our SDK consumer as soon as it becomes available for best user experience
             await session.receiverDelegate?.createdMessage(messageModel)

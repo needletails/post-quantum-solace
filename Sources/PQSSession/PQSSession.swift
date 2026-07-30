@@ -1174,8 +1174,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             deviceId: deviceId,
             messageId: failedMessageId,
             now: now)
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.orphanReplayStillUndecryptable sharedId=\(failedMessageId) sender=\(sender) deviceId=\(deviceId.uuidString) priorAttempts=\(attempts) action=rearmNack")
+        PQSAuditLog.log(.recovery, "pqs.recovery.orphanReplayStillUndecryptable sharedId=\(failedMessageId) sender=\(sender) deviceId=\(deviceId.uuidString) priorAttempts=\(attempts) action=rearmNack")
         return true
     }
     
@@ -1368,8 +1367,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             return (parts[0], deviceId)
         }
         for peer in expiredPeers {
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.episodeExpired sender=\(peer.sender) deviceId=\(peer.deviceId.uuidString) ttlSeconds=\(Int(reestablishmentEpisodeTTL))")
+            PQSAuditLog.log(.recovery, "pqs.recovery.episodeExpired sender=\(peer.sender) deviceId=\(peer.deviceId.uuidString) ttlSeconds=\(Int(reestablishmentEpisodeTTL))")
         }
         guard !expiredPeers.isEmpty else { return }
         let delegate = sessionDelegate
@@ -1451,8 +1449,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         deadSessionCiphertextEpisodes.remove(key)
         await clearUndecryptableLaneFailures(sender: sender, deviceId: deviceId)
         guard wasOpen else { return }
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.episodeEnded sender=\(sender) deviceId=\(deviceId.uuidString)")
+        PQSAuditLog.log(.recovery, "pqs.recovery.episodeEnded sender=\(sender) deviceId=\(deviceId.uuidString)")
         let delegate = sessionDelegate
         // Protocol signal: the transport releases held offline ciphertext on it.
         _ = await scheduleTransportProtocolWork {
@@ -1686,8 +1683,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         guard let cache else { throw SessionErrors.databaseNotInitialized }
         try await cache.upsertAcceptedEnvelope(record)
         rememberAcceptedEnvelopeKey(record.storageKey)
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.envelopeAccepted sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) envelope=\(envelopeMessageId) logical=\(logicalSharedId)",
+        PQSAuditLog.log(.recovery, "pqs.recovery.envelopeAccepted sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) envelope=\(envelopeMessageId) logical=\(logicalSharedId)",
             level: .debug)
     }
 
@@ -1768,8 +1764,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         if !expired.isEmpty {
             let delegate = sessionDelegate
             for pending in expired {
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.pendingResendExpired sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) failureClass=\(pending.failureClass) ttlSeconds=\(Int(inboundFailurePolicyTTL))")
+                PQSAuditLog.log(.recovery, "pqs.recovery.pendingResendExpired sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) failureClass=\(pending.failureClass) ttlSeconds=\(Int(inboundFailurePolicyTTL))")
                 let senderName = pending.senderName
                 let senderDeviceId = pending.senderDeviceId
                 let sharedMessageId = pending.failedSharedMessageId
@@ -1779,8 +1774,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                     sharedId: sharedMessageId,
                     now: now)
                 guard newlyTerminal else { continue }
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.contentUnrecoverable sharedId=\(sharedMessageId) sender=\(senderName) deviceId=\(senderDeviceId.uuidString) reason=pendingResendTTL")
+                PQSAuditLog.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(sharedMessageId) sender=\(senderName) deviceId=\(senderDeviceId.uuidString) reason=pendingResendTTL")
                 // Protocol signal: drives the transport's terminal purge of the
                 // spool copy. Dropping it on a viability flap leaves the copy
                 // immortal server-side.
@@ -2165,6 +2159,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         case invalidSecretName = "Invalid secret name."
         case invalidDeviceIdentity = "Invalid device identity."
         case missingSessionIdentity = "Missing session identity."
+        /// Persistable outbound fan-out could not create a durable job for every required peer device.
+        case outboundEnqueueIncomplete = "Outbound enqueue incomplete for one or more required devices."
         case invalidSignature = "Invalid signature."
         case missingSignature = "Missing signature."
         case configurationError = "Configuration error."

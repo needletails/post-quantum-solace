@@ -105,9 +105,15 @@ public protocol EventReceiver: Sendable {
     ///   - requestFriendship: A boolean indicating whether to request friendship
     ///     with the contact during synchronization. When `true`, a friendship
     ///     request will be sent to the contact.
+    ///   - notifyPeerOfCreation: When `requestFriendship` is `false`, controls whether
+    ///     a `.contactCreated` acknowledgment is sent to the peer. Defaults to `true`
+    ///     for inbound friendship / sibling paths; official inbox ensure passes `false`.
     /// - Throws: An error if the operation fails, such as network errors,
     ///   authentication failures, or synchronization conflicts.
-    func synchronize(contact: Contact, requestFriendship: Bool) async throws
+    func synchronize(
+        contact: Contact,
+        requestFriendship: Bool
+    ) async throws
 
     /// Transports contact metadata to other devices or users in the network.
     ///

@@ -9132,11 +9132,8 @@ actor EndToEndTests {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
         defer {
-            Task {
-                aliceTask?.cancel()
-                bobTask?.cancel()
-                await shutdownSessions()
-            }
+            aliceTask?.cancel()
+            bobTask?.cancel()
         }
 
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
@@ -9173,46 +9170,85 @@ actor EndToEndTests {
             }
         }
 
-        _ = try await _senderSession.refreshIdentities(
-            secretName: rMockUserData.ssn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true
-        )
-        _ = try await _recipientSession.refreshIdentities(
-            secretName: sMockUserData.ssn,
-            forceRefresh: true,
-            sendOneTimeIdentities: true
-        )
-        try await _recipientSession.writeTextMessage(
-            recipient: .nickname(sMockUserData.ssn),
-            text: "establish state"
-        )
+        do {
+            _ = try await _senderSession.refreshIdentities(
+                secretName: rMockUserData.ssn,
+                forceRefresh: true,
+                sendOneTimeIdentities: true
+            )
+            _ = try await _recipientSession.refreshIdentities(
+                secretName: sMockUserData.ssn,
+                forceRefresh: true,
+                sendOneTimeIdentities: true
+            )
+            try await _recipientSession.writeTextMessage(
+                recipient: .nickname(sMockUserData.ssn),
+                text: "establish state"
+            )
 
-        for _ in 0..<20 {
-            if await senderStore.createdMessages.count > 0 {
-                break
+            // Establish often lands as handshake + text (2 rows). Require a real quiet
+            // window before snapshotting — a short "stable" poll can freeze at 1 and then
+            // blame the late second row on the refresh control.
+            var sharedIdsBeforeRefresh = Set<String>()
+            var lastCount = -1
+            var quietPolls = 0
+            for _ in 0..<80 {
+                let messages = await senderStore.createdMessages
+                let count = messages.count
+                if count >= 1, count == lastCount {
+                    quietPolls += 1
+                    if quietPolls >= 10 { // 500ms unchanged
+                        sharedIdsBeforeRefresh = Set(messages.map(\.sharedId))
+                        break
+                    }
+                } else {
+                    lastCount = count
+                    quietPolls = 0
+                }
+                try await Task.sleep(for: .milliseconds(50))
             }
-            try await Task.sleep(for: .milliseconds(100))
+            #expect(
+                !sharedIdsBeforeRefresh.isEmpty,
+                "Establish must persist before sending refreshOneTimeKeys control"
+            )
+
+            let controlMetadata = try BinaryEncoder().encode(TransportEvent.refreshOneTimeKeys)
+            let senderIdentityCountBeforeRefresh = await senderStore.identities.count
+            try await _recipientSession.writeTextMessage(
+                recipient: .nickname(sMockUserData.ssn),
+                transportInfo: controlMetadata
+            )
+
+            // Allow the control to be received/handled, then require the sharedId set
+            // to stay unchanged (refreshOneTimeKeys sets canSaveMessage=false).
+            var sharedIdsAfter = sharedIdsBeforeRefresh
+            quietPolls = 0
+            for _ in 0..<40 {
+                let ids = Set(await senderStore.createdMessages.map(\.sharedId))
+                if ids == sharedIdsAfter {
+                    quietPolls += 1
+                    if quietPolls >= 6 { break } // 300ms unchanged
+                } else {
+                    sharedIdsAfter = ids
+                    quietPolls = 0
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+
+            let newSharedIds = sharedIdsAfter.subtracting(sharedIdsBeforeRefresh)
+            #expect(
+                newSharedIds.isEmpty,
+                "refreshOneTimeKeys control should not persist as a user message; new sharedIds=\(newSharedIds.sorted()) before=\(sharedIdsBeforeRefresh.sorted())"
+            )
+            #expect(
+                await senderStore.identities.count >= senderIdentityCountBeforeRefresh,
+                "refreshOneTimeKeys control should keep identity state stable"
+            )
+        } catch {
+            await shutdownSessions()
+            throw error
         }
-
-        let senderMessageCountBeforeRefresh = await senderStore.createdMessages.count
-        let controlMetadata = try BinaryEncoder().encode(TransportEvent.refreshOneTimeKeys)
-        let senderIdentityCountBeforeRefresh = await senderStore.identities.count
-        try await _recipientSession.writeTextMessage(
-            recipient: .nickname(sMockUserData.ssn),
-            transportInfo: controlMetadata
-        )
-
-        try await Task.sleep(for: .milliseconds(400))
-
-        #expect(
-            await senderStore.createdMessages.count == senderMessageCountBeforeRefresh,
-            "refreshOneTimeKeys control should not persist as a user message"
-        )
-        #expect(
-            await senderStore.identities.count >= senderIdentityCountBeforeRefresh,
-            "refreshOneTimeKeys control should keep identity state stable"
-        )
+        await shutdownSessions()
     }
 
     @Test("refreshOneTimeKeys control message is non-persistent and triggers refresh")
@@ -9853,15 +9889,19 @@ struct SessionDelegate: PQSSessionDelegate {
     let session: PQSSession
     let compromiseProbe: LinkedDeviceCompromiseProbe?
     let peerIdentityTrustProbe: PeerIdentityTrustProbe?
+    /// Test-only: forces `retrieveUserInfo` so Missing Offer Identity paths are deterministic.
+    var forcedRetrieveUserInfo: (secretName: String, deviceId: String)?
     
     init(
         session: PQSSession,
         compromiseProbe: LinkedDeviceCompromiseProbe? = nil,
-        peerIdentityTrustProbe: PeerIdentityTrustProbe? = nil
+        peerIdentityTrustProbe: PeerIdentityTrustProbe? = nil,
+        forcedRetrieveUserInfo: (secretName: String, deviceId: String)? = nil
     ) {
         self.session = session
         self.compromiseProbe = compromiseProbe
         self.peerIdentityTrustProbe = peerIdentityTrustProbe
+        self.forcedRetrieveUserInfo = forcedRetrieveUserInfo
     }
     
     func synchronizeCommunication(
@@ -9895,7 +9935,9 @@ struct SessionDelegate: PQSSessionDelegate {
     async throws
     {}
     func shouldPersist(transportInfo _: Data?) -> Bool { true }
-    func retrieveUserInfo(_: Data?) async -> (secretName: String, deviceId: String)? { nil }
+    func retrieveUserInfo(_: Data?) async -> (secretName: String, deviceId: String)? {
+        forcedRetrieveUserInfo
+    }
     func updateCryptoMessageMetadata(
         _ message: SessionModels.CryptoMessage, sharedMessageId _: String
     ) -> SessionModels.CryptoMessage { message }
@@ -10095,7 +10137,10 @@ actor ReceiverDelegate: EventReceiver {
     func removedContact(_: String) async throws {}
     func removedCommunication(_ type: SessionModels.MessageRecipient) async throws {}
     func createdChannel(_ model: SessionModels.BaseCommunication) async {}
-    func synchronize(contact: Contact, requestFriendship: Bool) async throws {
+    func synchronize(
+        contact: Contact,
+        requestFriendship: Bool
+    ) async throws {
         if requestFriendship {
             // Mirror the production receiver: re-add of an already-accepted /
             // already-rejected contact surfaces a typed `FriendshipRequestError`
@@ -10524,6 +10569,9 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     /// Optional hook to simulate message loss by preventing delivery into the async stream.
     var shouldDeliver: (@Sendable (ReceivedMessage) async -> Bool)?
 
+    /// When set, `sendMessage` throws before delivery — models half-open / ingress-barrier failure.
+    var sendMessageError: Error?
+
     /// Optional hook to transform outgoing messages before delivery (test-only).
     /// Useful for forging signatures or mutating payloads deterministically.
     var transformOutgoing: (@Sendable (ReceivedMessage) async throws -> ReceivedMessage)?
@@ -10562,6 +10610,13 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
 
     // Track findConfiguration calls for dogfood hang/cache tests (thread-safe)
     private let findConfigurationTracker = CallTracker()
+
+    // Track ciphertext transport sends for enqueue/viability assertions.
+    private let sendMessageTracker = CallTracker()
+
+    var sendMessageCallCount: Int {
+        get async { await sendMessageTracker.callCount }
+    }
 
     var publishRotatedKeysCallCount: Int {
         get async { await rotationTracker.callCount }
@@ -10686,6 +10741,13 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
 
         // Determine actual sender from the bound session, not from metadata
         guard let sessionContext = await session.sessionContext else { return }
+        await sendMessageTracker.record(
+            secretName: metadata.secretName,
+            deviceId: metadata.deviceId.uuidString,
+            keyCount: 1)
+        if let sendMessageError {
+            throw sendMessageError
+        }
         
         let received = ReceivedMessage(
             message: message,
@@ -10815,6 +10877,12 @@ actor MockIdentityStore: PQSSessionStore {
     var encyrptedConfigurationForTesting = Data()
     var createdMessages = [EncryptedMessage]()
     var contacts = [ContactModel]()
+    /// Disk-persistence boundary spy: jobs currently retained by the store.
+    var persistedJobs = [JobModel]()
+    /// Cumulative createJob successes (not cleared by deleteJob) for enqueue proofs.
+    var createJobHistory = [JobModel]()
+    /// When set, `createJob` throws before appending — models disk/store failure.
+    var createJobError: Error?
     
     func setLocalSalt(_ salt: String) async {
         localDeviceSalt = salt
@@ -10948,12 +11016,24 @@ actor MockIdentityStore: PQSSessionStore {
     }
     
     func messageCount(sharedIdentifier _: UUID) async throws -> Int { 1 }
-    func readJobs() async throws -> [SessionModels.JobModel] { [] }
-    func fetchJobs() async throws -> [SessionModels.JobModel] { [] }
-    func createJob(_: SessionModels.JobModel) async throws {}
-    func updateJob(_: SessionModels.JobModel) async throws {}
-    func removeJob(_: SessionModels.JobModel) async throws {}
-    func deleteJob(_: SessionModels.JobModel) async throws {}
+    func readJobs() async throws -> [SessionModels.JobModel] { persistedJobs }
+    func fetchJobs() async throws -> [SessionModels.JobModel] { persistedJobs }
+    func createJob(_ job: SessionModels.JobModel) async throws {
+        if let createJobError { throw createJobError }
+        persistedJobs.append(job)
+        createJobHistory.append(job)
+    }
+    func updateJob(_ job: SessionModels.JobModel) async throws {
+        if let index = persistedJobs.firstIndex(where: { $0.id == job.id }) {
+            persistedJobs[index] = job
+        }
+    }
+    func removeJob(_ job: SessionModels.JobModel) async throws {
+        persistedJobs.removeAll { $0.id == job.id }
+    }
+    func deleteJob(_ job: SessionModels.JobModel) async throws {
+        persistedJobs.removeAll { $0.id == job.id }
+    }
     func findMediaJobs(for _: String, symmetricKey _: SymmetricKey) async throws -> [SessionModels
         .DataPacket]
     { [] }
@@ -10974,6 +11054,9 @@ actor MockIdentityStore: PQSSessionStore {
         encyrptedConfigurationForTesting = Data()
         createdMessages.removeAll()
         contacts.removeAll()
+        persistedJobs.removeAll()
+        createJobHistory.removeAll()
+        createJobError = nil
     }
 }
 

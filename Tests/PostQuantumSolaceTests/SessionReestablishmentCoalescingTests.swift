@@ -433,6 +433,172 @@ struct SessionReestablishmentCoalescingTests {
         await session.shutdown()
     }
 
+    // MARK: - Dogfood catch-up characterization (CHILD_DEVICE 2026-07-28)
+
+    /// Child log: sunflower answered `messageResendUnavailable` for
+    /// `384252E7-…`. That path is terminal — no remint expectation.
+    @Test("Dogfood: sender messageResendUnavailable is terminal (no remint)")
+    func dogfoodUnavailableRemintIsTerminal() async throws {
+        let session = PQSSession()
+        await session.setViability(true)
+        defer { Task { await session.shutdown() } }
+        let probe = EpisodeEndProbe()
+        await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
+
+        let peerDeviceId = UUID()
+        // Exact sharedId from CHILD_DEVICE.txt unavailable notice.
+        let sharedId = "384252E7-64E1-4AC4-93C9-31D205D74456"
+        await session.deferPeerResendUntilReestablished(
+            sender: "sunflower",
+            deviceId: peerDeviceId,
+            failedMessageId: sharedId,
+            failureClass: "crypto.bodyDecryptionFailed",
+            notifyDelegate: false)
+        #expect(await session.hasPendingResendAfterReestablishment(
+            sender: "sunflower",
+            deviceId: peerDeviceId,
+            failedMessageId: sharedId))
+
+        await session.handleOutOfBandResendUnavailable(
+            from: "sunflower",
+            deviceId: peerDeviceId,
+            unavailableEnvelopeMessageIds: [sharedId])
+
+        #expect(!(await session.hasPendingResendAfterReestablishment(
+            sender: "sunflower",
+            deviceId: peerDeviceId,
+            failedMessageId: sharedId)))
+        #expect(await session.isInboundContentUnrecoverable(
+            sender: "sunflower",
+            deviceId: peerDeviceId,
+            sharedId: sharedId),
+            "Unavailable remint must mark the tuple terminal; do not expect orphan remint")
+
+        var observed: [(String, UUID, String)] = []
+        for _ in 0..<40 {
+            observed = await probe.unrecoverableContent()
+            if !observed.isEmpty { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        #expect(observed.contains(where: {
+            $0.0 == "sunflower" && $0.1 == peerDeviceId && $0.2 == sharedId
+        }))
+        await session.shutdown()
+    }
+
+    /// Child log: coalesce → `inboundRecoveryDeferred` → host poison spool purge.
+    /// Intentionally kept — characterization must fail if purge notification is dropped.
+    @Test("Dogfood: coalesced deferred recovery notifies host (poison purge contract)")
+    func dogfoodPoisonPurgeAfterCoalescedDeferred() async throws {
+        let session = PQSSession()
+        await session.setViability(true)
+        defer { Task { await session.shutdown() } }
+        let probe = EpisodeEndProbe()
+        await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
+
+        let peerDeviceId = UUID()
+        let sharedId = "A69A8697-2C03-480B-8BDE-9B2A99041358"
+        await session.deferPeerResendUntilReestablished(
+            sender: "sunflower",
+            deviceId: peerDeviceId,
+            failedMessageId: sharedId,
+            failureClass: "crypto.bodyDecryptionFailed",
+            notifyDelegate: true)
+
+        var deferred: [(String, UUID, String, String)] = []
+        for _ in 0..<40 {
+            deferred = await probe.deferredRecoveries()
+            if !deferred.isEmpty { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        let matchedDeferred = deferred.first(where: { entry in
+            entry.0 == "sunflower" && entry.1 == peerDeviceId && entry.2 == sharedId
+        })
+        #expect(
+            matchedDeferred != nil,
+            "deferPeerResendUntilReestablished must notify inboundRecoveryDeferred so the host can purge poison offline copies")
+        #expect(matchedDeferred?.3 == "crypto.bodyDecryptionFailed")
+        let stillPending = await session.hasPendingResendAfterReestablishment(
+            sender: "sunflower",
+            deviceId: peerDeviceId,
+            failedMessageId: sharedId)
+        #expect(stillPending)
+        // Deferred is not terminal — remint may still arrive; unavailable/TTL owns terminal.
+        let terminal = await session.isInboundContentUnrecoverable(
+            sender: "sunflower",
+            deviceId: peerDeviceId,
+            sharedId: sharedId)
+        #expect(!terminal)
+        await session.shutdown()
+    }
+
+    /// Child log: 10m pendingResendTTL → contentUnrecoverable when no episode is open.
+    @Test("Dogfood: pending TTL still terminal when no reestablishment episode is open")
+    func dogfoodPendingTTLStillTerminalWhenNoEpisode() async throws {
+        let session = PQSSession()
+        await session.setViability(true)
+        defer { Task { await session.shutdown() } }
+        let probe = EpisodeEndProbe()
+        await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
+
+        let peerDeviceId = UUID()
+        let sharedId = "F49BA5B5-861B-405F-AEBC-D363117B5CE2"
+        #expect(!(await session.hasOpenReestablishmentEpisode(
+            sender: "sunflower",
+            deviceId: peerDeviceId)))
+
+        let seededAt = Date().addingTimeInterval(-(await session.inboundFailurePolicyTTL + 1))
+        await session.deferPeerResendUntilReestablished(
+            sender: "sunflower",
+            deviceId: peerDeviceId,
+            failedMessageId: sharedId,
+            failureClass: "crypto.bodyDecryptionFailed",
+            now: seededAt,
+            notifyDelegate: false)
+
+        #expect(!(await session.hasOpenReestablishmentEpisode(
+            sender: "sunflower",
+            deviceId: peerDeviceId)))
+        #expect(!(await session.hasPendingResendAfterReestablishment(
+            sender: "sunflower",
+            deviceId: peerDeviceId,
+            failedMessageId: sharedId)))
+        #expect(await session.isInboundContentUnrecoverable(
+            sender: "sunflower",
+            deviceId: peerDeviceId,
+            sharedId: sharedId),
+            "No open episode: aged pending resend must terminalize (dogfood pendingResendTTL)")
+
+        var observed: [(String, UUID, String)] = []
+        for _ in 0..<40 {
+            observed = await probe.unrecoverableContent()
+            if !observed.isEmpty { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        #expect(observed.contains(where: {
+            $0.0 == "sunflower" && $0.1 == peerDeviceId && $0.2 == sharedId
+        }))
+        await session.shutdown()
+    }
+
+    /// Phase 2 gate: parked bounded TTL-refresh-on-episode-end must not ship
+    /// until a ≥90% fix hypothesis is chosen. Characterization Phase 1 only.
+    @Test("Dogfood Phase 2 gate: parked pendingResendTTLRefreshed is not shipped")
+    func dogfoodPhase2ParkedTTLRefreshNotShipped() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // PostQuantumSolaceTests
+            .deletingLastPathComponent() // Tests
+            .deletingLastPathComponent() // package root
+            .appendingPathComponent("Sources/PQSSession/PQSSession.swift")
+        let source = try String(contentsOf: url, encoding: .utf8)
+        #expect(
+            !source.contains("pendingResendTTLRefreshed"),
+            "Do not ship episode-end TTL refresh until Phase 2 clears the 90% hypothesis bar")
+        #expect(
+            !source.contains("pendingResendTTLRefreshed reason=episodeEnded"),
+            "Parked dogfood TTL refresh log must stay absent until explicitly approved")
+    }
+
     @Test("Sender suppresses repeat emission to same scope within cooldown")
     func senderCooldownSuppressesDuplicateEmission() async {
         let session = PQSSession()
@@ -939,6 +1105,7 @@ extension PQSSession {
 actor EpisodeEndProbe {
     private var ended: [(String, UUID)] = []
     private var unrecoverable: [(String, UUID, String)] = []
+    private var deferred: [(String, UUID, String, String)] = []
 
     func record(sender: String, deviceId: UUID) {
         ended.append((sender, deviceId))
@@ -954,6 +1121,19 @@ actor EpisodeEndProbe {
 
     func unrecoverableContent() -> [(String, UUID, String)] {
         unrecoverable
+    }
+
+    func recordDeferred(
+        sender: String,
+        deviceId: UUID,
+        failedSharedMessageId: String,
+        failureClass: String
+    ) {
+        deferred.append((sender, deviceId, failedSharedMessageId, failureClass))
+    }
+
+    func deferredRecoveries() -> [(String, UUID, String, String)] {
+        deferred
     }
 }
 
@@ -1013,5 +1193,18 @@ struct RecordingEpisodeEndDelegate: PQSSessionDelegate {
             sender: senderSecretName,
             deviceId: senderDeviceId,
             sharedMessageId: sharedMessageId)
+    }
+
+    func inboundRecoveryDeferred(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        failedSharedMessageId: String,
+        failureClass: String
+    ) async {
+        await probe.recordDeferred(
+            sender: senderSecretName,
+            deviceId: senderDeviceId,
+            failedSharedMessageId: failedSharedMessageId,
+            failureClass: failureClass)
     }
 }

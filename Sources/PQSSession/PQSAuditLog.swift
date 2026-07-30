@@ -1,37 +1,46 @@
 //
-//  DecryptFailureAuditLog.swift
+//  PQSAuditLog.swift
 //  post-quantum-solace
 //
-//  Dogfood / staging audit channel for PQS recovery and message-path trails.
+//  Staging audit channel for PQS recovery and message-path trails.
+//  Writes send / recv / recovery lines to separate NeedleTailLogger files.
 //
 //  Compile-time fence (same idea as PQSRTC_CRITICAL_BUG_LOGGING):
-//  - On when `DEBUG` or `-D PQS_DECRYPT_FAILURE_AUDIT`
-//  - Package.swift defines `PQS_DECRYPT_FAILURE_AUDIT` by default; production
-//    builds export `PQS_STRIP_DECRYPT_FAILURE_AUDIT=1` to omit it
+//  - On when `DEBUG` or `-D PQS_AUDIT_LOG`
+//  - Package.swift defines `PQS_AUDIT_LOG` by default; production
+//    builds export `PQS_STRIP_AUDIT_LOG=1` to omit it
 //  - When the fence is off, `log` / `configure` are no-ops (no string build, no I/O)
 //
 
 import Foundation
 import NeedleTailLogger
 
-public enum DecryptFailureAuditLog {
+public enum PQSAuditLog {
+    public enum Channel: String, Sendable, CaseIterable {
+        case send
+        case recv
+        case recovery
+
+        var loggerLabel: String { "[PQSAudit.\(rawValue)]" }
+    }
+
     private final class Storage: @unchecked Sendable {
         let lock = NSLock()
-        /// Meaningful only when `isCompileTimeEnabled`; defaults on for dogfood builds.
+        /// Meaningful only when `isCompileTimeEnabled`; defaults on for staging builds.
         var isEnabled = true
-        var fileLogger: NeedleTailLogger?
+        var fileLoggers: [Channel: NeedleTailLogger] = [:]
     }
 
     private static let storage = Storage()
 
-#if DEBUG || PQS_DECRYPT_FAILURE_AUDIT
+#if DEBUG || PQS_AUDIT_LOG
     private static let isCompileTimeEnabled = true
 #else
     private static let isCompileTimeEnabled = false
 #endif
 
-    /// Default file when using `NeedleTailLogger` file streaming:
-    /// `~/Library/Logs/NeedleTailLogger/[DecryptFailureAudit]/logs.txt`
+    /// Default files when using `NeedleTailLogger` file streaming:
+    /// `~/Library/Logs/NeedleTailLogger/[PQSAudit.send|recv|recovery]/logs.txt`
     public static var isEnabled: Bool {
         guard isCompileTimeEnabled else { return false }
         storage.lock.lock()
@@ -47,18 +56,22 @@ public enum DecryptFailureAuditLog {
         defer { storage.lock.unlock() }
         storage.isEnabled = isEnabled
         if !isEnabled {
-            storage.fileLogger = nil
+            storage.fileLoggers.removeAll()
         }
     }
 
     /// Logs only when enabled. Message is an autoclosure so string build/file I/O
     /// are skipped entirely when the channel is off.
-    public static func log(_ message: @autoclosure () -> String, level: Level = .warning) {
+    public static func log(
+        _ channel: Channel,
+        _ message: @autoclosure () -> String,
+        level: Level = .warning
+    ) {
         guard isCompileTimeEnabled else { return }
 
         storage.lock.lock()
         let enabled = storage.isEnabled
-        let existingLogger = storage.fileLogger
+        let existingLogger = storage.fileLoggers[channel]
         storage.lock.unlock()
 
         guard enabled else { return }
@@ -70,15 +83,15 @@ public enum DecryptFailureAuditLog {
         } else {
             storage.lock.lock()
             defer { storage.lock.unlock() }
-            if let again = storage.fileLogger {
+            if let again = storage.fileLoggers[channel] {
                 logger = again
             } else {
                 let created = NeedleTailLogger(
-                    "[DecryptFailureAudit]",
+                    channel.loggerLabel,
                     maxLines: 5_000,
                     maxLineLength: 512,
                     writeToFile: true)
-                storage.fileLogger = created
+                storage.fileLoggers[channel] = created
                 logger = created
             }
         }

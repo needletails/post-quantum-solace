@@ -675,7 +675,8 @@ public actor TaskProcessor {
                         identities = [offerIdentity]
                     } else {
                         logger.log(level: .error, message: "Missing Offer Identity: \(lookupSecretName)")
-                        return
+                        // Never report success with zero jobs when a targeted device was required.
+                        throw PQSSession.SessionErrors.missingSessionIdentity
                     }
                 }
             }
@@ -1096,10 +1097,30 @@ public actor TaskProcessor {
             }
         }
 
+        if shouldPersist {
+            guard encryptableMessage != nil else {
+                throw PQSSession.SessionErrors.missingMessage
+            }
+            guard persistedMessageProps != nil else {
+                if let savedMessage = encryptableMessage {
+                    try? await session.updateMessageDeliveryState(
+                        savedMessage,
+                        deliveryState: .failed("propsError"),
+                        messageRecipient: message.recipient)
+                }
+                throw PQSSession.SessionErrors.propsError
+            }
+        }
+
         let fanoutSharedId = encryptableMessage?.sharedId ?? sharedIdOverride ?? "ephemeral"
-        DecryptFailureAuditLog.log(
-            "pqs.send.attempt sharedId=\(fanoutSharedId) recipient=\(message.recipient.auditRecipientTag) deviceCount=\(sessionIdentities.count) persist=\(shouldPersist) members=\(recipients.sorted().joined(separator: ","))",
+        PQSAuditLog.log(.send, "pqs.send.attempt sharedId=\(fanoutSharedId) recipient=\(message.recipient.auditRecipientTag) deviceCount=\(sessionIdentities.count) persist=\(shouldPersist) members=\(recipients.sorted().joined(separator: ","))",
             level: .info)
+
+        var queuedRequiredDeviceIds = Set<UUID>()
+        var queuedOptionalSiblingDeviceIds = Set<UUID>()
+        var failedRequiredDevices: [(deviceId: UUID, sessionIdentityId: UUID, error: String)] = []
+        var failedOptionalSiblingDevices: [(deviceId: UUID, sessionIdentityId: UUID, error: String)] = []
+        var requiredTargetDeviceIds = Set<UUID>()
         
         for identity in sessionIdentities {
             do {
@@ -1114,9 +1135,17 @@ public actor TaskProcessor {
 
                 guard let identityProps = await identity.props(symmetricKey: symmetricKey) else {
                     logger.log(level: .warning, message: "Skipping outbound task for unreadable recipient identity \(identity.id)")
-                    DecryptFailureAuditLog.log(
-                        "pqs.send.deviceSkipped sharedId=\(fanoutSharedId) sessionIdentityId=\(identity.id.uuidString) reason=unreadableIdentity",
+                    PQSAuditLog.log(.send, "pqs.send.deviceSkipped sharedId=\(fanoutSharedId) sessionIdentityId=\(identity.id.uuidString) reason=unreadableIdentity",
                         level: .info)
+                    if shouldPersist {
+                        // Without props we cannot classify sibling vs peer; persistable fan-out
+                        // must not succeed while silently dropping an identity slot.
+                        failedRequiredDevices.append((
+                            deviceId: identity.id,
+                            sessionIdentityId: identity.id,
+                            error: "unreadableIdentity"
+                        ))
+                    }
                     continue
                 }
 
@@ -1124,6 +1153,16 @@ public actor TaskProcessor {
                 // non-persisted control/repair frames stay lower so they cannot
                 // starve the conversation path (see production multi-device delay).
                 let isSelfRecipient = identityProps.secretName == sender
+                // Persistable DMs require every peer device job. Sibling sync is best-effort.
+                // Persistable personal messages require every other local device.
+                let isRequiredTarget: Bool = {
+                    if case .personalMessage = message.recipient { return true }
+                    return !isSelfRecipient
+                }()
+                if isRequiredTarget {
+                    requiredTargetDeviceIds.insert(identityProps.deviceId)
+                }
+
                 let taskPriority: Priority = {
                     if shouldPersist {
                         return isSelfRecipient ? .standard : .urgent
@@ -1133,7 +1172,9 @@ public actor TaskProcessor {
 
                 let queuedSharedId: String
                 if shouldPersist {
-                    guard let encryptableMessage else { return }
+                    guard let encryptableMessage else {
+                        throw PQSSession.SessionErrors.missingMessage
+                    }
                     guard let messageProps = persistedMessageProps else {
                         throw PQSSession.SessionErrors.propsError
                     }
@@ -1178,17 +1219,87 @@ public actor TaskProcessor {
                         priority: taskPriority
                     )
                 }
-                DecryptFailureAuditLog.log(
-                    "pqs.send.deviceQueued sharedId=\(queuedSharedId) recipientSecret=\(identityProps.secretName) recipientDeviceId=\(identityProps.deviceId.uuidString) sessionIdentityId=\(identity.id.uuidString) self=\(isSelfRecipient) priority=\(String(describing: taskPriority))",
+                PQSAuditLog.log(.send, "pqs.send.deviceQueued sharedId=\(queuedSharedId) recipientSecret=\(identityProps.secretName) recipientDeviceId=\(identityProps.deviceId.uuidString) sessionIdentityId=\(identity.id.uuidString) self=\(isSelfRecipient) priority=\(String(describing: taskPriority))",
                     level: .info)
+                // Count queued only after feedTask returns (proves cache.createJob completed).
                 try await feedTask(task, session: session)
+                if isRequiredTarget {
+                    queuedRequiredDeviceIds.insert(identityProps.deviceId)
+                } else {
+                    queuedOptionalSiblingDeviceIds.insert(identityProps.deviceId)
+                }
             } catch {
                 // One device's prep/encrypt failure must not abort fan-out to others.
                 logger.log(
                     level: .warning,
                     message: "pqs.send.deviceSkipped recipientDevice=\(identity.id) error=\(error)")
-                DecryptFailureAuditLog.log(
-                    "pqs.send.deviceSkipped sharedId=\(fanoutSharedId) sessionIdentityId=\(identity.id.uuidString) error=\(String(describing: error))")
+                PQSAuditLog.log(.send, "pqs.send.deviceSkipped sharedId=\(fanoutSharedId) sessionIdentityId=\(identity.id.uuidString) error=\(String(describing: error))")
+                if let identityProps = await identity.props(symmetricKey: symmetricKey) {
+                    let isSelfRecipient = identityProps.secretName == sender
+                    let isRequiredTarget: Bool = {
+                        if case .personalMessage = message.recipient { return true }
+                        return !isSelfRecipient
+                    }()
+                    let failure = (
+                        deviceId: identityProps.deviceId,
+                        sessionIdentityId: identity.id,
+                        error: String(describing: error)
+                    )
+                    if isRequiredTarget {
+                        failedRequiredDevices.append(failure)
+                    } else {
+                        failedOptionalSiblingDevices.append(failure)
+                    }
+                }
+            }
+        }
+
+        if !failedOptionalSiblingDevices.isEmpty {
+            let detail = failedOptionalSiblingDevices
+                .map { "\($0.deviceId.uuidString):\($0.error)" }
+                .joined(separator: ",")
+            logger.log(
+                level: .warning,
+                message: "pqs.send.siblingEnqueuePartial sharedId=\(fanoutSharedId) failures=\(detail) queuedSiblings=\(queuedOptionalSiblingDeviceIds.count)")
+        }
+
+        // Persistable user messages may return success only when every required target
+        // has a durable job. Partial sibling-sync failures stay observable above.
+        if shouldPersist {
+            let missingRequired = requiredTargetDeviceIds.subtracting(queuedRequiredDeviceIds)
+            let incomplete: Bool = {
+                if !failedRequiredDevices.isEmpty { return true }
+                if !missingRequired.isEmpty { return true }
+                switch message.recipient {
+                case .personalMessage:
+                    // Multi-device notes: identities were present but none queued.
+                    return !sessionIdentities.isEmpty && queuedRequiredDeviceIds.isEmpty
+                case .nickname, .channel, .broadcast:
+                    // Peer-facing persistable sends must create at least one required peer job.
+                    return queuedRequiredDeviceIds.isEmpty
+                }
+            }()
+
+            if incomplete {
+                let failureDetail: String
+                if !failedRequiredDevices.isEmpty {
+                    failureDetail = failedRequiredDevices
+                        .map { "\($0.deviceId.uuidString):\($0.error)" }
+                        .joined(separator: ",")
+                } else if !missingRequired.isEmpty {
+                    failureDetail = missingRequired.map(\.uuidString).joined(separator: ",")
+                } else {
+                    failureDetail = "zeroRequiredJobs"
+                }
+                PQSAuditLog.log(.send, "pqs.send.enqueueIncomplete sharedId=\(fanoutSharedId) queued=\(queuedRequiredDeviceIds.count) required=\(requiredTargetDeviceIds.count) detail=\(failureDetail)",
+                    level: .error)
+                if let savedMessage = encryptableMessage {
+                    try? await session.updateMessageDeliveryState(
+                        savedMessage,
+                        deliveryState: .failed("outboundEnqueueIncomplete:\(failureDetail)"),
+                        messageRecipient: message.recipient)
+                }
+                throw PQSSession.SessionErrors.outboundEnqueueIncomplete
             }
         }
     }

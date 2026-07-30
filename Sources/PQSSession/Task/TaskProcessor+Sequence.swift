@@ -582,8 +582,7 @@ extension TaskProcessor {
                     logger.log(
                         level: .info,
                         message: "pqs.recovery.resendAwaitingSender failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=orphanResendOwnsSharedId")
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.otkBootstrapDeferredToOrphanResend sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.otkBootstrapDeferredToOrphanResend sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
                     try await cache.deleteJob(job)
                     return .deleted
                 }
@@ -650,8 +649,7 @@ extension TaskProcessor {
                     deviceId: message.senderDeviceId,
                     sharedId: message.sharedMessageId)
                 if newlyTerminal {
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=missingOneTimeKeyDeadEpoch")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=missingOneTimeKeyDeadEpoch")
                     await session.sessionDelegate?.inboundContentUnrecoverable(
                         senderSecretName: message.senderSecretName,
                         senderDeviceId: message.senderDeviceId,
@@ -732,8 +730,7 @@ extension TaskProcessor {
                         // Audit-level so device captures show whether the heal
                         // signal reached the wire; the info logger is filtered
                         // out on devices, which left this step invisible.
-                        DecryptFailureAuditLog.log(
-                            "pqs.recovery.reestablishmentEmitOutcome kind=peerRefresh outcome=\(emitted ? "queued" : "suppressed") failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) sharedId=\(sharedMessageId)")
+                        PQSAuditLog.log(.recovery, "pqs.recovery.reestablishmentEmitOutcome kind=peerRefresh outcome=\(emitted ? "queued" : "suppressed") failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) sharedId=\(sharedMessageId)")
                         logger.log(
                             level: .info,
                             message: "pqs.recovery.reestablishmentQueued kind=peerRefresh failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId) sharedId=\(sharedMessageId)")
@@ -917,8 +914,7 @@ extension TaskProcessor {
                 let senderSecretName = inbound.senderSecretName
                 let senderDeviceId = inbound.senderDeviceId
                 let sharedMessageId = inbound.sharedMessageId
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
+                PQSAuditLog.log(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
                 await session.scheduleTransportProtocolWork {
                     await delegate?.inboundRecoveryDeferred(
                         senderSecretName: senderSecretName,
@@ -1075,8 +1071,7 @@ extension TaskProcessor {
             deviceId: message.senderDeviceId,
             sharedId: message.sharedMessageId)
         {
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.redeliveryDropped reason=terminalContentUnrecoverable failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.redeliveryDropped reason=terminalContentUnrecoverable failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
             try await cache.deleteJob(job)
             return .deleted
         }
@@ -1122,8 +1117,7 @@ extension TaskProcessor {
             _ = try? await session.demoteZombieStateLessActives(
                 secretName: message.senderSecretName,
                 deviceId: message.senderDeviceId)
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.orphanReplayPreferredCleared sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.orphanReplayPreferredCleared sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId)")
         }
         // Resolve live heal ownership before deciding whether recovery control may
         // mint. A live orphan/recovery lane always owns subsequent control delivery.
@@ -1185,8 +1179,7 @@ extension TaskProcessor {
                     deviceId: message.senderDeviceId,
                     sharedId: message.sharedMessageId)
                 if newlyTerminal {
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
                     await session.sessionDelegate?.inboundContentUnrecoverable(
                         senderSecretName: message.senderSecretName,
                         senderDeviceId: message.senderDeviceId,
@@ -1247,8 +1240,7 @@ extension TaskProcessor {
             _ = await session.tryBeginReestablishmentEpisode(
                 sender: message.senderSecretName,
                 deviceId: message.senderDeviceId)
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.undecryptableLaneSaturated sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId) awaitingSenderOrphanResend=true")
+            PQSAuditLog.log(.recovery, "pqs.recovery.undecryptableLaneSaturated sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId) awaitingSenderOrphanResend=true")
             auditInboundDecryptFailure(
                 message: message,
                 failureClass: failureClass,
@@ -1284,8 +1276,7 @@ extension TaskProcessor {
         var action = didRequestResend ? "resendRequested" : "resendSkipped"
         if laneSaturated {
             action = didRequestResend ? "resendRequested.lane" : "resendSkipped.lane"
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.undecryptableLaneSaturated sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId) awaitingSenderOrphanResend=true")
+            PQSAuditLog.log(.recovery, "pqs.recovery.undecryptableLaneSaturated sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId) awaitingSenderOrphanResend=true")
         }
         auditInboundDecryptFailure(
             message: message,
@@ -1516,8 +1507,7 @@ extension TaskProcessor {
                 deviceId: message.senderDeviceId,
                 sharedId: message.sharedMessageId)
             if newlyTerminal {
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
+                PQSAuditLog.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
                 await session.sessionDelegate?.inboundContentUnrecoverable(
                     senderSecretName: message.senderSecretName,
                     senderDeviceId: message.senderDeviceId,

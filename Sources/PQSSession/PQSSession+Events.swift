@@ -272,8 +272,7 @@ public extension PQSSession {
                 deviceId: senderDeviceId,
                 sharedId: messageId)
             guard newlyTerminal else { continue }
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.contentUnrecoverable sharedId=\(messageId) sender=\(senderName) deviceId=\(senderDeviceId.uuidString) reason=oobUnavailable")
+            PQSAuditLog.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(messageId) sender=\(senderName) deviceId=\(senderDeviceId.uuidString) reason=oobUnavailable")
             // Protocol signal: drives the transport's terminal purge of the
             // spool copy. Same contract as pending-resend TTL / resend-cap.
             _ = await scheduleTransportProtocolWork {
@@ -568,6 +567,7 @@ extension PQSSession: SessionEvents {
         metadata: Data = .init(),
         friendshipMetadata: FriendshipMetadata? = nil,
         requestFriendship: Bool,
+        notifyPeerOfCreation: Bool = true,
         friendshipMetadataConflictPolicy: FriendshipMetadataConflictPolicy = .preferSettled
     ) async throws -> ContactModel {
         let params = try await requireAllSessionParameters()

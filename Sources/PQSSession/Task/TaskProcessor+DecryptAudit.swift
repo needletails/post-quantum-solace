@@ -38,6 +38,6 @@ extension TaskProcessor {
             parts.append("\(key)=\(value)")
         }
 
-        DecryptFailureAuditLog.log(parts.joined(separator: " "))
+        PQSAuditLog.log(.recovery, parts.joined(separator: " "))
     }
 }

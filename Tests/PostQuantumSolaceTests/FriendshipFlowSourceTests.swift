@@ -231,11 +231,15 @@ struct FriendshipFlowSourceTests {
         let ratchet = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
         #expect(ratchet.contains("pqs.send.deviceTransportOk"))
         #expect(ratchet.contains("pqs.recv.persisted"))
-        let auditLog = try PQSFriendshipSource.read("Sources/PQSSession/DecryptFailureAuditLog.swift")
-        #expect(auditLog.contains("DEBUG || PQS_DECRYPT_FAILURE_AUDIT"))
+        let auditLog = try PQSFriendshipSource.read("Sources/PQSSession/PQSAuditLog.swift")
+        #expect(auditLog.contains("DEBUG || PQS_AUDIT_LOG"))
+        #expect(auditLog.contains("case send"))
+        #expect(auditLog.contains("case recv"))
+        #expect(auditLog.contains("case recovery"))
+        #expect(auditLog.contains("[PQSAudit.\\(rawValue)]"))
         let packageSwift = try PQSFriendshipSource.read("Package.swift")
-        #expect(packageSwift.contains("PQS_STRIP_DECRYPT_FAILURE_AUDIT"))
-        #expect(packageSwift.contains("PQS_DECRYPT_FAILURE_AUDIT"))
+        #expect(packageSwift.contains("PQS_STRIP_AUDIT_LOG"))
+        #expect(packageSwift.contains("PQS_AUDIT_LOG"))
         // Friendship / OTK bootstrap must not use the chat fan-out helper.
         let nicknameCase = try #require(processor.range(of: "case .nickname(let nickname):"))
         let afterNickname = processor[nicknameCase.lowerBound...]
@@ -1084,17 +1088,28 @@ struct FriendshipFlowSourceTests {
         let ratchetSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
         let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
         let sessionSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession.swift")
+        let eventsSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession+Events.swift")
 
         // Requester: queue-time marking arms only the cooldown; attempts are spent
-        // when the request frame is handed to the transport. Counting at queue time
-        // exhausted the cap on requests that never left the device.
+        // when the authenticated OOB request is handed to the transport. Counting at
+        // queue/encrypt time exhausted the cap on requests that never left the device.
+        // Encrypted TransportEvent.requestMessageResend transport bookkeeping is dead
+        // legacy — OOB submit in PQSSession+Events owns attempt spend.
         let markSentBody = try PQSFriendshipSource.functionBody(
             named: "func markPeerResendRequestSent",
             in: sessionSource)
         #expect(!markSentBody.contains("resendRequestAttemptsByKey"))
         #expect(sessionSource.contains("func markPeerResendRequestTransported"))
-        #expect(ratchetSource.contains("markPeerResendRequestTransported("))
-        #expect(ratchetSource.contains("pqs.recovery.resendRequestTransported"))
+        #expect(eventsSource.contains("sendOutOfBandResendRequest("))
+        #expect(eventsSource.contains("markPeerResendRequestTransported("))
+        #expect(eventsSource.contains("pqs.recovery.resendRequestSubmittedOutOfBand"))
+        // Transport confirmation must follow a successful OOB write, not encrypt/queue.
+        let oobSubmit = try #require(eventsSource.range(of: "sendOutOfBandResendRequest("))
+        let transported = try #require(
+            eventsSource.range(of: "markPeerResendRequestTransported(", range: oobSubmit.upperBound..<eventsSource.endIndex))
+        #expect(oobSubmit.lowerBound < transported.lowerBound)
+        #expect(ratchetSource.contains("DEAD LEGACY: encrypted TransportEvent.requestMessageResend transport bookkeeping"))
+        #expect(!ratchetSource.contains("markPeerResendRequestTransported("))
 
         // Responder: request arrival and every replay outcome are in the audit file,
         // so a silent servicing path is attributable from production logs.

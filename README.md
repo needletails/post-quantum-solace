@@ -151,8 +151,8 @@ deployments.
 - **Recovery flood bounds**: In-memory recovery bookkeeping maps are pruned and
   capped (`PQSSessionConstants.recoveryTrackingMaxEntries`); batched resend
   requests are capped at `FailedMessageResendRequest.maxBatchedIds`.
-- **`DecryptFailureAuditLog`**: Optional file-backed audit trail for inbound
-  decrypt failures (enabled by default; disable via `DecryptFailureAuditLog.configure(isEnabled: false)`).
+- **`PQSAuditLog`**: Optional file-backed staging audit trails for send / recv /
+  recovery (enabled by default; disable via `PQSAuditLog.configure(isEnabled: false)`).
 - **DoubleRatchetKit 3.0.0**: Depends on deferred-persistence semantics in the
   underlying ratchet layer.
 

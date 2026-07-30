@@ -2594,10 +2594,13 @@ actor TaskProcessorSequenceTests {
             try await Task.sleep(until: .now + .milliseconds(50))
         }
 
+        // Wait for the processor to finish deleteJob before asserting cache emptiness;
+        // performRatchet records the message before the durable row is removed.
+        _ = try? await runner.value
+
         let processed = await mockDelegate.getProcessedMessages()
         #expect(processed == ["delayed_until"], "Expected exactly one delayed execution, got \(processed)")
         #expect(try await cache.fetchJobs().isEmpty, "Delayed job should be removed from cache after processing")
-        _ = try? await runner.value
         
         await session.shutdown()
     }

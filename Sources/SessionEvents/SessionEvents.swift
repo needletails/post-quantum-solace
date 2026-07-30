@@ -301,6 +301,8 @@ public protocol SessionEvents: Sendable {
     ///   - secretName: The secret name of the contact.
     ///   - metadata: The metadata associated with the contact.
     ///   - requestFriendship: A boolean indicating whether to request friendship.
+    ///   - notifyPeerOfCreation: When `requestFriendship` is `false`, whether to send
+    ///     a `.contactCreated` acknowledgment via `receiver.synchronize`.
     ///   - sessionContext: The context of the current session.
     ///   - cache: The `PQSSessionStore` used for caching.
     ///   - transport: The `SessionTransport` used for communication.

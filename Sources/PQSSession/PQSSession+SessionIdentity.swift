@@ -446,8 +446,7 @@ public extension PQSSession {
                 byDevice[deviceId] = identity
             }
             if !byDevice.isEmpty {
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.outboundLaneRepairedOnDemand peer=\(secretName) repairedDevices=\(byDevice.count)")
+                PQSAuditLog.log(.recovery, "pqs.recovery.outboundLaneRepairedOnDemand peer=\(secretName) repairedDevices=\(byDevice.count)")
             }
         }
         let result = Array(byDevice.values)
@@ -485,8 +484,7 @@ public extension PQSSession {
                 do {
                     try await cache?.deleteSessionIdentity(identityToRemove.id)
                     logger.log(level: .info, message: "Did remove stale session identity for recipient: \(secretName)")
-                    DecryptFailureAuditLog.log(
-                        "pqs.recovery.laneStalePruned peer=\(secretName) deviceId=\(deviceId.uuidString) verifiedDeviceCount=\(verifiedDeviceIds.count)")
+                    PQSAuditLog.log(.recovery, "pqs.recovery.laneStalePruned peer=\(secretName) deviceId=\(deviceId.uuidString) verifiedDeviceCount=\(verifiedDeviceIds.count)")
                     identities.removeAll { $0.id == identityToRemove.id }
                 } catch {
                     logger.log(
@@ -958,8 +956,7 @@ public extension PQSSession {
         logger.log(
             level: .info,
             message: "wipePeerRelationshipState: removed \(deletedCount) session identity row(s) and transient handshake state for \(secretName)")
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.laneWiped peer=\(secretName) deletedRows=\(deletedCount)")
+        PQSAuditLog.log(.recovery, "pqs.recovery.laneWiped peer=\(secretName) deletedRows=\(deletedCount)")
     }
 
     /// Waits briefly for the peer to replenish published OTKs. Returns whether keys are available.
@@ -1427,8 +1424,7 @@ public extension PQSSession {
             // Do not call `removeIdentity` / `clearPeerTransientState`: that drops
             // recovery state for the whole secretName beyond this device.
             invalidateSessionIdentityCache(secretName: provenProps.secretName)
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.laneActivatedAfterDecrypt peer=\(provenProps.secretName) deviceId=\(provenProps.deviceId.uuidString) demotedSiblings=\(demotedSiblingCount)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.laneActivatedAfterDecrypt peer=\(provenProps.secretName) deviceId=\(provenProps.deviceId.uuidString) demotedSiblings=\(demotedSiblingCount)")
         }
         // When `proven` is itself the orphan remint row, keep the mark — orphan
         // resend may still reuse that initiating SessionID until MessageRecord settles.
@@ -1522,8 +1518,7 @@ public extension PQSSession {
         let demoted = try await demoteActiveSessionIdentityToInactive(identity)
         if demoted {
             invalidateSessionIdentityCache(secretName: secretName)
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.proveFailedActiveDemoted peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(sessionId.uuidString)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.proveFailedActiveDemoted peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(sessionId.uuidString)")
             logger.log(
                 level: .warning,
                 message: "Demoted prove-failed active SessionIdentity \(sessionId) for \(secretName) (\(deviceId))")
@@ -1576,8 +1571,7 @@ public extension PQSSession {
             // clears in-flight orphan-resend `orphanResend` marks for the whole secretName.
             // Prefer the surviving initiating active on the next encrypt lookup.
             invalidateSessionIdentityCache(secretName: secretName)
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.zombieStateLessDemoted peer=\(secretName) deviceId=\(deviceId.uuidString) demoted=\(demoted)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.zombieStateLessDemoted peer=\(secretName) deviceId=\(deviceId.uuidString) demoted=\(demoted)")
             logger.log(
                 level: .warning,
                 message: "Demoted \(demoted) zombie state-less active SessionIdentity row(s) for \(secretName) (\(deviceId))")
@@ -1666,8 +1660,7 @@ public extension PQSSession {
         logger.log(
             level: .info,
             message: "Promoted cryptographically proven archived SessionIdentity for \(archivedProps.secretName) (\(archivedProps.deviceId)); demotedActive=\(demotedActiveCount)")
-        DecryptFailureAuditLog.log(
-            "pqs.recovery.lanePromotedFromArchive peer=\(archivedProps.secretName) deviceId=\(archivedProps.deviceId.uuidString) demotedActive=\(demotedActiveCount)")
+        PQSAuditLog.log(.recovery, "pqs.recovery.lanePromotedFromArchive peer=\(archivedProps.secretName) deviceId=\(archivedProps.deviceId.uuidString) demotedActive=\(demotedActiveCount)")
         return archived
     }
 
@@ -1767,8 +1760,7 @@ public extension PQSSession {
                 logger.log(
                     level: .info,
                     message: "Reusing existing state-less SessionIdentity for \(secretName) (\(device.deviceId)); repair lane does not consume OTKs")
-                DecryptFailureAuditLog.log(
-                    "pqs.recovery.laneReset outcome=reusedStateLessRow reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString)")
+                PQSAuditLog.log(.recovery, "pqs.recovery.laneReset outcome=reusedStateLessRow reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString)")
                 return reusable.identity
             }
         }
@@ -1833,11 +1825,9 @@ public extension PQSSession {
         // inbound lane failing right after one of these entries identifies the
         // caller that clobbered it.
         if demotePriorActives {
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.laneReset outcome=reset reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.laneReset outcome=reset reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
         } else {
-            DecryptFailureAuditLog.log(
-                "pqs.recovery.laneReset outcome=surgicalControlInsert reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
+            PQSAuditLog.log(.recovery, "pqs.recovery.laneReset outcome=surgicalControlInsert reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
         }
 
         return identity

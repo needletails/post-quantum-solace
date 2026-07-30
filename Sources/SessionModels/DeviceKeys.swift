@@ -185,7 +185,7 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
 /// Client-side state for the ML-DSA-65 device JWT key: the 32-byte FIPS 204
 /// seed the private key is derived from, and the server-confirmed `kid` once
 /// activation completes. Tokens are minted with this key only after
-/// `activatedKid` is set — until then the device keeps using HS256.
+/// `activatedKid` is set.
 public struct DeviceAuthMLDSAState: Codable, Sendable, Equatable {
     enum CodingKeys: String, CodingKey {
         case seed = "a"

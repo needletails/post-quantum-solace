@@ -4,15 +4,15 @@
 import Foundation
 import PackageDescription
 
-// DecryptFailureAuditLog file trails (recovery + send/recv path).
-// Local / staging dogfood: defined (Release dogfood keeps audits).
-// Public App Store / customer Release: export PQS_STRIP_DECRYPT_FAILURE_AUDIT=1.
-private let stripDecryptFailureAudit =
-    ProcessInfo.processInfo.environment["PQS_STRIP_DECRYPT_FAILURE_AUDIT"] == "1"
+// PQSAuditLog file trails (recovery + send/recv path, per-channel files).
+// Local / staging: defined (Release staging builds keep audits).
+// Public App Store / customer Release: export PQS_STRIP_AUDIT_LOG=1.
+private let stripPQSAuditLog =
+    ProcessInfo.processInfo.environment["PQS_STRIP_AUDIT_LOG"] == "1"
 
 private var pqsSessionSwiftSettings: [SwiftSetting] {
-    guard !stripDecryptFailureAudit else { return [] }
-    return [.define("PQS_DECRYPT_FAILURE_AUDIT")]
+    guard !stripPQSAuditLog else { return [] }
+    return [.define("PQS_AUDIT_LOG")]
 }
 
 let package = Package(
