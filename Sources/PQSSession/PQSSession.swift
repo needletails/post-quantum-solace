@@ -243,6 +243,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     private var refreshOTKeysTask: Task<Bool, Never>?
     private var refreshMLKEMOTKeysTask: Task<Bool, Never>?
     private var otkBatchReplacementPairTask: Task<Bool, Never>?
+    private var serverAcceptAckOverdueHandler: (@Sendable (String) async -> Void)?
 
     /// Bounded FIFO coordinator for session-scoped background / protocol work.
     private var sessionWorkCoordinator: SessionWorkCoordinator?
@@ -255,6 +256,39 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     public func setViability(_ value: Bool) async {
         let update = viabilityCompatibilityBridge.store(value)
         await applyViability(update)
+    }
+
+    /// Receives a server acceptance acknowledgment for an outbound envelope.
+    ///
+    public func confirmServerAcceptedEnvelope(_ envelopeMessageId: String) async {
+        await taskProcessor.confirmServerAcceptedEnvelope(envelopeMessageId, session: self)
+    }
+
+    /// Replays durable outbound envelopes which have not received server acceptance.
+    ///
+    public func resendUnackedOutboundEnvelopes(reason: String) async {
+        await taskProcessor.resendUnackedOutboundEnvelopes(reason: reason, session: self)
+    }
+
+    /// Retries a chat envelope that exhausted server-accept reconnect attempts.
+    @discardableResult
+    public func retryFailedServerAcceptOutbound(localMessageId: UUID) async -> Bool {
+        await taskProcessor.retryFailedServerAcceptOutbound(
+            localMessageId: localMessageId,
+            session: self)
+    }
+
+    /// Sets the owner callback for a concrete missing server-acceptance transition.
+    public func setServerAcceptAckOverdueHandler(
+        _ handler: (@Sendable (String) async -> Void)?
+    ) {
+        serverAcceptAckOverdueHandler = handler
+    }
+
+    public func notifyServerAcceptAckOverdue(envelopeMessageId: String) async {
+        if let serverAcceptAckOverdueHandler {
+            await serverAcceptAckOverdueHandler(envelopeMessageId)
+        }
     }
 
     private func applyViability(_ update: ViabilityCompatibilityBridge.Update) async {

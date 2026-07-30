@@ -43,22 +43,28 @@ private actor RecoveryEventGate<Event: Hashable & Sendable> {
     }
 }
 
-private actor PreparedTransportProbe: SessionTransport {
+actor PreparedTransportProbe: SessionTransport {
     enum ProbeError: Error {
         case unsupported
     }
 
     private var payloads: [Data] = []
+    private var envelopeMessageIds: [String] = []
 
     func sendMessage(
         _ message: SignedRatchetMessage,
         metadata: SignedRatchetMessageMetadata
     ) async throws {
         payloads.append(message.signed?.data ?? Data())
+        envelopeMessageIds.append(metadata.envelopeMessageId)
     }
 
     func capturedPayloads() -> [Data] {
         payloads
+    }
+
+    func capturedEnvelopeMessageIds() -> [String] {
+        envelopeMessageIds
     }
 
     func findConfiguration(for secretName: String) async throws -> UserConfiguration {

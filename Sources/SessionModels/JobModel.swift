@@ -328,6 +328,8 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         /// envelope MessageID for this prepared envelope; defaults to sharedMessageId for legacy rows.
         public let envelopeMessageId: String
         public let transportEvent: TransportEvent?
+        /// Whether the transport should request a server acceptance acknowledgment.
+        public let requiresServerAck: Bool
         public let sessionIdentityId: UUID
         public let needsRemoteDeletion: Bool
         public let curveOneTimeKeyId: String?
@@ -343,6 +345,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             sharedMessageId: String,
             envelopeMessageId: String? = nil,
             transportEvent: TransportEvent?,
+            requiresServerAck: Bool = false,
             sessionIdentityId: UUID,
             needsRemoteDeletion: Bool,
             curveOneTimeKeyId: String?,
@@ -357,6 +360,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             self.sharedMessageId = sharedMessageId
             self.envelopeMessageId = envelopeMessageId ?? sharedMessageId
             self.transportEvent = transportEvent
+            self.requiresServerAck = requiresServerAck
             self.sessionIdentityId = sessionIdentityId
             self.needsRemoteDeletion = needsRemoteDeletion
             self.curveOneTimeKeyId = curveOneTimeKeyId
@@ -367,7 +371,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         enum CodingKeys: String, CodingKey {
             case signedMessage, secretName, deviceId, recipient, transportMetadata
             case sharedMessageId, envelopeMessageId, transportEvent, sessionIdentityId
-            case needsRemoteDeletion, curveOneTimeKeyId, mlKEMOneTimeKeyId, createdAt
+            case requiresServerAck, needsRemoteDeletion, curveOneTimeKeyId, mlKEMOneTimeKeyId, createdAt
         }
 
         public init(from decoder: Decoder) throws {
@@ -380,6 +384,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             sharedMessageId = try c.decode(String.self, forKey: .sharedMessageId)
             envelopeMessageId = try c.decodeIfPresent(String.self, forKey: .envelopeMessageId) ?? sharedMessageId
             transportEvent = try c.decodeIfPresent(TransportEvent.self, forKey: .transportEvent)
+            requiresServerAck = try c.decodeIfPresent(Bool.self, forKey: .requiresServerAck) ?? false
             sessionIdentityId = try c.decode(UUID.self, forKey: .sessionIdentityId)
             needsRemoteDeletion = try c.decode(Bool.self, forKey: .needsRemoteDeletion)
             curveOneTimeKeyId = try c.decodeIfPresent(String.self, forKey: .curveOneTimeKeyId)
@@ -397,6 +402,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             try c.encode(sharedMessageId, forKey: .sharedMessageId)
             try c.encode(envelopeMessageId, forKey: .envelopeMessageId)
             try c.encodeIfPresent(transportEvent, forKey: .transportEvent)
+            try c.encode(requiresServerAck, forKey: .requiresServerAck)
             try c.encode(sessionIdentityId, forKey: .sessionIdentityId)
             try c.encode(needsRemoteDeletion, forKey: .needsRemoteDeletion)
             try c.encodeIfPresent(curveOneTimeKeyId, forKey: .curveOneTimeKeyId)

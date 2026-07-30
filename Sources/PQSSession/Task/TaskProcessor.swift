@@ -265,6 +265,26 @@ public actor TaskProcessor {
     let pendingOutboundTransportTTL: TimeInterval = 60 * 10
     let pendingOutboundTransportLimit = 256
 
+    /// A durable outbound envelope that has reached the local transport but has
+    /// not yet been accepted by the server.
+    struct UnackedOutboundEnvelope: Sendable {
+        var pending: PendingOutboundTransport
+        let localId: UUID
+        let sharedId: String
+        var connectionEpoch: UInt64
+        var resendAttempts: Int
+    }
+
+    var unackedServerAcceptByEnvelopeId: [String: UnackedOutboundEnvelope] = [:]
+    var unackedServerAcceptDeadlineTasks: [String: Task<Void, Never>] = [:]
+    var messagingConnectionEpoch: UInt64 = 0
+    let unackedServerAcceptTTL: TimeInterval = 60 * 10
+    let unackedServerAcceptLimit = 256
+    /// Overridable internally so tests can exercise the deadline without waiting ten seconds.
+    var serverAcceptAckDeadlineNanosecondsOverride: UInt64?
+    let serverAcceptAckDeadlineNanoseconds: UInt64 = 10_000_000_000
+    let maxServerAcceptResendAttempts = 5
+
     /// Jobs currently entering the ratchet, keyed by their logical shared id.
     var processingOutboundJobBySharedId: [String: JobModel] = [:]
     /// Outbound identities whose DRK delegate persistence is deferred until the

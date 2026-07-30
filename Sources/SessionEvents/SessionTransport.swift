@@ -75,6 +75,9 @@ public struct SignedRatchetMessageMetadata: Sendable {
     ///
     public let transportEvent: TransportEvent?
 
+    /// Whether the transport must request a server acceptance acknowledgment for this envelope.
+    public let requiresServerAck: Bool
+
     /// Initializes a new instance of `SignedRatchetMessageMetadata`.
     ///
     /// - Parameters:
@@ -85,6 +88,7 @@ public struct SignedRatchetMessageMetadata: Sendable {
     ///   - sharedMessageId: Logical shared identifier (stable across devices/resends)
     ///   - envelopeMessageId: Unique envelope MessageID for this encrypted envelope
     ///   - transportEvent: Optional transport event
+    ///   - requiresServerAck: Whether the transport should request a server acceptance acknowledgment
     public init(
         secretName: String,
         deviceId: UUID,
@@ -92,7 +96,8 @@ public struct SignedRatchetMessageMetadata: Sendable {
         transportMetadata: Data?,
         sharedMessageId: String,
         envelopeMessageId: String? = nil,
-        transportEvent: TransportEvent?
+        transportEvent: TransportEvent?,
+        requiresServerAck: Bool = false
     ) {
         self.secretName = secretName
         self.deviceId = deviceId
@@ -101,6 +106,7 @@ public struct SignedRatchetMessageMetadata: Sendable {
         self.sharedMessageId = sharedMessageId
         self.envelopeMessageId = envelopeMessageId ?? sharedMessageId
         self.transportEvent = transportEvent
+        self.requiresServerAck = requiresServerAck
     }
 }
 

@@ -1465,7 +1465,8 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             transportMetadata: outboundTask.message.transportInfo,
             sharedMessageId: outboundTask.sharedId,
             envelopeMessageId: envelopeMessageId,
-            transportEvent: transportEvent)
+            transportEvent: transportEvent,
+            requiresServerAck: outboundTask.isPersistedOutbound)
         if let persistenceJob {
             guard let cache = await session.cache,
                   var jobProps = await persistenceJob.props(symmetricKey: databaseSymmetricKey) else {
@@ -1486,6 +1487,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                 sharedMessageId: transportMetadata.sharedMessageId,
                 envelopeMessageId: transportMetadata.envelopeMessageId,
                 transportEvent: transportMetadata.transportEvent,
+                requiresServerAck: transportMetadata.requiresServerAck,
                 sessionIdentityId: sessionIdentity.id,
                 needsRemoteDeletion: results.needsRemoteDeletion,
                 curveOneTimeKeyId: results.localOneTimePrivateKey?.id.uuidString,
@@ -1581,7 +1583,20 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
 
         await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
 
-        if outboundTask.isPersistedOutbound {
+        if outboundTask.isPersistedOutbound || transportMetadata.requiresServerAck {
+            registerUnackedServerAccept(
+                pending: PendingOutboundTransport(
+                    message: signedMessage,
+                    metadata: transportMetadata,
+                    sessionIdentityId: sessionIdentity.id,
+                    needsRemoteDeletion: results.needsRemoteDeletion,
+                    curveOneTimeKeyId: results.localOneTimePrivateKey?.id.uuidString,
+                    mlKEMOneTimeKeyId: results.localMLKEMPrivateKey.id.uuidString,
+                    createdAt: Date()),
+                localId: outboundTask.localId,
+                sharedId: outboundTask.sharedId,
+                session: session)
+        } else {
             await markPersistedOutboundPastSendingIfNeeded(session: session, localMessageId: outboundTask.localId)
         }
         
@@ -2671,7 +2686,8 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
             transportMetadata: prepared.transportMetadata,
             sharedMessageId: prepared.sharedMessageId,
             envelopeMessageId: prepared.envelopeMessageId,
-            transportEvent: prepared.transportEvent)
+            transportEvent: prepared.transportEvent,
+            requiresServerAck: prepared.requiresServerAck)
         let pending = PendingOutboundTransport(
             message: prepared.signedMessage,
             metadata: metadata,
@@ -2715,7 +2731,13 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
 
         await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
 
-        if outboundTask.isPersistedOutbound {
+        if outboundTask.isPersistedOutbound || pendingTransport.metadata.requiresServerAck {
+            registerUnackedServerAccept(
+                pending: pendingTransport,
+                localId: outboundTask.localId,
+                sharedId: outboundTask.sharedId,
+                session: session)
+        } else {
             await markPersistedOutboundPastSendingIfNeeded(session: session, localMessageId: outboundTask.localId)
         }
 
@@ -4007,7 +4029,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     ///                      Contains sender's cryptographic identity.
     /// After the transport accepts an outbound ratchet payload, move the local persisted copy off `.sending`
     /// so clients can show a stable "sent" state without waiting for a peer receipt.
-    private func markPersistedOutboundPastSendingIfNeeded(session: PQSSession, localMessageId: UUID) async {
+    func markPersistedOutboundPastSendingIfNeeded(session: PQSSession, localMessageId: UUID) async {
         guard let cache = await session.cache else { return }
         let persisted: EncryptedMessage
         do {
