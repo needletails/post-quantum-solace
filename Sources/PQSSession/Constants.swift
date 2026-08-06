@@ -166,6 +166,15 @@ public enum PQSSessionConstants: Sendable {
     /// `messageResendUnavailable` notice is lost in transit.
     public static let peerResendRequestMaxSubmissions = 3
 
+    /// Sliding window for counting transport-confirmed resend-request submissions
+    /// toward `peerResendRequestMaxSubmissions`. Drain events (episode end,
+    /// offline replay boundary) are routinely further apart than the failure-policy
+    /// cooldown; pruning attempts on that cooldown resets the cap between drains,
+    /// so a dead lane would re-NACK on every event and never terminalize. Aligned
+    /// with `terminalInboundOutcomeTTLSeconds` so exhaustion and quarantine expire
+    /// together.
+    public static let resendRequestAttemptWindowSeconds: TimeInterval = 60 * 60 * 24 * 7
+
     /// Distinct undecryptable inbound messages from the same peer device after which
     /// further distinct-id NACKs coalesce (open reestablishment episode +
     /// `deferPeerResendUntilReestablished`) once at least one resend request has been

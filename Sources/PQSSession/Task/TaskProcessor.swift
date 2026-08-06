@@ -271,6 +271,8 @@ public actor TaskProcessor {
         var pending: PendingOutboundTransport
         let localId: UUID
         let sharedId: String
+        /// When false, `localId` is not a message-store row (control / ephemeral traffic).
+        let isPersistedOutbound: Bool
         var connectionEpoch: UInt64
         var resendAttempts: Int
     }
@@ -449,10 +451,12 @@ public actor TaskProcessor {
         sharedIdOverride: String? = nil,
         targetDeviceId: UUID? = nil,
         shouldPersist: Bool,
+        coalescingKey: String? = nil,
         logger: NeedleTailLogger
     ) async throws {
         var identities = [SessionIdentity]()
         var recipients = Set<String>()
+        var prePersistedMessage: EncryptedMessage?
         // Friendship / OTK bootstrap must avoid ghost non-master rows in published
         // peer configs. Normal DMs, channels, and sibling sync must keep every
         // linked device — otherwise child devices can send but never receive.
@@ -496,6 +500,33 @@ public actor TaskProcessor {
                 restrictPeerFanoutToMasterDevices = true
             }
 
+            recipients.formUnion([sender, nickname])
+
+            let hasTargetedTransportIdentity: Bool
+            if let (_, deviceId) = await session.sessionDelegate?.retrieveUserInfo(message.transportInfo) {
+                hasTargetedTransportIdentity = !deviceId.isEmpty
+            } else {
+                hasTargetedTransportIdentity = false
+            }
+            let hasActiveLocalLane =
+                try await session.hasActiveChatLane(secretName: nickname)
+            let canPersistBeforeRemoteLookup = shouldPersist
+                && targetDeviceId == nil
+                && !hasTargetedTransportIdentity
+                && !forceIdentityRefresh
+                && !sendOneTimeIdentities
+                && createIdentity
+                && hasActiveLocalLane
+            if canPersistBeforeRemoteLookup {
+                prePersistedMessage = try await persistOutboundMessage(
+                    message: message,
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey,
+                    recipients: recipients,
+                    sharedIdOverride: sharedIdOverride)
+            }
+
             // Friendship / OTK bootstrap keep the master-scoped gather path.
             // Persistable chat uses verified-device fan-out: one active lane per device.
             if forceIdentityRefresh || sendOneTimeIdentities || !createIdentity {
@@ -510,7 +541,16 @@ public actor TaskProcessor {
                 // offlineOutboundPersist / queueOutboundDespiteConfigurationLookupFailure:
                 // chat fan-out falls back to local lanes when live findConfiguration fails
                 // so compose can persist and drain on resume (offline-first).
-                identities = try await session.sessionIdentitiesForChatFanout(secretName: nickname)
+                do {
+                    identities = try await session.sessionIdentitiesForChatFanout(
+                        secretName: nickname)
+                } catch {
+                    await markPrePersistedIdentityResolutionFailure(
+                        prePersistedMessage,
+                        recipient: message.recipient,
+                        session: session)
+                    throw error
+                }
                 logger.log(
                     level: .info,
                     message: "Gathered \(identities.count) chat fan-out Session Identities for \(nickname)")
@@ -570,11 +610,33 @@ public actor TaskProcessor {
                 }
             }
             
-            recipients.formUnion([sender, nickname])
-            
         case .channel:
             do {
-                
+                if shouldPersist, targetDeviceId == nil {
+                    let communication = try await findCommunicationType(
+                        cache: cache,
+                        communicationType: type,
+                        session: session)
+                    if let props = await communication.props(symmetricKey: symmetricKey) {
+                        let peerMembers = props.members.filter { $0 != sender }
+                        var hasLocalLanesForEveryPeer = !peerMembers.isEmpty
+                        for member in peerMembers where hasLocalLanesForEveryPeer {
+                            hasLocalLanesForEveryPeer =
+                                try await session.hasActiveChatLane(secretName: member)
+                        }
+                        if hasLocalLanesForEveryPeer {
+                            recipients.formUnion(props.members)
+                            prePersistedMessage = try await persistOutboundMessage(
+                                message: message,
+                                cache: cache,
+                                session: session,
+                                symmetricKey: symmetricKey,
+                                recipients: recipients,
+                                sharedIdOverride: sharedIdOverride)
+                        }
+                    }
+                }
+
                 let (channelIdentities, members) = try await gatherChannelIdentities(
                     cache: cache,
                     session: session,
@@ -585,7 +647,8 @@ public actor TaskProcessor {
                 identities = channelIdentities
                 recipients.formUnion(members)
                 
-            } catch let sessionError as PQSSession.SessionErrors where sessionError == .cannotFindCommunication {
+            } catch let sessionError as PQSSession.SessionErrors where
+                sessionError == .cannotFindCommunication && prePersistedMessage == nil {
                 
                 let info = try BinaryDecoder().decode(ChannelInfo.self, from: message.metadata)
 
@@ -612,6 +675,10 @@ public actor TaskProcessor {
                 recipients.formUnion(gatheredMembers)
                 
             } catch {
+                await markPrePersistedIdentityResolutionFailure(
+                    prePersistedMessage,
+                    recipient: message.recipient,
+                    session: session)
                 throw error
             }
         case .broadcast:
@@ -720,6 +787,7 @@ public actor TaskProcessor {
                     recipients: Set([sender, peer]),
                     sharedIdOverride: sharedIdOverride,
                     shouldPersist: shouldPersist,
+                    coalescingKey: coalescingKey,
                     logger: logger)
             }
             return
@@ -735,7 +803,72 @@ public actor TaskProcessor {
             recipients: recipients,
             sharedIdOverride: sharedIdOverride,
             shouldPersist: shouldPersist,
+            prePersistedMessage: prePersistedMessage,
+            coalescingKey: coalescingKey,
             logger: logger)
+    }
+
+    /// Persists a user-visible outbound row before remote identity refresh.
+    ///
+    /// This is used only when active local recipient lanes already prove the chat is
+    /// established. Encryption and durable per-device jobs still use the normal
+    /// `createEncryptableTask` path after fan-out resolution.
+    private func persistOutboundMessage(
+        message: CryptoMessage,
+        cache: SessionCache,
+        session: PQSSession,
+        symmetricKey: SymmetricKey,
+        recipients: Set<String>,
+        sharedIdOverride: String?
+    ) async throws -> EncryptedMessage {
+        var communicationModel: BaseCommunication
+        var shouldUpdateCommunication: Bool
+
+        do {
+            communicationModel = try await findCommunicationType(
+                cache: cache,
+                communicationType: message.recipient,
+                session: session)
+            guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
+                throw PQSSession.SessionErrors.propsError
+            }
+            props.messageCount += 1
+            _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
+            shouldUpdateCommunication = true
+        } catch {
+            communicationModel = try await createCommunicationModel(
+                recipients: recipients,
+                communicationType: message.recipient,
+                metadata: message.metadata,
+                symmetricKey: symmetricKey)
+            shouldUpdateCommunication = false
+            await session.receiverDelegate?.updatedCommunication(
+                communicationModel,
+                members: recipients)
+        }
+
+        let savedMessage = try await createOutboundMessageModel(
+            message: message,
+            communication: communicationModel,
+            session: session,
+            symmetricKey: symmetricKey,
+            members: recipients,
+            sharedId: sharedIdOverride ?? UUID().uuidString,
+            shouldUpdateCommunication: shouldUpdateCommunication)
+        await session.receiverDelegate?.createdMessage(savedMessage)
+        return savedMessage
+    }
+
+    private func markPrePersistedIdentityResolutionFailure(
+        _ message: EncryptedMessage?,
+        recipient: MessageRecipient,
+        session: PQSSession
+    ) async {
+        guard let message else { return }
+        try? await session.updateMessageDeliveryState(
+            message,
+            deliveryState: .failed("identityResolution"),
+            messageRecipient: recipient)
     }
     
     public func createChannelCommunication(
@@ -986,11 +1119,34 @@ public actor TaskProcessor {
 
         let members = props.members
         var identities = Set<SessionIdentity>()
+        var activeMembers = Set<String>()
         for member in members {
-            try await identities.formUnion(session.refreshIdentities(secretName: member))
+            do {
+                let memberIdentities = try await session.refreshIdentities(secretName: member)
+                // Deleted accounts linger in channel `members` until roster repair.
+                // refreshIdentities returns no lanes for tombstoned accounts (graceful
+                // contract); exclude them from activeMembers too so recipients metadata
+                // does not carry ghost names. Members with empty lanes for any *other*
+                // reason (e.g. transient refresh failure) keep the legacy behavior.
+                if memberIdentities.isEmpty,
+                   await session.knownDeletedAccountSecretNames.contains(member) {
+                    logger.log(
+                        level: .info,
+                        message: "Skipping channel member with deleted account secretName=\(member)")
+                    continue
+                }
+                identities.formUnion(memberIdentities)
+                activeMembers.insert(member)
+            } catch PQSSession.SessionErrors.userNotFound {
+                // Defense-in-depth if a future refresh path surfaces userNotFound again.
+                logger.log(
+                    level: .info,
+                    message: "Skipping channel member with deleted account secretName=\(member)")
+                continue
+            }
         }
         logger.log(level: .info, message: "Gathered \(identities.count) Channel Session Identities")
-        return (Array(identities), members)
+        return (Array(identities), activeMembers)
     }
 
     // MARK: - Message Encryption
@@ -1037,6 +1193,8 @@ public actor TaskProcessor {
         recipients: Set<String>,
         sharedIdOverride: String? = nil,
         shouldPersist: Bool,
+        prePersistedMessage: EncryptedMessage? = nil,
+        coalescingKey: String? = nil,
         logger: NeedleTailLogger
     ) async throws {
 
@@ -1050,49 +1208,26 @@ public actor TaskProcessor {
             // control events (non-persisted) are a no-op, and persisted notes-to-self
             // fall through below so they are stored locally and marked delivered.
             guard message.recipient == .personalMessage else {
+                await markPrePersistedIdentityResolutionFailure(
+                    prePersistedMessage,
+                    recipient: message.recipient,
+                    session: session)
                 throw PQSSession.SessionErrors.missingSessionIdentity
             }
             guard shouldPersist else { return }
         }
 
         var task: EncryptableTask
-        var encryptableMessage: EncryptedMessage?
+        var encryptableMessage = prePersistedMessage
 
-        if shouldPersist {
-            var communicationModel: BaseCommunication
-            var shouldUpdateCommunication = false
-
-            do {
-                communicationModel = try await findCommunicationType(
-                    cache: cache,
-                    communicationType: message.recipient,
-                    session: session)
-                
-                guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
-                    throw PQSSession.SessionErrors.propsError
-                }
-                props.messageCount += 1
-                _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
-                shouldUpdateCommunication = true
-            } catch {
-                communicationModel = try await createCommunicationModel(
-                    recipients: recipients,
-                    communicationType: message.recipient,
-                    metadata: message.metadata,
-                    symmetricKey: symmetricKey)
-                await session.receiverDelegate?.updatedCommunication(communicationModel, members: recipients)
-            }
-
-            let savedMessage = try await createOutboundMessageModel(
+        if shouldPersist, encryptableMessage == nil {
+            encryptableMessage = try await persistOutboundMessage(
                 message: message,
-                communication: communicationModel,
+                cache: cache,
                 session: session,
                 symmetricKey: symmetricKey,
-                members: recipients,
-                sharedId: sharedIdOverride ?? UUID().uuidString,
-                shouldUpdateCommunication: shouldUpdateCommunication)
-            await session.receiverDelegate?.createdMessage(savedMessage)
-            encryptableMessage = savedMessage
+                recipients: recipients,
+                sharedIdOverride: sharedIdOverride)
         }
 
         if !hasRecipientIdentities {
@@ -1228,13 +1363,16 @@ public actor TaskProcessor {
                     }
 
                     queuedSharedId = sharedIdOverride ?? UUID().uuidString
+                    // Coalescing applies only to ephemeral state publishes; persisted
+                    // user messages above never carry a key and are never superseded.
                     task = EncryptableTask(
                         task: .writeMessage(OutboundTaskMessage(
                             message: message,
                             recipientIdentity: identity,
                             localId: UUID(),
                             sharedId: queuedSharedId,
-                            isPersistedOutbound: false
+                            isPersistedOutbound: false,
+                            coalescingKey: coalescingKey
                         )),
                         priority: taskPriority
                     )

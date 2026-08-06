@@ -224,7 +224,9 @@ struct FriendshipFlowSourceTests {
         let processor = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor.swift")
         let identitySource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession+SessionIdentity.swift")
         #expect(identitySource.contains("func sessionIdentitiesForChatFanout"))
-        #expect(processor.contains("sessionIdentitiesForChatFanout(secretName:"))
+        // Call is intentionally multiline (`sessionIdentitiesForChatFanout(\n secretName:`).
+        #expect(processor.contains("sessionIdentitiesForChatFanout("))
+        #expect(processor.contains("secretName: nickname"))
         #expect(processor.contains("pqs.send.deviceSkipped"))
         #expect(processor.contains("pqs.send.attempt"))
         #expect(processor.contains("pqs.send.deviceQueued"))
@@ -607,7 +609,7 @@ struct FriendshipFlowSourceTests {
         #expect(!outboundRepairBody.contains("hasRecentInboundPeerRefreshBootstrap"))
     }
 
-    @Test("terminal peerRefresh emit failures close the episode and gate identity")
+    @Test("terminal peerRefresh emit failures close the episode")
     func terminalPeerRefreshEmitFailuresCloseEpisodeAndGateIdentity() throws {
         let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
         let sessionSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession.swift")
@@ -615,8 +617,7 @@ struct FriendshipFlowSourceTests {
             named: "private func handleInvalidSignature",
             in: sequenceSource)
 
-        // Terminal emit failures on remaining ASR paths close the episode and gate.
-        #expect(invalidSigBody.contains("markRecoveryEmitBlocked"))
+        // Terminal emit failures close the episode (which drains deferred NACKs).
         #expect(invalidSigBody.contains("endReestablishmentEpisode"))
         #expect(invalidSigBody.contains("forceReemit: true"))
         // An incomplete batch replacement is non-terminal: the peerRefresh must
@@ -629,12 +630,12 @@ struct FriendshipFlowSourceTests {
         let emitCall = try #require(afterIncomplete.range(of: "emitSessionReestablishment("))
         let betweenIncompleteAndEmit = String(afterIncomplete[..<emitCall.lowerBound])
         #expect(!betweenIncompleteAndEmit.contains("endReestablishmentEpisode"))
-        #expect(sequenceSource.contains("markRecoveryEmitBlocked"))
 
         #expect(sessionSource.contains("accountIdentityRequiresAcknowledgement"))
-        #expect(sessionSource.contains("recoveryEmitBlockedLanes"))
         #expect(sessionSource.contains("noteRecoveryDependenciesBecameReady"))
         #expect(sessionSource.contains("reestablishmentEpisodeDidEnd"))
+        #expect(!sessionSource.contains("recoveryEmitBlockedLanes"))
+        #expect(!sequenceSource.contains("markRecoveryEmitBlocked"))
     }
 
     @Test("decrypt-driven peerRefresh leader forces emit and keeps episode open on suppress")
@@ -669,18 +670,18 @@ struct FriendshipFlowSourceTests {
         let sequenceSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Sequence.swift")
 
         #expect(sequenceSource.contains("replaceOTKBatchThenPeerRefresh"))
-        // OTK detached continuation must mark blocked + close on emit throw.
+        // OTK detached continuation must close the episode on emit throw (drains NACKs).
         let otkIncompleteMarker = try #require(
             sequenceSource.range(of: "pqs.recovery.otkBatchReplacementIncomplete"))
         let afterOTK = sequenceSource[otkIncompleteMarker.upperBound...]
-        // Anchor at the emit itself: the blocked-mark + episode-close handling
-        // lives in the emit call and its catch, regardless of what recovery
-        // steps are inserted between the replacement and the emit.
+        // Anchor at the emit itself: episode-close handling lives in the emit
+        // catch, regardless of what recovery steps are inserted between the
+        // replacement and the emit.
         let otkEmitAnchor = try #require(afterOTK.range(of: "emitSessionReestablishment("))
         let otkCatchWindow = String(afterOTK[otkEmitAnchor.lowerBound...].prefix(2_400))
-        #expect(otkCatchWindow.contains("markRecoveryEmitBlocked"))
         #expect(otkCatchWindow.contains("endReestablishmentEpisode"))
         #expect(otkCatchWindow.contains("forceReemit: true"))
+        #expect(!otkCatchWindow.contains("markRecoveryEmitBlocked"))
 
         // invalidSignature path uses the same leader-force / keep-open treatment.
         let invalidSigBody = try PQSFriendshipSource.functionBody(
@@ -801,9 +802,10 @@ struct FriendshipFlowSourceTests {
         let pendingCleanupBody = try PQSFriendshipSource.functionBody(
             named: "private func cleanupPendingResendAfterReestablishment",
             in: sessionSource)
-        #expect(pendingCleanupBody.contains("scheduleTransportProtocolWork"))
+        // LRU-only cleanup — no host notify / transport work on wall-clock age.
+        #expect(!pendingCleanupBody.contains("inboundContentUnrecoverable("))
         #expect(!pendingCleanupBody.contains("scheduleBackgroundWork"))
-        #expect(pendingCleanupBody.contains("inboundContentUnrecoverable("))
+        #expect(pendingCleanupBody.contains("recoveryTrackingMaxEntries"))
         let setViabilityBody = try PQSFriendshipSource.functionBody(
             named: "public func setViability",
             in: sessionSource)
@@ -815,7 +817,7 @@ struct FriendshipFlowSourceTests {
         #expect(applyViabilityBody.contains("performCoalescedJobQueueResume"))
     }
 
-    @Test("episode TTL expiry and pending-resend TTL drop are audited and notify the host")
+    @Test("episode TTL expiry drains deferred resends; pending cleanup is not wall-clock terminal")
     func episodeTTLExpiryAndPendingResendTTLDropAreAuditedAndNotifyTheHost() throws {
         let sessionSource = try PQSFriendshipSource.read("Sources/PQSSession/PQSSession.swift")
         let cleanupBody = try PQSFriendshipSource.functionBody(
@@ -823,24 +825,23 @@ struct FriendshipFlowSourceTests {
             in: sessionSource)
         #expect(cleanupBody.contains("pqs.recovery.episodeExpired"))
         #expect(cleanupBody.contains("reestablishmentEpisodeDidEnd"))
+        #expect(cleanupBody.contains("flushPendingResends("))
+        #expect(cleanupBody.contains("reason: \"episodeExpired\""))
 
         let endBody = try PQSFriendshipSource.functionBody(
             named: "func endReestablishmentEpisode",
             in: sessionSource)
         #expect(endBody.contains("pqs.recovery.episodeEnded"))
+        #expect(endBody.contains("flushPendingResends("))
 
         let pendingCleanup = try PQSFriendshipSource.functionBody(
             named: "private func cleanupPendingResendAfterReestablishment",
             in: sessionSource)
-        #expect(pendingCleanup.contains("pqs.recovery.pendingResendExpired"))
-        // TTL expiry is terminal content loss for the sharedId; the host must be
-        // told (same contract as the attempt-cap path) so the UI can mark it failed.
-        #expect(pendingCleanup.contains("inboundContentUnrecoverable("))
-        // Dogfood frank/Android: host notify alone is not enough — redelivery must
-        // hit isInboundContentUnrecoverable without a fresh NACK round.
-        #expect(pendingCleanup.contains("markInboundContentUnrecoverable("))
-        #expect(pendingCleanup.contains("contentUnrecoverable")
-            || pendingCleanup.contains("reason=pendingResendTTL"))
+        // No wall-clock terminality — LRU only. Terminal via unavailable/cap/dead-epoch.
+        #expect(!pendingCleanup.contains("pendingResendExpired"))
+        #expect(!pendingCleanup.contains("pendingResendTTL"))
+        #expect(!pendingCleanup.contains("inboundContentUnrecoverable("))
+        #expect(pendingCleanup.contains("recoveryTrackingMaxEntries"))
 
         let ratchetSource = try PQSFriendshipSource.read("Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
         #expect(ratchetSource.contains("pqs.recovery.recovered"))
@@ -1338,7 +1339,9 @@ struct FriendshipFlowSourceTests {
             in: processorSource)
 
         // Document current order risk: identity gather precedes createEncryptableTask.
-        #expect(outboundBody.contains("sessionIdentitiesForChatFanout(secretName:"))
+        // Call is intentionally multiline (`sessionIdentitiesForChatFanout(\n secretName:`).
+        #expect(outboundBody.contains("sessionIdentitiesForChatFanout("))
+        #expect(outboundBody.contains("secretName: nickname"))
         #expect(createBody.contains("createOutboundMessageModel") || createBody.contains("shouldPersist"))
 
         // Desired seam: offline/local-lane persist path that does not hard-throw on

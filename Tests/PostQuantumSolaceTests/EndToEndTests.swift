@@ -10141,6 +10141,17 @@ actor ReceiverDelegate: EventReceiver {
         contact: Contact,
         requestFriendship: Bool
     ) async throws {
+        try await synchronize(
+            contact: contact,
+            requestFriendship: requestFriendship,
+            notifyPeerOfCreation: true)
+    }
+
+    func synchronize(
+        contact: Contact,
+        requestFriendship: Bool,
+        notifyPeerOfCreation: Bool = true
+    ) async throws {
         if requestFriendship {
             // Mirror the production receiver: re-add of an already-accepted /
             // already-rejected contact surfaces a typed `FriendshipRequestError`
@@ -10153,7 +10164,7 @@ actor ReceiverDelegate: EventReceiver {
             } catch is FriendshipRequestError {
                 // no-op
             }
-        } else {
+        } else if notifyPeerOfCreation {
             //Acknowledge that the contact was created, this only happens on the receiving end
             try await session.sendContactCreatedAcknowledgment(recipient: contact.secretName)
         }
@@ -10589,6 +10600,9 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     /// If set, awaited before every `findConfiguration` lookup (never-resume = hang).
     var findConfigurationHang: (@Sendable () async -> Void)?
 
+    /// Optional observation point immediately before the mocked remote lookup.
+    var beforeFindConfiguration: (@Sendable (String) async -> Void)?
+
     /// Optional filter: hang/throw only for these secret names. `nil` = all names.
     var findConfigurationFaultSecretNames: Set<String>?
 
@@ -10773,6 +10787,7 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     
     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
         await findConfigurationTracker.record(secretName: secretName, deviceId: "", keyCount: 0)
+        await beforeFindConfiguration?(secretName)
         let shouldFault = findConfigurationFaultSecretNames?.contains(secretName) ?? true
         if shouldFault {
             if let findConfigurationHang {

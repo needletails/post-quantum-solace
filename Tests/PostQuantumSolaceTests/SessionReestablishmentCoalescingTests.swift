@@ -112,10 +112,11 @@ struct SessionReestablishmentCoalescingTests {
             sender: sender, deviceId: deviceId, sharedId: sharedId))
     }
 
-    @Test("Pending resend TTL expiry marks inbound content unrecoverable")
+    @Test("Aged pending resend is not wall-clock terminal")
     func pendingResendTTLExpiryMarksInboundContentUnrecoverable() async throws {
-        // Dogfood frank/Android: pendingResendExpired notified the host but did
-        // not set terminalInboundOutcomeAt, so spool redelivery re-NACKed forever.
+        // Idle senders must not silently lose deferred NACKs to wall-clock
+        // age. Entries stay until drain (episode end / offlineReplayComplete),
+        // unavailable notice, or submission cap.
         let session = PQSSession()
         defer { Task { await session.shutdown() } }
         let sender = "ttlPeer"
@@ -129,15 +130,15 @@ struct SessionReestablishmentCoalescingTests {
             failureClass: "crypto.bodyDecryptionFailed",
             now: seededAt,
             notifyDelegate: false)
-        // Any cleanup entry point with "now" past TTL must terminalize.
-        #expect(await !session.hasPendingResendAfterReestablishment(
+        #expect(await session.hasPendingResendAfterReestablishment(
             sender: sender,
             deviceId: deviceId,
-            failedMessageId: sharedId))
+            failedMessageId: sharedId),
+            "Aged pending resend must remain until an event drains it")
         #expect(
-            await session.isInboundContentUnrecoverable(
+            await !session.isInboundContentUnrecoverable(
                 sender: sender, deviceId: deviceId, sharedId: sharedId),
-            "BUG: pending-resend TTL must markInboundContentUnrecoverable so poison redelivery is swallowed")
+            "Wall-clock age must not terminalize deferred NACKs")
     }
 
     @Test("Transport-protocol work runs while the session is not viable")
@@ -352,7 +353,7 @@ struct SessionReestablishmentCoalescingTests {
         await session.shutdown()
     }
 
-    @Test("Pending resend TTL expiry notifies the host that content is unrecoverable")
+    @Test("Aged pending resend does not notify host unrecoverable")
     func pendingResendTTLExpiryNotifiesHostContentUnrecoverable() async throws {
         let session = PQSSession()
         await session.setViability(true)
@@ -373,21 +374,16 @@ struct SessionReestablishmentCoalescingTests {
             now: expiredCreation,
             notifyDelegate: false)
 
-        // Cleanup is event-driven: the next pending-resend access performs it and
-        // must treat the aged-out entry as terminal content loss for the host.
-        #expect(!(await session.hasPendingResendAfterReestablishment(
+        #expect(await session.hasPendingResendAfterReestablishment(
             sender: "alice",
-            deviceId: peerDeviceId)))
+            deviceId: peerDeviceId))
 
-        var observed: [(String, UUID, String)] = []
-        for _ in 0..<40 {
-            observed = await probe.unrecoverableContent()
-            if !observed.isEmpty { break }
-            try await Task.sleep(nanoseconds: 25_000_000)
-        }
-        #expect(observed.contains(where: {
+        // Give protocol work a brief window — wall-clock age must not notify.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let observed = await probe.unrecoverableContent()
+        #expect(!observed.contains(where: {
             $0.0 == "alice" && $0.1 == peerDeviceId && $0.2 == sharedId
-        }))
+        }), "No host unrecoverable from wall-clock pending age")
         await session.shutdown()
     }
 
@@ -523,7 +519,7 @@ struct SessionReestablishmentCoalescingTests {
             deviceId: peerDeviceId,
             failedMessageId: sharedId)
         #expect(stillPending)
-        // Deferred is not terminal — remint may still arrive; unavailable/TTL owns terminal.
+        // Deferred is not terminal — remint may still arrive; unavailable/cap owns terminal.
         let terminal = await session.isInboundContentUnrecoverable(
             sender: "sunflower",
             deviceId: peerDeviceId,
@@ -532,8 +528,8 @@ struct SessionReestablishmentCoalescingTests {
         await session.shutdown()
     }
 
-    /// Child log: 10m pendingResendTTL → contentUnrecoverable when no episode is open.
-    @Test("Dogfood: pending TTL still terminal when no reestablishment episode is open")
+    /// Aged pending with no open episode stays queued (not wall-clock terminal).
+    @Test("Dogfood: aged pending stays queued when no reestablishment episode is open")
     func dogfoodPendingTTLStillTerminalWhenNoEpisode() async throws {
         let session = PQSSession()
         await session.setViability(true)
@@ -559,26 +555,125 @@ struct SessionReestablishmentCoalescingTests {
         #expect(!(await session.hasOpenReestablishmentEpisode(
             sender: "sunflower",
             deviceId: peerDeviceId)))
-        #expect(!(await session.hasPendingResendAfterReestablishment(
+        #expect(await session.hasPendingResendAfterReestablishment(
             sender: "sunflower",
             deviceId: peerDeviceId,
-            failedMessageId: sharedId)))
-        #expect(await session.isInboundContentUnrecoverable(
+            failedMessageId: sharedId),
+            "Aged pending must stay queued for event-driven drain")
+        #expect(!(await session.isInboundContentUnrecoverable(
             sender: "sunflower",
             deviceId: peerDeviceId,
-            sharedId: sharedId),
-            "No open episode: aged pending resend must terminalize (dogfood pendingResendTTL)")
+            sharedId: sharedId)))
 
-        var observed: [(String, UUID, String)] = []
-        for _ in 0..<40 {
-            observed = await probe.unrecoverableContent()
-            if !observed.isEmpty { break }
-            try await Task.sleep(nanoseconds: 25_000_000)
-        }
-        #expect(observed.contains(where: {
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let observed = await probe.unrecoverableContent()
+        #expect(!observed.contains(where: {
             $0.0 == "sunflower" && $0.1 == peerDeviceId && $0.2 == sharedId
         }))
         await session.shutdown()
+    }
+
+    @Test("flushPendingResendsAfterOfflineReplay takes every deferred lane")
+    func flushPendingResendsAfterOfflineReplayTakesEveryDeferredLane() async throws {
+        let session = PQSSession()
+        await session.setViability(true)
+        defer { Task { await session.shutdown() } }
+
+        let deviceA = UUID()
+        let deviceB = UUID()
+        await session.deferPeerResendUntilReestablished(
+            sender: "alice",
+            deviceId: deviceA,
+            failedMessageId: "offline-flush-a",
+            failureClass: "ratchet.maxSkippedHeadersExceeded",
+            notifyDelegate: false)
+        await session.deferPeerResendUntilReestablished(
+            sender: "bob",
+            deviceId: deviceB,
+            failedMessageId: "offline-flush-b",
+            failureClass: "ratchet.maxSkippedHeadersExceeded",
+            notifyDelegate: false)
+
+        #expect(await session.hasPendingResendAfterReestablishment(
+            sender: "alice", deviceId: deviceA))
+        #expect(await session.hasPendingResendAfterReestablishment(
+            sender: "bob", deviceId: deviceB))
+
+        // Without a transport, drain re-defers after take — prove the public flush
+        // API visits every lane by taking first (empty after a second take).
+        let takenA = await session.takePendingResendsAfterReestablishment(
+            sender: "alice", deviceId: deviceA)
+        let takenB = await session.takePendingResendsAfterReestablishment(
+            sender: "bob", deviceId: deviceB)
+        #expect(takenA.map(\.failedSharedMessageId) == ["offline-flush-a"])
+        #expect(takenB.map(\.failedSharedMessageId) == ["offline-flush-b"])
+
+        // Re-seed and exercise the offline-replay flush entry point.
+        await session.deferPeerResendUntilReestablished(
+            sender: "alice",
+            deviceId: deviceA,
+            failedMessageId: "offline-flush-a2",
+            failureClass: "ratchet.maxSkippedHeadersExceeded",
+            notifyDelegate: false)
+        await session.flushPendingResendsAfterOfflineReplay()
+        // Flush takes before attempting OOB; without sessionContext the drain
+        // re-defers, so presence alone is not the assertion — the API must be
+        // callable and must not terminalize.
+        #expect(!(await session.isInboundContentUnrecoverable(
+            sender: "alice", deviceId: deviceA, sharedId: "offline-flush-a2")))
+    }
+
+    @Test("Host re-arm repopulates a deferred NACK lane after relaunch")
+    func hostRearmRepopulatesDeferredLane() async throws {
+        // Relaunch scenario: the host replays its durable placeholder ledger into
+        // the in-memory pending queue so the next drain event can retry recovery.
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let deviceId = UUID()
+
+        await session.rearmInboundRecoveryPendingResend(
+            sender: "alice",
+            deviceId: deviceId,
+            sharedMessageId: "rearm-shared-1")
+
+        let taken = await session.takePendingResendsAfterReestablishment(
+            sender: "alice", deviceId: deviceId)
+        #expect(taken.map(\.failedSharedMessageId) == ["rearm-shared-1"])
+        #expect(taken.map(\.failureClass) == ["hostRearm"])
+    }
+
+    @Test("Transported resend-request attempts survive past the failure-policy cooldown")
+    func resendRequestAttemptsSurviveFailurePolicyCooldown() async throws {
+        // Terminality contract: 3 transported NACKs → contentUnrecoverable. That
+        // cap only accumulates if attempt history outlives the 10-minute inbound
+        // failure-policy TTL, because consecutive drain events are usually
+        // further apart than one cooldown.
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let deviceId = UUID()
+        let sharedId = "attempt-window-shared"
+        let markedAt = Date()
+        await session.markPeerResendRequestTransported(
+            sender: "slowPeer",
+            deviceId: deviceId,
+            failedMessageIds: [sharedId],
+            now: markedAt)
+
+        let pastCooldown = markedAt.addingTimeInterval(
+            (await session.inboundFailurePolicyTTL) + 60)
+        #expect(await session.resendRequestSubmissionCount(
+            sender: "slowPeer",
+            deviceId: deviceId,
+            failedMessageId: sharedId,
+            now: pastCooldown) == 1)
+
+        // Still bounded: history ages out after the durable attempt window (7d).
+        let pastWindow = markedAt.addingTimeInterval(60 * 60 * 24 * 7 + 60)
+        #expect(await session.resendRequestSubmissionCount(
+            sender: "slowPeer",
+            deviceId: deviceId,
+            failedMessageId: sharedId,
+            now: pastWindow) == 0)
     }
 
     /// Phase 2 gate: parked bounded TTL-refresh-on-episode-end must not ship

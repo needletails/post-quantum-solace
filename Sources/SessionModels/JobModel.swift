@@ -46,12 +46,21 @@ public struct OutboundTaskMessage: Codable & Sendable {
     /// In that case `localId` is not meaningful for `fetchMessage(id:)` and must not be used to update delivery state.
     public let isPersistedOutbound: Bool
 
+    /// Opaque host-supplied supersede key for ephemeral state publishes
+    /// (e.g. transport consent blobs, schedule syncs) that are regenerated on
+    /// every registration. A keyed enqueue replaces the pending job with the
+    /// same key on the same recipient identity lane instead of accumulating
+    /// behind it. `nil` (the default) preserves full queue durability.
+    /// Only meaningful when `isPersistedOutbound == false`.
+    public let coalescingKey: String?
+
     private enum CodingKeys: String, CodingKey {
         case message
         case recipientIdentity
         case localId
         case sharedId
         case isPersistedOutbound
+        case coalescingKey
     }
 
     /// Initializes a new instance of `OutboundTaskMessage`.
@@ -61,18 +70,21 @@ public struct OutboundTaskMessage: Codable & Sendable {
     ///   - localId: A unique identifier for the local message.
     ///   - sharedId: A shared identifier for the message.
     ///   - isPersistedOutbound: Whether this send corresponds to a row in local message storage (`localId` is the row id).
+    ///   - coalescingKey: Optional supersede key for ephemeral state publishes.
     public init(
         message: CryptoMessage,
         recipientIdentity: SessionIdentity,
         localId: UUID,
         sharedId: String,
-        isPersistedOutbound: Bool = true
+        isPersistedOutbound: Bool = true,
+        coalescingKey: String? = nil
     ) {
         self.message = message
         self.recipientIdentity = recipientIdentity
         self.localId = localId
         self.sharedId = sharedId
         self.isPersistedOutbound = isPersistedOutbound
+        self.coalescingKey = coalescingKey
     }
 
     public init(from decoder: Decoder) throws {
@@ -82,6 +94,7 @@ public struct OutboundTaskMessage: Codable & Sendable {
         localId = try c.decode(UUID.self, forKey: .localId)
         sharedId = try c.decode(String.self, forKey: .sharedId)
         isPersistedOutbound = try c.decodeIfPresent(Bool.self, forKey: .isPersistedOutbound) ?? true
+        coalescingKey = try c.decodeIfPresent(String.self, forKey: .coalescingKey)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -91,6 +104,7 @@ public struct OutboundTaskMessage: Codable & Sendable {
         try c.encode(localId, forKey: .localId)
         try c.encode(sharedId, forKey: .sharedId)
         try c.encode(isPersistedOutbound, forKey: .isPersistedOutbound)
+        try c.encodeIfPresent(coalescingKey, forKey: .coalescingKey)
     }
 }
 

@@ -50,6 +50,7 @@ actor PreparedTransportProbe: SessionTransport {
 
     private var payloads: [Data] = []
     private var envelopeMessageIds: [String] = []
+    private var sendWaiters: [CheckedContinuation<Void, Never>] = []
 
     func sendMessage(
         _ message: SignedRatchetMessage,
@@ -57,6 +58,18 @@ actor PreparedTransportProbe: SessionTransport {
     ) async throws {
         payloads.append(message.signed?.data ?? Data())
         envelopeMessageIds.append(metadata.envelopeMessageId)
+        let waiters = sendWaiters
+        sendWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    /// Suspends until at least `count` sends were captured. Event-driven so tests never
+    /// race real code against a fixed sleep (deadline resends land whenever the actor
+    /// hop completes, not on a stopwatch).
+    func waitForCapturedSends(atLeast count: Int) async {
+        while payloads.count < count {
+            await withCheckedContinuation { sendWaiters.append($0) }
+        }
     }
 
     func capturedPayloads() -> [Data] {

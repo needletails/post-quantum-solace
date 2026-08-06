@@ -1584,7 +1584,7 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
 
         if outboundTask.isPersistedOutbound || transportMetadata.requiresServerAck {
-            registerUnackedServerAccept(
+            await registerUnackedServerAccept(
                 pending: PendingOutboundTransport(
                     message: signedMessage,
                     metadata: transportMetadata,
@@ -1595,10 +1595,10 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
                     createdAt: Date()),
                 localId: outboundTask.localId,
                 sharedId: outboundTask.sharedId,
+                isPersistedOutbound: outboundTask.isPersistedOutbound,
                 session: session)
-        } else {
-            await markPersistedOutboundPastSendingIfNeeded(session: session, localMessageId: outboundTask.localId)
         }
+        // Ephemeral / control traffic without accept-ack: no local delivery row to advance.
         
         // Perform remote key deletion only after a successful send
         if results.needsRemoteDeletion {
@@ -1694,12 +1694,15 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
 
         // Redelivery ingress guard: offline queues redeliver un-ACKed frames on
         // every reconnect. Lookup by logical id (chat row) with sender-device match.
+        // Waiting/failed recovery placeholders must NOT short-circuit — orphan
+        // resend heals by decrypting into that same sharedId.
         let logicalLookupId = inboundTask.resolvedLogicalSharedId
         if let existing = try await session.cache?.fetchMessageIfExists(sharedId: logicalLookupId) {
             let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
             if let existingProps = await existing.props(symmetricKey: databaseSymmetricKey),
                existingProps.senderSecretName == inboundTask.senderSecretName,
-               existingProps.senderDeviceId == inboundTask.senderDeviceId
+               existingProps.senderDeviceId == inboundTask.senderDeviceId,
+               !Self.isReplaceableInboundRecoveryPlaceholder(existingProps)
             {
                 PQSAuditLog.log(.recovery, "pqs.recovery.redeliveryDropped reason=alreadyPersisted sharedId=\(inboundTask.sharedMessageId) logical=\(logicalLookupId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
                 try await session.markEnvelopeAccepted(
@@ -2732,13 +2735,12 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
 
         if outboundTask.isPersistedOutbound || pendingTransport.metadata.requiresServerAck {
-            registerUnackedServerAccept(
+            await registerUnackedServerAccept(
                 pending: pendingTransport,
                 localId: outboundTask.localId,
                 sharedId: outboundTask.sharedId,
+                isPersistedOutbound: outboundTask.isPersistedOutbound,
                 session: session)
-        } else {
-            await markPersistedOutboundPastSendingIfNeeded(session: session, localMessageId: outboundTask.localId)
         }
 
         if pendingTransport.needsRemoteDeletion {
@@ -3752,6 +3754,16 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         logger.log(level: .info, message: "Removed Local Curve and MLKEM One Time Keys")
     }
 
+    /// Drains deferred NACK entries for idle-sender / episode-end paths.
+    /// Shared by peerRefresh-response drains and `PQSSession.flushPendingResends`.
+    func drainDeferredResendRequests(
+        _ pendingRequests: [PQSSession.PendingResendAfterReestablishment],
+        session: PQSSession,
+        reason: String
+    ) async {
+        await sendDeferredResendRequests(pendingRequests, session: session, reason: reason)
+    }
+
     private func sendDeferredResendRequests(
         _ pendingRequests: [PQSSession.PendingResendAfterReestablishment],
         session: PQSSession,
@@ -4102,12 +4114,30 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
         // notify the host twice. The sender-tuple match keeps this from ever
         // colliding with a *different* sender's frame or with our own outbound
         // record for the same conversation.
+        // Recovery placeholders (waiting/failed) are replaced in place on heal.
         if let existing = try await cache.fetchMessageIfExists(
             sharedId: inboundTask.resolvedLogicalSharedId),
            let existingProps = await existing.props(symmetricKey: databaseSymmetricKey),
            existingProps.senderSecretName == inboundTask.senderSecretName,
            existingProps.senderDeviceId == inboundTask.senderDeviceId
         {
+            if Self.isReplaceableInboundRecoveryPlaceholder(existingProps) {
+                var healedProps = existingProps
+                healedProps.message = decodedMessage
+                healedProps.deliveryState = .received
+                let healed = try await existing.updateMessage(
+                    with: healedProps,
+                    symmetricKey: databaseSymmetricKey)
+                try await cache.updateMessage(healed, symmetricKey: databaseSymmetricKey)
+                PQSAuditLog.log(.recovery, "pqs.recovery.placeholderHealed envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                await session.receiverDelegate?.createdMessage(healed)
+                await sendAutomaticDeliveredReceiptIfNeeded(
+                    session: session,
+                    inboundTask: inboundTask,
+                    sharedId: healed.sharedId,
+                    conversationRecipient: decodedMessage.recipient)
+                return
+            }
             PQSAuditLog.log(.recovery, "pqs.recovery.duplicateInboundPersistSkipped envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
             return
         }
@@ -4363,6 +4393,19 @@ extension TaskProcessor: SessionIdentityDelegate, TaskSequenceDelegate {
     /// - Returns: A tuple containing the verified `RatchetMessage` and the associated `SessionIdentity`.
     /// - Throws: An error if the verification or decryption fails due to issues such as invalid message format,
     ///           session errors, or decryption errors.
+    /// Host-inserted inbound recovery placeholders use `.waitingDelivery` / `.failed` until
+    /// an orphan resend decrypts into the same logical sharedId.
+    static func isReplaceableInboundRecoveryPlaceholder(
+        _ props: EncryptedMessage.UnwrappedProps
+    ) -> Bool {
+        switch props.deliveryState {
+        case .waitingDelivery, .failed:
+            return true
+        default:
+            return false
+        }
+    }
+
     private func verifyEncryptedMessage(
         session: PQSSession,
         inboundTask: InboundTaskMessage

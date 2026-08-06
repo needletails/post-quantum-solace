@@ -264,6 +264,23 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         await taskProcessor.confirmServerAcceptedEnvelope(envelopeMessageId, session: self)
     }
 
+    /// Whether this envelope is still waiting for server `privateMessageAccepted`.
+    public func isAwaitingServerAccept(_ envelopeMessageId: String) async -> Bool {
+        await taskProcessor.isAwaitingServerAccept(envelopeMessageId)
+    }
+
+    /// Restart one envelope's accept deadline (owner deferred recycle during backlog).
+    public func rearmServerAcceptDeadline(_ envelopeMessageId: String) async {
+        await taskProcessor.rearmServerAcceptDeadline(
+            envelopeMessageId: envelopeMessageId,
+            session: self)
+    }
+
+    /// Restart accept deadlines after offline backlog drains (accepts often queue behind it).
+    public func rearmAllServerAcceptDeadlines() async {
+        await taskProcessor.rearmAllServerAcceptDeadlines(session: self)
+    }
+
     /// Replays durable outbound envelopes which have not received server acceptance.
     ///
     public func resendUnackedOutboundEnvelopes(reason: String) async {
@@ -671,11 +688,9 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// (or a verified reprovisioning path updates the pin). Cleared only by that event.
     public internal(set) var accountIdentityRequiresAcknowledgement: Bool = false
 
-    /// Peer-device lanes where peerRefresh emit failed on a recoverable dependency
-    /// (e.g. `findConfiguration` timeout). Blocks opening a new episode until a
-    /// concrete readiness event clears the lane — successful config lookup,
-    /// identity acknowledgement, or transport-ready notification.
-    var recoveryEmitBlockedLanes: Set<String> = []
+    /// SharedIds for which ``inboundMessagePendingRecovery`` already notified the host.
+    /// Prevents placeholder spam across coalesce / redelivery of the same logical id.
+    var pendingRecoveryNotifiedKeys: Set<String> = []
 
     /// Outbound device-send ledger: which local SessionIdentity encrypted each
     /// `(sharedId, recipientDeviceId)`. Hot path is in-memory; mirrored to the store.
@@ -690,6 +705,16 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// `findConfiguration` during identity refresh / chat fan-out; used to avoid blocking
     /// network configuration fetch on warm sends when local lanes already match.
     var lastVerifiedDeviceIdsBySecretName: [String: Set<UUID>] = [:]
+
+    /// Accounts the transport definitively reported deleted (HTTP 404 / `userNotFound`).
+    /// Excluded from identity refresh / fan-out so ghost channel roster members stop
+    /// receiving encrypted traffic on stale device lanes. Cleared by any successful
+    /// live configuration fetch (background probe or forced refresh).
+    var knownDeletedAccountSecretNames: Set<String> = []
+
+    /// Rate limit for the fire-and-forget deleted-account probes on warm-lane sends.
+    var lastDeletedAccountProbeAtBySecretName: [String: Date] = [:]
+    let deletedAccountProbeInterval: TimeInterval = 300
 
     /// Maximum lifetime of a single-flight reestablishment episode before a new
     /// leader is allowed. Bounds stuck recovery without timer-based retry loops.
@@ -1237,7 +1262,8 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     /// Total transport-confirmed resend-request submissions recorded for this failed
-    /// message inside the pending-resend TTL window.
+    /// message inside the durable attempt window
+    /// (`PQSSessionConstants.resendRequestAttemptWindowSeconds`).
     func resendRequestSubmissionCount(sender: String, deviceId: UUID, failedMessageId: String, now: Date = Date()) -> Int {
         pruneResendRequestAttempts(now: now)
         let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
@@ -1261,7 +1287,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
     private func pruneResendRequestAttempts(now: Date) {
         resendRequestAttemptsByKey = resendRequestAttemptsByKey.filter { _, entry in
-            now.timeIntervalSince(entry.lastAt) < inboundFailurePolicyTTL
+            now.timeIntervalSince(entry.lastAt) < PQSSessionConstants.resendRequestAttemptWindowSeconds
         }
         let cap = PQSSessionConstants.recoveryTrackingMaxEntries
         guard resendRequestAttemptsByKey.count >= cap else { return }
@@ -1338,6 +1364,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
             failureClass: failureClass,
             createdAt: now)
         guard notifyDelegate else { return }
+        await noteInboundMessagePendingRecovery(
+            sender: sender,
+            deviceId: deviceId,
+            sharedMessageId: failedMessageId)
         let delegate = sessionDelegate
         // Protocol signal: drives the transport's bounded claim-and-purge of the
         // undecryptable spool copy. Dropping it on a viability flap leaves the
@@ -1349,6 +1379,99 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
                 failedSharedMessageId: failedMessageId,
                 failureClass: failureClass)
         }
+    }
+
+    /// Notifies the host once per logical sharedId that inbound recovery is pending
+    /// (placeholder UI). Subsequent coalesce/redelivery of the same id is silent.
+    func noteInboundMessagePendingRecovery(
+        sender: String,
+        deviceId: UUID,
+        sharedMessageId: String
+    ) async {
+        let trimmed = sharedMessageId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let key = inboundFailureQuarantineKey(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: trimmed)
+        if pendingRecoveryNotifiedKeys.contains(key) { return }
+        pendingRecoveryNotifiedKeys.insert(key)
+        let cap = PQSSessionConstants.recoveryTrackingMaxEntries
+        if pendingRecoveryNotifiedKeys.count > cap {
+            let overflow = pendingRecoveryNotifiedKeys.count - cap
+            for stale in pendingRecoveryNotifiedKeys.prefix(overflow) {
+                pendingRecoveryNotifiedKeys.remove(stale)
+            }
+        }
+        let delegate = sessionDelegate
+        _ = await scheduleTransportProtocolWork {
+            await delegate?.inboundMessagePendingRecovery(
+                senderSecretName: sender,
+                senderDeviceId: deviceId,
+                sharedMessageId: trimmed)
+        }
+    }
+
+    /// Takes deferred NACKs for a peer-device lane and submits one chunked OOB request.
+    func flushPendingResends(
+        sender: String,
+        deviceId: UUID,
+        reason: String,
+        now: Date = Date()
+    ) async {
+        let pending = await takePendingResendsAfterReestablishment(
+            sender: sender,
+            deviceId: deviceId,
+            now: now)
+        guard !pending.isEmpty else { return }
+        await taskProcessor.drainDeferredResendRequests(
+            pending,
+            session: self,
+            reason: reason)
+    }
+
+    /// Batch boundary after an offline backlog wave: drain every deferred lane so
+    /// idle senders still receive durable OOB NACKs (spooled if offline).
+    public func flushPendingResendsAfterOfflineReplay(now: Date = Date()) async {
+        await cleanupPendingResendAfterReestablishment(now: now)
+        struct Lane: Hashable {
+            let sender: String
+            let deviceId: UUID
+        }
+        let lanes = Set(
+            pendingResendAfterReestablishment.values.map {
+                Lane(sender: $0.senderName, deviceId: $0.senderDeviceId)
+            })
+        for lane in lanes {
+            await flushPendingResends(
+                sender: lane.sender,
+                deviceId: lane.deviceId,
+                reason: "offlineReplayComplete",
+                now: now)
+        }
+    }
+
+    /// Host re-arm after process relaunch: PQS pending-resend state is in-memory,
+    /// while the host's recovery placeholder rows are durable. Repopulating the
+    /// deferred NACK lane lets the next drain event retry recovery for rows that
+    /// would otherwise wait forever. `notifyDelegate: false` because the host
+    /// already owns the placeholder row and the spool copy was purged when the
+    /// failure was originally deferred — re-arming must not re-fire purge or
+    /// pending-recovery callbacks.
+    public func rearmInboundRecoveryPendingResend(
+        sender: String,
+        deviceId: UUID,
+        sharedMessageId: String,
+        now: Date = Date()
+    ) async {
+        await deferPeerResendUntilReestablished(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: sharedMessageId,
+            failureClass: "hostRearm",
+            now: now,
+            notifyDelegate: false)
+        PQSAuditLog.log(.recovery, "pqs.recovery.pendingResendRearmed sharedId=\(sharedMessageId) sender=\(sender) deviceId=\(deviceId.uuidString)")
     }
 
     func hasPendingResendAfterReestablishment(
@@ -1402,6 +1525,12 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
         for peer in expiredPeers {
             PQSAuditLog.log(.recovery, "pqs.recovery.episodeExpired sender=\(peer.sender) deviceId=\(peer.deviceId.uuidString) ttlSeconds=\(Int(reestablishmentEpisodeTTL))")
+            // Idle senders never produce a peerRefresh response; drain deferred
+            // NACKs on the concrete episode-end event so the queue cannot rot.
+            await flushPendingResends(
+                sender: peer.sender,
+                deviceId: peer.deviceId,
+                reason: "episodeExpired")
         }
         guard !expiredPeers.isEmpty else { return }
         let delegate = sessionDelegate
@@ -1484,6 +1613,12 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         await clearUndecryptableLaneFailures(sender: sender, deviceId: deviceId)
         guard wasOpen else { return }
         PQSAuditLog.log(.recovery, "pqs.recovery.episodeEnded sender=\(sender) deviceId=\(deviceId.uuidString)")
+        // Drain any leftover deferred NACKs (emit-failure / explicit end). Success
+        // paths that already `takePending` leave this a no-op.
+        await flushPendingResends(
+            sender: sender,
+            deviceId: deviceId,
+            reason: "episodeEnded")
         let delegate = sessionDelegate
         // Protocol signal: the transport releases held offline ciphertext on it.
         _ = await scheduleTransportProtocolWork {
@@ -1493,34 +1628,12 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         }
     }
 
-    func isRecoveryEmitBlocked(sender: String, deviceId: UUID) -> Bool {
-        recoveryEmitBlockedLanes.contains(reestablishmentEpisodeKey(sender: sender, deviceId: deviceId))
-    }
-
-    func markRecoveryEmitBlocked(sender: String, deviceId: UUID) {
-        recoveryEmitBlockedLanes.insert(reestablishmentEpisodeKey(sender: sender, deviceId: deviceId))
-    }
-
-    func clearRecoveryEmitBlocked(sender: String, deviceId: UUID) {
-        recoveryEmitBlockedLanes.remove(reestablishmentEpisodeKey(sender: sender, deviceId: deviceId))
-    }
-
-    func clearRecoveryEmitBlocked(secretName: String) {
-        let prefix = "\(secretName)|"
-        recoveryEmitBlockedLanes = recoveryEmitBlockedLanes.filter { !$0.hasPrefix(prefix) }
-    }
-
-    /// Transport-ready / config-ready event: unblock emit so the next decrypt failure
-    /// may open a fresh episode. Does not itself emit or schedule retries.
-    public func noteRecoveryDependenciesBecameReady() {
-        recoveryEmitBlockedLanes.removeAll()
-    }
+    /// Transport-ready / config-ready event hook. Kept for call-site compatibility;
+    /// emit gating via write-only blocked lanes was removed (event-driven drain path).
+    public func noteRecoveryDependenciesBecameReady() {}
 
     func setAccountIdentityRequiresAcknowledgement(_ requiresAcknowledgement: Bool) {
         accountIdentityRequiresAcknowledgement = requiresAcknowledgement
-        if !requiresAcknowledgement {
-            recoveryEmitBlockedLanes.removeAll()
-        }
     }
 
     func registerExpectedPeerRefreshResponse(
@@ -1783,43 +1896,10 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     }
 
     private func cleanupPendingResendAfterReestablishment(now: Date = Date()) async {
-        let cutoff = now.addingTimeInterval(-inboundFailurePolicyTTL)
-        let expired = pendingResendAfterReestablishment.values.filter { $0.createdAt <= cutoff }
-        pendingResendAfterReestablishment = pendingResendAfterReestablishment.filter { _, pending in
-            pending.createdAt > cutoff
-        }
-        // A pending entry aging out unresolved is terminal silent content loss for
-        // that sharedId: no further resend will be requested for it. Audit it so
-        // production forensics can distinguish "healed" from "gave up", and tell the
-        // host — same terminal contract as the attempt-cap path — so the UI can mark
-        // the message failed instead of leaving it pending forever.
-        // Also mark the local terminal ledger: host notify alone left redelivered
-        // spool copies free to NACK again (dogfood frank/Android: contentUnrecoverable=0).
-        if !expired.isEmpty {
-            let delegate = sessionDelegate
-            for pending in expired {
-                PQSAuditLog.log(.recovery, "pqs.recovery.pendingResendExpired sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) failureClass=\(pending.failureClass) ttlSeconds=\(Int(inboundFailurePolicyTTL))")
-                let senderName = pending.senderName
-                let senderDeviceId = pending.senderDeviceId
-                let sharedMessageId = pending.failedSharedMessageId
-                let newlyTerminal = markInboundContentUnrecoverable(
-                    sender: senderName,
-                    deviceId: senderDeviceId,
-                    sharedId: sharedMessageId,
-                    now: now)
-                guard newlyTerminal else { continue }
-                PQSAuditLog.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(sharedMessageId) sender=\(senderName) deviceId=\(senderDeviceId.uuidString) reason=pendingResendTTL")
-                // Protocol signal: drives the transport's terminal purge of the
-                // spool copy. Dropping it on a viability flap leaves the copy
-                // immortal server-side.
-                _ = await scheduleTransportProtocolWork {
-                    await delegate?.inboundContentUnrecoverable(
-                        senderSecretName: senderName,
-                        senderDeviceId: senderDeviceId,
-                        sharedMessageId: sharedMessageId)
-                }
-            }
-        }
+        // Event-driven terminality only (unavailable / submission cap / dead-epoch).
+        // Wall-clock age must not terminalize deferred NACKs for idle senders.
+        // Bound the in-memory queue by LRU only.
+        _ = now
         let cap = PQSSessionConstants.recoveryTrackingMaxEntries
         guard pendingResendAfterReestablishment.count >= cap else { return }
         let overflowKeys = pendingResendAfterReestablishment
@@ -3046,8 +3126,14 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         for key in staleKeys {
             openReestablishmentEpisodes.removeValue(forKey: key)
             expectedPeerRefreshIntentByPeer.removeValue(forKey: key)
+            let parts = key.split(separator: "|", maxSplits: 1).map(String.init)
+            if parts.count == 2, let deviceId = UUID(uuidString: parts[1]) {
+                await flushPendingResends(
+                    sender: parts[0],
+                    deviceId: deviceId,
+                    reason: "identityAcknowledged")
+            }
         }
-        clearRecoveryEmitBlocked(secretName: localSecretName)
         if !staleKeys.isEmpty {
             let delegate = sessionDelegate
             let keys = Array(staleKeys)

@@ -298,6 +298,15 @@ public protocol PQSSessionDelegate: Sendable {
         failureClass: String
     ) async
 
+    /// Called once per logical sharedId when inbound decrypt first fails and recovery
+    /// is pending (placeholder UI). Replaced in place by a later decrypt success for
+    /// the same sharedId, or flipped to failed by ``inboundContentUnrecoverable``.
+    func inboundMessagePendingRecovery(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        sharedMessageId: String
+    ) async
+
     /// Called when inbound ciphertext was successfully decrypted and accepted.
     /// Transport uses this to ACK/delete offline spool entries that were held
     /// until decrypt completed (instead of deleting on enqueue).
@@ -389,6 +398,12 @@ public extension PQSSessionDelegate {
         senderDeviceId: UUID,
         failedSharedMessageId: String,
         failureClass: String
+    ) async {}
+
+    func inboundMessagePendingRecovery(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        sharedMessageId: String
     ) async {}
 
     func inboundCiphertextAccepted(sharedMessageId: String) async {}

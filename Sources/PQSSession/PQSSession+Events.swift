@@ -67,6 +67,9 @@ public extension PQSSession {
     ///   - metadata: Additional metadata associated with the message (timestamps, flags, etc.).
     ///   - destructionTime: Optional time interval in seconds after which the message should be automatically destroyed.
     ///     If `nil`, the message persists indefinitely.
+    ///   - coalescingKey: Optional supersede key for ephemeral (non-persisted) state publishes.
+    ///     When set, enqueueing replaces any pending job with the same key on the same recipient
+    ///     device lane instead of accumulating behind it. Ignored for persisted messages.
     ///
     /// - Throws:
     ///   - `SessionErrors.sessionNotInitialized` if the session is not properly initialized
@@ -87,7 +90,8 @@ public extension PQSSession {
         destructionTime: TimeInterval? = nil,
         sharedIdOverride: String? = nil,
         shouldPersistOverride: Bool? = nil,
-        targetDeviceId: UUID? = nil
+        targetDeviceId: UUID? = nil,
+        coalescingKey: String? = nil
     ) async throws {
         do {
             let message = CryptoMessage(
@@ -103,7 +107,8 @@ public extension PQSSession {
                 session: self,
                 sharedIdOverride: sharedIdOverride,
                 shouldPersistOverride: shouldPersistOverride,
-                targetDeviceId: targetDeviceId
+                targetDeviceId: targetDeviceId,
+                coalescingKey: coalescingKey
             )
         } catch {
             logger.log(level: .error, message: "\(error)")
@@ -318,7 +323,8 @@ public extension PQSSession {
         session: PQSSession,
         sharedIdOverride: String? = nil,
         shouldPersistOverride: Bool? = nil,
-        targetDeviceId: UUID? = nil
+        targetDeviceId: UUID? = nil,
+        coalescingKey: String? = nil
     ) async throws {
         
         guard let sessionContext = await session.sessionContext else {
@@ -365,6 +371,7 @@ public extension PQSSession {
             sharedIdOverride: sharedIdOverride,
             targetDeviceId: targetDeviceId,
             shouldPersist: shouldPersist,
+            coalescingKey: coalescingKey,
             logger: logger)
     }
     
@@ -577,6 +584,7 @@ extension PQSSession: SessionEvents {
                 metadata: metadata,
                 friendshipMetadata: friendshipMetadata,
                 requestFriendship: requestFriendship,
+                notifyPeerOfCreation: notifyPeerOfCreation,
                 sessionContext: params.sessionContext,
                 cache: params.cache,
                 transport: params.transportDelegate,
@@ -591,6 +599,7 @@ extension PQSSession: SessionEvents {
                 metadata: metadata,
                 friendshipMetadata: friendshipMetadata,
                 requestFriendship: requestFriendship,
+                notifyPeerOfCreation: notifyPeerOfCreation,
                 sessionContext: params.sessionContext,
                 cache: params.cache,
                 transport: params.transportDelegate,

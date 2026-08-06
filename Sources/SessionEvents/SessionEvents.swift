@@ -301,8 +301,6 @@ public protocol SessionEvents: Sendable {
     ///   - secretName: The secret name of the contact.
     ///   - metadata: The metadata associated with the contact.
     ///   - requestFriendship: A boolean indicating whether to request friendship.
-    ///   - notifyPeerOfCreation: When `requestFriendship` is `false`, whether to send
-    ///     a `.contactCreated` acknowledgment via `receiver.synchronize`.
     ///   - sessionContext: The context of the current session.
     ///   - cache: The `PQSSessionStore` used for caching.
     ///   - transport: The `SessionTransport` used for communication.
@@ -311,6 +309,9 @@ public protocol SessionEvents: Sendable {
     ///   - logger: The logger for logging events.
     /// - Returns: A `ContactModel` representing the updated or created contact.
     /// - Throws: An error if the operation fails.
+    ///
+    /// Prefer the extension overload that accepts `notifyPeerOfCreation` when the
+    /// host must suppress `.contactCreated` (e.g. official inbox ensure).
     func createContact(
         secretName: String,
         metadata: Data,
@@ -625,6 +626,9 @@ public extension SessionEvents {
     /// - Returns: A `ContactModel` representing the created or updated contact.
     ///
     /// - Throws: An error if the operation fails due to issues such as invalid parameters or database errors.
+    /// Protocol-witnessing entry point (3.2.x signature). Forwards with
+    /// `notifyPeerOfCreation: true` so existing `SessionEvents` conformers keep
+    /// compiling without adopting the new overload.
     func createContact(
         secretName: String,
         metadata: Data = .init(),
@@ -642,6 +646,7 @@ public extension SessionEvents {
             metadata: metadata,
             friendshipMetadata: friendshipMetadata,
             requestFriendship: requestFriendship,
+            notifyPeerOfCreation: true,
             sessionContext: sessionContext,
             cache: cache,
             transport: transport,
@@ -652,11 +657,14 @@ public extension SessionEvents {
         )
     }
 
+    /// Extension overload: threads `notifyPeerOfCreation` into
+    /// `receiver.synchronize`. Not a protocol requirement — additive for 3.3.x.
     func createContact(
         secretName: String,
         metadata: Data = .init(),
         friendshipMetadata: FriendshipMetadata?,
         requestFriendship: Bool,
+        notifyPeerOfCreation: Bool = true,
         sessionContext: SessionContext,
         cache: PQSSessionStore,
         transport: SessionTransport,
@@ -762,7 +770,8 @@ public extension SessionEvents {
             if requestFriendship {
                 try await receiver.synchronize(
                     contact: updatedContact,
-                    requestFriendship: true)
+                    requestFriendship: true,
+                    notifyPeerOfCreation: notifyPeerOfCreation)
             }
             return contactModel
         } else {
@@ -808,7 +817,8 @@ public extension SessionEvents {
             
             try await receiver.synchronize(
                 contact: contact,
-                requestFriendship: requestFriendship)
+                requestFriendship: requestFriendship,
+                notifyPeerOfCreation: notifyPeerOfCreation)
             
             return contactModel
         }

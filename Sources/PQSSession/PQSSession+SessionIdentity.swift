@@ -238,6 +238,25 @@ public extension PQSSession {
         
         // Determine if refresh is needed
         let needsRefresh = forceRefresh || !hasValidIdentities
+
+        // Accounts the transport definitively reported deleted (HTTP 404 / userNotFound)
+        // must not ride warm local SessionIdentity rows (ghost channel roster members).
+        // Contract: refreshIdentities degrades gracefully — return no lanes rather than
+        // throw, so long-standing callers keep their non-throwing error handling.
+        // This check is in-memory only; a deliberate forceRefresh may re-probe live.
+        if knownDeletedAccountSecretNames.contains(secretName), !forceRefresh {
+            logger.log(
+                level: .info,
+                message: "Skipping identity refresh for deleted account secretName=\(secretName)")
+            return []
+        }
+
+        // Warm lanes never re-run findConfiguration on the send path (dogfood N1: compose
+        // must not block on config lookup). Deleted-account discovery is therefore a
+        // rate-limited background probe: the *next* send observes the tombstone above.
+        if hasValidIdentities, !forceRefresh {
+            scheduleDeletedAccountProbeIfNeeded(secretName: secretName)
+        }
         
         if needsRefresh {
             do {
@@ -251,6 +270,8 @@ public extension PQSSession {
                     oneTime: syncKeys?.curveId,
                     oneTime: syncKeys?.mlKEMId)
                 
+                knownDeletedAccountSecretNames.remove(secretName)
+
                 // Ensure we never return inactive snapshots.
                 let symmetricKey = try await getDatabaseSymmetricKey()
                 
@@ -266,6 +287,14 @@ public extension PQSSession {
                 case .invalidSignature, .signingKeyOutOfSync, .peerSigningKeyOutOfSync, .longTermKeyRotationFailed:
                     logger.log(level: .error, message: "Critical refreshIdentities failure for \(secretName): \(sessionError)")
                     throw sessionError
+                case .userNotFound:
+                    // Definitive 404 from a live lookup: tombstone the account and return
+                    // no lanes. Returning [] (not throwing) preserves this method's
+                    // graceful-degradation contract while still preventing fan-out to
+                    // ghost device lanes; sessionIdentitiesForChatFanout is the path
+                    // that surfaces userNotFound to callers prepared to skip.
+                    markAccountDeleted(secretName: secretName)
+                    return []
                 default:
                     logger.log(level: .error, message: "Error in refreshIdentities for \(secretName): \(sessionError)")
                     return existingIdentities
@@ -277,6 +306,44 @@ public extension PQSSession {
         } else {
             return existingIdentities
         }
+    }
+
+    /// Records a transport-confirmed deleted account so warm-lane sends stop fanning
+    /// out to its stale device lanes. Ratchet rows are intentionally NOT deleted here —
+    /// a spurious 404 must never destroy decrypt state; rows are only excluded.
+    internal func markAccountDeleted(secretName: String) {
+        knownDeletedAccountSecretNames.insert(secretName)
+        lastVerifiedDeviceIdsBySecretName.removeValue(forKey: secretName)
+        logger.log(
+            level: .info,
+            message: "Marked account deleted (userNotFound); excluding from fan-out secretName=\(secretName)")
+    }
+
+    /// Fire-and-forget existence check for warm-lane recipients. Rate-limited per
+    /// secret name; the transport layer's lookup cache absorbs the actual network cost
+    /// and serves 404 tombstones instantly on subsequent probes.
+    private func scheduleDeletedAccountProbeIfNeeded(secretName: String) {
+        guard let transportDelegate else { return }
+        let now = Date()
+        if let last = lastDeletedAccountProbeAtBySecretName[secretName],
+           now.timeIntervalSince(last) < deletedAccountProbeInterval {
+            return
+        }
+        lastDeletedAccountProbeAtBySecretName[secretName] = now
+        Task { [weak self] in
+            do {
+                _ = try await transportDelegate.findConfiguration(for: secretName)
+                await self?.clearDeletedAccountMark(secretName: secretName)
+            } catch PQSSession.SessionErrors.userNotFound {
+                await self?.markAccountDeleted(secretName: secretName)
+            } catch {
+                // Transient network failure: keep warm lanes (offline-first).
+            }
+        }
+    }
+
+    internal func clearDeletedAccountMark(secretName: String) {
+        knownDeletedAccountSecretNames.remove(secretName)
     }
 
     /// Chat fan-out: one active `SessionIdentity` per server-verified device.
@@ -328,6 +395,14 @@ public extension PQSSession {
         // Non-viable: never block compose on live config — local lanes are enough
         // to persist and park until `resumeJobQueue`.
         let offlineOutboundPersist = !isViable
+        if offlineOutboundPersist,
+           lastVerifiedDeviceIdsBySecretName[secretName]?.isEmpty != false,
+           !localActiveDeviceIds.isEmpty {
+            // The verified-id memo is intentionally in-memory, but active
+            // SessionIdentity rows survive restart. Rehydrate the offline candidate
+            // set from those established lanes so compose never needs HTTP offline.
+            lastVerifiedDeviceIdsBySecretName[secretName] = localActiveDeviceIds
+        }
 
         var verifiedIds: Set<UUID>
         var usedConfigurationLookupFallback = false
@@ -342,6 +417,11 @@ public extension PQSSession {
         } else {
             do {
                 verifiedIds = try await fetchVerifiedIdsFromRemote()
+            } catch PQSSession.SessionErrors.userNotFound {
+                // Deleted accounts must not ride stale local SessionIdentity rows
+                // (channel roster ghosts like a removed `bob` still listed as members).
+                markAccountDeleted(secretName: secretName)
+                throw PQSSession.SessionErrors.userNotFound
             } catch {
                 verifiedIds = localLaneFallbackVerifiedIds()
                 guard !verifiedIds.isEmpty else { throw error }
@@ -454,6 +534,16 @@ public extension PQSSession {
             level: .info,
             message: "Chat fan-out resolved \(result.count) device lane(s) for \(secretName) forceRefresh=\(forceRefresh)")
         return result
+    }
+
+    /// Whether an established chat has at least one active local recipient lane.
+    ///
+    /// This is a local-store check only; it never refreshes configuration or creates
+    /// identities. Callers use it to decide whether a user-visible message can be
+    /// persisted before remote fan-out reconciliation.
+    func hasActiveChatLane(secretName: String) async throws -> Bool {
+        let identities = try await getSessionIdentities(with: secretName)
+        return !identities.isEmpty
     }
 
     /// Removes local `SessionIdentity` rows whose device IDs are absent from `verifiedDeviceIds`.
@@ -1697,9 +1787,6 @@ public extension PQSSession {
 
         let symmetricKey = try await getDatabaseSymmetricKey()
         let configuration = try await transportDelegate.findConfiguration(for: secretName)
-        // Config lookup succeeded — clear any dependency block for this lane so a
-        // subsequent decrypt failure may emit peerRefresh again.
-        clearRecoveryEmitBlocked(sender: secretName, deviceId: deviceId)
         // A non-orphanReset replaces the intentional orphan-resend initiating mark and
         // recovery-session history; orphanResend callers re-mark the returned row after
         // this returns. NACK control delivery must not wipe recovery history either —

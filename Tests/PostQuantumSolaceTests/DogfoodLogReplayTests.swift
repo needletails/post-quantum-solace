@@ -146,6 +146,91 @@ extension EndToEndTests {
         }
     }
 
+    @Test("persist-first: established DM row exists before remote configuration lookup")
+    func establishedDMPersistsBeforeRemoteConfigurationLookup() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceStore = createSenderStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        let aliceStream = AsyncStream<ReceivedMessage> { bobTransport.continuation = $0 }
+        let bobStream = AsyncStream<ReceivedMessage> { aliceTransport.continuation = $0 }
+
+        try await createSenderSession(
+            store: aliceStore,
+            transport: aliceTransport,
+            sessionDelegate: sd)
+        try await createRecipientSession(
+            store: createRecipientStore(),
+            transport: bobTransport,
+            sessionDelegate: rsd)
+
+        aliceTask = Task {
+            for await received in aliceStream {
+                _ = try? await self._senderSession.receiveMessage(
+                    message: received.message,
+                    sender: received.sender,
+                    deviceId: received.deviceId,
+                    messageId: received.messageId,
+                    logicalMessageId: received.logicalMessageId)
+            }
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                _ = try? await self._recipientSession.receiveMessage(
+                    message: received.message,
+                    sender: received.sender,
+                    deviceId: received.deviceId,
+                    messageId: received.messageId,
+                    logicalMessageId: received.logicalMessageId)
+            }
+        }
+
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        let localBobLanes = try await _senderSession.getSessionIdentities(with: "bob")
+        #expect(!localBobLanes.isEmpty, "Precondition: established bob lanes")
+        await _senderSession.test_removeLastVerifiedDeviceIds(for: "bob")
+
+        let sharedId = "persist-before-config-\(UUID().uuidString)"
+        let observation = CallTracker()
+        aliceTransport.beforeFindConfiguration = { secretName in
+            guard secretName == "bob" else { return }
+            let persisted = await aliceStore.createdMessages.contains {
+                $0.sharedId == sharedId
+            }
+            await observation.record(
+                secretName: secretName,
+                deviceId: "",
+                keyCount: persisted ? 1 : 0)
+        }
+
+        try await _senderSession.writeTextMessage(
+            recipient: .nickname("bob"),
+            text: "persist before config",
+            sharedIdOverride: sharedId)
+
+        let calls = await observation.calls
+        #expect(!calls.isEmpty, "Cold verified memo should exercise remote configuration")
+        #expect(
+            calls.allSatisfy { $0.keyCount == 1 },
+            "The local message row must exist before findConfiguration starts")
+    }
+
     // MARK: - N1b: cold findConfiguration timeout fails fast when no local lanes
 
     /// When there are no local recipient lanes and live `findConfiguration` times out,

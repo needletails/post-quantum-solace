@@ -95,24 +95,30 @@ public protocol EventReceiver: Sendable {
 
     /// Synchronizes a contact with the remote system, optionally requesting friendship.
     ///
-    /// This method is invoked to synchronize contact information with other devices
-    /// or users in the network. It can optionally initiate a friendship request as
-    /// part of the synchronization process.
-    ///
     /// - Parameters:
-    ///   - contact: The `Contact` instance to synchronize. Contains the contact's
-    ///     identification information and metadata to be synchronized.
-    ///   - requestFriendship: A boolean indicating whether to request friendship
-    ///     with the contact during synchronization. When `true`, a friendship
-    ///     request will be sent to the contact.
-    ///   - notifyPeerOfCreation: When `requestFriendship` is `false`, controls whether
-    ///     a `.contactCreated` acknowledgment is sent to the peer. Defaults to `true`
-    ///     for inbound friendship / sibling paths; official inbox ensure passes `false`.
-    /// - Throws: An error if the operation fails, such as network errors,
-    ///   authentication failures, or synchronization conflicts.
+    ///   - contact: The `Contact` instance to synchronize.
+    ///   - requestFriendship: When `true`, a friendship request is sent to the contact.
+    /// - Throws: An error if the operation fails.
+    @available(*, deprecated, message: "Use synchronize(contact:requestFriendship:notifyPeerOfCreation:)")
     func synchronize(
         contact: Contact,
         requestFriendship: Bool
+    ) async throws
+
+    /// Synchronizes a contact, optionally requesting friendship and/or sending a
+    /// `.contactCreated` acknowledgment.
+    ///
+    /// - Parameters:
+    ///   - contact: The `Contact` instance to synchronize.
+    ///   - requestFriendship: When `true`, a friendship request is sent to the contact.
+    ///   - notifyPeerOfCreation: When `requestFriendship` is `false`, controls whether
+    ///     a `.contactCreated` acknowledgment is sent to the peer. Defaults to `true`
+    ///     for inbound friendship / sibling paths; official inbox ensure passes `false`.
+    /// - Throws: An error if the operation fails.
+    func synchronize(
+        contact: Contact,
+        requestFriendship: Bool,
+        notifyPeerOfCreation: Bool
     ) async throws
 
     /// Transports contact metadata to other devices or users in the network.
@@ -181,4 +187,20 @@ public protocol EventReceiver: Sendable {
     ///     updated communication information and settings.
     /// - Returns: An asynchronous operation that completes when the event has been processed.
     func createdChannel(_ model: BaseCommunication) async
+}
+
+public extension EventReceiver {
+    /// Source-compatible default for hosts that only implement the legacy 2-arg
+    /// ``synchronize(contact:requestFriendship:)``. When the caller asks not to
+    /// notify (`notifyPeerOfCreation == false` and no friendship request), skip
+    /// entirely so official-inbox creates do not emit `contactCreated`. Otherwise
+    /// forward to the legacy method.
+    func synchronize(
+        contact: Contact,
+        requestFriendship: Bool,
+        notifyPeerOfCreation: Bool
+    ) async throws {
+        if !requestFriendship && !notifyPeerOfCreation { return }
+        try await synchronize(contact: contact, requestFriendship: requestFriendship)
+    }
 }

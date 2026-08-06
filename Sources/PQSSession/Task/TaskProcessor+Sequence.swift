@@ -43,6 +43,17 @@ extension TaskProcessor {
         
         let seq = incrementId()
         let symmetricKey = try await session.getDatabaseSymmetricKey()
+
+        // Keyed ephemeral state publishes (consent blobs, schedule syncs) are
+        // regenerated on every registration; only the newest per recipient lane
+        // matters. Supersede the pending copy before persisting the new one so
+        // short sessions cannot accumulate stale jobs that later flood offline
+        // spools. Persisted user messages never carry a key and are untouched.
+        try await supersedePendingCoalescedJobs(
+            for: task,
+            cache: cache,
+            symmetricKey: symmetricKey)
+
         let job = try createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
         // Always persist first. Offline / non-viable compose must survive until
         // `resumeJobQueue` after IRC registration — never depend on in-memory dequeue.
@@ -78,7 +89,51 @@ extension TaskProcessor {
 
         try await startProcessingIfNeeded(session)
     }
-    
+
+    /// Deletes pending jobs superseded by a keyed ephemeral publish.
+    ///
+    /// A candidate is superseded only when all of the following hold:
+    /// - the new task is `.writeMessage`, non-persisted, and carries a
+    ///   `coalescingKey`;
+    /// - the candidate is `.writeMessage`, non-persisted, carries the same
+    ///   key, and targets the same recipient identity lane;
+    /// - the candidate is not currently in flight (an executing send is mid
+    ///   transport; superseding it would race an unknown outcome — the worst
+    ///   case is one redundant send, never a lost one).
+    ///
+    /// Matches are removed from the durable cache first, then from the live
+    /// consumer deque so a running drain cannot still transport them.
+    private func supersedePendingCoalescedJobs(
+        for task: EncryptableTask,
+        cache: SessionCache,
+        symmetricKey: SymmetricKey
+    ) async throws {
+        guard case .writeMessage(let newOutbound) = task.task,
+              !newOutbound.isPersistedOutbound,
+              let key = newOutbound.coalescingKey
+        else { return }
+
+        var supersededIds = Set<UUID>()
+        for job in try await cache.fetchJobs() {
+            guard !inFlightJobIds.contains(job.id) else { continue }
+            guard let props = await job.props(symmetricKey: symmetricKey),
+                  case .writeMessage(let pending) = props.task.task,
+                  !pending.isPersistedOutbound,
+                  pending.coalescingKey == key,
+                  pending.recipientIdentity.id == newOutbound.recipientIdentity.id
+            else { continue }
+
+            try await cache.deleteJob(job)
+            supersededIds.insert(job.id)
+            PQSAuditLog.log(.send, "pqs.send.jobSuperseded coalescingKey=\(key) staleSharedId=\(pending.sharedId) newSharedId=\(newOutbound.sharedId) sessionIdentityId=\(pending.recipientIdentity.id.uuidString) jobId=\(job.id)",
+                level: .info)
+        }
+
+        if !supersededIds.isEmpty {
+            await jobConsumer.removeJobs(withIds: supersededIds)
+        }
+    }
+
     public func loadTasks(
         _ job: JobModel? = nil,
         cache: SessionCache,
@@ -739,10 +794,7 @@ extension TaskProcessor {
                     } catch {
                         // Terminal for this episode: nothing is on the wire, so keeping
                         // it open would coalesce failures against a request that was
-                        // never sent. Same handling as the fresh-repair catch-all.
-                        await session.markRecoveryEmitBlocked(
-                            sender: senderSecretName,
-                            deviceId: senderDeviceId)
+                        // never sent. Episode end drains deferred NACKs.
                         await session.endReestablishmentEpisode(
                             sender: senderSecretName,
                             deviceId: senderDeviceId)
@@ -1288,6 +1340,10 @@ extension TaskProcessor {
         // must leave the tuple retryable for the next concrete inbound/event.
         if didRequestResend {
             await session.markInboundFailure(message, failureClass: failureClass)
+            await session.noteInboundMessagePendingRecovery(
+                sender: message.senderSecretName,
+                deviceId: message.senderDeviceId,
+                sharedMessageId: message.sharedMessageId)
         }
         try await cache.deleteJob(job)
         return .deleted
@@ -1658,9 +1714,6 @@ extension TaskProcessor {
             } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
                 await reportPeerSigningKeyOutOfSync(message: message, session: session)
             } catch {
-                await session.markRecoveryEmitBlocked(
-                    sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId)
                 await session.endReestablishmentEpisode(
                     sender: message.senderSecretName,
                     deviceId: message.senderDeviceId)

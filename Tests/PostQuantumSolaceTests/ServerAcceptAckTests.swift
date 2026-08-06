@@ -10,13 +10,25 @@ import Testing
 
 private actor ServerAcceptAckEventRecorder {
     private var envelopeIds: [String] = []
+    private var waiters: [CheckedContinuation<Void, Never>] = []
 
     func record(_ envelopeId: String) {
         envelopeIds.append(envelopeId)
+        let resumed = waiters
+        waiters.removeAll()
+        resumed.forEach { $0.resume() }
     }
 
     func all() -> [String] {
         envelopeIds
+    }
+
+    /// Suspends until the first overdue event is recorded. Event-driven so tests never
+    /// race deadline fires against fixed sleeps.
+    func waitForFirst() async {
+        while envelopeIds.isEmpty {
+            await withCheckedContinuation { waiters.append($0) }
+        }
     }
 }
 
@@ -52,6 +64,7 @@ struct ServerAcceptAckTests {
             pending: pending,
             localId: UUID(),
             sharedId: "shared-id",
+            isPersistedOutbound: true,
             session: session)
 
         #expect(await processor.testUnackedCountForTests() == 1)
@@ -70,11 +83,13 @@ struct ServerAcceptAckTests {
             pending: pending(envelopeMessageId: "envelope-a"),
             localId: localId,
             sharedId: "shared-id",
+            isPersistedOutbound: true,
             session: session)
         await processor.registerUnackedServerAccept(
             pending: pending(envelopeMessageId: "envelope-b"),
             localId: localId,
             sharedId: "shared-id",
+            isPersistedOutbound: true,
             session: session)
 
         await processor.confirmServerAcceptedEnvelope("envelope-a", session: session)
@@ -95,8 +110,8 @@ struct ServerAcceptAckTests {
         await session.shutdown()
     }
 
-    @Test("ack deadline signals path suspect without resending")
-    func testAckDeadlineExpiryEmitsPathSuspectEventAndDoesNotResendInPlace() async throws {
+    @Test("ack deadline resends identical ciphertext in place")
+    func testAckDeadlineExpiryResendsInPlaceWithoutConnectionHook() async throws {
         let processor = TaskProcessor()
         let session = PQSSession()
         let transport = PreparedTransportProbe()
@@ -106,15 +121,103 @@ struct ServerAcceptAckTests {
             await events.record(envelopeId)
         }
         await processor.testSetAckDeadlineNanosecondsForTests(10_000_000)
+        let outbound = pending(envelopeMessageId: "deadline")
         await processor.registerUnackedServerAccept(
-            pending: pending(envelopeMessageId: "deadline"),
+            pending: outbound,
             localId: UUID(),
             sharedId: "shared-id",
+            isPersistedOutbound: true,
             session: session)
 
-        try await Task.sleep(nanoseconds: 100_000_000)
-        #expect(await events.all() == ["deadline"])
+        // Event-driven: suspend until the overdue in-place resend actually reaches the
+        // transport. A fixed sleep races the handler's notify actor hop — if confirm
+        // wins that race the handler (correctly) drops the resend, flaking the test.
+        await transport.waitForCapturedSends(atLeast: 1)
+        // Deadline rearms after in-place resend; stop further fires before asserting.
+        await processor.confirmServerAcceptedEnvelope("deadline", session: session)
+        #expect(await events.all().contains("deadline"))
+        #expect(await transport.capturedPayloads().contains(outbound.message.signed?.data ?? Data()))
+        #expect(await processor.isAwaitingServerAccept("deadline") == false)
+        try? await processor.ratchetManager.shutdown()
+        await session.shutdown()
+    }
+
+    @Test("ack deadline exhaustion marks failed and keeps ciphertext")
+    func testAckDeadlineExhaustionMarksFailed() async throws {
+        let processor = TaskProcessor()
+        let session = PQSSession()
+        let transport = PreparedTransportProbe()
+        await session.setTransportDelegate(conformer: transport)
+        let localId = UUID()
+        let outbound = pending(envelopeMessageId: "exhausted-deadline")
+        await processor.testInsertUnackedForTests(
+            envelopeMessageId: "exhausted-deadline",
+            entry: .init(
+                pending: outbound,
+                localId: localId,
+                sharedId: "shared-id",
+                isPersistedOutbound: true,
+                connectionEpoch: 0,
+                resendAttempts: 5))
+        await processor.testSetAckDeadlineNanosecondsForTests(10_000_000)
+        // Manually fire overdue path (entry already at cap).
+        await processor.handleServerAcceptAckOverdue(
+            envelopeMessageId: "exhausted-deadline",
+            session: session)
+        #expect(await processor.isAwaitingServerAccept("exhausted-deadline") == true)
         #expect(await transport.capturedPayloads().isEmpty)
+        try? await processor.ratchetManager.shutdown()
+        await session.shutdown()
+    }
+
+    @Test("isAwaitingServerAccept tracks unacked map")
+    func testIsAwaitingServerAccept() async {
+        let processor = TaskProcessor()
+        let session = PQSSession()
+        #expect(await processor.isAwaitingServerAccept("missing") == false)
+        await processor.registerUnackedServerAccept(
+            pending: pending(envelopeMessageId: "awaiting"),
+            localId: UUID(),
+            sharedId: "shared-id",
+            isPersistedOutbound: true,
+            session: session)
+        #expect(await processor.isAwaitingServerAccept("awaiting") == true)
+        await processor.confirmServerAcceptedEnvelope("awaiting", session: session)
+        #expect(await processor.isAwaitingServerAccept("awaiting") == false)
+        try? await processor.ratchetManager.shutdown()
+        await session.shutdown()
+    }
+
+    @Test("rearmAll keeps unacked and replaces deadline task")
+    func testRearmAllServerAcceptDeadlines() async throws {
+        let processor = TaskProcessor()
+        let session = PQSSession()
+        let events = ServerAcceptAckEventRecorder()
+        await session.setServerAcceptAckOverdueHandler { envelopeId in
+            await events.record(envelopeId)
+        }
+        // First window is far in the future (5s): if rearm fails to cancel it, the
+        // exactly-once assertion below would still hold, but the entry check would
+        // observe a spurious early fire — deterministic in both directions, no sleeps.
+        await processor.testSetAckDeadlineNanosecondsForTests(5_000_000_000)
+        await processor.registerUnackedServerAccept(
+            pending: pending(envelopeMessageId: "rearm"),
+            localId: UUID(),
+            sharedId: "shared-id",
+            isPersistedOutbound: true,
+            session: session)
+        #expect(await events.all().isEmpty)
+        // Cancel the first window and start a fresh, short one.
+        await processor.testSetAckDeadlineNanosecondsForTests(10_000_000)
+        await processor.rearmAllServerAcceptDeadlines(session: session)
+        // Any re-arm the overdue handler performs after firing (no transport delegate
+        // here) uses the override read at fire time — push it far out so the handler
+        // cannot fire a second time before we confirm.
+        await processor.testSetAckDeadlineNanosecondsForTests(5_000_000_000)
+        await events.waitForFirst()
+        #expect(await processor.isAwaitingServerAccept("rearm") == true)
+        await processor.confirmServerAcceptedEnvelope("rearm", session: session)
+        #expect(await events.all() == ["rearm"])
         try? await processor.ratchetManager.shutdown()
         await session.shutdown()
     }
@@ -132,6 +235,7 @@ struct ServerAcceptAckTests {
             pending: pending(envelopeMessageId: "cancelled"),
             localId: UUID(),
             sharedId: "shared-id",
+            isPersistedOutbound: true,
             session: session)
         await processor.confirmServerAcceptedEnvelope("cancelled", session: session)
 
@@ -152,6 +256,7 @@ struct ServerAcceptAckTests {
             pending: outbound,
             localId: UUID(),
             sharedId: "shared-id",
+            isPersistedOutbound: true,
             session: session)
 
         await processor.resendUnackedOutboundEnvelopes(reason: "registered", session: session)
@@ -171,6 +276,7 @@ struct ServerAcceptAckTests {
             pending: pending(envelopeMessageId: "late"),
             localId: UUID(),
             sharedId: "shared-id",
+            isPersistedOutbound: true,
             session: session)
 
         await processor.resendUnackedOutboundEnvelopes(reason: "registered", session: session)
@@ -192,6 +298,7 @@ struct ServerAcceptAckTests {
                 pending: outbound,
                 localId: localId,
                 sharedId: "shared-id",
+                isPersistedOutbound: true,
                 connectionEpoch: 0,
                 resendAttempts: 5))
 

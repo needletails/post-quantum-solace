@@ -19,6 +19,7 @@
 //  proper sequence ordering based on cryptographic properties.
 //
 
+import Foundation
 import NeedleTailAsyncSequence
 import SessionModels
 import Crypto
@@ -83,6 +84,21 @@ extension NeedleTailAsyncConsumer {
         await feedConsumer(typedJob, priority: props.task.priority)
     }
     
+    /// Removes enqueued jobs by id without touching the rest of the deque.
+    ///
+    /// Used by keyed outbound coalescing: when a fresh ephemeral state publish
+    /// supersedes a pending one, the stale job is deleted from the cache and
+    /// must also leave the live queue so a running drain cannot still send it.
+    /// Runs inside the consumer actor, so removal is atomic with respect to
+    /// enqueue/dequeue.
+    func removeJobs(withIds ids: Set<UUID>) async {
+        guard !ids.isEmpty else { return }
+        deque.removeAll { entry in
+            guard let job = entry.item as? JobModel else { return false }
+            return ids.contains(job.id)
+        }
+    }
+
     /// Gracefully shuts down the consumer by clearing the deque and stopping processing.
     ///
     /// This method is called when the task processor needs to stop processing jobs,
