@@ -1961,14 +1961,30 @@ public extension PQSSession {
         if createIdentity, forceRefresh || sessionIdentities.isEmpty || !sessionIdentities.contains(secretName) {
 
             // Get the user configuration for the recipient
-            let configuration = try await transportDelegate.findConfiguration(for: secretName)
+            var configuration = try await transportDelegate.findConfiguration(for: secretName)
             try validateUserConfigurationSignatures(configuration)
 
-            if isSelfSecretName, forceRefresh {
-                // For linked-device convergence, force-refreshing self identities should also
-                // synchronize the persisted active account bundle.
-                try await synchronizeActiveUserConfiguration(configuration)
-            } else if !isSelfSecretName {
+            if isSelfSecretName {
+                // The local context is authoritative for own-account device *additions*:
+                // device linking signs the child locally before every remote read path
+                // observes it (transport lookup caches, read-after-publish races). Merge
+                // locally signed devices missing from the fetched snapshot so that
+                //   1. a stale snapshot can never silently un-link a freshly added
+                //      device from the local session context, and
+                //   2. an identity is still minted for it, so its inbound messages
+                //      decrypt instead of dying with `missingIdentity` and being purged
+                //      (2026-08-08 device-link dogfood).
+                // The merged document remains fully signature-checked: local entries are
+                // signed by the same pinned account key, and it is re-validated below.
+                configuration = await selfConfigurationMergingLocallySignedDevices(
+                    remote: configuration)
+                try validateUserConfigurationSignatures(configuration)
+                if forceRefresh {
+                    // For linked-device convergence, force-refreshing self identities should also
+                    // synchronize the persisted active account bundle.
+                    try await synchronizeActiveUserConfiguration(configuration)
+                }
+            } else {
                 try await enforcePeerAccountSigningKeyPin(
                     for: secretName,
                     configuration: configuration,
@@ -2407,5 +2423,49 @@ public extension PQSSession {
         // Route through the public TOFU-pinned adoption helper so the account
         // signing key cannot silently change via a self-refresh path.
         try await adoptVerifiedUserConfiguration(configuration)
+    }
+
+    /// Merges locally signed own-account devices missing from a fetched snapshot.
+    ///
+    /// Device linking signs the child into the *local* active configuration before every
+    /// remote read path can observe the republished document (transport lookup caches,
+    /// read-after-publish races). Adopting such a stale snapshot verbatim un-links the
+    /// child locally, and refreshing identities against it mints no lane for the child —
+    /// its inbound messages then fail `missingIdentity` and are purged.
+    ///
+    /// Only *additions* are preserved: entries are appended, never replaced, and only when
+    /// the snapshot is signed by the same pinned account key (a differing key is a TOFU
+    /// question handled by `adoptVerifiedUserConfiguration`). Device *removal* does not
+    /// flow through self-refresh — it converges via the explicit unlink paths that update
+    /// the local context first, after which there is no local entry to re-merge.
+    internal func selfConfigurationMergingLocallySignedDevices(
+        remote configuration: UserConfiguration
+    ) async -> UserConfiguration {
+        guard let localConfiguration = await sessionContext?.activeUserConfiguration else {
+            return configuration
+        }
+        guard localConfiguration.signingPublicKey == configuration.signingPublicKey else {
+            return configuration
+        }
+        let remoteDeviceIds = Set(configuration.signedDevices.map(\.id))
+        let missingLocalDevices = localConfiguration.signedDevices.filter {
+            !remoteDeviceIds.contains($0.id)
+        }
+        guard !missingLocalDevices.isEmpty else { return configuration }
+
+        var merged = configuration
+        merged.signedDevices.append(contentsOf: missingLocalDevices)
+
+        let missingDeviceIds = Set(missingLocalDevices.map(\.id))
+        let remoteBundleIds = Set(configuration.signedDeviceKeyBundles.map(\.id))
+        merged.signedDeviceKeyBundles.append(
+            contentsOf: localConfiguration.signedDeviceKeyBundles.filter {
+                missingDeviceIds.contains($0.id) && !remoteBundleIds.contains($0.id)
+            })
+
+        logger.log(
+            level: .warning,
+            message: "pqs.recovery.selfConfigMergedLocalDevices mergedDeviceIds=\(missingLocalDevices.map(\.id.uuidString).joined(separator: ",")) remoteDeviceCount=\(remoteDeviceIds.count)")
+        return merged
     }
 }
