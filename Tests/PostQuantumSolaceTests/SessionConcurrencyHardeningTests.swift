@@ -1,4 +1,5 @@
 import Foundation
+import NeedleTailCrypto
 import Testing
 @testable import PQSSession
 
@@ -97,6 +98,64 @@ struct SessionConcurrencyHardeningTests {
             try? await Task.sleep(for: .milliseconds(10))
         }
         #expect(await counter.value == 1)
+    }
+
+    @Test("failed ratchet persistence retains processor until revive retry succeeds")
+    func failedRatchetPersistenceRetainsProcessorUntilRetrySucceeds() async throws {
+        let session = PQSSession()
+        let user = MockUserData(session: session)
+        let identityStore = user.identityStore(isSender: true)
+        let transportStore = TransportStore()
+        let transport = _MockTransportDelegate(session: session, store: transportStore)
+        let receiver = ReceiverDelegate(session: session)
+        let sessionDelegate = SessionDelegate(session: session)
+
+        await identityStore.setLocalSalt("restart-after-failed-ratchet-persistence")
+        await transportStore.setPublishableName(user.ssn)
+        await session.setDatabaseDelegate(conformer: identityStore)
+        await session.setTransportDelegate(conformer: transport)
+        await session.setReceiverDelegate(conformer: receiver)
+        await session.setPQSSessionDelegate(conformer: sessionDelegate)
+        await session.setViability(true)
+        _ = try await session.createSession(
+            secretName: user.ssn,
+            appPassword: user.sap
+        ) {}
+        _ = try await session.startSession(appPassword: user.sap)
+
+        let originalProcessor = await session.taskProcessor
+        let ratchetManager = await originalProcessor.ratchetManager
+        let persistence = ControlledRatchetPersistence()
+        let fixture = try makeShutdownRatchetFixture()
+        await ratchetManager.setDelegate(persistence)
+        try await ratchetManager.senderInitialization(
+            sessionIdentity: fixture.identity,
+            sessionSymmetricKey: fixture.symmetricKey,
+            remoteKeys: fixture.remoteKeys,
+            localKeys: fixture.localKeys)
+
+        await persistence.setShouldFail(true)
+        await session.shutdown()
+        #expect(await session.lifecyclePhase == .shutDown)
+
+        await session.setDatabaseDelegate(conformer: identityStore)
+        await session.setTransportDelegate(conformer: transport)
+        await session.setReceiverDelegate(conformer: receiver)
+        await session.setPQSSessionDelegate(conformer: sessionDelegate)
+        await session.setViability(true)
+
+        await #expect(throws: ControlledRatchetPersistence.PersistenceError.self) {
+            _ = try await session.startSession(appPassword: user.sap)
+        }
+        #expect(await session.taskProcessor === originalProcessor)
+        #expect(await session.lifecyclePhase == .shutDown)
+
+        await persistence.setShouldFail(false)
+        _ = try await session.startSession(appPassword: user.sap)
+        #expect(await session.taskProcessor !== originalProcessor)
+        #expect(await session.lifecyclePhase == .running)
+
+        await session.shutdown()
     }
 
     @Test("transport protocol items admitted while running complete exactly once")
@@ -291,4 +350,94 @@ struct SessionConcurrencyHardeningTests {
         // Neither waiter should hang past timeout; both must complete.
         _ = results
     }
+}
+
+private actor ControlledRatchetPersistence: SessionIdentityDelegate {
+    enum PersistenceError: Error {
+        case forced
+    }
+
+    private var shouldFail = false
+
+    func setShouldFail(_ shouldFail: Bool) {
+        self.shouldFail = shouldFail
+    }
+
+    func updateSessionIdentity(_ identity: SessionIdentity) async throws {
+        if shouldFail {
+            throw PersistenceError.forced
+        }
+    }
+
+    func fetchOneTimePrivateKey(_ id: UUID?) async throws -> CurvePrivateKey? {
+        nil
+    }
+
+    func updateOneTimeKey(remove id: UUID) async {}
+}
+
+private func makeShutdownRatchetFixture() throws -> (
+    identity: SessionIdentity,
+    symmetricKey: SymmetricKey,
+    remoteKeys: RemoteKeys,
+    localKeys: LocalKeys
+) {
+    let crypto = NeedleTailCrypto()
+    let symmetricKey = SymmetricKey(size: .bits256)
+
+    let remoteLongTerm = crypto.generateCurve25519PrivateKey()
+    let remoteOneTime = crypto.generateCurve25519PrivateKey()
+    let remoteSigning = crypto.generateCurve25519SigningPrivateKey()
+    let remoteKEM = try crypto.generateMLKem1024PrivateKey()
+    let remoteLongTermID = UUID()
+    let remoteOneTimeID = UUID()
+    let remoteKEMID = UUID()
+
+    let localLongTerm = crypto.generateCurve25519PrivateKey()
+    let localOneTime = crypto.generateCurve25519PrivateKey()
+    let localKEM = try crypto.generateMLKem1024PrivateKey()
+    let localLongTermID = UUID()
+    let localOneTimeID = UUID()
+    let localKEMID = UUID()
+
+    let identity = try SessionIdentity(
+        id: UUID(),
+        props: .init(
+            secretName: "shutdown-persistence-peer",
+            deviceId: UUID(),
+            sessionContextId: 1,
+            longTermPublicKey: remoteLongTerm.publicKey.rawRepresentation,
+            signingPublicKey: remoteSigning.publicKey.rawRepresentation,
+            mlKEMPublicKey: MLKEMPublicKey(
+                id: remoteKEMID,
+                remoteKEM.publicKey.rawRepresentation),
+            oneTimePublicKey: CurvePublicKey(
+                id: remoteOneTimeID,
+                remoteOneTime.publicKey.rawRepresentation),
+            deviceName: "Shutdown Persistence Peer",
+            isMasterDevice: true),
+        symmetricKey: symmetricKey)
+
+    let remoteKeys = try RemoteKeys(
+        longTerm: CurvePublicKey(
+            id: remoteLongTermID,
+            remoteLongTerm.publicKey.rawRepresentation),
+        oneTime: CurvePublicKey(
+            id: remoteOneTimeID,
+            remoteOneTime.publicKey.rawRepresentation),
+        mlKEM: MLKEMPublicKey(
+            id: remoteKEMID,
+            remoteKEM.publicKey.rawRepresentation))
+    let localKeys = try LocalKeys(
+        longTerm: CurvePrivateKey(
+            id: localLongTermID,
+            localLongTerm.rawRepresentation),
+        oneTime: CurvePrivateKey(
+            id: localOneTimeID,
+            localOneTime.rawRepresentation),
+        mlKEM: MLKEMPrivateKey(
+            id: localKEMID,
+            localKEM.encode()))
+
+    return (identity, symmetricKey, remoteKeys, localKeys)
 }

@@ -354,8 +354,15 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
     /// gate, so a persisted session restart must use a new `TaskProcessor`.
     /// This transition is only called by explicit session creation/restoration;
     /// ordinary scheduling after shutdown remains rejected.
-    private func reviveAfterShutdownIfNeeded() async {
+    private func reviveAfterShutdownIfNeeded() async throws {
         guard lifecyclePhase == .shutDown else { return }
+
+        // A prior best-effort shutdown may have failed to persist ratchet state.
+        // Retry while the old processor is still retained. If persistence still
+        // fails, propagate the error and keep the processor alive; replacing it
+        // would discard unpersisted ratchet state and trip its deinit contract.
+        let previous = taskProcessor
+        try await previous.ratchetManager.shutdown()
 
         let replacement = TaskProcessor(
             logger: logger,
@@ -2589,7 +2596,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
         guard let cache else {
             throw SessionErrors.databaseNotInitialized
         }
-        await reviveAfterShutdownIfNeeded()
+        try await reviveAfterShutdownIfNeeded()
         await beginSessionLifecycleIfNeeded()
 
         let bundle = try await createDeviceCryptographicBundle(isMaster: true)
@@ -3464,7 +3471,7 @@ public actor PQSSession: NetworkDelegate, SessionCacheSynchronizer {
 
             // Authentication succeeded. Only now revive runtime components so an
             // invalid password cannot reopen a shut-down session.
-            await reviveAfterShutdownIfNeeded()
+            try await reviveAfterShutdownIfNeeded()
             await beginSessionLifecycleIfNeeded()
             await setSessionContext(sessionContext)
             // `shutdown()` parks the processor before delegates/cache are released.
