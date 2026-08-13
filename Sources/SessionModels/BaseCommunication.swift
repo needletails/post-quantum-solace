@@ -233,7 +233,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ///     securely managed and shared only with authorized parties who need to
     ///     decrypt the communication data.
     ///
-    /// - Throws: `CryptoError.encryptionFailed` if the encryption process fails.
+    /// - Throws: `PQSError.encryptionFailed` if the encryption process fails.
     ///
     /// - Note: The symmetric key should be derived from a secure key exchange
     ///   process and should be unique to this communication or a group of related
@@ -247,7 +247,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
         let crypto = NeedleTailCrypto()
         let data = try BinaryEncoder().encode(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-            throw CryptoError.encryptionFailed
+            throw PQSError.encryptionFailed
         }
         self.data = encryptedData
     }
@@ -285,7 +285,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     /// - Parameter symmetricKey: The symmetric key used for decryption. Must be the
     ///   same key that was used to encrypt the data originally.
     /// - Returns: The decrypted properties as `UnwrappedProps`.
-    /// - Throws: `CryptoError.decryptionFailed` if decryption fails due to incorrect
+    /// - Throws: `PQSError.decryptionFailed` if decryption fails due to incorrect
     ///   key or corrupted data.
     ///
     /// - Note: This method performs the actual decryption operation and should be
@@ -293,17 +293,17 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ///   graceful approach, consider using `props(symmetricKey:)` instead.
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         try lock.withLock { [weak self] in
-            guard let self else { throw CryptoError.decryptionFailed }
+            guard let self else { throw PQSError.decryptionFailed }
             let crypto = NeedleTailCrypto()
-            guard !data.isEmpty else { throw CryptoError.decryptionFailed }
+            guard !data.isEmpty else { throw PQSError.decryptionFailed }
             guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
-                throw CryptoError.decryptionFailed
+                throw PQSError.decryptionFailed
             }
-            guard !decrypted.isEmpty else { throw CryptoError.decryptionFailed }
+            guard !decrypted.isEmpty else { throw PQSError.decryptionFailed }
             do {
                 return try BinaryDecoder().decode(SessionModels.BaseCommunication.UnwrappedProps.self, from: decrypted)
             } catch {
-                throw CryptoError.decryptionFailed
+                throw PQSError.decryptionFailed
             }
         }
     }
@@ -321,18 +321,18 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ///     conform to both `Codable` and `Sendable` protocols.
     /// - Returns: The updated decrypted properties as `UnwrappedProps`, confirming
     ///   that the update was successful.
-    /// - Throws: `CryptoError.encryptionFailed` if the encryption process fails.
+    /// - Throws: `PQSError.encryptionFailed` if the encryption process fails.
     ///
     /// - Note: This method performs both encryption and decryption operations to
     ///   ensure that the update was successful. The returned properties can be
     ///   used to verify that the update was applied correctly.
     public func updateProps(symmetricKey: SymmetricKey, props: Codable & Sendable) async throws -> UnwrappedProps? {
         try lock.withLock { [weak self] in
-            guard let self else { throw CryptoError.encryptionFailed }
+            guard let self else { throw PQSError.encryptionFailed }
             let crypto = NeedleTailCrypto()
             let data = try BinaryEncoder().encode(props)
             guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-                throw CryptoError.encryptionFailed
+                throw PQSError.encryptionFailed
             }
             self.data = encryptedData
         }
@@ -352,7 +352,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ///     key that was used to encrypt the data originally.
     /// - Returns: An instance of the specified type populated with the decrypted properties.
     /// - Throws:
-    ///   - `CryptoError.propsError` if the properties cannot be decrypted.
+    ///   - `PQSError.propsError` if the properties cannot be decrypted.
     ///   - A decoding error if the decrypted properties cannot be converted to the specified type.
     ///
     /// - Note: This method is currently hardcoded to return a `Communication` instance.
@@ -360,7 +360,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ///   currently used in the implementation.
     public func makeDecryptedModel<T: Sendable & Codable>(of _: T.Type, symmetricKey: SymmetricKey) async throws -> T {
         guard let props = await props(symmetricKey: symmetricKey) else {
-            throw CryptoError.propsError
+            throw PQSError.propsError
         }
         return Communication(
             id: id,
@@ -377,67 +377,6 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     
     public static func == (lhs: BaseCommunication, rhs: BaseCommunication) -> Bool {
         lhs.id == rhs.id
-    }
-}
-
-/// Errors that can occur during cryptographic operations
-///
-/// This enum represents errors that may occur during encryption, decryption,
-/// or property access operations in the SDK. All errors conform to `LocalizedError`
-/// and provide detailed descriptions, failure reasons, and recovery suggestions.
-///
-/// ## Usage
-///
-/// ```swift
-/// do {
-///     try await communication.updateProps(symmetricKey: key, props: newProps)
-/// } catch let error as CryptoError {
-///     if let localizedError = error as? LocalizedError {
-///         print("Error: \(localizedError.errorDescription ?? "")")
-///         if let suggestion = localizedError.recoverySuggestion {
-///             print("Suggestion: \(suggestion)")
-///         }
-///     }
-/// }
-/// ```
-///
-/// - Note: This error type is specific to cryptographic operations in
-///   `BaseCommunication`, `EncryptedMessage`, `ContactModel`, and `JobModel`.
-///   For Double Ratchet operations, see `DoubleRatchetKit.CryptoError`.
-public enum CryptoError: Error, LocalizedError {
-    case encryptionFailed
-    case decryptionFailed
-    case propsError
-    
-    public var errorDescription: String? {
-        switch self {
-        case .encryptionFailed:
-            return "Encryption operation failed"
-        case .decryptionFailed:
-            return "Decryption operation failed"
-        case .propsError:
-            return "Error occurred while accessing properties"
-        }
-    }
-    
-    public var failureReason: String? {
-        switch self {
-        case .encryptionFailed:
-            return "The encryption process failed, possibly due to invalid key or data"
-        case .decryptionFailed:
-            return "The decryption process failed, possibly due to incorrect key, corrupted data, or authentication failure"
-        case .propsError:
-            return "Failed to decrypt or access the encrypted properties"
-        }
-    }
-    
-    public var recoverySuggestion: String? {
-        switch self {
-        case .encryptionFailed, .decryptionFailed:
-            return "Verify that the symmetric key is correct and the data is valid"
-        case .propsError:
-            return "Ensure the symmetric key matches the one used for encryption"
-        }
     }
 }
 

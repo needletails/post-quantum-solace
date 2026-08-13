@@ -1,51 +1,43 @@
 # ``PQSSession``
 
-The singleton actor at the heart of the Post-Quantum Solace SDK. It owns
+The session actor at the heart of the Post-Quantum Solace SDK. It owns
 session state, drives every encrypt/decrypt path, schedules key rotation,
-enforces TOFU on the account-level signing key, and coordinates the four
-delegate surfaces.
+enforces TOFU on the account-level signing key, and coordinates the host
+protocol surfaces.
 
 ## Overview
 
 `PQSSession` is an `actor`; every public method is async and serializes on
-the actor's executor. Always use ``shared``. Configuration happens once via
-``configure(with:)``; afterward you create a brand-new local session with
-``createSession(secretName:appPassword:createInitialTransport:)`` or restore
-an existing one with ``startSession(appPassword:)``.
+the actor's executor. You construct an instance with
+``init(configuration:ratchetConfiguration:)``, passing a
+``SessionConfiguration`` that wires your transport, store, observer, and
+optional host delegate. Afterward you create a brand-new local session with
+``createAccount(secretName:appPassword:createInitialTransport:)`` or restore
+an existing one with ``unlock(appPassword:)``.
 
 ## Topics
 
-### Singleton
+### Construction
 
-- ``shared``
+- ``init(configuration:ratchetConfiguration:)``
 - ``init(_:)``
+- ``SessionConfiguration``
 - ``isViable``
-
-### Configuration
-
-- ``configure(with:)``
-- ``setTransportDelegate(conformer:)``
-- ``setDatabaseDelegate(conformer:)``
-- ``setReceiverDelegate(conformer:)``
-- ``setPQSSessionDelegate(conformer:)``
-- ``setSessionEventDelegate(conformer:)``
 - ``linkDelegate``
 
 ### Session lifecycle
 
-- ``createSession(secretName:appPassword:createInitialTransport:)``
-- ``startSession(appPassword:)``
+- ``createAccount(secretName:appPassword:createInitialTransport:)``
+- ``unlock(appPassword:)``
 - ``linkDevice(bundle:password:)``
 - ``shutdown()``
 - ``resumeJobQueue()``
 
-### Session context & cache
+### Session context
 
 - ``sessionContext``
 - ``setSessionContext(_:)``
-- ``cache``
 - ``appPassword``
-- ``SessionContext/hostLocalPolicyData``
 
 ### Account identity & TOFU trust
 
@@ -61,14 +53,14 @@ an existing one with ``startSession(appPassword:)``.
 
 ### Messaging
 
-- ``writeTextMessage(recipient:text:transportInfo:metadata:destructionTime:sharedIdOverride:)``
+- ``send(recipient:text:transportInfo:metadata:destructionTime:sharedIdOverride:shouldPersistOverride:targetDeviceId:coalescingKey:)``
 - ``receiveMessage(message:sender:deviceId:messageId:)``
 - ``editCurrentMessage(_:newText:)``
 - ``updateMessageDeliveryState(_:deliveryState:messageRecipient:allowExternalUpdate:)``
 
 ### Channels & contacts
 
-- ``findCommunication(for:)``
+- ``conversation(for:)``
 - ``addContacts(_:)``
 - ``createContact(secretName:metadata:friendshipMetadata:requestFriendship:)``
 - ``sendCommunicationSynchronization(contact:)``
@@ -89,7 +81,7 @@ Before the first friendship packet after add or crypto wipe, call
 ``PeerContactBootstrapPurpose/friendshipReply`` (acceptor). Use
 ``peerNeedsOutboundBootstrap(_:)`` to decide whether bootstrap is still
 required. Multi-device hosts should implement
-``PQSSessionDelegate/preferredOnlinePeerDeviceId(for:)`` so OTK notify
+`RecoveryObserver.preferredOnlinePeerDeviceId(for:)` so OTK notify
 targets a live peer device rather than a ghost still listed in the published
 account config. Full host checklist:
 <doc:FriendshipContactBootstrap>.
@@ -101,7 +93,7 @@ account config. Full host checklist:
 - ``refreshOneTimeKeysTask(policy:)``
 - ``refreshMLKEMOneTimeKeysTask(policy:)``
 - ``OneTimeKeyRefreshPolicy``
-- ``updateUseroneTimePublicKeys(_:)``
+- ``updateUserOneTimePublicKeys(_:)``
 
 ### Identities (per-device)
 
@@ -124,7 +116,8 @@ account config. Full host checklist:
 
 ### Errors
 
-- ``SessionErrors``
+All public throws are cases of the unified `PQSError` enum, defined in
+`SessionModels`.
 
 ### Configuration constants
 
@@ -136,7 +129,7 @@ The local account's `signingPublicKey` is **pinned** the first time a
 `SessionContext` is set. Routine refresh paths
 (``adoptVerifiedUserConfiguration(_:)``) reject any server-supplied
 configuration whose account signing key disagrees with the pin, throwing
-``SessionErrors/signingKeyOutOfSync``.
+`PQSError.signingKeyOutOfSync`.
 
 Two paths legitimately update the pin:
 
@@ -154,8 +147,8 @@ a 60-digit safety number for out-of-band verification.
 
 Contacts also pin the peer's account-level `signingPublicKey`. A forced
 identity refresh that sees a different peer account key throws
-``SessionErrors/peerSigningKeyOutOfSync`` and notifies
-``PQSSessionDelegate/peerAccountIdentityChanged(secretName:deviceId:failedSharedMessageId:)``
+`PQSError.peerSigningKeyOutOfSync` and notifies
+`RecoveryObserver.peerAccountIdentityChanged(secretName:deviceId:failedSharedMessageId:)`
 instead of attempting automatic ratchet repair. Resume communication only
 after the user verifies and accepts the new safety number.
 
@@ -169,29 +162,27 @@ after the user verifies and accepts the new safety number.
   ``adoptVerifiedUserConfiguration(_:)``.
 - Startup performs a non-fatal diagnostic check for cached per-device key
   divergence. Reprovisioning and key-rotation paths enforce the invariant and
-  throw ``SessionErrors/deviceIdentityCorrupted`` if a bundle tries to
+  throw `PQSError.deviceIdentityCorrupted` if a bundle tries to
   re-attest a child device with a foreign per-device key; that device should be
   re-linked.
 
 ## Quick start
 
 ```swift
-let session = PQSSession.shared
-
-try await session.configure(with: SessionConfiguration(
+let session = await PQSSession(configuration: SessionConfiguration(
     transport: myTransport,
     store: myStore,
-    receiver: myReceiver
+    observer: myReceiver
 ))
 
-try await session.createSession(
+try await session.createAccount(
     secretName: "alice",
     appPassword: "correct horse battery staple",
     createInitialTransport: bootstrapTransport
 )
-try await session.startSession(appPassword: "correct horse battery staple")
+try await session.unlock(appPassword: "correct horse battery staple")
 
-try await session.writeTextMessage(
+try await session.send(
     recipient: .nickname("bob"),
     text: "Hello, world!",
     metadata: Data(),
@@ -203,15 +194,16 @@ try await session.writeTextMessage(
 
 `PQSSession` is an `actor`, so all public methods are serialized on the
 actor's executor. Long-running cryptographic work is offloaded to dedicated
-executors managed by ``TaskProcessor`` so that encrypt/decrypt does not
-contend with regular API calls.
+executors managed by the SDK's internal message pipeline so that
+encrypt/decrypt does not contend with regular API calls (see
+<doc:MessagePipeline>).
 
 ## See also
 
 - ``SessionConfiguration``
 - ``PQSSessionConstants``
-- ``SecurityIdentity``
-- ``SessionErrors``
+- `SecurityIdentity`
+- `PQSError`
 - <doc:FriendshipContactBootstrap>
 - <doc:AccountIdentityRecovery>
 - <doc:ControlEventCoalescing>

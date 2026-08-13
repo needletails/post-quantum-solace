@@ -8,6 +8,7 @@
 //
 
 import Foundation
+import BinaryCodable
 
 /// Per-device, never-synchronized UI overlay for a channel
 /// communication.
@@ -90,10 +91,10 @@ public struct ChannelLocalOverlay: Codable, Sendable, Hashable {
 ///
 /// `ChannelStoredMetadata` is what the SDK actually serializes into
 /// ``BaseCommunication/UnwrappedProps/metadata`` for channel
-/// communications. The `core` field is wire-compatible with
-/// `ChannelInfo` so legacy rows that stored only the bare info struct
-/// continue to decode; the optional `overlay` is local-only and must
-/// not be relied upon by remote peers.
+/// communications. The `core` field is the synchronized `ChannelInfo`. Schema 2
+/// stores keyed `core`/`overlay` only; bare `ChannelInfo` blobs are rewritten
+/// on unlock. The optional `overlay` is local-only and must not be relied upon
+/// by remote peers.
 public struct ChannelStoredMetadata: Codable, Sendable, Hashable {
     /// Synchronized channel descriptor (name, members, roles).
     public var core: ChannelInfo
@@ -104,5 +105,34 @@ public struct ChannelStoredMetadata: Codable, Sendable, Hashable {
     public init(core: ChannelInfo, overlay: ChannelLocalOverlay? = nil) {
         self.core = core
         self.overlay = overlay
+    }
+
+    /// Schema 2: keyed `core`/`overlay` only. Bare `ChannelInfo` blobs are rewritten on unlock.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        core = try container.decode(ChannelInfo.self, forKey: .core)
+        overlay = try container.decodeIfPresent(ChannelLocalOverlay.self, forKey: .overlay)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(core, forKey: .core)
+        try container.encodeIfPresent(overlay, forKey: .overlay)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case core
+        case overlay
+    }
+
+    /// Unwraps a schema-1 communication metadata blob: keyed metadata, or a bare `ChannelInfo`.
+    public static func migrating(from data: Data) -> ChannelStoredMetadata? {
+        if let keyed = try? BinaryDecoder().decode(ChannelStoredMetadata.self, from: data) {
+            return keyed
+        }
+        if let info = try? BinaryDecoder().decode(ChannelInfo.self, from: data) {
+            return ChannelStoredMetadata(core: info, overlay: nil)
+        }
+        return nil
     }
 }

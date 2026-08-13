@@ -57,10 +57,10 @@ import Foundation
 /// ```
 ///
 /// ## Error Handling
-/// The class throws `CryptoError` instances for encryption/decryption failures:
-/// - `CryptoError.encryptionFailed`: When message encryption fails
-/// - `CryptoError.decryptionFailed`: When message decryption fails
-/// - `CryptoError.propsError`: When property access fails
+/// The class throws `PQSError` instances for encryption/decryption failures:
+/// - `PQSError.encryptionFailed`: When message encryption fails
+/// - `PQSError.decryptionFailed`: When message decryption fails
+/// - `PQSError.propsError`: When property access fails
 public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, Hashable {
     /// The unique identifier for the message.
     public let id: UUID
@@ -78,7 +78,7 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     public let sequenceNumber: Int
 
     /// The encrypted data of the message containing the serialized `UnwrappedProps`.
-    public var data: Data
+    public private(set) var data: Data
 
     /// Thread-safe lock for protecting encryption/decryption operations.
     private let lock = NSLock()
@@ -213,7 +213,7 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     ///   - sequenceNumber: The sequence number of the message in the communication.
     ///   - props: The unwrapped properties of the message to be encrypted.
     ///   - symmetricKey: The symmetric key used for encryption.
-    /// - Throws: `CryptoError.encryptionFailed` if encryption fails.
+    /// - Throws: `PQSError.encryptionFailed` if encryption fails.
     public init(
         id: UUID,
         communicationId: UUID,
@@ -231,7 +231,7 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
 
         let data = try BinaryEncoder().encode(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-            throw CryptoError.encryptionFailed
+            throw PQSError.encryptionFailed
         }
         self.data = encryptedData
     }
@@ -272,20 +272,20 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     ///
     /// - Parameter symmetricKey: The symmetric key used for decryption.
     /// - Returns: The decrypted properties of the message.
-    /// - Throws: `CryptoError.decryptionFailed` if decryption fails.
+    /// - Throws: `PQSError.decryptionFailed` if decryption fails.
     /// - Note: This method is thread-safe and uses locks to prevent concurrent access issues.
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         try lock.withLock { [weak self] in
-            guard let self else { throw CryptoError.decryptionFailed }
-            guard !data.isEmpty else { throw CryptoError.decryptionFailed }
+            guard let self else { throw PQSError.decryptionFailed }
+            guard !data.isEmpty else { throw PQSError.decryptionFailed }
             guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
-                throw CryptoError.decryptionFailed
+                throw PQSError.decryptionFailed
             }
-            guard !decrypted.isEmpty else { throw CryptoError.decryptionFailed }
+            guard !decrypted.isEmpty else { throw PQSError.decryptionFailed }
             do {
                 return try BinaryDecoder().decode(UnwrappedProps.self, from: decrypted)
             } catch {
-                throw CryptoError.decryptionFailed
+                throw PQSError.decryptionFailed
             }
         }
     }
@@ -299,15 +299,15 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     ///   - symmetricKey: The symmetric key used for encryption.
     ///   - props: The new unwrapped properties to be set.
     /// - Returns: The updated decrypted properties, or `nil` if the operation fails.
-    /// - Throws: `CryptoError.encryptionFailed` if encryption fails.
+    /// - Throws: `PQSError.encryptionFailed` if encryption fails.
     /// - Note: This method is thread-safe and uses locks to prevent concurrent access issues.
     public func updateProps(symmetricKey: SymmetricKey, props: UnwrappedProps) async throws -> UnwrappedProps? {
         do {
             try lock.withLock { [weak self] in
-                guard let self else { throw CryptoError.encryptionFailed }
+                guard let self else { throw PQSError.encryptionFailed }
                 let data = try BinaryEncoder().encode(props)
                 guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-                    throw CryptoError.encryptionFailed
+                    throw PQSError.encryptionFailed
                 }
                 self.data = encryptedData
             }
@@ -326,14 +326,14 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     ///   - props: The new unwrapped properties to be set.
     ///   - symmetricKey: The symmetric key used for encryption.
     /// - Returns: The updated `EncryptedMessage` instance.
-    /// - Throws: `CryptoError.encryptionFailed` if encryption fails.
+    /// - Throws: `PQSError.encryptionFailed` if encryption fails.
     /// - Note: This method is thread-safe and uses locks to prevent concurrent access issues.
     public func updateMessage(with props: UnwrappedProps, symmetricKey: SymmetricKey) async throws -> EncryptedMessage {
         try lock.withLock { [weak self] in
-            guard let self else { throw CryptoError.encryptionFailed }
+            guard let self else { throw PQSError.encryptionFailed }
             let data = try BinaryEncoder().encode(props)
             guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-                throw CryptoError.encryptionFailed
+                throw PQSError.encryptionFailed
             }
             self.data = encryptedData
             return self
@@ -349,11 +349,11 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     ///   - of: The type of the model to create.
     ///   - symmetricKey: The symmetric key used for decryption.
     /// - Returns: An instance of the specified type containing the decrypted properties.
-    /// - Throws: `CryptoError.propsError` if decryption fails or if the properties cannot be cast to the specified type.
+    /// - Throws: `PQSError.propsError` if decryption fails or if the properties cannot be cast to the specified type.
     /// - Warning: This method uses force casting (`as!`) which may crash if the type conversion fails.
     public func makeDecryptedModel<T: Sendable & Codable>(of _: T.Type, symmetricKey: SymmetricKey) async throws -> T {
         guard let props = await props(symmetricKey: symmetricKey) else {
-            throw CryptoError.propsError
+            throw PQSError.propsError
         }
         return EncryptedMessage.UnwrappedProps(
             id: id,

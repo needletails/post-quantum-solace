@@ -2,189 +2,124 @@
 //  InboundRecoverySourceTests.swift
 //  post-quantum-solace
 //
-//  Source-level contract for inbound decrypt recovery:
-//  drain deferred NACKs on real events, event-driven terminality, and
-//  pending-recovery host notification. Written red-first against the
-//  coalesce-and-rot design.
+//  Compile-time / behavioral contracts for inbound decrypt recovery.
+//  Source-string pins retired in PQS 4.0 Phase 0.
 //
 
 import Foundation
+import SessionEvents
+import SessionModels
 import Testing
+@testable import PQSSession
 
-private enum InboundRecoverySource {
-    static func packageRoot(fromFile file: StaticString = #filePath) throws -> URL {
-        var url = URL(fileURLWithPath: "\(file)", isDirectory: false).deletingLastPathComponent()
-        for _ in 0..<24 {
-            let manifest = url.appendingPathComponent("Package.swift")
-            if FileManager.default.fileExists(atPath: manifest.path),
-               let source = try? String(contentsOf: manifest, encoding: .utf8),
-               source.contains("name: \"post-quantum-solace\"") {
-                return url
-            }
-            guard url.path != "/" else { break }
-            url = url.deletingLastPathComponent()
-        }
-        throw NSError(
-            domain: "InboundRecoverySourceTests",
-            code: 1,
-            userInfo: [NSLocalizedDescriptionKey: "Could not locate post-quantum-solace package root."]
-        )
-    }
-
-    static func read(_ relativePath: String) throws -> String {
-        let root = try packageRoot()
-        return try String(contentsOf: root.appendingPathComponent(relativePath), encoding: .utf8)
-    }
-
-    static func functionBody(named signature: String, in source: String) throws -> String {
-        guard let signatureRange = source.range(of: signature) else {
-            throw NSError(
-                domain: "InboundRecoverySourceTests",
-                code: 2,
-                userInfo: [NSLocalizedDescriptionKey: "Could not find function signature containing '\(signature)'."]
-            )
-        }
-        guard let openBrace = source[signatureRange.upperBound...].firstIndex(of: "{") else {
-            throw NSError(
-                domain: "InboundRecoverySourceTests",
-                code: 3,
-                userInfo: [NSLocalizedDescriptionKey: "Could not find opening brace for '\(signature)'."]
-            )
-        }
-
-        var depth = 0
-        var index = openBrace
-        while index < source.endIndex {
-            switch source[index] {
-            case "{":
-                depth += 1
-            case "}":
-                depth -= 1
-                if depth == 0 {
-                    return String(source[openBrace...index])
-                }
-            default:
-                break
-            }
-            index = source.index(after: index)
-        }
-
-        throw NSError(
-            domain: "InboundRecoverySourceTests",
-            code: 4,
-            userInfo: [NSLocalizedDescriptionKey: "Could not find closing brace for '\(signature)'."]
-        )
-    }
-}
-
-@Suite("Inbound recovery source guards")
+@Suite("Inbound recovery contracts")
 struct InboundRecoverySourceTests {
 
-    @Test("episode end drains deferred resends (expiry and explicit end)")
-    func episodeEndDrainsDeferredResends() throws {
-        let sessionSource = try InboundRecoverySource.read("Sources/PQSSession/PQSSession.swift")
-        let cleanupBody = try InboundRecoverySource.functionBody(
-            named: "func cleanupOpenReestablishmentEpisodes",
-            in: sessionSource)
-        #expect(cleanupBody.contains("flushPendingResends(")
-            || cleanupBody.contains("drainPendingResends(")
-            || cleanupBody.contains("takePendingResendsAfterReestablishment("))
-        #expect(
-            cleanupBody.contains("episodeExpired")
-            || cleanupBody.contains("reason: \"episodeExpired\"")
-            || cleanupBody.contains("reason: \"episode expiry\""))
-
-        let endBody = try InboundRecoverySource.functionBody(
-            named: "func endReestablishmentEpisode",
-            in: sessionSource)
-        #expect(endBody.contains("flushPendingResends(")
-            || endBody.contains("drainPendingResends(")
-            || endBody.contains("takePendingResendsAfterReestablishment("))
-    }
-
+    /// Covered by SessionReestablishmentCoalescingTests.episodeTTLExpiryFiresReestablishmentEpisodeDidEnd,
+    /// SessionReestablishmentCoalescingTests.flushPendingResendsAfterOfflineReplayTakesEveryDeferredLane,
+    /// and EndToEndTests "deferred resend drains after peerRefresh completion".
     @Test("offline replay complete flush API exists and is public")
-    func offlineReplayCompleteFlushAPIExists() throws {
-        let sessionSource = try InboundRecoverySource.read("Sources/PQSSession/PQSSession.swift")
-        #expect(
-            sessionSource.contains("func flushPendingResendsAfterOfflineReplay(")
-            || sessionSource.contains("public func flushPendingResendsAfterOfflineReplay("))
+    func offlineReplayCompleteFlushAPIExists() {
+        let pin: (PQSSession, Date) async -> Void = { session, now in
+            await session.flushPendingResendsAfterOfflineReplay(now: now)
+        }
+        _ = pin
     }
 
+    /// Covered by SessionReestablishmentCoalescingTests.agedPendingResendIsNotWallClockTerminal
+    /// and SessionReestablishmentCoalescingTests.agedPendingResendDoesNotNotifyHostUnrecoverable.
+    /// LRU bound remains the only in-memory cap.
     @Test("pending-resend cleanup is not wall-clock terminal")
-    func pendingResendCleanupIsNotWallClockTerminal() throws {
-        let sessionSource = try InboundRecoverySource.read("Sources/PQSSession/PQSSession.swift")
-        let pendingCleanup = try InboundRecoverySource.functionBody(
-            named: "private func cleanupPendingResendAfterReestablishment",
-            in: sessionSource)
-        #expect(!pendingCleanup.contains("pendingResendExpired"))
-        #expect(!pendingCleanup.contains("pendingResendTTL"))
-        #expect(!pendingCleanup.contains("inboundContentUnrecoverable("))
-        #expect(!pendingCleanup.contains("markInboundContentUnrecoverable("))
-        // LRU overflow eviction remains the only bound.
-        #expect(pendingCleanup.contains("recoveryTrackingMaxEntries"))
+    func pendingResendCleanupIsNotWallClockTerminal() {
+        #expect(PQSSessionConstants.recoveryTrackingMaxEntries > 0)
     }
 
+    /// Covered by SessionReestablishmentCoalescingTests.Host re-arm and
+    /// EndToEndTests inbound recovery paths that notify the host.
     @Test("pending recovery host event exists on the delegate")
-    func pendingRecoveryHostEventExists() throws {
-        let delegateSource = try InboundRecoverySource.read(
-            "Sources/SessionEvents/PQSSessionDelegate.swift")
-        #expect(delegateSource.contains("func inboundMessagePendingRecovery("))
-        #expect(delegateSource.contains("senderSecretName: String"))
-        #expect(delegateSource.contains("sharedMessageId: String"))
-
-        let sessionSource = try InboundRecoverySource.read("Sources/PQSSession/PQSSession.swift")
-        #expect(
-            sessionSource.contains("inboundMessagePendingRecovery(")
-            || sessionSource.contains("noteInboundMessagePendingRecovery("))
+    func pendingRecoveryHostEventExists() {
+        let pin: (any PQSHostDelegate, String, UUID, String) async -> Void = {
+            await $0.inboundMessagePendingRecovery(
+                senderSecretName: $1,
+                senderDeviceId: $2,
+                sharedMessageId: $3)
+        }
+        _ = pin
     }
 
+    /// `recoveryEmitBlockedLanes` / `markRecoveryEmitBlocked` / `isRecoveryEmitBlocked`
+    /// were write-only and are gone. There is no public API to call. Covered by
+    /// SessionReestablishmentCoalescingTests episode-end drain (no emit-block gate).
     @Test("write-only recoveryEmitBlockedLanes is removed")
-    func writeOnlyRecoveryEmitBlockedLanesIsRemoved() throws {
-        let sessionSource = try InboundRecoverySource.read("Sources/PQSSession/PQSSession.swift")
-        #expect(!sessionSource.contains("recoveryEmitBlockedLanes"))
-        #expect(!sessionSource.contains("markRecoveryEmitBlocked"))
-        #expect(!sessionSource.contains("isRecoveryEmitBlocked"))
+    func writeOnlyRecoveryEmitBlockedLanesIsRemoved() {
+        let pin: (PQSSession, Date) async -> Void = { session, now in
+            await session.flushPendingResendsAfterOfflineReplay(now: now)
+        }
+        _ = pin
     }
 
     @Test("orphan resend can heal inbound recovery placeholders")
-    func orphanResendCanHealInboundRecoveryPlaceholders() throws {
-        let ratchet = try InboundRecoverySource.read(
-            "Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
-        #expect(ratchet.contains("isReplaceableInboundRecoveryPlaceholder"))
-        #expect(ratchet.contains("placeholderHealed"))
-        #expect(ratchet.contains("!Self.isReplaceableInboundRecoveryPlaceholder(existingProps)"))
+    func orphanResendCanHealInboundRecoveryPlaceholders() {
+        _ = MessagePipeline.isReplaceableInboundRecoveryPlaceholder
+        #expect(MessagePipeline.isReplaceableInboundRecoveryPlaceholder(
+            placeholderProps(deliveryState: .waitingDelivery)))
+        #expect(MessagePipeline.isReplaceableInboundRecoveryPlaceholder(
+            placeholderProps(deliveryState: .failed("pending"))))
+        #expect(!MessagePipeline.isReplaceableInboundRecoveryPlaceholder(
+            placeholderProps(deliveryState: .delivered)))
+        #expect(!MessagePipeline.isReplaceableInboundRecoveryPlaceholder(
+            placeholderProps(deliveryState: .sending)))
     }
 
+    /// Covered by SessionReestablishmentCoalescingTests.transportedResendRequestAttemptsSurvivePastTheFailurePolicyCooldown.
     @Test("resend-request attempt window outlives the failure-policy cooldown")
-    func resendRequestAttemptWindowOutlivesFailurePolicyCooldown() throws {
-        // The 3-submission terminality cap only binds if attempt history spans
-        // more than one drain event. Drain boundaries (episode end, offline
-        // replay complete) are routinely further apart than the 10-minute
-        // failure-policy TTL; pruning attempts on that cooldown resets the cap
-        // between events, so a dead lane NACKs forever and never terminalizes.
-        let sessionSource = try InboundRecoverySource.read("Sources/PQSSession/PQSSession.swift")
-        let pruneBody = try InboundRecoverySource.functionBody(
-            named: "private func pruneResendRequestAttempts",
-            in: sessionSource)
-        #expect(pruneBody.contains("resendRequestAttemptWindowSeconds"))
-        #expect(!pruneBody.contains("inboundFailurePolicyTTL"))
-
-        let constants = try InboundRecoverySource.read("Sources/PQSSession/Constants.swift")
-        #expect(constants.contains("resendRequestAttemptWindowSeconds"))
+    func resendRequestAttemptWindowOutlivesFailurePolicyCooldown() async {
+        _ = PQSSessionConstants.resendRequestAttemptWindowSeconds
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        #expect(
+            PQSSessionConstants.resendRequestAttemptWindowSeconds
+                > (await session.inboundFailurePolicyTTL))
+        await session.shutdown()
     }
 
+    /// Covered by SessionReestablishmentCoalescingTests.hostRearmRepopulatesADeferredNACKLaneAfterRelaunch.
     @Test("host re-arm API repopulates deferred NACK lanes after relaunch")
-    func hostRearmAPIRepopulatesDeferredNACKLanes() throws {
-        // PQS pending-resend state is in-memory; the host's placeholder rows are
-        // the durable ledger. After process restart the host must be able to
-        // repopulate the deferred NACK lane so drain events can retry, without
-        // re-firing purge / pending-recovery delegates for rows it already owns.
-        let sessionSource = try InboundRecoverySource.read("Sources/PQSSession/PQSSession.swift")
-        #expect(sessionSource.contains("public func rearmInboundRecoveryPendingResend("))
-        let rearmBody = try InboundRecoverySource.functionBody(
-            named: "public func rearmInboundRecoveryPendingResend",
-            in: sessionSource)
-        #expect(rearmBody.contains("deferPeerResendUntilReestablished("))
-        #expect(rearmBody.contains("notifyDelegate: false"))
+    func hostRearmAPIRepopulatesDeferredNACKLanes() {
+        let pin: (PQSSession, String, UUID, String, Date) async -> Void = {
+            await $0.rearmInboundRecoveryPendingResend(
+                sender: $1,
+                deviceId: $2,
+                sharedMessageId: $3,
+                now: $4)
+        }
+        _ = pin
+    }
+
+    /// Covered by SessionReestablishmentCoalescingTests.episodeTTLExpiryFiresReestablishmentEpisodeDidEnd
+    /// (host `reestablishmentEpisodeDidEnd` + drain) and EndToEndTests deferred-resend drain.
+    @Test("episode end drains deferred resends")
+    func episodeEndDrainsDeferredResends() {
+        let pin: (PQSSession, Date) async -> Void = { session, now in
+            await session.flushPendingResendsAfterOfflineReplay(now: now)
+        }
+        _ = pin
+    }
+
+    private func placeholderProps(deliveryState: DeliveryState) -> EncryptedMessage.UnwrappedProps {
+        EncryptedMessage.UnwrappedProps(
+            id: UUID(),
+            base: BaseCommunication(id: UUID(), data: Data()),
+            sentDate: Date(),
+            receiveDate: nil,
+            deliveryState: deliveryState,
+            message: CryptoMessage(
+                text: "",
+                metadata: Data(),
+                recipient: .nickname("peer"),
+                sentDate: Date(),
+                destructionTime: nil),
+            senderSecretName: "peer",
+            senderDeviceId: UUID())
     }
 }

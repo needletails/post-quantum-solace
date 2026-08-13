@@ -89,7 +89,7 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     /// These keys provide forward secrecy by being used only once for ephemeral
     /// key exchange. They should be consumed and replaced regularly to maintain
     /// security. Each key is used for a single cryptographic operation.
-    public var oneTimePrivateKeys: [CurvePrivateKey]
+    public var oneTimePrivateKeys: [X25519PrivateKey]
 
     /// Array of private MLKEM one-time keys for the device.
     ///
@@ -138,7 +138,7 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
         deviceId: UUID,
         signingPrivateKey: Data,
         longTermPrivateKey: Data,
-        oneTimePrivateKeys: [CurvePrivateKey],
+        oneTimePrivateKeys: [X25519PrivateKey],
         mlKEMOneTimePrivateKeys: [MLKEMPrivateKey],
         finalMLKEMPrivateKey: MLKEMPrivateKey,
         rotateKeysDate: Date? = nil

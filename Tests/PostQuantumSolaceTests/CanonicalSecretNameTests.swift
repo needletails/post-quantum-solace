@@ -25,7 +25,7 @@ struct CanonicalSecretNameTests {
 
         for input in inputs {
             #expect(
-                input.pqsCanonicalSecretName ==
+                SecretName(input).rawValue ==
                 input.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
             )
         }
@@ -33,10 +33,10 @@ struct CanonicalSecretNameTests {
 
     @Test("IRC-equivalent characters are folded so PQS lookups match transport-stored names")
     func ircEquivalentCharactersAreFolded() {
-        #expect("Foo[bar]".pqsCanonicalSecretName == "foo{bar}")
-        #expect("Back\\Slash".pqsCanonicalSecretName == "back|slash")
-        #expect("Tilde~Name".pqsCanonicalSecretName == "tilde^name")
-        #expect("[mix]\\Of~All".pqsCanonicalSecretName == "{mix}|of^all")
+        #expect(SecretName("Foo[bar]").rawValue == "foo{bar}")
+        #expect(SecretName("Back\\Slash").rawValue == "back|slash")
+        #expect(SecretName("Tilde~Name").rawValue == "tilde^name")
+        #expect(SecretName("[mix]\\Of~All").rawValue == "{mix}|of^all")
     }
 
     @Test("Normalization is idempotent")
@@ -50,8 +50,8 @@ struct CanonicalSecretNameTests {
         ]
 
         for input in inputs {
-            let once = input.pqsCanonicalSecretName
-            let twice = once.pqsCanonicalSecretName
+            let once = SecretName(input).rawValue
+            let twice = SecretName(once).rawValue
             #expect(once == twice)
         }
     }

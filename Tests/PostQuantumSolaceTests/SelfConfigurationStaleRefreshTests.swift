@@ -51,16 +51,16 @@ actor SelfConfigurationStaleRefreshTests {
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: ReceiverDelegate(session: session))
 
-        await session.setViability(true)
+        await session.setConnectivity(true)
         await store.setPublishableName(mockUserData.ssn)
 
-        session = try await session.createSession(
+        session = try await session.createAccount(
             secretName: mockUserData.ssn,
             appPassword: mockUserData.sap
         ) {}
 
         await session.setAppPassword(mockUserData.sap)
-        session = try await session.startSession(appPassword: mockUserData.sap)
+        session = try await session.unlock(appPassword: mockUserData.sap)
         return mockUserData
     }
 
@@ -71,7 +71,7 @@ actor SelfConfigurationStaleRefreshTests {
         guard let signedSelf = context.activeUserConfiguration.signedDevices.first(where: {
             $0.id == context.sessionUser.deviceId
         }), let device = try signedSelf.verified(using: accountKey) else {
-            throw PQSSession.SessionErrors.invalidDeviceIdentity
+            throw PQSError.invalidDeviceIdentity
         }
         return device
     }
@@ -100,12 +100,12 @@ actor SelfConfigurationStaleRefreshTests {
 
     private func persist(context: SessionContext) async throws {
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
         await session.setSessionContext(context)
         let encoded = try BinaryEncoder().encode(context)
         guard let encrypted = try await crypto.encrypt(data: encoded, symmetricKey: session.getAppSymmetricKey()) else {
-            throw PQSSession.SessionErrors.sessionEncryptionError
+            throw PQSError.sessionEncryptionError
         }
         try await cache.updateLocalSessionContext(encrypted)
     }

@@ -23,12 +23,12 @@ actor OutboundIdentityResolutionTests {
         await session.setTransportDelegate(conformer: transport)
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: receiver)
-        await session.setViability(true)
+        await session.setConnectivity(true)
         await transportStore.setPublishableName("alice")
 
-        session = try await session.createSession(secretName: "alice", appPassword: "123") {}
+        session = try await session.createAccount(secretName: "alice", appPassword: "123") {}
         await session.setAppPassword("123")
-        session = try await session.startSession(appPassword: "123")
+        session = try await session.unlock(appPassword: "123")
         try await receiver.setKey(session.getDatabaseSymmetricKey())
 
         let cache = try #require(await session.cache)
@@ -41,7 +41,7 @@ actor OutboundIdentityResolutionTests {
             destructionTime: nil)
 
         do {
-            try await session.taskProcessor.outboundTask(
+            try await session.messagePipeline.outboundTask(
                 message: message,
                 cache: cache,
                 symmetricKey: session.getDatabaseSymmetricKey(),
@@ -52,7 +52,7 @@ actor OutboundIdentityResolutionTests {
                 shouldPersist: true,
                 logger: NeedleTailLogger("[ outbound-identity-resolution-test ]"))
             Issue.record("Expected missingSessionIdentity before local message persistence")
-        } catch let error as PQSSession.SessionErrors {
+        } catch let error as PQSError {
             #expect(error == .missingSessionIdentity || error == .userNotFound)
         }
 
@@ -79,12 +79,12 @@ actor OutboundIdentityResolutionTests {
         await session.setTransportDelegate(conformer: transport)
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: receiver)
-        await session.setViability(true)
+        await session.setConnectivity(true)
         await transportStore.setPublishableName("alice")
 
-        session = try await session.createSession(secretName: "alice", appPassword: "123") {}
+        session = try await session.createAccount(secretName: "alice", appPassword: "123") {}
         await session.setAppPassword("123")
-        session = try await session.startSession(appPassword: "123")
+        session = try await session.unlock(appPassword: "123")
         try await receiver.setKey(session.getDatabaseSymmetricKey())
 
         let cache = try #require(await session.cache)
@@ -97,7 +97,7 @@ actor OutboundIdentityResolutionTests {
             sentDate: Date(),
             destructionTime: nil)
 
-        try await session.taskProcessor.outboundTask(
+        try await session.messagePipeline.outboundTask(
             message: message,
             cache: cache,
             symmetricKey: session.getDatabaseSymmetricKey(),
@@ -130,12 +130,12 @@ actor OutboundIdentityResolutionTests {
         await session.setTransportDelegate(conformer: transport)
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: receiver)
-        await session.setViability(true)
+        await session.setConnectivity(true)
         await transportStore.setPublishableName("alice")
 
-        session = try await session.createSession(secretName: "alice", appPassword: "123") {}
+        session = try await session.createAccount(secretName: "alice", appPassword: "123") {}
         await session.setAppPassword("123")
-        session = try await session.startSession(appPassword: "123")
+        session = try await session.unlock(appPassword: "123")
         try await receiver.setKey(session.getDatabaseSymmetricKey())
 
         let cache = try #require(await session.cache)
@@ -147,7 +147,7 @@ actor OutboundIdentityResolutionTests {
             sentDate: Date(),
             destructionTime: nil)
 
-        try await session.taskProcessor.outboundTask(
+        try await session.messagePipeline.outboundTask(
             message: message,
             cache: cache,
             symmetricKey: session.getDatabaseSymmetricKey(),

@@ -46,15 +46,15 @@ actor TaskProcessorSequenceTests {
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: senderReceiver)
         
-        await session.setViability(true)
+        await session.setConnectivity(true)
         await self.store.setPublishableName("alice")
         if shouldCreate {
-            session = try await session.createSession(
+            session = try await session.createAccount(
                 secretName: "alice", appPassword: "123"
             ) {}
         }
         await session.setAppPassword("123")
-        session = try await session.startSession(appPassword: "123")
+        session = try await session.unlock(appPassword: "123")
         try await senderReceiver.setKey(session.getDatabaseSymmetricKey())
     }
     
@@ -129,12 +129,12 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         let message = createTestMessage("1")
         
-        try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+        try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
             message: message,
             recipientIdentity: recipientIdentity,
             localId: localId,
@@ -155,14 +155,14 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         
         // Feed 10 messages in sequence
         for i in 1...10 {
             let message = createTestMessage("\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -189,14 +189,14 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         
         // Feed 100 messages in sequence
         for i in 1...100 {
             let message = createTestMessage("\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -225,7 +225,7 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         
@@ -249,7 +249,7 @@ actor TaskProcessorSequenceTests {
                     // Record the order this message was fed
                     _ = await fedOrderTracker.getNextOrder()
                     
-                    try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+                    try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                         message: message,
                         recipientIdentity: recipientIdentity,
                         localId: localId,
@@ -310,12 +310,12 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         
         // Feed messages in an interleaved (out-of-order) pattern.
-        // NOTE: Although TaskProcessor is an actor, upstream executor scheduling differs
+        // NOTE: Although MessagePipeline is an actor, upstream executor scheduling differs
         // between platforms. We keep this test deterministic (single producer) while
         // still validating the queue can handle non-monotonic enqueue patterns.
         let messageCount = 100
@@ -326,7 +326,7 @@ actor TaskProcessorSequenceTests {
 
         for i in feedOrder {
             let message = createTestMessage("\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -367,14 +367,14 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         
         // Feed some messages
         for i in 1...10 {
             let message = createTestMessage("\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -382,13 +382,13 @@ actor TaskProcessorSequenceTests {
         }
         
         // Toggle session viability
-        await session.setViability(false)
+        await session.setConnectivity(false)
         try await Task.sleep(until: .now + .seconds(1))
         
         // Feed more messages while session is not viable
         for i in 11...20 {
             let message = createTestMessage("\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -396,7 +396,7 @@ actor TaskProcessorSequenceTests {
         }
         
         // Make session viable again
-        await session.setViability(true)
+        await session.setConnectivity(true)
         try await Task.sleep(until: .now + .seconds(5))
         try await session.resumeJobQueue()
         
@@ -418,16 +418,16 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         let expectedSet = Set((1...50).map { "\($0)" })
         
         // Start feeding messages
-        let feedTask = Task {
+        let enqueue = Task {
             for i in 1...50 {
                 let message = createTestMessage("\(i)")
-                try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+                try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                     message: message,
                     recipientIdentity: recipientIdentity,
                     localId: localId,
@@ -440,23 +440,23 @@ actor TaskProcessorSequenceTests {
         let toggleTask = Task {
             for _ in 0..<20 {
                 let current = await session.isViable
-                await session.setViability(!current)
+                await session.setConnectivity(!current)
                 try await Task.sleep(until: .now + .milliseconds(Int.random(in: 50...200)))
             }
-            await session.setViability(true) // Ensure it's viable at the end
+            await session.setConnectivity(true) // Ensure it's viable at the end
         }
         
         // Wait for both tasks to complete
         try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { try await feedTask.value }
+            group.addTask { try await enqueue.value }
             group.addTask { try await toggleTask.value }
             try await group.waitForAll()
         }
         
-        // setViability(true) already schedules a coalesced resumeJobQueue. Poll for
+        // setConnectivity(true) already schedules a coalesced resumeJobQueue. Poll for
         // eventual delivery instead of a fixed sleep + second resume, which can race
         // job-delete and inflate the mock delegate count (51 vs 50 flake).
-        await session.setViability(true)
+        await session.setConnectivity(true)
         var processedMessages: [String] = []
         let deadline = Date().addingTimeInterval(30)
         while Date() < deadline {
@@ -494,14 +494,14 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegateWithErrors(errorType: .missingIdentity)
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         
         // Feed messages that will cause missing identity errors
         for i in 1...10 {
             let message = createTestMessage("\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -525,14 +525,14 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegateWithErrors(errorType: .authenticationFailure)
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         
         // Feed messages that will cause authentication failures
         for i in 1...10 {
             let message = createTestMessage("\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -556,14 +556,14 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegateWithMixedErrors()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         
         // Feed messages - some will succeed, some will fail
         for i in 1...20 {
             let message = createTestMessage("\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -593,7 +593,7 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
 
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
         let symmetricKey = try await session.getDatabaseSymmetricKey()
         let recipientIdentity = createTestRecipientIdentity()
@@ -611,13 +611,13 @@ actor TaskProcessorSequenceTests {
             sharedId: "processed_after_resume_shared"
         )))
 
-        let firstJob = try await session.taskProcessor.createJobModel(
-            sequenceId: await session.taskProcessor.incrementId(),
+        let firstJob = try await session.messagePipeline.createJobModel(
+            sequenceId: await session.messagePipeline.incrementId(),
             task: firstTask,
             symmetricKey: symmetricKey
         )
-        let secondJob = try await session.taskProcessor.createJobModel(
-            sequenceId: await session.taskProcessor.incrementId(),
+        let secondJob = try await session.messagePipeline.createJobModel(
+            sequenceId: await session.messagePipeline.incrementId(),
             task: secondTask,
             symmetricKey: symmetricKey
         )
@@ -627,9 +627,9 @@ actor TaskProcessorSequenceTests {
 
         let failingDelegate = MockTaskDelegateWithOneShotError(
             failingMessage: "fatal_invalid_signature",
-            error: PQSSession.SessionErrors.invalidSignature
+            error: PQSError.invalidSignature
         )
-        await session.taskProcessor.setTaskDelegate(failingDelegate)
+        await session.messagePipeline.setTaskDelegate(failingDelegate)
 
         try await session.resumeJobQueue()
 
@@ -652,8 +652,8 @@ actor TaskProcessorSequenceTests {
 
         let probe = LinkedDeviceCompromiseProbe()
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session, compromiseProbe: probe))
-        await session.taskProcessor.setTaskDelegate(
-            MockTaskDelegateWithStreamError(error: PQSSession.SessionErrors.invalidSignature)
+        await session.messagePipeline.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: PQSError.invalidSignature)
         )
 
         guard let context = await session.sessionContext else {
@@ -673,7 +673,7 @@ actor TaskProcessorSequenceTests {
             mlKEMOneTimeKeyId: UUID(),
             encrypted: Data([0x04])
         )
-        let ratchetMessage = RatchetMessage(header: header, encryptedData: Data([0x03]))
+        let ratchetMessage = RatchetMessage(header: header, ciphertext: Data([0x03]))
         let signed = try SignedRatchetMessage(
             message: ratchetMessage,
             signingPrivateKey: signingKey.rawRepresentation
@@ -683,10 +683,11 @@ actor TaskProcessorSequenceTests {
             message: signed,
             senderSecretName: context.sessionUser.secretName,
             senderDeviceId: claimedDeviceId,
-            sharedMessageId: "same_account_invalid_signature"
+            sharedMessageId: "same_account_invalid_signature",
+            logicalSharedId: "same_account_invalid_signature"
         )
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -708,8 +709,8 @@ actor TaskProcessorSequenceTests {
             session: session,
             compromiseProbe: probe,
             peerIdentityTrustProbe: peerProbe))
-        await session.taskProcessor.setTaskDelegate(
-            MockTaskDelegateWithStreamError(error: PQSSession.SessionErrors.peerSigningKeyOutOfSync)
+        await session.messagePipeline.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: PQSError.peerSigningKeyOutOfSync)
         )
 
         let signingKey = Curve25519.Signing.PrivateKey()
@@ -723,7 +724,7 @@ actor TaskProcessorSequenceTests {
             mlKEMOneTimeKeyId: UUID(),
             encrypted: Data([0x04])
         )
-        let ratchetMessage = RatchetMessage(header: header, encryptedData: Data([0x03]))
+        let ratchetMessage = RatchetMessage(header: header, ciphertext: Data([0x03]))
         let signed = try SignedRatchetMessage(
             message: ratchetMessage,
             signingPrivateKey: signingKey.rawRepresentation
@@ -733,10 +734,11 @@ actor TaskProcessorSequenceTests {
             message: signed,
             senderSecretName: "bob",
             senderDeviceId: peerDeviceId,
-            sharedMessageId: "peer_signing_key_out_of_sync"
+            sharedMessageId: "peer_signing_key_out_of_sync",
+            logicalSharedId: "peer_signing_key_out_of_sync"
         )
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -788,7 +790,7 @@ actor TaskProcessorSequenceTests {
         // Documented receive-side ASR (missingOneTimeKey) still fetches the peer
         // bundle on emit; pin mismatch must surface as trust change, not a silent
         // open episode. Decrypt-failure classes are orphan-resend only.
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
         )
 
@@ -803,7 +805,7 @@ actor TaskProcessorSequenceTests {
             mlKEMOneTimeKeyId: UUID(),
             encrypted: Data([0x04])
         )
-        let ratchetMessage = RatchetMessage(header: header, encryptedData: Data([0x03]))
+        let ratchetMessage = RatchetMessage(header: header, ciphertext: Data([0x03]))
         let signed = try SignedRatchetMessage(
             message: ratchetMessage,
             signingPrivateKey: signingKey.rawRepresentation
@@ -812,10 +814,11 @@ actor TaskProcessorSequenceTests {
             message: signed,
             senderSecretName: peerName,
             senderDeviceId: foreignBundle.deviceKeys.deviceId,
-            sharedMessageId: "fresh_repair_peer_signing_key_out_of_sync"
+            sharedMessageId: "fresh_repair_peer_signing_key_out_of_sync",
+            logicalSharedId: "fresh_repair_peer_signing_key_out_of_sync"
         )
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -858,7 +861,7 @@ actor TaskProcessorSequenceTests {
         ]
 
         for (index, recoverable) in recoverableErrors.enumerated() {
-            await session.taskProcessor.setTaskDelegate(
+            await session.messagePipeline.setTaskDelegate(
                 MockTaskDelegateWithStreamError(error: recoverable.error)
             )
 
@@ -869,7 +872,7 @@ actor TaskProcessorSequenceTests {
                 senderDeviceId: peerDeviceId,
                 sharedMessageId: "desync_\(index)")
 
-            try await session.taskProcessor.feedTask(
+            try await session.messagePipeline.enqueue(
                 EncryptableTask(task: .streamMessage(inbound)),
                 session: session
             )
@@ -887,7 +890,7 @@ actor TaskProcessorSequenceTests {
                     deviceId: peerDeviceId)),
                 "First \(recoverable.failureClass) must not open peerRefresh")
 
-            try await session.taskProcessor.feedTask(
+            try await session.messagePipeline.enqueue(
                 EncryptableTask(task: .streamMessage(inbound)),
                 session: session
             )
@@ -907,7 +910,7 @@ actor TaskProcessorSequenceTests {
     func testCryptoKitBodyDecryptionFailureResendsAndAwaitsSenderOrphanResend() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: CryptoKitError.authenticationFailure)
         )
 
@@ -918,7 +921,7 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "cryptokit_body_repeat")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -936,7 +939,7 @@ actor TaskProcessorSequenceTests {
                 deviceId: peerDeviceId)),
             "First CryptoKit body failure must not open peerRefresh")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -955,7 +958,7 @@ actor TaskProcessorSequenceTests {
     func testDistinctUndecryptableMessagesStayOnResendWithoutSessionReset() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: CryptoKitError.authenticationFailure)
         )
 
@@ -967,7 +970,7 @@ actor TaskProcessorSequenceTests {
                 senderSecretName: peerName,
                 senderDeviceId: peerDeviceId,
                 sharedMessageId: "lane_fail_\(index)")
-            try await session.taskProcessor.feedTask(
+            try await session.messagePipeline.enqueue(
                 EncryptableTask(task: .streamMessage(inbound)),
                 session: session
             )
@@ -986,8 +989,8 @@ actor TaskProcessorSequenceTests {
     func testSessionDecryptionErrorResendsAndAwaitsSenderOrphanResend() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
-            MockTaskDelegateWithStreamError(error: PQSSession.SessionErrors.sessionDecryptionError)
+        await session.messagePipeline.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: PQSError.sessionDecryptionError)
         )
 
         let peerDeviceId = UUID()
@@ -997,7 +1000,7 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "session_decrypt_repeat")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -1015,7 +1018,7 @@ actor TaskProcessorSequenceTests {
                 deviceId: peerDeviceId)),
             "First sessionDecryptionError must not open peerRefresh")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -1048,7 +1051,7 @@ actor TaskProcessorSequenceTests {
             poisonDelayMilliseconds: poisonDelayMs,
             probe: probe,
             startGate: startGate)
-        await session.taskProcessor.setTaskDelegate(delegate)
+        await session.messagePipeline.setTaskDelegate(delegate)
 
         let peerName = "bob_archive_hol"
         let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
@@ -1058,15 +1061,15 @@ actor TaskProcessorSequenceTests {
             deviceId: peerDeviceId,
             config: peerBundle.userConfiguration)
 
-        // First feedTask awaits the full processing drain. Hold the first job on
-        // startGate so later feedTasks hit isRunning and only enqueue (urgent
+        // First enqueue awaits the full processing drain. Hold the first job on
+        // startGate so later enqueues hit isRunning and only enqueue (urgent
         // prepends ahead of remaining background work).
         let firstPoison = try makeTestInboundTaskMessage(
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
             sharedMessageId: "poison-archive-0")
         let draining = Task {
-            try await self.session.taskProcessor.feedTask(
+            try await self.session.messagePipeline.enqueue(
                 EncryptableTask(task: .streamMessage(firstPoison), priority: .background),
                 session: self.session)
         }
@@ -1080,7 +1083,7 @@ actor TaskProcessorSequenceTests {
                 senderSecretName: peerName,
                 senderDeviceId: peerDeviceId,
                 sharedMessageId: "poison-archive-\(i)")
-            try await session.taskProcessor.feedTask(
+            try await session.messagePipeline.enqueue(
                 EncryptableTask(task: .streamMessage(poison), priority: .background),
                 session: session)
         }
@@ -1088,7 +1091,7 @@ actor TaskProcessorSequenceTests {
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
             sharedMessageId: freshId)
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(fresh), priority: .urgent),
             session: session)
         await startGate.release()
@@ -1120,7 +1123,7 @@ actor TaskProcessorSequenceTests {
         // freshSessionRepair left a state-less active and never healed.
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.stateUninitialized)
         )
 
@@ -1137,7 +1140,7 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "poisoned_state_uninit_0")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -1161,7 +1164,7 @@ actor TaskProcessorSequenceTests {
             "Must not defer resend behind a freshSessionRepair episode")
 
         // Repeat of the same sharedId: await sender, still no ASR.
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -1177,7 +1180,7 @@ actor TaskProcessorSequenceTests {
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
             sharedMessageId: "poisoned_state_uninit_1")
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(second)),
             session: session
         )
@@ -1201,7 +1204,7 @@ actor TaskProcessorSequenceTests {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         // Orphan-resend: rootKeyIsNil after try-all is undecryptable → sender orphanResend.
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.rootKeyIsNil)
         )
 
@@ -1217,7 +1220,7 @@ actor TaskProcessorSequenceTests {
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
             sharedMessageId: "coalesced_repair_0")
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(first)),
             session: session)
         try await exhaustInboundHandshakeDeferrals()
@@ -1233,7 +1236,7 @@ actor TaskProcessorSequenceTests {
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
             sharedMessageId: "coalesced_repair_extra")
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(extra)),
             session: session)
         try await exhaustInboundHandshakeDeferrals()
@@ -1251,7 +1254,7 @@ actor TaskProcessorSequenceTests {
     func testMissingOneTimeKeyFailuresCoalescePerPeer() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
         )
 
@@ -1267,7 +1270,7 @@ actor TaskProcessorSequenceTests {
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
             sharedMessageId: "otk_coalesced_repair_0")
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(first)),
             session: session)
         #expect(try await waitForPendingRepair(sender: peerName, deviceId: peerDeviceId))
@@ -1280,7 +1283,7 @@ actor TaskProcessorSequenceTests {
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
             sharedMessageId: "otk_coalesced_repair_extra")
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(extra)),
             session: session)
 
@@ -1304,7 +1307,7 @@ actor TaskProcessorSequenceTests {
     func testPendingDeferredResendDoesNotThrashFreshLeadersUnderCooldown() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
         )
 
@@ -1340,7 +1343,7 @@ actor TaskProcessorSequenceTests {
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
             sharedMessageId: "thrash_poison_redelivery")
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(poison)),
             session: session)
 
@@ -1372,7 +1375,7 @@ actor TaskProcessorSequenceTests {
     func testExpiredRecoveryEpisodeRestartsWithPendingReplay() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
         )
 
@@ -1401,7 +1404,7 @@ actor TaskProcessorSequenceTests {
             senderSecretName: peerName,
             senderDeviceId: peerDeviceId,
             sharedMessageId: "expired_recovery_next")
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(next)),
             session: session)
 
@@ -1424,7 +1427,7 @@ actor TaskProcessorSequenceTests {
     func testMaxSkippedRequestsResendWithoutReceiveSidePeerRefresh() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
         )
 
@@ -1440,7 +1443,7 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "max_skipped_needs_refresh")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session)
         try await Task.sleep(until: .now + .seconds(1))
@@ -1449,7 +1452,7 @@ actor TaskProcessorSequenceTests {
             "First maxSkipped must request resend only (orphan-resend)")
 
         // Repeat: still await sender orphanResend — no receive-side ASR.
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session)
 
@@ -1478,7 +1481,7 @@ actor TaskProcessorSequenceTests {
             RatchetError.maxSkippedHeadersExceeded,
             RatchetError.missingOneTimeKey
         ])
-        await session.taskProcessor.setTaskDelegate(sequenced)
+        await session.messagePipeline.setTaskDelegate(sequenced)
 
         let peerName = "bob_orphan_resend_owns_shared_id"
         let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
@@ -1494,7 +1497,7 @@ actor TaskProcessorSequenceTests {
             sharedMessageId: sharedId)
 
         // 1) Orphan-resend maxSkipped → request resend only.
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session)
         try await Task.sleep(until: .now + .milliseconds(400))
@@ -1509,7 +1512,7 @@ actor TaskProcessorSequenceTests {
             "orphan-resend must mark the sharedId as awaiting sender orphanResend")
 
         // 2) Same sharedId reclassified as missingOneTimeKey — must NOT open OTK ASR.
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session)
         try await Task.sleep(until: .now + .milliseconds(400))
@@ -1529,7 +1532,7 @@ actor TaskProcessorSequenceTests {
     func testExpiredKeyDropsWithoutFreshSessionRepair() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.expiredKey)
         )
 
@@ -1539,7 +1542,7 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "expired_key_replay")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -1559,7 +1562,7 @@ actor TaskProcessorSequenceTests {
     func testMissingOneTimeKeyPendingRedeliveryDoesNotRepeatOTKReplacement() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
         )
 
@@ -1569,7 +1572,7 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "missing_otk_replay")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -1597,7 +1600,7 @@ actor TaskProcessorSequenceTests {
 
         // Redelivery of the identical frame must not trigger another OTK batch replacement.
         let otkCallsAfterFirst = await transport.updateOneTimeKeysCallCount
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -1614,9 +1617,21 @@ actor TaskProcessorSequenceTests {
     func testMissingOneTimeKeyBurstCoalescesRecoveryForDistinctMessages() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
         )
+
+        // Hold the published-batch upload so peerRefresh cannot fail and end the
+        // episode before the second sharedId is recorded. Waiting for the upload
+        // to finish races `endReestablishmentEpisode` (userNotFound in this
+        // harness) which drains pending resends.
+        let uploadPause = OTKUploadPause()
+        transport.beforeUpdateOneTimeKeys = {
+            await uploadPause.beforeFirstUpload()
+        }
+        defer {
+            transport.beforeUpdateOneTimeKeys = nil
+        }
 
         let peerDeviceId = UUID()
         let first = try makeTestInboundTaskMessage(
@@ -1628,7 +1643,7 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "missing_otk_burst_2")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(first)),
             session: session
         )
@@ -1637,15 +1652,13 @@ actor TaskProcessorSequenceTests {
             deviceId: peerDeviceId)
         #expect(hasPendingRepair, "First missingOneTimeKey should start a recovery episode")
 
-        // The batch replacement now runs off the job loop; wait for the first
-        // upload to land before capturing the baseline.
-        let sawFirstUpload = try await waitUntil {
-            await self.transport.updateOneTimeKeysCallCount >= 1
+        let uploadPaused = try await waitUntil {
+            await uploadPause.isPaused()
         }
-        #expect(sawFirstUpload, "First missingOneTimeKey recovery should upload a replacement batch")
+        #expect(uploadPaused, "First missingOneTimeKey recovery should reach OTK upload")
 
         let otkCallsAfterFirst = await transport.updateOneTimeKeysCallCount
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(second)),
             session: session
         )
@@ -1665,6 +1678,7 @@ actor TaskProcessorSequenceTests {
         #expect(pendingIds.contains("missing_otk_burst_1"))
         #expect(pendingIds.contains("missing_otk_burst_2"))
 
+        await uploadPause.release()
         await session.shutdown()
     }
 
@@ -1672,7 +1686,7 @@ actor TaskProcessorSequenceTests {
     func testMissingOneTimeKeyMarksRecoveryPendingBeforeOTKReplacementCompletes() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
         )
 
@@ -1694,7 +1708,7 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "missing_otk_inflight_2")
 
-        async let firstFeed: Void = session.taskProcessor.feedTask(
+        async let firstFeed: Void = session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(first)),
             session: session
         )
@@ -1709,7 +1723,7 @@ actor TaskProcessorSequenceTests {
                 deviceId: peerDeviceId),
             "Recovery episode must be visible before OTK replacement completes")
 
-        async let secondFeed: Void = session.taskProcessor.feedTask(
+        async let secondFeed: Void = session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(second)),
             session: session
         )
@@ -1725,10 +1739,10 @@ actor TaskProcessorSequenceTests {
                 failedMessageId: "missing_otk_inflight_2"),
             "Second missingOneTimeKey should be recorded inside the in-flight recovery episode")
 
-        let sawSingleCurveUpload = try await waitUntil {
+        let sawSingleX25519Upload = try await waitUntil {
             await self.transport.updateOneTimeKeysCallCount == 1
         }
-        #expect(sawSingleCurveUpload, "Only the first in-flight recovery should upload a replacement curve OTK batch")
+        #expect(sawSingleX25519Upload, "Only the first in-flight recovery should upload a replacement curve OTK batch")
 
         await session.shutdown()
     }
@@ -1737,7 +1751,7 @@ actor TaskProcessorSequenceTests {
     func testMissingOneTimeKeyRecoveryRetainsLocalPrivateKeys() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
         )
 
@@ -1746,9 +1760,9 @@ actor TaskProcessorSequenceTests {
             await session.shutdown()
             return
         }
-        let curveIdsBefore = Set(contextBefore.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        let x25519IdsBefore = Set(contextBefore.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
         let mlKEMIdsBefore = Set(contextBefore.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.map(\.id))
-        #expect(!curveIdsBefore.isEmpty, "Session should start with local curve one-time private keys")
+        #expect(!x25519IdsBefore.isEmpty, "Session should start with local curve one-time private keys")
         #expect(!mlKEMIdsBefore.isEmpty, "Session should start with local MLKEM one-time private keys")
 
         let peerDeviceId = UUID()
@@ -1757,7 +1771,7 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "retain_privates_1")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -1767,7 +1781,7 @@ actor TaskProcessorSequenceTests {
         // the in-flight backlog that was encrypted against them.
         let sawFreshBatches = try await waitUntil(timeout: 10) {
             guard let context = await self.session.sessionContext else { return false }
-            return context.sessionUser.deviceKeys.oneTimePrivateKeys.count > curveIdsBefore.count
+            return context.sessionUser.deviceKeys.oneTimePrivateKeys.count > x25519IdsBefore.count
                 && context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count > mlKEMIdsBefore.count
         }
         #expect(sawFreshBatches, "Recovery should append fresh one-time keys without wiping the existing pool")
@@ -1777,10 +1791,10 @@ actor TaskProcessorSequenceTests {
             await session.shutdown()
             return
         }
-        let curveIdsAfter = Set(contextAfter.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        let x25519IdsAfter = Set(contextAfter.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
         let mlKEMIdsAfter = Set(contextAfter.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.map(\.id))
         #expect(
-            curveIdsBefore.isSubset(of: curveIdsAfter),
+            x25519IdsBefore.isSubset(of: x25519IdsAfter),
             "missingOneTimeKey recovery must not delete curve private keys that in-flight messages still reference")
         #expect(
             mlKEMIdsBefore.isSubset(of: mlKEMIdsAfter),
@@ -1800,12 +1814,12 @@ actor TaskProcessorSequenceTests {
             return
         }
         let deviceId = contextBefore.sessionUser.deviceId
-        let originalCurveIds = Set(contextBefore.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        let originalX25519Ids = Set(contextBefore.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
         let originalPublicIds = Set(
             contextBefore.activeUserConfiguration.signedOneTimePublicKeys
                 .filter { $0.deviceId == deviceId }
                 .map(\.id))
-        #expect(!originalCurveIds.isEmpty)
+        #expect(!originalX25519Ids.isEmpty)
 
         let firstReplace = await session.refreshOneTimeKeysTask(policy: .replacePublishedBatch)
         #expect(firstReplace, "Published-batch replacement should succeed")
@@ -1815,16 +1829,16 @@ actor TaskProcessorSequenceTests {
             await session.shutdown()
             return
         }
-        let curveIdsAfterFirst = Set(contextAfterFirst.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        let x25519IdsAfterFirst = Set(contextAfterFirst.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
         let publicIdsAfterFirst = Set(
             contextAfterFirst.activeUserConfiguration.signedOneTimePublicKeys
                 .filter { $0.deviceId == deviceId }
                 .map(\.id))
         #expect(
-            originalCurveIds.isSubset(of: curveIdsAfterFirst),
+            originalX25519Ids.isSubset(of: x25519IdsAfterFirst),
             "Private keys must be retained across a published-batch replacement")
         #expect(
-            curveIdsAfterFirst.count > originalCurveIds.count,
+            x25519IdsAfterFirst.count > originalX25519Ids.count,
             "A fresh batch of private keys must be appended")
         #expect(
             publicIdsAfterFirst.isDisjoint(with: originalPublicIds),
@@ -1851,7 +1865,7 @@ actor TaskProcessorSequenceTests {
     func testMissingOneTimeKeyRecoveryDoesNotBlockJobQueue() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
         )
 
@@ -1874,7 +1888,7 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: secondPeerDeviceId,
             sharedMessageId: "nonblocking_2")
 
-        async let firstFeed: Void = session.taskProcessor.feedTask(
+        async let firstFeed: Void = session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(first)),
             session: session
         )
@@ -1887,7 +1901,7 @@ actor TaskProcessorSequenceTests {
         // While the first peer's OTK upload is still in flight the job queue must
         // keep draining: a failure from a *different* peer has to be recorded
         // without waiting for the network round-trip to finish.
-        async let secondFeed: Void = session.taskProcessor.feedTask(
+        async let secondFeed: Void = session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(second)),
             session: session
         )
@@ -1914,7 +1928,7 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
 
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
 
         guard let cache = await session.cache else {
             Issue.record("Cache should be available")
@@ -1955,7 +1969,7 @@ actor TaskProcessorSequenceTests {
         try await cache.createJob(delayedJob)
         try await cache.createJob(readyJob)
 
-        async let load: Void = session.taskProcessor.loadTasks(
+        async let load: Void = session.messagePipeline.loadTasks(
             cache: cache,
             symmetricKey: symmetricKey,
             session: session)
@@ -2344,7 +2358,7 @@ actor TaskProcessorSequenceTests {
     func testRatchetDecryptionFailedResendsAndAwaitsSenderOrphanResend() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
-        await session.taskProcessor.setTaskDelegate(
+        await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.decryptionFailed)
         )
 
@@ -2354,7 +2368,7 @@ actor TaskProcessorSequenceTests {
             senderDeviceId: peerDeviceId,
             sharedMessageId: "decrypt_failed_repeat")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -2375,7 +2389,7 @@ actor TaskProcessorSequenceTests {
                 deviceId: peerDeviceId)),
             "decryptionFailed must not open receive-side peerRefresh")
 
-        try await session.taskProcessor.feedTask(
+        try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
@@ -2397,14 +2411,14 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         
         // Feed write message tasks
         for i in 1...10 {
             let message = createTestMessage("write_\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -2431,14 +2445,14 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         
         // Feed write message tasks
         for i in 1...10 {
             let message = createTestMessage("write_\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -2467,7 +2481,7 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         // Don't feed any messages
         try await Task.sleep(until: .now + .seconds(2))
@@ -2484,12 +2498,12 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegateWithDelay(delaySeconds: 2)
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         let message = createTestMessage("slow_message")
         
-        try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+        try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
             message: message,
             recipientIdentity: recipientIdentity,
             localId: localId,
@@ -2510,15 +2524,15 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         let recipientIdentity = createTestRecipientIdentity()
         
         // Feed messages rapidly
-        let feedTask = Task {
+        let enqueue = Task {
             for i in 1...100 {
                 let message = createTestMessage("\(i)")
-                try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+                try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                     message: message,
                     recipientIdentity: recipientIdentity,
                     localId: localId,
@@ -2527,7 +2541,7 @@ actor TaskProcessorSequenceTests {
         }
         
         // Start feeding and immediately shutdown
-        try await feedTask.value
+        try await enqueue.value
         await session.shutdown()
         
         try await Task.sleep(until: .now + .seconds(2))
@@ -2551,10 +2565,10 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
 
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
 
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
         let symmetricKey = try await session.getDatabaseSymmetricKey()
         
@@ -2570,8 +2584,8 @@ actor TaskProcessorSequenceTests {
         )
         
         // Create a job, then set delayedUntil in the encrypted props.
-        let seq = await session.taskProcessor.incrementId()
-        let job = try await session.taskProcessor.createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
+        let seq = await session.messagePipeline.incrementId()
+        let job = try await session.messagePipeline.createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
         if var props = await job.props(symmetricKey: symmetricKey) {
             props.delayedUntil = Date().addingTimeInterval(0.35)
             _ = try await job.updateProps(symmetricKey: symmetricKey, props: props)
@@ -2614,9 +2628,9 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
 
         let delegate = CancellationOnceTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(delegate)
+        await session.messagePipeline.setTaskDelegate(delegate)
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
 
         let task = EncryptableTask(
@@ -2626,7 +2640,7 @@ actor TaskProcessorSequenceTests {
                 localId: localId,
                 sharedId: "cancel_once_shared")))
 
-        try await session.taskProcessor.feedTask(task, session: session)
+        try await session.messagePipeline.enqueue(task, session: session)
 
         #expect(await delegate.invocationCount == 1)
         #expect(
@@ -2655,10 +2669,10 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
         let symmetricKey = try await session.getDatabaseSymmetricKey()
         
@@ -2673,10 +2687,10 @@ actor TaskProcessorSequenceTests {
             ))
             )
             
-            let seq = await session.taskProcessor.incrementId()
-        let job = try await session.taskProcessor.createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
+            let seq = await session.messagePipeline.incrementId()
+        let job = try await session.messagePipeline.createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
         guard var props = await job.props(symmetricKey: symmetricKey) else {
-            throw PQSSession.SessionErrors.propsError
+            throw PQSError.propsError
         }
         props.delayedUntil = Date().addingTimeInterval(0.35)
         _ = try await job.updateProps(symmetricKey: symmetricKey, props: props)
@@ -2687,7 +2701,7 @@ actor TaskProcessorSequenceTests {
             try await session.resumeJobQueue()
         }
         try await Task.sleep(until: .now + .milliseconds(100))
-        await session.setViability(false)
+        await session.setConnectivity(false)
         _ = try? await runner.value
 
         // After delayedUntil elapses, processor should pause (not execute) because session is not viable.
@@ -2695,7 +2709,7 @@ actor TaskProcessorSequenceTests {
         #expect(try await cache.fetchJobs().count == 1, "Job should remain in cache when paused due to non-viable session")
 
         // Resume and ensure it runs once.
-        await session.setViability(true)
+        await session.setConnectivity(true)
         try await session.resumeJobQueue()
         
         let deadline = Date().addingTimeInterval(3)
@@ -2718,10 +2732,10 @@ actor TaskProcessorSequenceTests {
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
         let symmetricKey = try await session.getDatabaseSymmetricKey()
         
@@ -2737,13 +2751,13 @@ actor TaskProcessorSequenceTests {
                     sharedId: "seeded_shared_\(i)"
                 ))
             )
-            let seq = await session.taskProcessor.incrementId()
-            let job = try await session.taskProcessor.createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
+            let seq = await session.messagePipeline.incrementId()
+            let job = try await session.messagePipeline.createJobModel(sequenceId: seq, task: task, symmetricKey: symmetricKey)
             try await cache.createJob(job)
         }
 
         // This call seeds the consumer with cache jobs then starts processing.
-        try await session.taskProcessor.loadTasks(nil, cache: cache, symmetricKey: symmetricKey, session: session)
+        try await session.messagePipeline.loadTasks(nil, cache: cache, symmetricKey: symmetricKey, session: session)
 
         // Poll until all jobs are processed (or timeout).
         let deadline = Date().addingTimeInterval(5)
@@ -2761,23 +2775,23 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
     
-    @Test("Edge Cases - feedTask while not viable pauses and processes after resume")
+    @Test("Edge Cases - enqueue while not viable pauses and processes after resume")
     func testEdgeCasesFeedTaskWhileNotViablePausesAndResumes() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
 
         // Make the session non-viable and enqueue a task.
-        await session.setViability(false)
+        await session.setConnectivity(false)
         let recipientIdentity = createTestRecipientIdentity()
         let message = createTestMessage("paused_nonviable")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -2790,7 +2804,7 @@ actor TaskProcessorSequenceTests {
         #expect(try await cache.fetchJobs().count == 1, "Job should remain in cache while session is not viable")
         
         // Resume viability and explicitly resume the job queue.
-        await session.setViability(true)
+        await session.setConnectivity(true)
         try await session.resumeJobQueue()
 
         let deadline = Date().addingTimeInterval(3)
@@ -2814,18 +2828,18 @@ actor TaskProcessorSequenceTests {
     ///
     /// Without the defensive post-loop drain check in `startProcessingIfNeeded`,
     /// a task fed while the processing loop is between its final deque-empty check
-    /// and `stop()` can be stranded in cache indefinitely (until another feedTask
+    /// and `stop()` can be stranded in cache indefinitely (until another enqueue
     /// or resumeJobQueue happens to pick it up).
-    @Test("Job Stranding - concurrent feedTask calls should not strand jobs in cache")
+    @Test("Job Stranding - concurrent enqueue calls should not strand jobs in cache")
     func concurrentFeedTaskDoesNotStrandJobs() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
 
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
 
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
 
         let recipientIdentity = createTestRecipientIdentity()
@@ -2844,11 +2858,11 @@ actor TaskProcessorSequenceTests {
                 sharedId: "strand_B_\(iteration)")))
 
             let t1 = Task {
-                try? await session.taskProcessor.feedTask(task1, session: session)
+                try? await session.messagePipeline.enqueue(task1, session: session)
             }
             await Task.yield()
             let t2 = Task {
-                try? await session.taskProcessor.feedTask(task2, session: session)
+                try? await session.messagePipeline.enqueue(task2, session: session)
             }
 
             await t1.value
@@ -2873,16 +2887,16 @@ actor TaskProcessorSequenceTests {
     }
 
     /// Feeds a rapid burst of tasks and ensures none remain stranded in cache.
-    @Test("Job Stranding - rapid sequential feedTask should drain all jobs from cache")
+    @Test("Job Stranding - rapid sequential enqueue should drain all jobs from cache")
     func rapidSequentialFeedTaskDrainsAllFromCache() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
 
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
 
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
 
         let recipientIdentity = createTestRecipientIdentity()
@@ -2894,7 +2908,7 @@ actor TaskProcessorSequenceTests {
                 recipientIdentity: recipientIdentity,
                 localId: localId,
                 sharedId: "rapid_\(i)")))
-            try await session.taskProcessor.feedTask(task, session: session)
+            try await session.messagePipeline.enqueue(task, session: session)
         }
 
         let deadline = Date().addingTimeInterval(10)
@@ -2956,7 +2970,7 @@ actor TaskProcessorSequenceTests {
             mlKEMOneTimeKeyId: UUID(),
             encrypted: Data([0x04])
         )
-        let ratchetMessage = RatchetMessage(header: header, encryptedData: Data([0x03]))
+        let ratchetMessage = RatchetMessage(header: header, ciphertext: Data([0x03]))
         let signed = try SignedRatchetMessage(
             message: ratchetMessage,
             signingPrivateKey: signingKey.rawRepresentation
@@ -2965,7 +2979,8 @@ actor TaskProcessorSequenceTests {
             message: signed,
             senderSecretName: senderSecretName,
             senderDeviceId: senderDeviceId,
-            sharedMessageId: sharedMessageId
+            sharedMessageId: sharedMessageId,
+            logicalSharedId: sharedMessageId
         )
     }
 
@@ -3032,13 +3047,13 @@ actor TaskProcessorSequenceTests {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         let recipientIdentity = createTestRecipientIdentity()
         let midBatch = 25
         // Feed first batch
         for i in 1...midBatch {
             let message = createTestMessage("first_\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                 message: message,
                 recipientIdentity: recipientIdentity,
                 localId: localId,
@@ -3048,7 +3063,7 @@ actor TaskProcessorSequenceTests {
         try await Task.sleep(until: .now + .milliseconds(50))
         for i in (midBatch+1)...(midBatch*2) {
             let message = createTestMessage("second_\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                     message: message,
                     recipientIdentity: recipientIdentity,
                     localId: localId,
@@ -3072,12 +3087,12 @@ actor TaskProcessorSequenceTests {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         let mockDelegate = MockTaskDelegate()
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         let recipientIdentity = createTestRecipientIdentity()
         // Feed half, shutdown, then feed more, then restart
         for i in 1...10 {
             let message = createTestMessage("A_\(i)")
-            try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+            try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                     message: message,
                     recipientIdentity: recipientIdentity,
                     localId: localId,
@@ -3088,11 +3103,11 @@ actor TaskProcessorSequenceTests {
         
         // Restart session properly - don't clear store data to maintain session context
         try await createSenderSession(store: store, shouldCreate: false)
-        await session.taskProcessor.setTaskDelegate(mockDelegate)
+        await session.messagePipeline.setTaskDelegate(mockDelegate)
         let recipientIdentity2 = createTestRecipientIdentity()
         for i in 11...20 {
             let message = createTestMessage("B_\(i)")
-                try await session.taskProcessor.feedTask(.init(task: .writeMessage(.init(
+                try await session.messagePipeline.enqueue(.init(task: .writeMessage(.init(
                     message: message,
                 recipientIdentity: recipientIdentity2,
                     localId: localId,
@@ -3180,9 +3195,9 @@ final class MockTaskDelegateWithErrors: TaskSequenceDelegate, @unchecked Sendabl
         
         switch errorType {
         case .missingIdentity:
-            throw TaskProcessor.JobProcessorErrors.missingIdentity
+            throw MessagePipeline.JobProcessorErrors.missingIdentity
         case .authenticationFailure:
-            throw PQSSession.SessionErrors.invalidKeyId
+            throw PQSError.invalidKeyId
         }
     }
     
@@ -3214,7 +3229,7 @@ final class MockTaskDelegateWithMixedErrors: TaskSequenceDelegate, @unchecked Se
         } else {
             // Even messages fail
             await errorTracker.incrementErrorCount()
-            throw TaskProcessor.JobProcessorErrors.missingIdentity
+            throw MessagePipeline.JobProcessorErrors.missingIdentity
         }
     }
     

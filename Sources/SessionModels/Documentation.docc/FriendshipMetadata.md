@@ -50,7 +50,7 @@ the raw `State` properties without calling
 Use ``PQSSession/requestFriendshipStateChange(state:contact:)`` to
 publish a friendship state change to the remote party. The SDK
 serializes the new `FriendshipMetadata` and routes it through the
-configured ``SessionTransport``.
+configured transport (`PQSNetworkHost`).
 
 Before the first friendship packet after add or crypto wipe, hosts should
 call ``PQSSession/bootstrapPeerContactSession(secretName:purpose:)`` so the

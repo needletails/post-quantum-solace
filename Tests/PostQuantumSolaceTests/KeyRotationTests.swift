@@ -46,16 +46,16 @@ actor KeyRotationTests {
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: ReceiverDelegate(session: session))
 
-        await session.setViability(true)
+        await session.setConnectivity(true)
         await store.setPublishableName(mockUserData.ssn)
 
-        session = try await session.createSession(
+        session = try await session.createAccount(
             secretName: mockUserData.ssn,
             appPassword: mockUserData.sap
         ) {}
 
         await session.setAppPassword(mockUserData.sap)
-        session = try await session.startSession(appPassword: mockUserData.sap)
+        session = try await session.unlock(appPassword: mockUserData.sap)
 
         return (transport, cacheStore)
     }
@@ -68,7 +68,7 @@ actor KeyRotationTests {
               let currentDevice = try? currentSignedDevice.verified(
                 using: Curve25519.Signing.PublicKey(rawRepresentation: context.activeUserConfiguration.signingPublicKey)
               ) else {
-            throw PQSSession.SessionErrors.invalidDeviceIdentity
+            throw PQSError.invalidDeviceIdentity
         }
 
         let linkedDevice = UserDeviceConfiguration(
@@ -91,7 +91,7 @@ actor KeyRotationTests {
     ) throws -> UserConfiguration.SignedDeviceConfiguration {
         let signedDeviceJSON = try JSONEncoder().encode(signedDevice)
         guard var signedDeviceObject = try JSONSerialization.jsonObject(with: signedDeviceJSON) as? [String: Any] else {
-            throw PQSSession.SessionErrors.invalidSignature
+            throw PQSError.invalidSignature
         }
         signedDeviceObject["c"] = Data(repeating: 0xA5, count: 64).base64EncodedString()
         return try JSONDecoder().decode(
@@ -105,7 +105,7 @@ actor KeyRotationTests {
             rawRepresentation: context.activeUserConfiguration.signingPublicKey
         )
         let newSigningKey = Curve25519.Signing.PrivateKey()
-        let newCurveKey = Curve25519.KeyAgreement.PrivateKey()
+        let newX25519Key = Curve25519.KeyAgreement.PrivateKey()
         let mlKEMPrivateKey = try crypto.generateMLKem1024PrivateKey()
         let mlKEMPublicKey = try MLKEMPublicKey(
             id: UUID(),
@@ -113,11 +113,11 @@ actor KeyRotationTests {
         )
         guard let currentSignedDevice = context.activeUserConfiguration.signedDevices.first,
               var currentDevice = try? currentSignedDevice.verified(using: oldSigningKey) else {
-            throw PQSSession.SessionErrors.invalidDeviceIdentity
+            throw PQSError.invalidDeviceIdentity
         }
 
         await currentDevice.updateSigningPublicKey(newSigningKey.publicKey.rawRepresentation)
-        await currentDevice.updateLongTermPublicKey(newCurveKey.publicKey.rawRepresentation)
+        await currentDevice.updateLongTermPublicKey(newX25519Key.publicKey.rawRepresentation)
         await currentDevice.updateFinalMLKEMPublicKey(mlKEMPublicKey)
 
         return try RotatedPublicKeys(
@@ -131,10 +131,10 @@ actor KeyRotationTests {
 
     private func setCurrentDeviceMasterFlag(_ isMaster: Bool) async throws {
         guard var context = await session.sessionContext else {
-            throw PQSSession.SessionErrors.sessionNotInitialized
+            throw PQSError.sessionNotInitialized
         }
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
 
         let signingPrivateKey = try Curve25519.Signing.PrivateKey(
@@ -146,7 +146,7 @@ actor KeyRotationTests {
 
         let updatedSignedDevices = try context.activeUserConfiguration.signedDevices.map { signed -> UserConfiguration.SignedDeviceConfiguration in
             guard let verified = try signed.verified(using: signingPublicKey) else {
-                throw PQSSession.SessionErrors.invalidSignature
+                throw PQSError.invalidSignature
             }
             let updated = UserDeviceConfiguration(
                 deviceId: verified.deviceId,
@@ -171,7 +171,7 @@ actor KeyRotationTests {
 
         let encoded = try BinaryEncoder().encode(context)
         guard let encrypted = try await crypto.encrypt(data: encoded, symmetricKey: session.getAppSymmetricKey()) else {
-            throw PQSSession.SessionErrors.sessionEncryptionError
+            throw PQSError.sessionEncryptionError
         }
         try await cache.updateLocalSessionContext(encrypted)
     }
@@ -185,14 +185,14 @@ actor KeyRotationTests {
         var devices: [UserDeviceConfiguration] = []
         var signedDevices: [UserConfiguration.SignedDeviceConfiguration] = []
         for suffix in 0 ..< deviceCount {
-            let curve = crypto.generateCurve25519PrivateKey()
+            let x25519 = crypto.generateCurve25519PrivateKey()
             let deviceSigning = crypto.generateCurve25519SigningPrivateKey()
             let mlkemPrivate = try crypto.generateMLKem1024PrivateKey()
             let mlkemPublic = try MLKEMPublicKey(id: UUID(), mlkemPrivate.publicKey.rawRepresentation)
             let device = UserDeviceConfiguration(
                 deviceId: UUID(),
                 signingPublicKey: deviceSigning.publicKey.rawRepresentation,
-                longTermPublicKey: curve.publicKey.rawRepresentation,
+                longTermPublicKey: x25519.publicKey.rawRepresentation,
                 finalMLKEMPublicKey: mlkemPublic,
                 deviceName: "peer-\(suffix)",
                 hmacData: Data(repeating: UInt8(suffix + 1), count: 32),
@@ -233,7 +233,7 @@ actor KeyRotationTests {
         let oldSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: context.activeUserConfiguration.signingPublicKey)
         let reSignedDevices = try context.activeUserConfiguration.signedDevices.map { signed in
             guard let verified = try signed.verified(using: oldSigningKey) else {
-                throw PQSSession.SessionErrors.invalidSignature
+                throw PQSError.invalidSignature
             }
             return try UserConfiguration.SignedDeviceConfiguration(device: verified, signingKey: newSigningKey)
         }
@@ -258,7 +258,7 @@ actor KeyRotationTests {
             return
         }
         let originalSigningKey = originalContext.sessionUser.deviceKeys.signingPrivateKey
-        let originalCurveKey = originalContext.sessionUser.deviceKeys.longTermPrivateKey
+        let originalX25519Key = originalContext.sessionUser.deviceKeys.longTermPrivateKey
 
         // Act
         try await session.rotateKeysOnPotentialCompromise()
@@ -270,7 +270,7 @@ actor KeyRotationTests {
         }
 
         #expect(rotatedContext.sessionUser.deviceKeys.signingPrivateKey != originalSigningKey)
-        #expect(rotatedContext.sessionUser.deviceKeys.longTermPrivateKey != originalCurveKey)
+        #expect(rotatedContext.sessionUser.deviceKeys.longTermPrivateKey != originalX25519Key)
         #expect(await session.keyLoadingState == .complete)
 
         // Assert that publishRotatedKeys was called by checking store user configuration was updated
@@ -291,7 +291,7 @@ actor KeyRotationTests {
 
         let deviceId = originalContext.sessionUser.deviceId
         let secretName = originalContext.sessionUser.secretName
-        let originalCurveIds = Set(
+        let originalX25519Ids = Set(
             originalContext.activeUserConfiguration.signedOneTimePublicKeys
                 .filter { $0.deviceId == deviceId }
                 .map(\.id)
@@ -302,7 +302,7 @@ actor KeyRotationTests {
                 .map(\.id)
         )
 
-        #expect(originalCurveIds.count == PQSSessionConstants.oneTimeKeyBatchSize)
+        #expect(originalX25519Ids.count == PQSSessionConstants.oneTimeKeyBatchSize)
         #expect(originalMLKEMIds.count == PQSSessionConstants.oneTimeKeyBatchSize)
 
         try await session.rotateKeysOnPotentialCompromise()
@@ -312,7 +312,7 @@ actor KeyRotationTests {
             return
         }
 
-        let rotatedCurveIds = Set(
+        let rotatedX25519Ids = Set(
             rotatedContext.activeUserConfiguration.signedOneTimePublicKeys
                 .filter { $0.deviceId == deviceId }
                 .map(\.id)
@@ -323,21 +323,21 @@ actor KeyRotationTests {
                 .map(\.id)
         )
 
-        #expect(rotatedCurveIds.count == PQSSessionConstants.oneTimeKeyBatchSize)
+        #expect(rotatedX25519Ids.count == PQSSessionConstants.oneTimeKeyBatchSize)
         #expect(rotatedMLKEMIds.count == PQSSessionConstants.oneTimeKeyBatchSize)
-        #expect(rotatedCurveIds.isDisjoint(with: originalCurveIds))
+        #expect(rotatedX25519Ids.isDisjoint(with: originalX25519Ids))
         #expect(rotatedMLKEMIds.isDisjoint(with: originalMLKEMIds))
 
-        let verifiedCurveKeys = try rotatedContext.activeUserConfiguration.getVerifiedCurveKeys(deviceId: deviceId)
+        let verifiedX25519Keys = try rotatedContext.activeUserConfiguration.getVerifiedX25519Keys(deviceId: deviceId)
         let verifiedMLKEMKeys = try rotatedContext.activeUserConfiguration.getVerifiedMLKEMKeys(deviceId: deviceId)
-        #expect(verifiedCurveKeys.count == PQSSessionConstants.oneTimeKeyBatchSize)
+        #expect(verifiedX25519Keys.count == PQSSessionConstants.oneTimeKeyBatchSize)
         #expect(verifiedMLKEMKeys.count == PQSSessionConstants.oneTimeKeyBatchSize)
 
-        let remoteCurveIds = Set(
+        let remoteX25519Ids = Set(
             try await store.fetchOneTimeKeyIdentities(
                 for: secretName,
                 deviceId: deviceId.uuidString,
-                type: .curve
+                type: .x25519
             )
         )
         let remoteMLKEMIds = Set(
@@ -347,7 +347,7 @@ actor KeyRotationTests {
                 type: .mlKEM
             )
         )
-        #expect(remoteCurveIds == rotatedCurveIds)
+        #expect(remoteX25519Ids == rotatedX25519Ids)
         #expect(remoteMLKEMIds == rotatedMLKEMIds)
 
         await session.shutdown()
@@ -443,7 +443,7 @@ actor KeyRotationTests {
         do {
             try await session.rotateKeysOnPotentialCompromise()
             Issue.record("Expected key rotation to fail when local signing key is out of sync")
-        } catch let error as PQSSession.SessionErrors {
+        } catch let error as PQSError {
             #expect(error == .signingKeyOutOfSync)
         }
 
@@ -461,7 +461,7 @@ actor KeyRotationTests {
         do {
             try await session.rotateKeysOnPotentialCompromise()
             Issue.record("Expected key rotation to fail for non-master devices")
-        } catch let error as PQSSession.SessionErrors {
+        } catch let error as PQSError {
             #expect(error == .compromiseRotationRequiresMasterDevice)
         }
 
@@ -586,7 +586,7 @@ actor KeyRotationTests {
         await store.setUserConfigurations(index: 0, config: reSignedConfiguration)
         
         let mySecret = originalContext.sessionUser.secretName
-        await #expect(throws: PQSSession.SessionErrors.signingKeyOutOfSync) {
+        await #expect(throws: PQSError.signingKeyOutOfSync) {
             _ = try await session.refreshIdentities(secretName: mySecret, forceRefresh: true)
         }
         
@@ -672,14 +672,14 @@ actor KeyRotationTests {
         await session.setSessionContext(context)
         let encodedMulti = try BinaryEncoder().encode(context)
         guard let encryptedMulti = try await crypto.encrypt(data: encodedMulti, symmetricKey: session.getAppSymmetricKey()) else {
-            throw PQSSession.SessionErrors.sessionEncryptionError
+            throw PQSError.sessionEncryptionError
         }
         // Persist through SessionCache so PQSSession.getSessionContext() sees the same blob (not stale in-memory cache).
         try await sessionCache.updateLocalSessionContext(encryptedMulti)
 
         let roundTripData = try await sessionCache.fetchLocalSessionContext()
         guard let roundTripPlain = try await crypto.decrypt(data: roundTripData, symmetricKey: session.getAppSymmetricKey()) else {
-            throw PQSSession.SessionErrors.sessionDecryptionError
+            throw PQSError.sessionDecryptionError
         }
         let persistedContext = try BinaryDecoder().decode(SessionContext.self, from: roundTripPlain)
         #expect(persistedContext.activeUserConfiguration.signedDevices.count == 2)

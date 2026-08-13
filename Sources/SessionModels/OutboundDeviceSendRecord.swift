@@ -44,35 +44,11 @@ public struct OutboundDeviceSendRecord: Sendable, Equatable, Codable, Hashable {
         self.supersededAt = supersededAt
     }
 
-    /// Legacy convenience: backfill treats sharedId as the envelope id.
-    public init(
-        sharedId: String,
-        recipientSecretName: String,
-        recipientDeviceId: UUID,
-        sessionIdentityId: UUID,
-        createdAt: Date = Date()
-    ) {
-        self.init(
-            envelopeMessageId: sharedId,
-            sharedId: sharedId,
-            recipientSecretName: recipientSecretName,
-            recipientDeviceId: recipientDeviceId,
-            sessionIdentityId: sessionIdentityId,
-            resendAttempt: 0,
-            createdAt: createdAt,
-            supersededAt: nil)
-    }
-
     public static func key(envelopeMessageId: String) -> String {
         envelopeMessageId
     }
 
     public static func logicalKey(sharedId: String, recipientDeviceId: UUID) -> String {
         "\(sharedId)|\(recipientDeviceId.uuidString)"
-    }
-
-    /// Legacy key retained for dual-read callers during migration.
-    public static func key(sharedId: String, recipientDeviceId: UUID) -> String {
-        logicalKey(sharedId: sharedId, recipientDeviceId: recipientDeviceId)
     }
 }

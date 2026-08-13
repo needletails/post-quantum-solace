@@ -36,7 +36,7 @@ struct ServerAcceptAckTests {
     private func pending(
         envelopeMessageId: String,
         sharedId: String = "shared-id"
-    ) -> TaskProcessor.PendingOutboundTransport {
+    ) -> MessagePipeline.PendingOutboundTransport {
         .init(
             message: SignedRatchetMessage(outOfBandPlaceholder: ()),
             metadata: .init(
@@ -50,14 +50,14 @@ struct ServerAcceptAckTests {
                 requiresServerAck: true),
             sessionIdentityId: UUID(),
             needsRemoteDeletion: false,
-            curveOneTimeKeyId: nil,
+            x25519OneTimeKeyId: nil,
             mlKEMOneTimeKeyId: "mlkem",
             createdAt: Date())
     }
 
     @Test("persisted send stays pending until server ack")
     func testPersistedSendStaysSendingUntilServerAck() async {
-        let processor = TaskProcessor()
+        let processor = MessagePipeline()
         let session = PQSSession()
         let pending = pending(envelopeMessageId: "envelope-1")
         await processor.registerUnackedServerAccept(
@@ -70,13 +70,13 @@ struct ServerAcceptAckTests {
         #expect(await processor.testUnackedCountForTests() == 1)
         await processor.confirmServerAcceptedEnvelope("envelope-1", session: session)
         #expect(await processor.testUnackedCountForTests() == 0)
-        try? await processor.ratchetManager.shutdown()
+        try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
 
     @Test("confirm waits for every device envelope")
     func testConfirmAckRemovesEntryAndAdvancesWhenAllDeviceEnvelopesAcked() async {
-        let processor = TaskProcessor()
+        let processor = MessagePipeline()
         let session = PQSSession()
         let localId = UUID()
         await processor.registerUnackedServerAccept(
@@ -96,23 +96,23 @@ struct ServerAcceptAckTests {
         #expect(await processor.testUnackedCountForTests() == 1)
         await processor.confirmServerAcceptedEnvelope("envelope-b", session: session)
         #expect(await processor.testUnackedCountForTests() == 0)
-        try? await processor.ratchetManager.shutdown()
+        try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
 
     @Test("unknown server ack is a no-op")
     func testUnknownAckIdIsNoOp() async {
-        let processor = TaskProcessor()
+        let processor = MessagePipeline()
         let session = PQSSession()
         await processor.confirmServerAcceptedEnvelope("unknown", session: session)
         #expect(await processor.testUnackedCountForTests() == 0)
-        try? await processor.ratchetManager.shutdown()
+        try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
 
     @Test("ack deadline resends identical ciphertext in place")
     func testAckDeadlineExpiryResendsInPlaceWithoutConnectionHook() async throws {
-        let processor = TaskProcessor()
+        let processor = MessagePipeline()
         let session = PQSSession()
         let transport = PreparedTransportProbe()
         let events = ServerAcceptAckEventRecorder()
@@ -138,13 +138,13 @@ struct ServerAcceptAckTests {
         #expect(await events.all().contains("deadline"))
         #expect(await transport.capturedPayloads().contains(outbound.message.signed?.data ?? Data()))
         #expect(await processor.isAwaitingServerAccept("deadline") == false)
-        try? await processor.ratchetManager.shutdown()
+        try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
 
     @Test("ack deadline exhaustion marks failed and keeps ciphertext")
     func testAckDeadlineExhaustionMarksFailed() async throws {
-        let processor = TaskProcessor()
+        let processor = MessagePipeline()
         let session = PQSSession()
         let transport = PreparedTransportProbe()
         await session.setTransportDelegate(conformer: transport)
@@ -166,13 +166,13 @@ struct ServerAcceptAckTests {
             session: session)
         #expect(await processor.isAwaitingServerAccept("exhausted-deadline") == true)
         #expect(await transport.capturedPayloads().isEmpty)
-        try? await processor.ratchetManager.shutdown()
+        try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
 
     @Test("isAwaitingServerAccept tracks unacked map")
     func testIsAwaitingServerAccept() async {
-        let processor = TaskProcessor()
+        let processor = MessagePipeline()
         let session = PQSSession()
         #expect(await processor.isAwaitingServerAccept("missing") == false)
         await processor.registerUnackedServerAccept(
@@ -184,13 +184,13 @@ struct ServerAcceptAckTests {
         #expect(await processor.isAwaitingServerAccept("awaiting") == true)
         await processor.confirmServerAcceptedEnvelope("awaiting", session: session)
         #expect(await processor.isAwaitingServerAccept("awaiting") == false)
-        try? await processor.ratchetManager.shutdown()
+        try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
 
     @Test("rearmAll keeps unacked and replaces deadline task")
     func testRearmAllServerAcceptDeadlines() async throws {
-        let processor = TaskProcessor()
+        let processor = MessagePipeline()
         let session = PQSSession()
         let events = ServerAcceptAckEventRecorder()
         await session.setServerAcceptAckOverdueHandler { envelopeId in
@@ -218,13 +218,13 @@ struct ServerAcceptAckTests {
         #expect(await processor.isAwaitingServerAccept("rearm") == true)
         await processor.confirmServerAcceptedEnvelope("rearm", session: session)
         #expect(await events.all() == ["rearm"])
-        try? await processor.ratchetManager.shutdown()
+        try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
 
     @Test("server ack cancels deadline")
     func testAckCancelsDeadline() async throws {
-        let processor = TaskProcessor()
+        let processor = MessagePipeline()
         let session = PQSSession()
         let events = ServerAcceptAckEventRecorder()
         await session.setServerAcceptAckOverdueHandler { envelopeId in
@@ -241,13 +241,13 @@ struct ServerAcceptAckTests {
 
         try await Task.sleep(nanoseconds: 150_000_000)
         #expect(await events.all().isEmpty)
-        try? await processor.ratchetManager.shutdown()
+        try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
 
     @Test("registered epoch resends identical ciphertext")
     func testRegisteredEpochResendsIdenticalCiphertext() async {
-        let processor = TaskProcessor()
+        let processor = MessagePipeline()
         let session = PQSSession()
         let transport = PreparedTransportProbe()
         await session.setTransportDelegate(conformer: transport)
@@ -262,13 +262,13 @@ struct ServerAcceptAckTests {
         await processor.resendUnackedOutboundEnvelopes(reason: "registered", session: session)
         #expect(await transport.capturedPayloads() == [outbound.message.signed?.data ?? Data()])
         #expect(await transport.capturedEnvelopeMessageIds() == ["epoch"])
-        try? await processor.ratchetManager.shutdown()
+        try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
 
     @Test("late ack after epoch resend completes")
     func testLateAckAfterResendStillCompletes() async {
-        let processor = TaskProcessor()
+        let processor = MessagePipeline()
         let session = PQSSession()
         let transport = PreparedTransportProbe()
         await session.setTransportDelegate(conformer: transport)
@@ -282,13 +282,13 @@ struct ServerAcceptAckTests {
         await processor.resendUnackedOutboundEnvelopes(reason: "registered", session: session)
         await processor.confirmServerAcceptedEnvelope("late", session: session)
         #expect(await processor.testUnackedCountForTests() == 0)
-        try? await processor.ratchetManager.shutdown()
+        try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
 
     @Test("resend exhaustion marks failed but keeps ciphertext for retry")
     func testExhaustionAfterCapMarksFailed() async {
-        let processor = TaskProcessor()
+        let processor = MessagePipeline()
         let session = PQSSession()
         let outbound = pending(envelopeMessageId: "exhausted")
         let localId = UUID()
@@ -313,7 +313,7 @@ struct ServerAcceptAckTests {
         #expect(didRetry == false || didRetry == true)
         #expect(await processor.testUnackedCountForTests() == 1)
 
-        try? await processor.ratchetManager.shutdown()
+        try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
 }

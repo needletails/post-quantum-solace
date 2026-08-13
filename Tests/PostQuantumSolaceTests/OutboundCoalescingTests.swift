@@ -13,9 +13,9 @@
 //  lane instead of accumulating behind it.
 //
 //  Contract:
-//  - `writeTextMessage(coalescingKey:)` threads an opaque host key onto the
+//  - `send(coalescingKey:)` threads an opaque host key onto the
 //    per-device outbound job.
-//  - `feedTask` deletes pending (not in-flight) jobs with the same key and
+//  - `enqueue` deletes pending (not in-flight) jobs with the same key and
 //    the same recipient identity lane before persisting the new job.
 //  - Coalescing applies only to non-persisted outbound jobs. Persisted user
 //    messages are never superseded.
@@ -104,26 +104,26 @@ extension EndToEndTests {
             bobSession: _recipientSession,
             rsd: rsd)
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "warmup-before-coalesce",
             sharedIdOverride: "coalesce-warmup-\(UUID().uuidString)")
         try? await Task.sleep(for: .milliseconds(200))
 
         // Persist without transporting so pending jobs are observable.
-        await _senderSession.setViability(false)
+        await _senderSession.setConnectivity(false)
 
         let key = "test.consent:bob"
         let staleSharedId = "coalesce-stale-\(UUID().uuidString)"
         let freshSharedId = "coalesce-fresh-\(UUID().uuidString)"
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "stale consent blob",
             sharedIdOverride: staleSharedId,
             shouldPersistOverride: false,
             coalescingKey: key)
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "fresh consent blob",
             sharedIdOverride: freshSharedId,
@@ -203,22 +203,22 @@ extension EndToEndTests {
             bobSession: _recipientSession,
             rsd: rsd)
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "warmup-before-nilkey",
             sharedIdOverride: "nilkey-warmup-\(UUID().uuidString)")
         try? await Task.sleep(for: .milliseconds(200))
 
-        await _senderSession.setViability(false)
+        await _senderSession.setConnectivity(false)
 
         let firstSharedId = "nilkey-first-\(UUID().uuidString)"
         let secondSharedId = "nilkey-second-\(UUID().uuidString)"
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "first control frame",
             sharedIdOverride: firstSharedId,
             shouldPersistOverride: false)
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "second control frame",
             sharedIdOverride: secondSharedId,
@@ -295,23 +295,23 @@ extension EndToEndTests {
             bobSession: _recipientSession,
             rsd: rsd)
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "warmup-before-persisted-guard",
             sharedIdOverride: "guard-warmup-\(UUID().uuidString)")
         try? await Task.sleep(for: .milliseconds(200))
 
-        await _senderSession.setViability(false)
+        await _senderSession.setConnectivity(false)
 
         // Queue a persisted user message while offline.
         let userSharedId = "guard-user-\(UUID().uuidString)"
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "real user message queued offline",
             sharedIdOverride: userSharedId)
 
         // A keyed ephemeral publish to the same lane must not disturb it.
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "consent blob",
             sharedIdOverride: "guard-consent-\(UUID().uuidString)",

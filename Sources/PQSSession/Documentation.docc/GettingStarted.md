@@ -13,7 +13,7 @@ and recovering from a verified account-identity change.
 - iOS 18.0+ / macOS 15.0+ (also Linux and Android via the supported package platforms)
 - Swift 6.1+
 - Xcode 15+
-- DoubleRatchetKit 3.0.0+
+- DoubleRatchetKit 4.0.0+
 
 ## Installation
 
@@ -21,7 +21,7 @@ Add Post-Quantum Solace to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "3.2.0")
+    .package(url: "https://github.com/needletails/post-quantum-solace.git", from: "4.0.0")
 ]
 ```
 
@@ -33,37 +33,28 @@ import PQSSession
 
 ## 1. Configure delegates
 
-The recommended path is ``SessionConfiguration`` — it bundles the three
-required delegates and the two optional ones:
+A session is constructed from a ``SessionConfiguration`` — it bundles the
+three required host conformances, the optional host delegate, and the audit
+sink:
 
 ```swift
-let config = SessionConfiguration(
-    transport: myTransport,         // any SessionTransport
-    store: myStore,                 // any PQSSessionStore
-    receiver: myReceiver,           // any EventReceiver
-    delegate: mySessionDelegate,    // optional PQSSessionDelegate
-    eventDelegate: myEventDelegate  // optional SessionEvents override
-)
-
-try await PQSSession.shared.configure(with: config)
+let session = await PQSSession(configuration: SessionConfiguration(
+    transport: myTransport,         // any PQSNetworkHost
+    store: myStore,                 // any PQSPersistenceHost
+    observer: myObserver,           // any MessageStoreObserver
+    delegate: myHostDelegate        // optional PQSHostDelegate
+))
 ```
 
-You can still wire delegates individually if you need to swap them at runtime:
-
-```swift
-await session.setTransportDelegate(conformer: myTransport)
-await session.setDatabaseDelegate(conformer: myStore)
-session.setReceiverDelegate(conformer: myReceiver)
-await session.setPQSSessionDelegate(conformer: mySessionDelegate)   // optional
-await session.setSessionEventDelegate(conformer: myEventDelegate)   // optional
-```
+The configuration is the single wiring point; there are no public delegate
+setters in 4.0.0.
 
 ## 2. Create or start a session
 
 For a brand-new account / device:
 
 ```swift
-try await session.createSession(
+try await session.createAccount(
     secretName: "alice",
     appPassword: "correct horse battery staple",
     createInitialTransport: {
@@ -75,15 +66,17 @@ try await session.createSession(
 For subsequent launches (the local session is persisted):
 
 ```swift
-try await session.startSession(appPassword: "correct horse battery staple")
+try await session.unlock(appPassword: "correct horse battery staple")
 ```
 
-## 3. Implement the delegate protocols
+## 3. Implement the host protocols
 
-### SessionTransport
+### PQSNetworkHost
+
+`PQSNetworkHost` is `PQSTransport & PQSKeyDirectory & PQSRecoveryTransport`:
 
 ```swift
-final class NetworkTransport: SessionTransport {
+final class NetworkTransport: PQSNetworkHost {
     func sendMessage(_ message: SignedRatchetMessage,
                      metadata: SignedRatchetMessageMetadata) async throws {
         try await api.send(message, to: metadata.secretName, deviceId: metadata.deviceId)
@@ -106,10 +99,12 @@ final class NetworkTransport: SessionTransport {
 > Important: `publishUserConfiguration` takes **two** `recipient`-prefixed
 > parameters: the recipient's `secretName` and the recipient device's `UUID`.
 
-### PQSSessionStore
+### PQSPersistenceHost
+
+`PQSPersistenceHost` is `PQSStore & PQSRecoveryStore`:
 
 ```swift
-final class DatabaseStore: PQSSessionStore {
+final class DatabaseStore: PQSPersistenceHost {
     func createMessage(_ message: EncryptedMessage,
                        symmetricKey: SymmetricKey) async throws {
         try await db.insert(message)
@@ -118,16 +113,16 @@ final class DatabaseStore: PQSSessionStore {
     func fetchMessage(id: UUID) async throws -> EncryptedMessage {
         try await db.fetchMessage(id: id)
     }
-    // ... see ``PQSSessionStore`` for the full surface
+    // ... see `PQSStore` and `PQSRecoveryStore` for the full surface
 }
 ```
 
-### EventReceiver
+### MessageStoreObserver
 
 ```swift
-final class AppEventReceiver: EventReceiver {
+final class AppMessageObserver: MessageStoreObserver {
     func createdMessage(_ message: EncryptedMessage) async {
-        let key = try? await PQSSession.shared.getDatabaseSymmetricKey()
+        let key = try? await session.getDatabaseSymmetricKey()
         if let key, let props = await message.props(symmetricKey: key) {
             await ui.append(text: props.message.text,
                             from: props.senderSecretName)
@@ -143,7 +138,7 @@ final class AppEventReceiver: EventReceiver {
         await ui.openChannel(model.id)
     }
 
-    // ... see ``EventReceiver`` for the full surface
+    // ... see `MessageStoreObserver` for the full surface
 }
 ```
 
@@ -153,7 +148,7 @@ final class AppEventReceiver: EventReceiver {
 its contents. Pass `Data()` if you have nothing to attach.
 
 ```swift
-try await session.writeTextMessage(
+try await session.send(
     recipient: .nickname("bob"),
     text: "Hello, world!",
     metadata: try BinaryEncoder().encode(MyAppMetadata(priority: .high)),
@@ -165,28 +160,28 @@ try await session.writeTextMessage(
 
 ```swift
 // Personal note (delivered to your other devices only):
-try await session.writeTextMessage(recipient: .personalMessage, text: "Note to self")
+try await session.send(recipient: .personalMessage, text: "Note to self")
 
 // 1:1 conversation:
-try await session.writeTextMessage(recipient: .nickname("bob"),     text: "Hi Bob")
+try await session.send(recipient: .nickname("bob"),     text: "Hi Bob")
 
 // Channel:
-try await session.writeTextMessage(recipient: .channel(channelId),  text: "Hi everyone")
+try await session.send(recipient: .channel(channelId),  text: "Hi everyone")
 
 // System broadcast (rare; usually transport-level):
-try await session.writeTextMessage(recipient: .broadcast,           text: "Service notice")
+try await session.send(recipient: .broadcast,           text: "Service notice")
 ```
 
 ## 5. Receive a message
 
 Inbound messages flow from your transport into the SDK via
 ``PQSSession/receiveMessage(message:sender:deviceId:messageId:)``, then bubble
-up to ``EventReceiver/createdMessage(_:)``. Decryption uses the database
+up to `MessageStoreObserver.createdMessage(_:)`. Decryption uses the database
 symmetric key:
 
 ```swift
 func createdMessage(_ message: EncryptedMessage) async {
-    guard let key = try? await PQSSession.shared.getDatabaseSymmetricKey(),
+    guard let key = try? await session.getDatabaseSymmetricKey(),
           let props = await message.props(symmetricKey: key) else { return }
     await ui.show(text: props.message.text, from: props.senderSecretName)
 }
@@ -198,7 +193,7 @@ The SDK refills one-time keys automatically when their count drops below
 ``PQSSessionConstants/oneTimeKeyLowWatermark``. You can also nudge them:
 
 ```swift
-_ = await session.refreshOneTimeKeysTask()         // Curve OTPKs
+_ = await session.refreshOneTimeKeysTask()         // X25519 OTPKs
 _ = await session.refreshMLKEMOneTimeKeysTask()    // post-quantum OTPKs
 ```
 
@@ -216,7 +211,7 @@ try await session.rotateKeysOnPotentialCompromise()
 
 > Important: ``PQSSession/rotateKeysOnPotentialCompromise()`` rotates the
 > account-level signing key. Calling it on a child device throws
-> ``PQSSession/SessionErrors/compromiseRotationRequiresMasterDevice``.
+> `PQSError.compromiseRotationRequiresMasterDevice`.
 
 ### Useful constants
 
@@ -258,7 +253,7 @@ print(display) // "12345 67890 12345 67890 ..." 12 groups of 5 digits
 ### Recover from a TOFU mismatch
 
 If a configuration refresh throws
-``PQSSession/SessionErrors/signingKeyOutOfSync``, the **server's account
+`PQSError.signingKeyOutOfSync`, the **server's account
 signing key has changed** since you last accepted it. Surface a confirmation
 flow to the user (compare safety numbers, scan QR, etc.). After the user
 verifies, commit the new identity:
@@ -274,16 +269,16 @@ confirmation (passcode, biometrics, or a typed destructive phrase).
 
 ## 9. Error handling
 
-All SDK errors conform to `LocalizedError` and surface
-`errorDescription`, `failureReason`, and `recoverySuggestion`:
+All public SDK throws are cases of the unified `PQSError` enum
+(`Error`, `Equatable`, `Sendable`), so hosts can pattern-match directly:
 
 ```swift
 do {
-    try await session.writeTextMessage(
+    try await session.send(
         recipient: .nickname("bob"),
         text: "Hello"
     )
-} catch let error as PQSSession.SessionErrors {
+} catch let error as PQSError {
     switch error {
     case .sessionNotInitialized:    await prompt("Sign in again.")
     case .databaseNotInitialized:   await prompt("Storage unavailable.")
@@ -296,7 +291,7 @@ do {
         // Background refill will run; show a transient banner if needed.
         break
     default:
-        await prompt(error.recoverySuggestion ?? error.errorDescription ?? "")
+        await prompt("\(error)")
     }
 } catch {
     await prompt(error.localizedDescription)
@@ -305,11 +300,11 @@ do {
 
 ### Error types
 
-- ``PQSSession/SessionErrors`` — session lifecycle and operation errors.
-- ``SessionCache/CacheErrors`` — cache and storage errors.
-- `CryptoError` — encryption/decryption failures (in `SessionModels`).
-- `EventErrors`, `SigningErrors`, `JobProcessorErrors` — internal protocol
-  surfaces, surfaced via the public errors above.
+- `PQSError` (in `SessionModels`) — the single public error surface for
+  session lifecycle, messaging, key management, and recovery operations. It
+  replaces the 3.x `PQSSession.SessionErrors`, `EventErrors`, and
+  `CryptoError` enums; internal errors are mapped onto it before they reach
+  host code.
 
 ## Best practices
 
@@ -317,7 +312,7 @@ do {
 - Use strong app passwords; back them with biometrics where possible.
 - Treat ``PQSSession/acknowledgeAccountIdentityChange(_:)`` like factory-reset:
   always require explicit, conscious user consent.
-- Surface ``PQSSession/SessionErrors/signingKeyOutOfSync`` to the user — never
+- Surface `PQSError.signingKeyOutOfSync` to the user — never
   swallow it silently.
 - Compare safety numbers out of band before sharing sensitive content.
 
@@ -329,12 +324,13 @@ do {
   actor.
 
 ### Integration
-- Implement all four delegate protocols in dedicated, single-purpose types.
-- Wire them once via ``SessionConfiguration`` rather than scattering setter
-  calls.
+- Implement the three required host protocols (`PQSNetworkHost`,
+  `PQSPersistenceHost`, `MessageStoreObserver`) in dedicated, single-purpose
+  types; add a `PQSHostDelegate` when you need policy or recovery hooks.
+- Wire them once via ``SessionConfiguration`` at construction.
 - Persist `EncryptedMessage` and `BaseCommunication` blobs verbatim — the SDK
   treats them as opaque ciphertext.
 - For multi-device friendship add / delete → re-add, implement
-  ``PQSSessionDelegate/preferredOnlinePeerDeviceId(for:)`` and call
+  `RecoveryObserver.preferredOnlinePeerDeviceId(for:)` and call
   ``PQSSession/bootstrapPeerContactSession(secretName:purpose:)`` before the
   first friendship packet. See <doc:FriendshipContactBootstrap>.

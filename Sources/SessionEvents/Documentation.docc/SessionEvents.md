@@ -1,95 +1,62 @@
 # ``SessionEvents``
 
-The protocol that drives the session's contact, friendship, and
-message-state side effects.
+The host protocol surface of the Post-Quantum Solace SDK — the protocols an
+application implements to plug the SDK into its network, database, and UI.
 
 ## Overview
 
-`SessionEvents` is an *override surface*: the SDK ships a complete
-default implementation in a protocol extension. Conform to it only when
-you need to alter how contacts are added, how friendship state changes,
-how message delivery state propagates, or how communication
-synchronization is sent.
+In 4.0.0 the host surface is split into granular protocols so each host
+object implements exactly what it provides. Typealiases keep single-object
+hosts convenient:
 
-By default, `PQSSession` itself conforms to `SessionEvents` and uses the
-extension methods. You can install your own conformer at runtime via
-``PQSSession/setSessionEventDelegate(conformer:)`` to intercept any of
-these flows.
+| Surface | Protocols | Typealias |
+|---|---|---|
+| Transport | ``PQSTransport`` + ``PQSKeyDirectory`` + ``PQSRecoveryTransport`` | ``PQSNetworkHost`` |
+| Store | ``PQSStore`` + ``PQSRecoveryStore`` | ``PQSPersistenceHost`` |
+| Events | ``MessageStoreObserver`` | — |
+| Policy & recovery hooks (optional) | ``MessagingPolicy`` + ``RecoveryObserver`` | ``PQSHostDelegate`` |
 
-The protocol is `Sendable`. Every method is `async`.
+All protocols are `Sendable`; every method is `async` and may be called from
+the session actor's executor, so implementations must be thread-safe and
+should return quickly.
+
+Conformers are wired once, at session construction, through
+`SessionConfiguration`:
+
+```swift
+let session = await PQSSession(configuration: SessionConfiguration(
+    transport: myTransport,        // any PQSNetworkHost
+    store: myStore,                // any PQSPersistenceHost
+    observer: myObserver,          // any MessageStoreObserver
+    delegate: myHostDelegate       // optional PQSHostDelegate
+))
+```
 
 ## Topics
 
-### Contact lifecycle
+### Transport
 
-- ``SessionEvents/addContacts(_:sessionContext:cache:transport:receiver:sessionDelegate:symmetricKey:logger:)``
-- ``SessionEvents/createContact(secretName:metadata:friendshipMetadata:requestFriendship:sessionContext:cache:transport:receiver:symmetricKey:logger:)``
-- ``SessionEvents/sendCommunicationSynchronization(recipient:metadata:sessionContext:sessionDelegate:cache:receiver:symmetricKey:logger:)``
-- ``SessionEvents/sendContactCreatedAcknowledgment(recipient:sessionDelegate:logger:)``
+- ``PQSNetworkHost``
+- ``PQSTransport``
+- ``PQSKeyDirectory``
+- ``PQSRecoveryTransport``
 
-### Friendship state
+### Persistence
 
-- ``SessionEvents/requestFriendshipStateChange(state:contact:cache:receiver:sessionDelegate:symmetricKey:logger:)``
+- ``PQSPersistenceHost``
+- ``PQSStore``
+- ``PQSRecoveryStore``
 
-For `.requested`, `.accepted`, and `.pending`, the default implementation
-sends `blockData=false` so the server can clear a stale `blockedUsers`
-entry before routing. Pair friendship sends with
-``PQSSession/bootstrapPeerContactSession(secretName:purpose:)`` when the
-peer outbound ratchet is not ready. See <doc:FriendshipContactBootstrap>.
+### Events
 
-### Message lifecycle
+- ``MessageStoreObserver``
 
-- ``SessionEvents/updateMessageDeliveryState(_:deliveryState:messageRecipient:allowExternalUpdate:sessionDelegate:cache:receiver:symmetricKey:)``
-- ``SessionEvents/editCurrentMessage(_:newText:sessionDelegate:cache:receiver:symmetricKey:logger:)``
+### Policy and recovery hooks
 
-### Metadata
+- ``PQSHostDelegate``
+- ``MessagingPolicy``
+- ``RecoveryObserver``
 
-- ``SessionEvents/requestMetadata(from:sessionDelegate:logger:)``
-- ``SessionEvents/requestMyMetadata(sessionDelegate:logger:)``
+### Helper types
 
-### Lookup
-
-- ``SessionEvents/findCommunication(for:cache:symmetricKey:)``
-
-## Customising the default implementation
-
-```swift
-struct LoggingSessionEvents: SessionEvents {
-    func addContacts(_ contactInfos: [SharedContactInfo],
-                     sessionContext: SessionContext,
-                     cache: PQSSessionStore,
-                     transport: SessionTransport,
-                     receiver: EventReceiver,
-                     sessionDelegate: PQSSessionDelegate,
-                     symmetricKey: SymmetricKey,
-                     logger: NeedleTailLogger) async throws {
-        analytics.recordContactImport(count: contactInfos.count)
-
-        // Forward to the protocol-extension default implementation.
-        try await (self as SessionEvents).addContacts(
-            contactInfos,
-            sessionContext: sessionContext,
-            cache: cache,
-            transport: transport,
-            receiver: receiver,
-            sessionDelegate: sessionDelegate,
-            symmetricKey: symmetricKey,
-            logger: logger
-        )
-    }
-}
-
-try await PQSSession.shared.setSessionEventDelegate(conformer: LoggingSessionEvents())
-```
-
-You normally do **not** need to implement `SessionEvents` yourself —
-`PQSSession` already does. Use ``PQSSessionDelegate`` for transport-side
-hooks and ``EventReceiver`` for UI-side notifications.
-
-## See also
-
-- ``PQSSession``
-- ``PQSSessionDelegate``
-- ``EventReceiver``
-- ``SessionTransport``
-- <doc:FriendshipContactBootstrap>
+- ``SignedRatchetMessageMetadata``

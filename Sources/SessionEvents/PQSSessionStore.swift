@@ -19,12 +19,12 @@ import Foundation
 import SessionModels
 import Crypto
 
-// MARK: - Ordering Enum
+// MARK: - SortOrder Enum
 
 /// An enumeration representing the order in which items can be sorted.
 /// - `ascending`: Represents an ascending order.
 /// - `descending`: Represents a descending order.
-public enum Ordering: Sendable {
+public enum SortOrder: Sendable {
     case ascending, descending
 }
 
@@ -49,10 +49,13 @@ public struct MessageRecord: Sendable {
     }
 }
 
-// MARK: - PQSSessionStore Protocol
+// MARK: - Persistence protocols
 
-/// A protocol that defines CRUD (Create, Read, Update, Delete) operations for managing device configurations in a database store.
-public protocol PQSSessionStore: Sendable {
+/// Typical host store: core CRUD plus recovery ledgers on one object.
+public typealias PQSPersistenceHost = PQSStore & PQSRecoveryStore
+
+/// Core session persistence. The atomic identity+job commit is required.
+public protocol PQSStore: Sendable {
     /// Creates a local device configuration with the provided data.
     /// - Parameter data: The configuration data to be stored.
     /// - Throws: An error if the operation fails, such as if the data is invalid or if there is a database error.
@@ -258,83 +261,30 @@ public protocol PQSSessionStore: Sendable {
     /// - Parameter id: The unique identifier of the media job to be deleted.
     /// - Throws: An error if the operation fails.
     func deleteMediaJob(_ id: UUID) async throws
+}
 
-    /// Upserts a per-device outbound encrypt ledger entry.
+/// Outbound send records and accepted-envelope ledgers. Hosts must implement these.
+public protocol PQSRecoveryStore: Sendable {
     func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws
 
-    /// Fetches the live send record for `(sharedId, recipientDeviceId)`, if any.
     func fetchOutboundDeviceSendRecord(
         sharedId: String,
         recipientDeviceId: UUID
     ) async throws -> OutboundDeviceSendRecord?
 
-    /// Fetches a send record by envelope MessageID, if any.
     func fetchOutboundDeviceSendRecord(
         envelopeMessageId: String
     ) async throws -> OutboundDeviceSendRecord?
 
-    /// Deletes all send records for a shared message id (e.g. when the message is removed).
     func deleteOutboundDeviceSendRecords(sharedId: String) async throws
 
-    /// Upserts an accepted-envelope ledger entry (transport idempotency).
     func upsertAcceptedEnvelope(_ record: AcceptedEnvelopeRecord) async throws
 
-    /// Fetches an accepted-envelope ledger entry, if any.
     func fetchAcceptedEnvelope(
         senderSecretName: String,
         senderDeviceId: UUID,
         envelopeMessageId: String
     ) async throws -> AcceptedEnvelopeRecord?
 
-    /// Prunes accepted-envelope rows older than `olderThan`.
     func pruneAcceptedEnvelopes(olderThan: Date) async throws -> Int
-}
-
-public extension PQSSessionStore {
-    /// Compatibility fallback for test/in-memory stores. The production SQLite
-    /// store overrides this with a single transaction.
-    func updateSessionIdentity(
-        _ session: SessionIdentity,
-        andPreparedJob job: JobModel
-    ) async throws {
-        try await updateSessionIdentity(session)
-        try await updateJob(job)
-    }
-
-    /// Default bridge for stores that only implement the throwing lookup: a thrown
-    /// error is treated as "no message", so probing callers do not surface expected
-    /// misses as store failures. Stores should override this with a real optional
-    /// query to avoid error-level logging inside their throwing implementation.
-    func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage? {
-        try? await fetchMessage(sharedId: sharedId)
-    }
-
-    func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws {}
-
-    func fetchOutboundDeviceSendRecord(
-        sharedId: String,
-        recipientDeviceId: UUID
-    ) async throws -> OutboundDeviceSendRecord? {
-        nil
-    }
-
-    func fetchOutboundDeviceSendRecord(
-        envelopeMessageId: String
-    ) async throws -> OutboundDeviceSendRecord? {
-        nil
-    }
-
-    func deleteOutboundDeviceSendRecords(sharedId: String) async throws {}
-
-    func upsertAcceptedEnvelope(_ record: AcceptedEnvelopeRecord) async throws {}
-
-    func fetchAcceptedEnvelope(
-        senderSecretName: String,
-        senderDeviceId: UUID,
-        envelopeMessageId: String
-    ) async throws -> AcceptedEnvelopeRecord? {
-        nil
-    }
-
-    func pruneAcceptedEnvelopes(olderThan: Date) async throws -> Int { 0 }
 }

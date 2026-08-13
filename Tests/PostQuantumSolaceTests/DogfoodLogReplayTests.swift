@@ -21,7 +21,7 @@ extension EndToEndTests {
     // MARK: - N1: warm send must not block on hanging findConfiguration
 
     /// CHILD_DEVICE_2: after traffic has already warmed peer lanes, a staging API hang on
-    /// `find-configuration` must not strand `writeTextMessage` for minutes.
+    /// `find-configuration` must not strand `send` for minutes.
     ///
     /// Desired: warm chat fan-out uses `lastVerifiedDeviceIdsBySecretName` and completes
     /// without awaiting a hung `findConfiguration`.
@@ -82,7 +82,7 @@ extension EndToEndTests {
             rsd: rsd)
 
         // Warm peer lanes + verified-device cache (friendship + one delivered text).
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "warm-baseline",
             sharedIdOverride: "dogfood-n1-warm-\(UUID().uuidString)")
@@ -103,7 +103,7 @@ extension EndToEndTests {
 
         let warmSharedId = "dogfood-n1-warm-send-\(UUID().uuidString)"
         let sendTask = Task {
-            try await self._senderSession.writeTextMessage(
+            try await self._senderSession.send(
                 recipient: .nickname("bob"),
                 text: "must-not-hang-on-find-configuration",
                 sharedIdOverride: warmSharedId)
@@ -135,7 +135,7 @@ extension EndToEndTests {
         #expect(
             completed,
             """
-            BUG (CHILD_DEVICE_2): warm writeTextMessage blocked on hanging findConfiguration. \
+            BUG (CHILD_DEVICE_2): warm send blocked on hanging findConfiguration. \
             Expected encrypt path to avoid awaiting live config when verified device cache \
             already matches. findConfigurationCallCount=\(findConfigurationCallCount)
             """)
@@ -219,7 +219,7 @@ extension EndToEndTests {
                 keyCount: persisted ? 1 : 0)
         }
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "persist before config",
             sharedIdOverride: sharedId)
@@ -239,10 +239,8 @@ extension EndToEndTests {
     /// by dogfood N3.
     @Test("dogfood N1b: findConfiguration timedOut fails send within one second")
     func dogfoodN1b_findConfigurationTimedOutFailsSendWithinOneSecond() async throws {
-        var aliceTask: Task<Void, Never>?
         defer {
             Task {
-                aliceTask?.cancel()
                 await shutdownSessions()
             }
         }
@@ -268,7 +266,7 @@ extension EndToEndTests {
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask {
-                    try await self._senderSession.writeTextMessage(
+                    try await self._senderSession.send(
                         recipient: .nickname("bob"),
                         text: "cold-find-should-fail-fast",
                         sharedIdOverride: "dogfood-n1b-\(UUID().uuidString)")
@@ -368,7 +366,7 @@ extension EndToEndTests {
             bobSession: _recipientSession,
             rsd: rsd)
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "warm-before-offline",
             sharedIdOverride: "dogfood-n3-warm-\(UUID().uuidString)")
@@ -386,14 +384,14 @@ extension EndToEndTests {
         // Clearing the verified-id memo forces chat fan-out onto live findConfiguration
         // (CHILD_DEVICE_2 -1001 / cannotFindUserConfiguration path).
         await _senderSession.test_removeLastVerifiedDeviceIds(for: "bob")
-        await _senderSession.setViability(false)
+        await _senderSession.setConnectivity(false)
         aliceTransport.findConfigurationError = URLError(.timedOut)
         aliceTransport.findConfigurationFaultSecretNames = ["bob", "alice"]
 
         let offlineSharedId = "dogfood-n3-offline-\(UUID().uuidString)"
         var composeError: Error?
         do {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "composed while offline / API timed out",
                 sharedIdOverride: offlineSharedId)
@@ -426,7 +424,7 @@ extension EndToEndTests {
         aliceTransport.findConfigurationError = nil
         aliceTransport.findConfigurationHang = nil
         aliceTransport.findConfigurationFaultSecretNames = nil
-        await _senderSession.setViability(true)
+        await _senderSession.setConnectivity(true)
         try await _senderSession.resumeJobQueue()
 
         func waitUntil(
@@ -643,7 +641,7 @@ extension EndToEndTests {
             "Friendship ratchet must be ready before personal gap-drop")
 
         // Baseline personal sync before arming drops.
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "personal-baseline-before-gap",
             sharedIdOverride: "dogfood-c1-baseline-\(UUID().uuidString)")
@@ -652,7 +650,7 @@ extension EndToEndTests {
         await gate.arm()
 
         for i in 0..<13 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "personal-gap-\(i)",
                 sharedIdOverride: "dogfood-c1-gap-\(i)-\(UUID().uuidString)")
@@ -676,7 +674,7 @@ extension EndToEndTests {
 
         // New traffic after the failure window must still sync to the linked child.
         let freshSharedId = "dogfood-c1-fresh-\(UUID().uuidString)"
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "personal-after-heal",
             sharedIdOverride: freshSharedId)

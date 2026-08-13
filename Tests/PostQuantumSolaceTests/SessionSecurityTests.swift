@@ -33,11 +33,11 @@ actor SessionSecurityTests {
         case publishFailed
     }
 
-    final class CreateSessionFailClosedTransport: SessionTransport, @unchecked Sendable {
+    final class CreateSessionFailClosedTransport: PQSTransport, PQSKeyDirectory, PQSRecoveryTransport, @unchecked Sendable {
         func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {}
 
         func findConfiguration(for secretName: String) async throws -> UserConfiguration {
-            throw PQSSession.SessionErrors.userNotFound
+            throw PQSError.userNotFound
         }
 
         func publishUserConfiguration(
@@ -49,10 +49,10 @@ actor SessionSecurityTests {
         }
 
         func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys {
-            OneTimeKeys(curve: nil, mlKEM: nil)
+            OneTimeKeys(x25519: nil, mlKEM: nil)
         }
 
-        func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] {
+        func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeyKind) async throws -> [UUID] {
             []
         }
 
@@ -68,8 +68,8 @@ actor SessionSecurityTests {
             keys: [UserConfiguration.SignedMLKEMOneTimeKey]
         ) async throws {}
 
-        func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
-        func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
+        func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeyKind) async throws {}
+        func deleteOneTimeKeys(for secretName: String, with id: String, type: KeyKind) async throws {}
 
         func publishRotatedKeys(
             for secretName: String,
@@ -83,6 +83,8 @@ actor SessionSecurityTests {
             recipient: MessageRecipient,
             metadata: Data
         ) async throws {}
+        func sendOutOfBandResendRequest(failedEnvelopeMessageIds: [String], to secretName: String, deviceId: UUID, requestingDeviceId: UUID) async throws {}
+        func sendOutOfBandResendUnavailable(unavailableEnvelopeMessageIds: [String], to secretName: String, deviceId: UUID, respondingDeviceId: UUID) async throws {}
     }
 
     // MARK: - Helpers
@@ -99,21 +101,21 @@ actor SessionSecurityTests {
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: ReceiverDelegate(session: session))
 
-        await session.setViability(true)
+        await session.setConnectivity(true)
         await store.setPublishableName(secretName)
 
-        session = try await session.createSession(
+        session = try await session.createAccount(
             secretName: secretName,
             appPassword: password
         ) {}
 
         await session.setAppPassword(password)
-        session = try await session.startSession(appPassword: password)
+        session = try await session.unlock(appPassword: password)
     }
 
     // MARK: - Tests
 
-    @Test("createSession rethrows registration publish failures")
+    @Test("createAccount rethrows registration publish failures")
     func testCreateSessionRethrowsRegistrationPublishFailure() async throws {
         let testSession = PQSSession()
         let mockUserData = MockUserData(session: testSession)
@@ -122,14 +124,14 @@ actor SessionSecurityTests {
         await cacheStore.setLocalSalt("securitySalt")
         await testSession.setDatabaseDelegate(conformer: cacheStore)
         await testSession.setTransportDelegate(conformer: CreateSessionFailClosedTransport())
-        await testSession.setViability(true)
+        await testSession.setConnectivity(true)
 
         do {
-            _ = try await testSession.createSession(
+            _ = try await testSession.createAccount(
                 secretName: "alice",
                 appPassword: "123"
             ) {}
-            Issue.record("Expected createSession to rethrow registration publish failure")
+            Issue.record("Expected createAccount to rethrow registration publish failure")
         } catch CreateSessionFailure.publishFailed {
             // Expected.
         } catch {
@@ -172,7 +174,7 @@ actor SessionSecurityTests {
         #expect(newOk == true)
 
         // Starting a new session with the new password should yield an equivalent context
-        let restarted = try await session.startSession(appPassword: "new-password")
+        let restarted = try await session.unlock(appPassword: "new-password")
         guard let restartedContext = await restarted.sessionContext else {
             Issue.record("Restarted session context should not be nil")
             return

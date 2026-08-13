@@ -7,7 +7,7 @@ import Foundation
 import NeedleTailLogger
 import SessionModels
 
-extension TaskProcessor {
+extension MessagePipeline {
     func auditInboundDecryptFailure(
         message: InboundTaskMessage,
         failureClass: String,
@@ -38,6 +38,6 @@ extension TaskProcessor {
             parts.append("\(key)=\(value)")
         }
 
-        PQSAuditLog.log(.recovery, parts.joined(separator: " "))
+        audit(.recovery, parts.joined(separator: " "))
     }
 }

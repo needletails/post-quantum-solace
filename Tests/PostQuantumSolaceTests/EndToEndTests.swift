@@ -191,7 +191,7 @@ actor EndToEndTests {
     
     
     
-    func createSenderSession(store: MockIdentityStore, createSession: Bool = true, transport: _MockTransportDelegate, sessionDelegate: SessionDelegate) async throws {
+    func createSenderSession(store: MockIdentityStore, createAccount: Bool = true, transport: _MockTransportDelegate, sessionDelegate: SessionDelegate) async throws {
         await store.setLocalSalt("testSalt1")
         await _senderSession.setLogLevel(.trace)
         await _senderSession.setDatabaseDelegate(conformer: store)
@@ -199,19 +199,19 @@ actor EndToEndTests {
         await _senderSession.setPQSSessionDelegate(conformer: sessionDelegate)
         await _senderSession.setReceiverDelegate(conformer: senderReceiver)
         
-        await _senderSession.setViability(true)
+        await _senderSession.setConnectivity(true)
         await self.store.setPublishableName(sMockUserData.ssn)
-        if createSession {
-            _senderSession = try await _senderSession.createSession(
+        if createAccount {
+            _senderSession = try await _senderSession.createAccount(
                 secretName: sMockUserData.ssn, appPassword: sMockUserData.sap
             ) {}
         }
         await _senderSession.setAppPassword(sMockUserData.sap)
-        _senderSession = try await _senderSession.startSession(appPassword: sMockUserData.sap)
+        _senderSession = try await _senderSession.unlock(appPassword: sMockUserData.sap)
         try await senderReceiver.setKey(_senderSession.getDatabaseSymmetricKey())
     }
     
-    func createSenderMaxSkipSession(store: MockIdentityStore, createSession: Bool = true, transport: _MockTransportDelegate, sessionDelegate: SessionDelegate) async throws {
+    func createSenderMaxSkipSession(store: MockIdentityStore, createAccount: Bool = true, transport: _MockTransportDelegate, sessionDelegate: SessionDelegate) async throws {
         await store.setLocalSalt("testSalt1")
         await _senderMaxSkipSession.setLogLevel(.trace)
         await _senderMaxSkipSession.setDatabaseDelegate(conformer: store)
@@ -219,15 +219,15 @@ actor EndToEndTests {
         await _senderMaxSkipSession.setPQSSessionDelegate(conformer: sessionDelegate)
         await _senderMaxSkipSession.setReceiverDelegate(conformer: senderMaxSkipReceiver)
         
-        await _senderMaxSkipSession.setViability(true)
+        await _senderMaxSkipSession.setConnectivity(true)
         await self.store.setPublishableName(sMockUserData.ssn)
-        if createSession {
-            _senderMaxSkipSession = try await _senderMaxSkipSession.createSession(
+        if createAccount {
+            _senderMaxSkipSession = try await _senderMaxSkipSession.createAccount(
                 secretName: sMockUserData.ssn, appPassword: sMockUserData.sap
             ) {}
         }
         await _senderMaxSkipSession.setAppPassword(sMockUserData.sap)
-        _senderMaxSkipSession = try await _senderMaxSkipSession.startSession(appPassword: sMockUserData.sap)
+        _senderMaxSkipSession = try await _senderMaxSkipSession.unlock(appPassword: sMockUserData.sap)
         try await senderReceiver.setKey(_senderMaxSkipSession.getDatabaseSymmetricKey())
     }
     
@@ -237,7 +237,7 @@ actor EndToEndTests {
         useProvidedTransport: Bool = false
     ) async throws {
         await store.setLocalSalt("testChildSalt1")
-        await _senderChildSession1.setViability(true)
+        await _senderChildSession1.setConnectivity(true)
         await self.store.setPublishableName(sMockUserData.ssn)
         _senderChildSession1.linkDelegate = senderChild1LinkDelegate
         
@@ -272,7 +272,7 @@ actor EndToEndTests {
     ) async throws {
         await store.setLocalSalt("testChildSalt2")
         await _senderChildSession2.setLogLevel(.trace)
-        await _senderChildSession2.setViability(true)
+        await _senderChildSession2.setConnectivity(true)
         await self.store.setPublishableName(sMockUserData.ssn)
         _senderChildSession2.linkDelegate = senderChild2LinkDelegate
         let bundle = try await _senderChildSession2.createDeviceCryptographicBundle(isMaster: false)
@@ -299,43 +299,43 @@ actor EndToEndTests {
             secretName: sMockUserData.ssn, forceRefresh: true)
     }
     
-    func createRecipientSession(store: MockIdentityStore, createSession: Bool = true, transport: _MockTransportDelegate, sessionDelegate: SessionDelegate) async throws {
+    func createRecipientSession(store: MockIdentityStore, createAccount: Bool = true, transport: _MockTransportDelegate, sessionDelegate: SessionDelegate) async throws {
         await store.setLocalSalt("testSalt2")
         await _recipientSession.setLogLevel(.trace)
         await _recipientSession.setDatabaseDelegate(conformer: store)
         await _recipientSession.setTransportDelegate(conformer: transport)
         await _recipientSession.setPQSSessionDelegate(conformer: sessionDelegate)
         
-        await _recipientSession.setViability(true)
+        await _recipientSession.setConnectivity(true)
         await _recipientSession.setReceiverDelegate(conformer: recipientReceiver)
         await self.store.setPublishableName(rMockUserData.rsn)
-        if createSession {
-            _recipientSession = try await _recipientSession.createSession(
+        if createAccount {
+            _recipientSession = try await _recipientSession.createAccount(
                 secretName: rMockUserData.rsn, appPassword: rMockUserData.sap
             ) {}
         }
         await _recipientSession.setAppPassword(rMockUserData.sap)
-        _recipientSession = try await _recipientSession.startSession(appPassword: rMockUserData.sap)
+        _recipientSession = try await _recipientSession.unlock(appPassword: rMockUserData.sap)
         try await recipientReceiver.setKey(_recipientSession.getDatabaseSymmetricKey())
     }
     
-    func createRecipientMaxSkipSession(store: MockIdentityStore, createSession: Bool = true, transport: _MockTransportDelegate, sessionDelegate: SessionDelegate) async throws {
+    func createRecipientMaxSkipSession(store: MockIdentityStore, createAccount: Bool = true, transport: _MockTransportDelegate, sessionDelegate: SessionDelegate) async throws {
         await store.setLocalSalt("testSalt2")
         await _recipientMaxSkipSession.setLogLevel(.trace)
         await _recipientMaxSkipSession.setDatabaseDelegate(conformer: store)
         await _recipientMaxSkipSession.setTransportDelegate(conformer: transport)
         await _recipientMaxSkipSession.setPQSSessionDelegate(conformer: sessionDelegate)
         
-        await _recipientMaxSkipSession.setViability(true)
+        await _recipientMaxSkipSession.setConnectivity(true)
         await _recipientMaxSkipSession.setReceiverDelegate(conformer: recipientMaxSkipReceiver)
         await self.store.setPublishableName(rMockUserData.rsn)
-        if createSession {
-            _recipientMaxSkipSession = try await _recipientMaxSkipSession.createSession(
+        if createAccount {
+            _recipientMaxSkipSession = try await _recipientMaxSkipSession.createAccount(
                 secretName: rMockUserData.rsn, appPassword: rMockUserData.sap
             ) {}
         }
         await _recipientMaxSkipSession.setAppPassword(rMockUserData.sap)
-        _recipientMaxSkipSession = try await _recipientMaxSkipSession.startSession(appPassword: rMockUserData.sap)
+        _recipientMaxSkipSession = try await _recipientMaxSkipSession.unlock(appPassword: rMockUserData.sap)
         try await recipientReceiver.setKey(_recipientMaxSkipSession.getDatabaseSymmetricKey())
     }
     
@@ -345,7 +345,7 @@ actor EndToEndTests {
         useProvidedTransport: Bool = false
     ) async throws {
         await store.setLocalSalt("testChildSalt1")
-        await _recipientChildSession1.setViability(true)
+        await _recipientChildSession1.setConnectivity(true)
         await self.store.setPublishableName(rMockUserData.rsn)
         _recipientChildSession1.linkDelegate = recipientChild1LinkDelegate
         let bundle = try await _recipientChildSession1.createDeviceCryptographicBundle(
@@ -375,7 +375,7 @@ actor EndToEndTests {
     
     func linkRecipientChildSession2(store: MockIdentityStore, transport: _MockTransportDelegate) async throws {
         await store.setLocalSalt("testChildSalt2")
-        await _recipientChildSession2.setViability(true)
+        await _recipientChildSession2.setConnectivity(true)
         await self.store.setPublishableName(rMockUserData.rsn)
         _recipientChildSession2.linkDelegate = recipientChild2LinkDelegate
         let bundle = try await _recipientChildSession2.createDeviceCryptographicBundle(
@@ -401,12 +401,12 @@ actor EndToEndTests {
         childBundle: PQSSession.CryptographicBundle
     ) async throws -> UserConfiguration {
         guard let masterContext = await masterSession.sessionContext else {
-            throw PQSSession.SessionErrors.sessionNotInitialized
+            throw PQSError.sessionNotInitialized
         }
         guard let childDevice = try childBundle.userConfiguration.getVerifiedDevices().first(where: {
             $0.deviceId == childBundle.deviceKeys.deviceId
         }) else {
-            throw PQSSession.SessionErrors.invalidDeviceIdentity
+            throw PQSError.invalidDeviceIdentity
         }
         let masterSigningKey = try Curve25519.Signing.PrivateKey(
             rawRepresentation: masterContext.sessionUser.deviceKeys.signingPrivateKey)
@@ -446,24 +446,18 @@ actor EndToEndTests {
     ) async throws -> Bool {
         // Strict §4.1 OOB retry/unavailable ride authenticated transport, not DR.
         // Service them before any signature/ratchet path (placeholder ciphertext is empty).
-        if case .requestMessageResend(let request) = received.transportEvent {
+        if let request = received.oobResendRequest {
             _ = try await session.handleOutOfBandResendRequest(
                 from: received.sender,
                 deviceId: received.deviceId,
                 failedSharedMessageIds: request.failedSharedMessageIds)
             return true
         }
-        if case .messageResendUnavailable(let notice) = received.transportEvent {
-            _ = await session.clearPendingResends(
-                sender: received.sender,
+        if let notice = received.oobUnavailableNotice {
+            await session.handleOutOfBandResendUnavailable(
+                from: received.sender,
                 deviceId: received.deviceId,
-                messageIds: notice.unavailableSharedMessageIds)
-            for sharedId in notice.unavailableSharedMessageIds {
-                _ = await session.markInboundContentUnrecoverable(
-                    sender: received.sender,
-                    deviceId: received.deviceId,
-                    sharedId: sharedId)
-            }
+                unavailableEnvelopeMessageIds: notice.unavailableSharedMessageIds)
             return true
         }
         do {
@@ -477,20 +471,18 @@ actor EndToEndTests {
             return true
         } catch let ratchetError as RatchetError where [
             .maxSkippedHeadersExceeded,
-            .stateUninitialized,
-            .initialMessageNotReceived,
-            .skippedKeysDrained
+            .stateUninitialized
         ].contains(ratchetError) {
             return false
-        } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+        } catch let sessionError as PQSError where sessionError == .invalidSignature {
             return false
-        } catch let sessionError as PQSSession.SessionErrors where sessionError == .databaseNotInitialized {
+        } catch let sessionError as PQSError where sessionError == .databaseNotInitialized {
             // Some long-running receive loops can outlive teardown by a tick.
             // Treat this as recoverable in test harness loops.
             return false
         } catch is CryptoKitError {
             return false
-        } catch let sessionError as PQSSession.SessionErrors
+        } catch let sessionError as PQSError
             where sessionError == .sessionDecryptionError {
             return false
         }
@@ -536,11 +528,11 @@ actor EndToEndTests {
         await joeSession.setTransportDelegate(conformer: joeTransport)
         await joeSession.setPQSSessionDelegate(conformer: joeDelegate)
         await joeSession.setReceiverDelegate(conformer: joeReceiver)
-        await joeSession.setViability(true)
+        await joeSession.setConnectivity(true)
         await self.store.setPublishableName("joe")
-        joeSession = try await joeSession.createSession(secretName: "joe", appPassword: "123") {}
+        joeSession = try await joeSession.createAccount(secretName: "joe", appPassword: "123") {}
         await joeSession.setAppPassword("123")
-        joeSession = try await joeSession.startSession(appPassword: "123")
+        joeSession = try await joeSession.unlock(appPassword: "123")
         try await joeReceiver.setKey(joeSession.getDatabaseSymmetricKey())
         
         // Pre-create channel communication on both caches so inbound channel can resolve it
@@ -586,7 +578,7 @@ actor EndToEndTests {
         }
         
         // Send a channel message from Alice
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .channel(channelName),
             text: "hello channel",
             metadata: metadata
@@ -670,12 +662,12 @@ actor EndToEndTests {
                         if processed == 1 {
                             // After first warmup delivery, rotate on Alice and immediately send
                             try await self._senderSession.rotateKeysOnPotentialCompromise()
-                            try await self._senderSession.writeTextMessage(
+                            try await self._senderSession.send(
                                 recipient: .nickname("bob"),
                                 text: "post-rotate")
                         } else if processed == 2 {
                             // Reply from Bob after receiving Alice's post-rotation message
-                            try await self._recipientSession.writeTextMessage(
+                            try await self._recipientSession.send(
                                 recipient: .nickname("alice"),
                                 text: "ack post-rotate")
                         }
@@ -684,7 +676,7 @@ actor EndToEndTests {
             }
         
             // Warm-up to establish identity/ratchet
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+            try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
 
             // Let the receive loops finish the rotation flow before deterministic teardown.
             try await Task.sleep(until: .now + .seconds(5))
@@ -877,12 +869,12 @@ actor EndToEndTests {
                     return
                 } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
                     // Recipient failed to decrypt; request sender to resend the same message.
-                    try? await self._senderMaxSkipSession.writeTextMessage(
+                    try? await self._senderMaxSkipSession.send(
                         recipient: .nickname("bob"),
                         text: messageToSend)
-                } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+                } catch let sessionError as PQSError where sessionError == .invalidSignature {
                     // Message signature is invalid (e.g., after key rotation); request resend.
-                    try? await self._senderMaxSkipSession.writeTextMessage(
+                    try? await self._senderMaxSkipSession.send(
                         recipient: .nickname("bob"),
                         text: messageToSend)
                 } catch {
@@ -924,7 +916,7 @@ actor EndToEndTests {
         try await _recipientMaxSkipSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .seconds(2))
 
-        try await _senderMaxSkipSession.writeTextMessage(
+        try await _senderMaxSkipSession.send(
             recipient: .nickname("bob"),
             text: messageToSend)
 
@@ -999,7 +991,7 @@ actor EndToEndTests {
             }
         }
         
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "replay-payload",
             sharedIdOverride: replaySharedId
@@ -1014,91 +1006,8 @@ actor EndToEndTests {
         #expect(persisted.contains(where: { $0.sharedId == replaySharedId }), "Sender persistence should retain replay shared id")
     }
 
-    @Test("RequestMessageResend control event carries failed shared id over transport")
-    func testRequestMessageResendControlEventTransportPayload() async throws {
-        actor EventProbe {
-            private var event: TransportEvent?
-            func set(_ value: TransportEvent?) { event = value }
-            func get() -> TransportEvent? { event }
-        }
-        
-        var aliceTask: Task<Void, Never>?
-        let probe = EventProbe()
-        let failedSharedId = UUID().uuidString
-        
-        func waitForEvent(timeoutSeconds: TimeInterval = 4) async -> Bool {
-            let deadline = Date().addingTimeInterval(timeoutSeconds)
-            while Date() < deadline {
-                if await probe.get() != nil { return true }
-                try? await Task.sleep(until: .now + .milliseconds(50))
-            }
-            return false
-        }
-        
-        defer {
-            Task {
-                aliceTask?.cancel()
-                await shutdownSessions()
-            }
-        }
-        
-        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
-        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-        let senderStore = createSenderStore()
-        let recipientStore = createRecipientStore()
-        let sd = SessionDelegate(session: _senderSession)
-        let rsd = SessionDelegate(session: _recipientSession)
-        
-        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-        try await createFriendship(
-            aliceSession: _senderSession,
-            sd: sd,
-            bobSession: _recipientSession,
-            rsd: rsd
-        )
-        
-        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
-            bobTransport.continuation = continuation
-        }
-        
-        aliceTask = Task {
-            for await received in aliceStream {
-                if received.sender == "bob", received.recipient == "alice" {
-                    await probe.set(received.transportEvent)
-                    return
-                }
-            }
-        }
-        
-        guard let requesterDeviceId = await _recipientSession.sessionContext?.sessionUser.deviceId else {
-            Issue.record("Missing requester device id")
-            return
-        }
-        let request = FailedMessageResendRequest(
-            failedSharedMessageId: failedSharedId,
-            requestingDeviceId: requesterDeviceId
-        )
-        let metadata = try BinaryEncoder().encode(TransportEvent.requestMessageResend(request))
-        try await _recipientSession.writeTextMessage(
-            recipient: .nickname("alice"),
-            transportInfo: metadata
-        )
-        
-        #expect(await waitForEvent(), "Expected requestMessageResend control event on transport")
-        guard let event = await probe.get() else {
-            Issue.record("Expected requestMessageResend event")
-            return
-        }
-        switch event {
-        case .requestMessageResend(let received):
-            #expect(received.failedSharedMessageId == failedSharedId)
-            #expect(received.requestingDeviceId == requesterDeviceId)
-        default:
-            Issue.record("Unexpected control event type")
-        }
-    }
-    
+    // Encrypted-retry TransportEvent delivery was deleted in Phase 2; OOB coverage is StrictOOBRetryTests.
+
     @Test("MaxSkipped defers resend for the failed shared id without key rotation")
     func testMaxSkippedResendRequestAndReplaySharedIdEndToEnd() async throws {
         actor FlowProbe {
@@ -1167,7 +1076,7 @@ actor EndToEndTests {
         // Drop a burst of Alice->Bob non-control messages once armed to trigger max-skipped on the first delivered gap message.
         aliceTransport.shouldDeliver = { received in
             guard received.sender == "alice", received.recipient == "bob" else { return true }
-            guard received.transportEvent == nil else { return true }
+            guard received.isContentMessage else { return true }
             let shouldDrop = await gate.shouldDropNext()
             return !shouldDrop
         }
@@ -1241,7 +1150,7 @@ actor EndToEndTests {
         }, "Friendship ratchet must be ready before gap-drop burst")
 
         // Prime the conversation with one delivered message before arming gap-drop behavior.
-        try await _senderMaxSkipSession.writeTextMessage(
+        try await _senderMaxSkipSession.send(
             recipient: .nickname("bob"),
             text: "baseline-before-gap"
         )
@@ -1251,7 +1160,7 @@ actor EndToEndTests {
 
         // Burst: first 12 dropped, next delivered should trigger max-skipped.
         for i in 0..<13 {
-            try await _senderMaxSkipSession.writeTextMessage(
+            try await _senderMaxSkipSession.send(
                 recipient: .nickname("bob"),
                 text: "gap-\(i)"
             )
@@ -1355,7 +1264,7 @@ actor EndToEndTests {
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
         aliceTransport.shouldDeliver = { received in
             guard received.sender == "alice", received.recipient == "bob" else { return true }
-            guard received.transportEvent == nil else { return true }
+            guard received.isContentMessage else { return true }
             let shouldDrop = await gate.shouldDropNext()
             return !shouldDrop
         }
@@ -1423,15 +1332,15 @@ actor EndToEndTests {
             return outboundReady && inboundReady
         })
 
-        try await _senderMaxSkipSession.writeTextMessage(
+        try await _senderMaxSkipSession.send(
             recipient: .nickname("bob"),
             text: "baseline-before-gap"
         )
-        #expect(await waitUntil { await self._recipientMaxSkipSession.taskProcessor.isRunning })
+        #expect(await waitUntil { await self._recipientMaxSkipSession.messagePipeline.isRunning })
 
         await gate.arm()
         for i in 0..<13 {
-            try await _senderMaxSkipSession.writeTextMessage(
+            try await _senderMaxSkipSession.send(
                 recipient: .nickname("bob"),
                 text: "running-gap-\(i)"
             )
@@ -1526,12 +1435,12 @@ actor EndToEndTests {
         }
         replayCaptureTask = Task {
             for await received in replayStream {
-                guard received.transportEvent == nil else { continue }
+                guard received.isContentMessage else { continue }
                 await probe.markOutbound(received)
             }
         }
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "replay-admission-source",
             sharedIdOverride: replaySharedId
@@ -1547,7 +1456,8 @@ actor EndToEndTests {
             message: original.message,
             senderSecretName: original.sender,
             senderDeviceId: original.deviceId,
-            sharedMessageId: original.messageId
+            sharedMessageId: original.messageId,
+            logicalSharedId: original.messageId
         )
         await _recipientSession.markInboundFailure(
             failedInbound,
@@ -1657,12 +1567,12 @@ actor EndToEndTests {
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
         aliceTransport.shouldDeliver = { received in
             guard received.sender == "alice", received.recipient == "bob" else { return true }
-            guard received.transportEvent == nil else { return true }
+            guard received.isContentMessage else { return true }
             let shouldDrop = await gate.shouldDropNext()
             return !shouldDrop
         }
         bobTransport.transformOutgoing = { received in
-            if case .requestMessageResend = received.transportEvent {
+            if received.oobResendRequest != nil {
                 throw SyntheticControlSendError.failed
             }
             return received
@@ -1709,7 +1619,7 @@ actor EndToEndTests {
             }
         }
         
-        try await _senderMaxSkipSession.writeTextMessage(
+        try await _senderMaxSkipSession.send(
             recipient: .nickname("bob"),
             text: "baseline-before-gap"
         )
@@ -1717,7 +1627,7 @@ actor EndToEndTests {
         
         await gate.arm()
         for i in 0..<13 {
-            try await _senderMaxSkipSession.writeTextMessage(
+            try await _senderMaxSkipSession.send(
                 recipient: .nickname("bob"),
                 text: "masking-gap-\(i)"
             )
@@ -1735,7 +1645,8 @@ actor EndToEndTests {
             message: failedInbound.message,
             senderSecretName: failedInbound.sender,
             senderDeviceId: failedInbound.deviceId,
-            sharedMessageId: failedInbound.messageId
+            sharedMessageId: failedInbound.messageId,
+            logicalSharedId: failedInbound.messageId
         )
         #expect(
             !(await _recipientMaxSkipSession.shouldSuppressInboundFailure(
@@ -1766,16 +1677,16 @@ actor EndToEndTests {
         }
         
         final class OneShotMissingIdentityDelegate: @unchecked Sendable, TaskSequenceDelegate {
-            let processor: TaskProcessor
+            let processor: MessagePipeline
             let gate = OneShotFailureGate()
             
-            init(processor: TaskProcessor) {
+            init(processor: MessagePipeline) {
                 self.processor = processor
             }
             
             func performRatchet(task: TaskType, session: PQSSession) async throws {
                 if case .streamMessage = task, await gate.consumeFailure() {
-                    throw PQSSession.SessionErrors.missingSessionIdentity
+                    throw PQSError.missingSessionIdentity
                 }
                 try await processor.performRatchet(task: task, session: session)
             }
@@ -1820,7 +1731,7 @@ actor EndToEndTests {
             rsd: rsd
         )
         
-        let recipientProcessor = await _recipientSession.taskProcessor
+        let recipientProcessor = await _recipientSession.messagePipeline
         let injectedDelegate = OneShotMissingIdentityDelegate(processor: recipientProcessor)
         await recipientProcessor.setTaskDelegate(injectedDelegate)
         
@@ -1860,11 +1771,11 @@ actor EndToEndTests {
             }
         }
         
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "first-message-injected-missing-identity"
         )
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "second-message-still-should-decrypt"
         )
@@ -1895,10 +1806,10 @@ actor EndToEndTests {
         }
 
         final class OneShotSendingKeyNilDelegate: @unchecked Sendable, TaskSequenceDelegate {
-            let processor: TaskProcessor
+            let processor: MessagePipeline
             let gate = OneShotFailureGate()
 
-            init(processor: TaskProcessor) {
+            init(processor: MessagePipeline) {
                 self.processor = processor
             }
 
@@ -1946,7 +1857,7 @@ actor EndToEndTests {
             rsd: rsd
         )
 
-        let senderProcessor = await _senderSession.taskProcessor
+        let senderProcessor = await _senderSession.messagePipeline
         await senderProcessor.setTaskDelegate(OneShotSendingKeyNilDelegate(processor: senderProcessor))
 
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
@@ -1971,7 +1882,7 @@ actor EndToEndTests {
             }
         }
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "outbound-sending-key-recovered"
         )
@@ -2067,7 +1978,9 @@ actor EndToEndTests {
             guard let symmetricKey = try? await _recipientSession.getDatabaseSymmetricKey() else {
                 return false
             }
-            let contacts = await recipientStore.contacts
+            guard let contacts = try? await recipientStore.fetchContacts() else {
+                return false
+            }
             for contact in contacts {
                 if await contact.props(symmetricKey: symmetricKey)?.secretName == "alice" {
                     return true
@@ -2241,12 +2154,12 @@ actor EndToEndTests {
         }
 
         final class OneShotPeerRefreshFailureDelegate: @unchecked Sendable, TaskSequenceDelegate {
-            let processor: TaskProcessor
+            let processor: MessagePipeline
             let gate = OneShotFailureGate()
             let peerName: String
             let peerDeviceId: UUID
 
-            init(processor: TaskProcessor, peerName: String, peerDeviceId: UUID) {
+            init(processor: MessagePipeline, peerName: String, peerDeviceId: UUID) {
                 self.processor = processor
                 self.peerName = peerName
                 self.peerDeviceId = peerDeviceId
@@ -2336,7 +2249,7 @@ actor EndToEndTests {
             return
         }
 
-        let senderProcessor = await _senderSession.taskProcessor
+        let senderProcessor = await _senderSession.messagePipeline
         await senderProcessor.setTaskDelegate(OneShotPeerRefreshFailureDelegate(
             processor: senderProcessor,
             peerName: rMockUserData.rsn,
@@ -2376,12 +2289,12 @@ actor EndToEndTests {
         }
 
         final class OneShotPersonalPeerRefreshFailureDelegate: @unchecked Sendable, TaskSequenceDelegate {
-            let processor: TaskProcessor
+            let processor: MessagePipeline
             let gate = OneShotFailureGate()
             let peerName: String
             let peerDeviceId: UUID
 
-            init(processor: TaskProcessor, peerName: String, peerDeviceId: UUID) {
+            init(processor: MessagePipeline, peerName: String, peerDeviceId: UUID) {
                 self.processor = processor
                 self.peerName = peerName
                 self.peerDeviceId = peerDeviceId
@@ -2586,7 +2499,7 @@ actor EndToEndTests {
             }
         ]
 
-        let childProcessor = await _senderChildSession1.taskProcessor
+        let childProcessor = await _senderChildSession1.messagePipeline
         let peerRefreshFailureDelegate = OneShotPersonalPeerRefreshFailureDelegate(
             processor: childProcessor,
             peerName: sMockUserData.ssn,
@@ -2629,7 +2542,7 @@ actor EndToEndTests {
             forceRefresh: true)
 
         let sharedId = "linked-parent-first-child-message-\(UUID().uuidString)"
-        try await _senderChildSession1.writeTextMessage(
+        try await _senderChildSession1.send(
             recipient: .nickname(rMockUserData.rsn),
             text: "single child message after linked-device repair",
             sharedIdOverride: sharedId)
@@ -2690,7 +2603,7 @@ actor EndToEndTests {
                 bobSession: _recipientSession,
                 rsd: rsd)
             
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"), text: "Message One")
         }
         
@@ -2713,9 +2626,9 @@ actor EndToEndTests {
                     )
                     
                     if aliceIterations == 2 {
-                        try await _senderSession.writeTextMessage(
+                        try await _senderSession.send(
                             recipient: .nickname("bob"), text: "Message Four")
-                        try await _senderSession.writeTextMessage(
+                        try await _senderSession.send(
                             recipient: .nickname("bob"), text: "Message Five")
                     }
                 }
@@ -2737,9 +2650,9 @@ actor EndToEndTests {
                 )
                 
                 if bobIterations == 1 {
-                    try await _recipientSession.writeTextMessage(
+                    try await _recipientSession.send(
                         recipient: .nickname("alice"), text: "Message Two")
-                    try await _recipientSession.writeTextMessage(
+                    try await _recipientSession.send(
                         recipient: .nickname("alice"), text: "Message Three")
                 }
                 
@@ -2798,7 +2711,7 @@ actor EndToEndTests {
                 rsd: rsd)
             
             // 3) Kick off the very first message from Alice → Bob
-            try await self._senderSession.writeTextMessage(
+            try await self._senderSession.send(
                 recipient: .nickname("bob"),
                 text: "1")
         }
@@ -2823,7 +2736,7 @@ actor EndToEndTests {
                     // If Bob still needs to send more, reply with next number
                     if bobReceivedCount < totalMessages {
                         let next = bobReceivedCount * 2  // Bob sends even‑numbered msgs
-                        try await self._recipientSession.writeTextMessage(
+                        try await self._recipientSession.send(
                             recipient: .nickname("alice"),
                             text: "\(next)")
                     } else {
@@ -2854,7 +2767,7 @@ actor EndToEndTests {
                 // If Alice still needs to send more, reply with next odd number
                 if aliceReceivedCount < totalMessages {
                     let next = aliceReceivedCount * 2 + 1  // Alice sends odd‑numbered msgs
-                    try await self._senderSession.writeTextMessage(
+                    try await self._senderSession.send(
                         recipient: .nickname("bob"),
                         text: "\(next)")
                 }
@@ -2899,7 +2812,7 @@ actor EndToEndTests {
             
             // 4) Send them all (in-order) from Alice → Bob
             for text in messages {
-                try await self._senderSession.writeTextMessage(
+                try await self._senderSession.send(
                     recipient: .nickname("bob"),
                     text: text)
             }
@@ -2983,12 +2896,12 @@ actor EndToEndTests {
                         deviceId: received.deviceId,
                         messageId: received.messageId,
                         logicalMessageId: received.logicalMessageId)
-                } catch PQSSession.SessionErrors.databaseNotInitialized {
+                } catch PQSError.databaseNotInitialized {
                     return
                 } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
                     // Message is unrecoverable due to key rotation; continue to next message
                     continue
-                } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+                } catch let sessionError as PQSError where sessionError == .invalidSignature {
                     // Message signature is invalid (e.g., after key rotation); continue to next message
                     continue
                 } catch {
@@ -2998,7 +2911,7 @@ actor EndToEndTests {
                 // First user message (after protocol message)
                 if aliceIterations == 1 {
                     try await self._senderSession.rotateKeysOnPotentialCompromise()
-                    try await self._senderSession.writeTextMessage(
+                    try await self._senderSession.send(
                         recipient: .nickname("bob"), text: "Message Three")
                     await self.bobProcessedRotated.wait()
                 }
@@ -3023,12 +2936,12 @@ actor EndToEndTests {
                         deviceId: received.deviceId,
                         messageId: received.messageId,
                         logicalMessageId: received.logicalMessageId)
-                } catch PQSSession.SessionErrors.databaseNotInitialized {
+                } catch PQSError.databaseNotInitialized {
                     return
                 } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
                     // Message is unrecoverable due to key rotation; continue to next message
                     continue
-                } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+                } catch let sessionError as PQSError where sessionError == .invalidSignature {
                     // Message signature is invalid (e.g., after key rotation); continue to next message
                     continue
                 } catch {
@@ -3038,13 +2951,13 @@ actor EndToEndTests {
                 // First user message (after protocol message)
                 if bobIterations == 1 {
                     await self.bobProcessedRotated.signal()
-                    try await self._recipientSession.writeTextMessage(
+                    try await self._recipientSession.send(
                         recipient: .nickname("alice"), text: "Message Two")
                 }
                 // After Alice's post-rotation message
                 if bobIterations == 2 {
                     try await self._recipientSession.rotateKeysOnPotentialCompromise()
-                    try await self._recipientSession.writeTextMessage(
+                    try await self._recipientSession.send(
                         recipient: .nickname("alice"), text: "Message Four")
                     await self.aliceProcessedBobRotation.wait()
                     aliceTransport.continuation?.finish()
@@ -3053,7 +2966,7 @@ actor EndToEndTests {
             }
         }
         // Kick off the flow after loops are active
-        try await self._senderSession.writeTextMessage(
+        try await self._senderSession.send(
             recipient: .nickname("bob"), text: "Message One")
         try await Task.sleep(until: .now + .seconds(3))
         await shutdownSessions()
@@ -3164,9 +3077,9 @@ actor EndToEndTests {
     
     private func conformSessionDelegate(
         session: PQSSession,
-        pqsDelegate: PQSSessionDelegate,
-        store: PQSSessionStore,
-        receiver: EventReceiver,
+        pqsDelegate: PQSHostDelegate,
+        store: PQSPersistenceHost,
+        receiver: MessageStoreObserver,
         transport: _MockTransportDelegate
     ) async {
         await session.setPQSSessionDelegate(conformer: pqsDelegate)
@@ -3325,7 +3238,7 @@ actor EndToEndTests {
             try await self._recipientSession.updateUserConfiguration(
                 newRecipientConfig.getVerifiedDevices())
             
-            try await self._senderSession.writeTextMessage(
+            try await self._senderSession.send(
                 recipient: .nickname("bob"), text: "Message One")
             
         }
@@ -3383,9 +3296,9 @@ actor EndToEndTests {
                 }
                 
                 if bobIterations == 1 {
-                    try await self._recipientSession.writeTextMessage(
+                    try await self._recipientSession.send(
                         recipient: .nickname("alice"), text: "Message Two")
-                    try await self._recipientSession.writeTextMessage(
+                    try await self._recipientSession.send(
                         recipient: .nickname("alice"), text: "Message Three")
                 }
                 
@@ -3421,7 +3334,7 @@ actor EndToEndTests {
         
         // Send initial messages to establish session
         for i in 1...5 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
             
@@ -3436,7 +3349,7 @@ actor EndToEndTests {
         
         for i in 6...20 {
             do {
-                try await _senderSession.writeTextMessage(
+                try await _senderSession.send(
                     recipient: .nickname("bob"),
                     text: "Rapid message \(i)")
                 successfulMessages += 1
@@ -3490,11 +3403,11 @@ actor EndToEndTests {
         
         // Send initial messages from both devices to establish bidirectional communication
         for i in 1...3 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Alice message \(i)")
             
-            try await _recipientSession.writeTextMessage(
+            try await _recipientSession.send(
                 recipient: .nickname("alice"),
                 text: "Bob message \(i)")
             
@@ -3511,7 +3424,7 @@ actor EndToEndTests {
         for i in 4...15 {
             // Alice sends message
             do {
-                try await _senderSession.writeTextMessage(
+                try await _senderSession.send(
                     recipient: .nickname("bob"),
                     text: "Alice rapid \(i)")
                 aliceSuccess += 1
@@ -3525,7 +3438,7 @@ actor EndToEndTests {
             
             // Bob sends message
             do {
-                try await _recipientSession.writeTextMessage(
+                try await _recipientSession.send(
                     recipient: .nickname("alice"),
                     text: "Bob rapid \(i)")
                 bobSuccess += 1
@@ -3577,7 +3490,7 @@ actor EndToEndTests {
         
         // Send initial messages to establish session
         for i in 1...3 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
@@ -3595,7 +3508,7 @@ actor EndToEndTests {
                     let randomDelay = UInt64.random(in: 0...20)
                     try await Task.sleep(until: .now + .milliseconds(randomDelay))
                     
-                    try await _senderSession.writeTextMessage(
+                    try await _senderSession.send(
                         recipient: .nickname("bob"),
                         text: "Timing test message \(i)")
                     return MessageResult.success
@@ -3702,7 +3615,7 @@ actor EndToEndTests {
         }
 
         let beforeRestart = UUID().uuidString
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "before restart",
             sharedIdOverride: beforeRestart)
@@ -3711,17 +3624,17 @@ actor EndToEndTests {
             "Bob should decrypt and persist the pre-shutdown message")
 
         // Full runtime teardown persists ratchet state but permanently closes the
-        // current ratchet manager. `startSession` must replace runtime components.
+        // current ratchet manager. `unlock` must replace runtime components.
         await shutdownSessions()
 
-        try await createSenderSession(store: senderStore, createSession: false, transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientSession(store: recipientStore, createSession: false, transport: bobTransport, sessionDelegate: rsd)
+        try await createSenderSession(store: senderStore, createAccount: false, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, createAccount: false, transport: bobTransport, sessionDelegate: rsd)
 
         #expect(await _senderSession.lifecyclePhase == .running)
         #expect(await _recipientSession.lifecyclePhase == .running)
 
         let afterRestart = UUID().uuidString
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "after restart",
             sharedIdOverride: afterRestart)
@@ -3759,7 +3672,7 @@ actor EndToEndTests {
         
         // Send initial messages to establish session
         for i in 1...3 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
@@ -3774,7 +3687,7 @@ actor EndToEndTests {
         for burst in 0..<3 {
             for i in 1...5 {
                 do {
-                    try await _senderSession.writeTextMessage(
+                    try await _senderSession.send(
                         recipient: .nickname("bob"),
                         text: "Transport test burst \(burst) message \(i)")
                     successfulMessages += 1
@@ -3854,20 +3767,20 @@ actor EndToEndTests {
         aliceTask = Task {
             for await received in aliceStream {
                 if received.sender == self.sMockUserData.ssn { continue }
-                try? await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
+                _ = try? await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
             }
         }
         bobTask = Task {
             for await received in bobStream {
                 if received.sender == self.rMockUserData.rsn { continue }
                 await bobInboundRecorder.record(received)
-                try? await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received)
+                _ = try? await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received)
             }
         }
         try await Task.sleep(until: .now + .milliseconds(100))
 
         // Establish the lane with a normal message first.
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "establish lane")
 
@@ -3877,7 +3790,7 @@ actor EndToEndTests {
         // one row may be persisted.
         let duplicatedSharedId = UUID().uuidString
         for _ in 0..<2 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "replayed message body",
                 sharedIdOverride: duplicatedSharedId)
@@ -3903,7 +3816,7 @@ actor EndToEndTests {
         // the ingress guard drops them without minting rows or throwing.
         let baselineCount = rows.count
         for received in await bobInboundRecorder.all() {
-            try? await receiveIgnoringRecoverableErrors(_recipientSession, received: received)
+            _ = try? await receiveIgnoringRecoverableErrors(_recipientSession, received: received)
         }
         try await Task.sleep(until: .now + .seconds(1))
 
@@ -3942,7 +3855,7 @@ actor EndToEndTests {
         
         // Send initial messages to establish session
         for i in 1...3 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
@@ -3959,7 +3872,7 @@ actor EndToEndTests {
                 let processingDelay = UInt64.random(in: 0...50)
                 try await Task.sleep(until: .now + .milliseconds(processingDelay))
                 
-                try await _senderSession.writeTextMessage(
+                try await _senderSession.send(
                     recipient: .nickname("bob"),
                     text: "Sync test message \(i)")
                 successfulMessages += 1
@@ -4007,7 +3920,7 @@ actor EndToEndTests {
         
         // Send initial messages to establish session
         for i in 1...3 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
@@ -4028,7 +3941,7 @@ actor EndToEndTests {
                         // Minimal delay to ensure they start almost simultaneously
                         try await Task.sleep(until: .now + .milliseconds(UInt64(i % 6)))
                         
-                        try await senderSession.writeTextMessage(
+                        try await senderSession.send(
                             recipient: .nickname("bob"),
                             text: "Race condition test \(i)")
                         return MessageResult.success
@@ -4093,7 +4006,7 @@ actor EndToEndTests {
         
         // Send initial messages to establish session
         for i in 1...3 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
@@ -4119,7 +4032,7 @@ actor EndToEndTests {
                         "sdpMid": "0"
                     ]
                     let metadata = try BinaryEncoder().encode(iceData)
-                    try await _senderSession.writeTextMessage(
+                    try await _senderSession.send(
                         recipient: .nickname("bob"),
                         text: "ICE candidate \(i)",
                         metadata: metadata
@@ -4203,7 +4116,7 @@ actor EndToEndTests {
         
         // Send initial messages to establish session (like in the logs)
         for i in 1...4 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
             // Small delay to allow processing
@@ -4222,7 +4135,7 @@ actor EndToEndTests {
         // Send messages rapidly to create the skipped message pattern
         for i in 5...10 {
             do {
-                try await _senderSession.writeTextMessage(
+                try await _senderSession.send(
                     recipient: .nickname("bob"),
                     text: "Message \(i) - should cause skipped keys")
                 successfulMessages += 1
@@ -4309,7 +4222,7 @@ actor EndToEndTests {
                             desc.contains("AUTHENTICATIONFAILURE") ||
                             desc.localizedCaseInsensitiveContains("invalidKeyId") {
                             authenticationFailures += 1
-                        } else if case PQSSession.SessionErrors.databaseNotInitialized = error {
+                        } else if case PQSError.databaseNotInitialized = error {
                             break
                         } else {
                             #expect(Bool(false), "Unexpected receive error: \(error)")
@@ -4322,7 +4235,7 @@ actor EndToEndTests {
         
         // Warmup to establish session
         for i in 1...4 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
@@ -4330,7 +4243,7 @@ actor EndToEndTests {
         
         // Rapid burst to create a skipped-key pattern without breaking correctness
         for i in 5...10 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Message \(i)")
             try await Task.sleep(until: .now + .milliseconds(5))
@@ -4399,7 +4312,7 @@ actor EndToEndTests {
                         desc.contains("AUTHENTICATIONFAILURE") ||
                         desc.localizedCaseInsensitiveContains("invalidKeyId") {
                         authenticationFailures += 1
-                    } else if case PQSSession.SessionErrors.databaseNotInitialized = error {
+                    } else if case PQSError.databaseNotInitialized = error {
                         break
                     } else {
                         // Unexpected error; fail this loop
@@ -4413,7 +4326,7 @@ actor EndToEndTests {
     
     // Warmup to establish session
         for i in 1...4 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
         try await Task.sleep(until: .now + .milliseconds(50))
@@ -4421,7 +4334,7 @@ actor EndToEndTests {
     
     // Send a rapid burst intended to reproduce the real-world scenario
     for i in 5...total {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
             text: "Message \(i)")
             try await Task.sleep(until: .now + .milliseconds(5))
@@ -4493,7 +4406,7 @@ actor EndToEndTests {
                         desc.contains("AUTHENTICATIONFAILURE") ||
                         desc.localizedCaseInsensitiveContains("invalidKeyId") {
                         authenticationFailures += 1
-                    } else if case PQSSession.SessionErrors.databaseNotInitialized = error {
+                    } else if case PQSError.databaseNotInitialized = error {
                         break
                     } else {
                         #expect(Bool(false), "Unexpected receive error: \(error)")
@@ -4506,7 +4419,7 @@ actor EndToEndTests {
     
     // Warmup to establish session
         for i in 1...4 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
         try await Task.sleep(until: .now + .milliseconds(50))
@@ -4514,7 +4427,7 @@ actor EndToEndTests {
     
     // Rapid burst intended to stress ratchet state
         for i in 5...15 {
-                try await _senderSession.writeTextMessage(
+                try await _senderSession.send(
                     recipient: .nickname("bob"),
             text: "Message \(i)")
         // tiny delay to vary arrival order
@@ -4602,13 +4515,13 @@ actor EndToEndTests {
         
         // 3) Round‑robin messages from all devices on both sides
         for i in 1...10 {
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "Alice(master) #\(i)")
-            try await _senderChildSession1.writeTextMessage(recipient: .nickname("bob"), text: "Alice(child1) #\(i)")
-            try await _senderChildSession2.writeTextMessage(recipient: .nickname("bob"), text: "Alice(child2) #\(i)")
+            try await _senderSession.send(recipient: .nickname("bob"), text: "Alice(master) #\(i)")
+            try await _senderChildSession1.send(recipient: .nickname("bob"), text: "Alice(child1) #\(i)")
+            try await _senderChildSession2.send(recipient: .nickname("bob"), text: "Alice(child2) #\(i)")
             
-            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "Bob(master) #\(i)")
-            try await _recipientChildSession1.writeTextMessage(recipient: .nickname("alice"), text: "Bob(child1) #\(i)")
-            try await _recipientChildSession2.writeTextMessage(recipient: .nickname("alice"), text: "Bob(child2) #\(i)")
+            try await _recipientSession.send(recipient: .nickname("alice"), text: "Bob(master) #\(i)")
+            try await _recipientChildSession1.send(recipient: .nickname("alice"), text: "Bob(child1) #\(i)")
+            try await _recipientChildSession2.send(recipient: .nickname("alice"), text: "Bob(child2) #\(i)")
             
             try await Task.sleep(until: .now + .milliseconds(10))
         }
@@ -4677,16 +4590,16 @@ actor EndToEndTests {
         }
 
         for i in 1...5 {
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup alice #\(i)")
-            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "warmup bob #\(i)")
+            try await _senderSession.send(recipient: .nickname("bob"), text: "warmup alice #\(i)")
+            try await _recipientSession.send(recipient: .nickname("alice"), text: "warmup bob #\(i)")
             try await Task.sleep(until: .now + .milliseconds(15))
         }
         
         try await self._senderSession.rotateCurrentDeviceKeys()
         
         for i in 6...10 {
-            try await self._senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice post-rotate #\(i)")
-            try await self._recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob steady #\(i)")
+            try await self._senderSession.send(recipient: .nickname("bob"), text: "alice post-rotate #\(i)")
+            try await self._recipientSession.send(recipient: .nickname("alice"), text: "bob steady #\(i)")
             try await Task.sleep(until: .now + .milliseconds(15))
         }
         
@@ -4694,8 +4607,8 @@ actor EndToEndTests {
         try await _recipientSession.rotateCurrentDeviceKeys()
         
         for i in 11...15 {
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice steady #\(i)")
-            try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob post-rotate #\(i)")
+            try await _senderSession.send(recipient: .nickname("bob"), text: "alice steady #\(i)")
+            try await _recipientSession.send(recipient: .nickname("alice"), text: "bob post-rotate #\(i)")
             try await Task.sleep(until: .now + .milliseconds(15))
         }
         
@@ -4791,9 +4704,7 @@ actor EndToEndTests {
                         await counter.incrementBob()
                     } catch let ratchetError as RatchetError where [
                         .maxSkippedHeadersExceeded,
-                        .stateUninitialized,
-                        .initialMessageNotReceived,
-                        .skippedKeysDrained
+                        .stateUninitialized
                     ].contains(ratchetError) {
                         continue
                     }
@@ -4815,12 +4726,10 @@ actor EndToEndTests {
                         await counter.incrementAlice()
                     } catch let ratchetError as RatchetError where [
                         .maxSkippedHeadersExceeded,
-                        .stateUninitialized,
-                        .initialMessageNotReceived,
-                        .skippedKeysDrained
+                        .stateUninitialized
                     ].contains(ratchetError) {
                         continue
-                    } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+                    } catch let sessionError as PQSError where sessionError == .invalidSignature {
                         continue
                     }
                 }
@@ -4828,7 +4737,7 @@ actor EndToEndTests {
         }
         
         // Step 1: Initial warm-up message to establish session
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup message")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "warmup message")
         try await Task.sleep(until: .now + .milliseconds(200))
         
         // Step 2: Alice rotates her keys
@@ -4840,15 +4749,15 @@ actor EndToEndTests {
         // This message will be signed with Alice's NEW signing key
         // Bob's cached identity has the OLD key, so verification will fail initially
         // Bob should refresh identities and get the NEW key to verify successfully
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "message after rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "message after rotation")
         try await Task.sleep(until: .now + .milliseconds(200))
         
         // Step 4: Alice sends another message to ensure consistency
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "second post-rotation message")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "second post-rotation message")
         try await Task.sleep(until: .now + .milliseconds(200))
         
         // Step 5: Bob sends a reply to confirm bidirectional communication still works
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob's reply")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "bob's reply")
         try await Task.sleep(until: .now + .milliseconds(200))
         
         // Allow time for all messages to be processed
@@ -4966,8 +4875,8 @@ actor EndToEndTests {
         }
         
         // Step 1: Initial warm-up messages
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup 1")
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "warmup 2")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "warmup 1")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "warmup 2")
         try await Task.sleep(until: .now + .milliseconds(300))
         
         // Step 2: Alice rotates keys (this sends sessionReestablishment notification)
@@ -4978,11 +4887,11 @@ actor EndToEndTests {
         // This is the critical test - Bob should either:
         // a) Have refreshed identities proactively, OR
         // b) The notification will arrive and trigger refresh before Alice decrypts
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob sends after alice rotation")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "bob sends after alice rotation")
         try await Task.sleep(until: .now + .milliseconds(300))
         
         // Step 4: Alice sends a message to Bob (Bob should have received notification by now)
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice post-rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "alice post-rotation")
         try await Task.sleep(until: .now + .milliseconds(300))
         
         // Allow time for all messages to be processed
@@ -5059,7 +4968,7 @@ actor EndToEndTests {
                         bobReceivedCount += 1
                     }
                     // Prefer transport metadata over decrypted payload hooks: this is set at send-time
-                    // in TaskProcessor and passed through the mock transport deterministically.
+                    // in MessagePipeline and passed through the mock transport deterministically.
                     if case .sessionReestablishment = received.transportEvent {
                         bobReceivedReestablishment = true
                     }
@@ -5077,7 +4986,7 @@ actor EndToEndTests {
         }
         
         // Step 1: Initial warm-up
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
         
         // Step 2: Alice rotates keys (sends sessionReestablishment to Bob)
@@ -5086,11 +4995,11 @@ actor EndToEndTests {
         
         // Step 3: Bob sends a message AFTER receiving notification
         // Bob should have refreshed identities, so this should work
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob after notification")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "bob after notification")
         try await Task.sleep(until: .now + .milliseconds(300))
         
         // Step 4: Alice sends a message (should work since Bob has new keys)
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice post-rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "alice post-rotation")
         try await Task.sleep(until: .now + .milliseconds(300))
         
         // Allow time for processing
@@ -5173,7 +5082,7 @@ actor EndToEndTests {
         }
         
         // Step 1: Initial warm-up
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
         
         // Step 2: Alice rotates keys
@@ -5183,17 +5092,17 @@ actor EndToEndTests {
         // Step 3: Alice sends multiple messages after rotation
         // The first send should trigger needsRemoteDeletion = true
         // Subsequent sends should have needsRemoteDeletion = false (rotatingKeys was reset)
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "message 1 after rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "message 1 after rotation")
         try await Task.sleep(until: .now + .milliseconds(200))
         
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "message 2 after rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "message 2 after rotation")
         try await Task.sleep(until: .now + .milliseconds(200))
         
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "message 3 after rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "message 3 after rotation")
         try await Task.sleep(until: .now + .milliseconds(200))
         
         // Step 4: Bob sends a reply
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob's reply")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "bob's reply")
         try await Task.sleep(until: .now + .milliseconds(300))
         
         // Allow time for processing
@@ -5301,7 +5210,7 @@ actor EndToEndTests {
         }
         
         // Step 1: Initial warm-up to establish session
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
         
         // Step 2: Alice rotates keys (sends sessionReestablishment to Bob)
@@ -5311,11 +5220,11 @@ actor EndToEndTests {
         // Step 3: Alice sends a regular text message (not sessionReestablishment)
         // This message will use Alice's new keys but Bob's cached identity has stale state
         // Bob should hit maxSkippedHeadersExceeded, then recover by clearing state
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "message after rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "message after rotation")
         try await Task.sleep(until: .now + .milliseconds(500))
         
         // Step 4: Alice sends another message to verify recovery worked
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "second message after rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "second message after rotation")
         try await Task.sleep(until: .now + .milliseconds(300))
         
         // Allow time for processing
@@ -5409,7 +5318,7 @@ actor EndToEndTests {
         }
 
         // Warm-up
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
 
         // Alice rotates (sender rotation); Bob will receive reestablishment
@@ -5419,9 +5328,9 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .milliseconds(500))
 
         // Subsequent sends from Bob to Alice must re-synchronize (Bob has fresh identity after reestablishment)
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob resync 1")
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob resync 2")
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob resync 3")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "bob resync 1")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "bob resync 2")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "bob resync 3")
         try await Task.sleep(until: .now + .seconds(2))
 
         aliceTransport.continuation?.finish()
@@ -5502,7 +5411,7 @@ actor EndToEndTests {
         }
 
         // Warm-up
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
 
         // Bob rotates (recipient rotation); Alice will receive reestablishment
@@ -5512,9 +5421,9 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .milliseconds(500))
 
         // Subsequent sends from Alice to Bob must re-synchronize (Alice has fresh identity after reestablishment)
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice resync 1")
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice resync 2")
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice resync 3")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "alice resync 1")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "alice resync 2")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "alice resync 3")
         try await Task.sleep(until: .now + .seconds(2))
 
         aliceTransport.continuation?.finish()
@@ -5602,7 +5511,7 @@ actor EndToEndTests {
 
         // Pre-rotation burst
         for i in 1...3 {
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "pre-rotation \(i)")
+            try await _senderSession.send(recipient: .nickname("bob"), text: "pre-rotation \(i)")
             try await Task.sleep(until: .now + .milliseconds(80))
         }
         try await Task.sleep(until: .now + .milliseconds(200))
@@ -5613,7 +5522,7 @@ actor EndToEndTests {
 
         // Post-rotation burst
         for i in 1...3 {
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "post-rotation \(i)")
+            try await _senderSession.send(recipient: .nickname("bob"), text: "post-rotation \(i)")
             try await Task.sleep(until: .now + .milliseconds(80))
         }
 
@@ -5685,7 +5594,7 @@ actor EndToEndTests {
             }
         }
 
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
 
         try await _senderSession.rotateKeysOnPotentialCompromise()
@@ -5693,7 +5602,7 @@ actor EndToEndTests {
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .milliseconds(300))
 
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "after second rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "after second rotation")
         try await Task.sleep(until: .now + .seconds(2))
 
         aliceTransport.continuation?.finish()
@@ -5761,14 +5670,14 @@ actor EndToEndTests {
         }
 
         for i in 1...5 {
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "rapid \(i)")
+            try await _senderSession.send(recipient: .nickname("bob"), text: "rapid \(i)")
             try await Task.sleep(until: .now + .milliseconds(20))
         }
         try await Task.sleep(until: .now + .milliseconds(250))
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .milliseconds(200))
         for i in 6...10 {
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "rapid \(i)")
+            try await _senderSession.send(recipient: .nickname("bob"), text: "rapid \(i)")
             try await Task.sleep(until: .now + .milliseconds(20))
         }
 
@@ -5836,14 +5745,14 @@ actor EndToEndTests {
             }
         }
 
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(400))
 
         try await _recipientSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .seconds(1))
 
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "after bob rotation 1")
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "after bob rotation 2")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "after bob rotation 1")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "after bob rotation 2")
         try await Task.sleep(until: .now + .seconds(2))
 
         aliceTransport.continuation?.finish()
@@ -5925,13 +5834,13 @@ actor EndToEndTests {
             }
         }
 
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "pre-1")
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "pre-2")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "pre-1")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "pre-2")
         try await Task.sleep(until: .now + .milliseconds(200))
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .milliseconds(200))
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "post-1")
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "post-2")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "post-1")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "post-2")
         try await Task.sleep(until: .now + .seconds(2))
 
         aliceTransport.continuation?.finish()
@@ -6009,14 +5918,14 @@ actor EndToEndTests {
             }
         }
 
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice 1")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "alice 1")
         try await Task.sleep(until: .now + .milliseconds(150))
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob 1")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "bob 1")
         try await Task.sleep(until: .now + .milliseconds(150))
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .seconds(1))
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice 2")
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob 2")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "alice 2")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "bob 2")
         try await Task.sleep(until: .now + .seconds(2))
 
         aliceTransport.continuation?.finish()
@@ -6086,7 +5995,7 @@ actor EndToEndTests {
                         }
                     } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
                         await counts.incError()
-                    } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+                    } catch let sessionError as PQSError where sessionError == .invalidSignature {
                         await counts.incError()
                     }
                 }
@@ -6101,7 +6010,7 @@ actor EndToEndTests {
         }
 
         // Establish session
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "pre-rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "pre-rotation")
         try await Task.sleep(until: .now + .milliseconds(300))
 
         // Alice rotates; Bob will get out of sync when he receives post-rotation message before/without reestablishment
@@ -6109,12 +6018,12 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .milliseconds(200))
 
         // Message that may cause Bob to hit maxSkipped or need recovery
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "post-rotation 1")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "post-rotation 1")
         try await Task.sleep(until: .now + .milliseconds(500))
 
         // Subsequent sends must re-synchronize: Bob has processed reestablishment (or recovery), so these should be delivered
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "resync 1")
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "resync 2")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "resync 1")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "resync 2")
         try await Task.sleep(until: .now + .seconds(2))
 
         aliceTransport.continuation?.finish()
@@ -6192,8 +6101,8 @@ actor EndToEndTests {
         }
 
         // Warm-up
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup alice")
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "warmup bob")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "warmup alice")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "warmup bob")
         try await Task.sleep(until: .now + .milliseconds(400))
 
         // Both rotate (out of sync with each other until reestablishments are processed)
@@ -6205,10 +6114,10 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .milliseconds(500))
 
         // Subsequent sends in both directions must re-synchronize
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice after both rotation")
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob after both rotation")
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "alice resync 2")
-        try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob resync 2")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "alice after both rotation")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "bob after both rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "alice resync 2")
+        try await _recipientSession.send(recipient: .nickname("alice"), text: "bob resync 2")
         try await Task.sleep(until: .now + .seconds(2))
 
         aliceTransport.continuation?.finish()
@@ -6279,9 +6188,9 @@ actor EndToEndTests {
                             aliceTransport.continuation?.finish()
                             break
                         }
-                    } catch PQSSession.SessionErrors.databaseNotInitialized {
+                    } catch PQSError.databaseNotInitialized {
                         break
-                    } catch PQSSession.SessionErrors.sessionNotInitialized {
+                    } catch PQSError.sessionNotInitialized {
                         // Deferred shutdown can outrun this loop under full-suite
                         // load; a torn-down session is teardown, not a failure.
                         break
@@ -6305,9 +6214,9 @@ actor EndToEndTests {
                             bobTransport.continuation?.finish()
                             break
                         }
-                    } catch PQSSession.SessionErrors.databaseNotInitialized {
+                    } catch PQSError.databaseNotInitialized {
                         break
-                    } catch PQSSession.SessionErrors.sessionNotInitialized {
+                    } catch PQSError.sessionNotInitialized {
                         // Deferred shutdown can outrun this loop under full-suite
                         // load; a torn-down session is teardown, not a failure.
                         break
@@ -6319,14 +6228,14 @@ actor EndToEndTests {
 		
 			Task {
             for i in 1...total {
-                    try await self._senderMaxSkipSession.writeTextMessage(
+                    try await self._senderMaxSkipSession.send(
                         recipient: .nickname("bob"),
                         text: "A->B #\(i)")
                 }
 			}
 			Task {
                 for i in 1...total {
-				try await self._recipientMaxSkipSession.writeTextMessage(
+				try await self._recipientMaxSkipSession.send(
                         recipient: .nickname("alice"),
                         text: "B->A #\(i)")
                 }
@@ -6370,7 +6279,7 @@ actor EndToEndTests {
                     }
                     
                     if currentMessage == 13 {
-                        try await self._senderMaxSkipSession.writeTextMessage(
+                        try await self._senderMaxSkipSession.send(
                             recipient: .nickname("bob"),
                             text: "A->B #\(currentMessage)")
                     }
@@ -6381,7 +6290,7 @@ actor EndToEndTests {
         try await withThrowingTaskGroup(of: Void.self) { group in
             for i in 1...total {
                 group.addTask {
-                    try await self._senderMaxSkipSession.writeTextMessage(
+                    try await self._senderMaxSkipSession.send(
                         recipient: .nickname("bob"),
                         text: "A->B #\(i)")
                 }
@@ -6438,7 +6347,7 @@ actor EndToEndTests {
         }
 
         // Warmup handshake (do not drop)
-        try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup 1")
+        try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup 1")
         try await Task.sleep(until: .now + .milliseconds(200))
 
         // Drop first 11 messages to Bob; then deliver subsequent messages.
@@ -6461,7 +6370,7 @@ actor EndToEndTests {
         }
 
         for i in 1...15 {
-            try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "msg \(i)")
+            try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "msg \(i)")
         }
 
         // Give Bob time to process the delivered late messages and trigger repair.
@@ -6504,12 +6413,12 @@ actor EndToEndTests {
         actor Counters {
             var peerRefreshes = 0
             var resendRequests = 0
-            func saw(_ event: TransportEvent?) {
-                if case .sessionReestablishment(let envelope) = event,
+            func saw(_ received: ReceivedMessage) {
+                if case .sessionReestablishment(let envelope) = received.transportEvent,
                    envelope.kind == .peerRefresh {
                     peerRefreshes += 1
                 }
-                if case .requestMessageResend = event {
+                if received.oobResendRequest != nil {
                     resendRequests += 1
                 }
             }
@@ -6526,7 +6435,7 @@ actor EndToEndTests {
 
         aliceRepairTask = Task {
             for await received in aliceRepairStream {
-                await counters.saw(received.transportEvent)
+                await counters.saw(received)
                 _ = try? await self.receiveIgnoringRecoverableErrors(
                     self._senderMaxSkipSession,
                     received: received)
@@ -6568,7 +6477,7 @@ actor EndToEndTests {
             return outboundReady && inboundReady
         })
 
-        try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(200))
         let baselineMessageCount = await bobStore.getAllMessages().count
 
@@ -6586,12 +6495,12 @@ actor EndToEndTests {
         let dropper = Dropper(11)
         aliceTransport.shouldDeliver = { received in
             guard received.recipient == "bob" else { return true }
-            guard received.transportEvent == nil else { return true }
+            guard received.isContentMessage else { return true }
             return !(await dropper.shouldDrop())
         }
 
         for i in 1...15 {
-            try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "msg \(i)")
+            try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "msg \(i)")
         }
 
         // Orphan-resend contract: the receiver NACKs the failed shared id or briefly
@@ -6705,7 +6614,7 @@ actor EndToEndTests {
             return outboundReady && inboundReady
         })
 
-        try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(200))
 
         _ = try await _recipientMaxSkipSession.emitSessionReestablishment(
@@ -6737,12 +6646,12 @@ actor EndToEndTests {
         let dropper = Dropper(11)
         aliceTransport.shouldDeliver = { received in
             guard received.recipient == "bob" else { return true }
-            guard received.transportEvent == nil else { return true }
+            guard received.isContentMessage else { return true }
             return !(await dropper.shouldDrop())
         }
 
         for i in 1...15 {
-            try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "msg \(i)")
+            try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "msg \(i)")
         }
 
         #expect(await waitUntil {
@@ -6789,7 +6698,7 @@ actor EndToEndTests {
         try await createFriendship(aliceSession: _senderMaxSkipSession, sd: sd, bobSession: _recipientMaxSkipSession, rsd: rsd)
         
         // Warmup handshake (do not drop)
-        try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(200))
         
         actor Dropper {
@@ -6810,7 +6719,7 @@ actor EndToEndTests {
         }
         
         for i in 1...15 {
-            try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "msg \(i)")
+            try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "msg \(i)")
         }
         
         actor Flags {
@@ -6873,7 +6782,7 @@ actor EndToEndTests {
         try await createFriendship(aliceSession: _senderMaxSkipSession, sd: sd, bobSession: _recipientMaxSkipSession, rsd: rsd)
 
         // Warmup handshake (do not drop)
-        try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(200))
         
         actor MaxSkippedCounter {
@@ -6919,7 +6828,7 @@ actor EndToEndTests {
                 return !(await dropper.shouldDrop())
             }
             for i in 1...15 {
-                try await _senderMaxSkipSession.writeTextMessage(
+                try await _senderMaxSkipSession.send(
                     recipient: .nickname("bob"),
                     text: "\(label) msg \(i)"
                 )
@@ -7022,9 +6931,7 @@ actor EndToEndTests {
                     await flags.incOk()
                 } catch let ratchetError as RatchetError where [
                     .maxSkippedHeadersExceeded,
-                    .stateUninitialized,
-                    .initialMessageNotReceived,
-                    .skippedKeysDrained
+                    .stateUninitialized
                 ].contains(ratchetError) {
                     continue
                 } catch {
@@ -7035,7 +6942,7 @@ actor EndToEndTests {
         }
 
         // Warmup handshake (must be delivered)
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(250))
 
         // Hold back ONE pre-rotation message so it arrives *after* Bob refreshes identity.
@@ -7044,11 +6951,11 @@ actor EndToEndTests {
             return true
         }
 
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "pre-rotation heldback")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "pre-rotation heldback")
 
         // Rotate (sends sessionReestablishment control frame signed with new key)
         try await _senderSession.rotateKeysOnPotentialCompromise()
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "post-rotation")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "post-rotation")
 
         // Allow time for Bob to process reestablishment and post-rotation message(s).
         try await Task.sleep(until: .now + .seconds(2))
@@ -7102,8 +7009,8 @@ actor EndToEndTests {
         }
         actor ResendProbe {
             var resendRequests = 0
-            func saw(_ event: TransportEvent?) {
-                if case .requestMessageResend = event {
+            func saw(_ received: ReceivedMessage) {
+                if received.oobResendRequest != nil {
                     resendRequests += 1
                 }
             }
@@ -7145,12 +7052,12 @@ actor EndToEndTests {
         // Don't deliver into any async stream; we only want the captured message.
         aliceTransport.shouldDeliver = { _ in false }
         bobTransport.shouldDeliver = { received in
-            await resendProbe.saw(received.transportEvent)
+            await resendProbe.saw(received)
             return false
         }
         
         // Send one message from Alice; Bob should receive a forged version.
-        try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "forged")
+        try await _senderSession.send(recipient: .nickname("bob"), text: "forged")
         guard let received = await capture.get() else {
             Issue.record("Expected to capture a forged outbound message from Alice")
             return
@@ -7178,7 +7085,8 @@ actor EndToEndTests {
             message: received.message,
             senderSecretName: received.sender,
             senderDeviceId: received.deviceId,
-            sharedMessageId: received.messageId)
+            sharedMessageId: received.messageId,
+            logicalSharedId: received.messageId)
         #expect(
             await _recipientSession.shouldSuppressInboundFailure(
                 failedInbound,
@@ -7264,7 +7172,7 @@ actor EndToEndTests {
             // the consumer code would look like:
             // do {
             //     try await receiveMessage(...)
-            // } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+            // } catch let sessionError as PQSError where sessionError == .invalidSignature {
             //     // TODO: Notify server to delete message and request resend
             // } catch let ratchetError as DoubleRatchetKit.RatchetError where ratchetError == .maxSkippedHeadersExceeded {
             //     // TODO: Notify server to delete all offline messages and request resend
@@ -7280,7 +7188,7 @@ actor EndToEndTests {
         }
 
         // Warmup: establish session (successful encrypt/decrypt before the storm)
-        try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
 
         // Phase 1: Alice sends many messages while Bob is offline (server queues them)
@@ -7288,7 +7196,7 @@ actor EndToEndTests {
         // Send enough messages to potentially exceed maxSkippedMessageKeys if Bob skips some
         let offlineMessageCount = 25
         for i in 1...offlineMessageCount {
-            try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "offline msg \(i)")
+            try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "offline msg \(i)")
         }
 
         // Phase 2: Alice rotates keys (this changes her signing key)
@@ -7305,7 +7213,7 @@ actor EndToEndTests {
 
         // Phase 3: Alice sends a few more messages with new keys
         for i in (offlineMessageCount + 1)...(offlineMessageCount + 3) {
-            try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "post-rotation msg \(i)")
+            try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "post-rotation msg \(i)")
         }
 
         // Finish the stream (all messages have been sent and queued by "server")
@@ -7443,7 +7351,7 @@ actor EndToEndTests {
         }
 
         // Warmup: establish session (successful encrypt/decrypt before the storm)
-        try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "warmup")
+        try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
 
         // Phase 1: Alice sends many messages while Bob is offline (server queues them)
@@ -7453,7 +7361,7 @@ actor EndToEndTests {
         // they exceed the maxSkippedMessageKeys threshold
         let offlineMessageCount = 15  // More than maxSkippedMessageKeys (10)
         for i in 1...offlineMessageCount {
-            try await _senderMaxSkipSession.writeTextMessage(recipient: .nickname("bob"), text: "offline msg \(i)")
+            try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "offline msg \(i)")
             // Small delay to ensure messages are sent in sequence
             try await Task.sleep(until: .now + .milliseconds(10))
         }
@@ -7546,14 +7454,14 @@ actor EndToEndTests {
                     if messageCount == 1 {
                         try await _senderMaxSkipSession.rotateKeysOnPotentialCompromise()
                         try await Task.sleep(until: .now + .seconds(1))
-                        try await self._senderMaxSkipSession.writeTextMessage(
+                        try await self._senderMaxSkipSession.send(
                             recipient: .nickname("bob"),
                             text: "A2->B2")
                     }
                     
                     if messageCount == 2 {
                         
-                        try! await self._recipientMaxSkipSession.writeTextMessage(
+                        try! await self._recipientMaxSkipSession.send(
                             recipient: .nickname("alice"),
                             text: "B->A")
                     }
@@ -7574,7 +7482,7 @@ actor EndToEndTests {
             }
         }
         
-        try await self._senderMaxSkipSession.writeTextMessage(
+        try await self._senderMaxSkipSession.send(
             recipient: .nickname("bob"),
             text: "A->B")
         
@@ -7659,14 +7567,14 @@ actor EndToEndTests {
                     
                     if bobMessageCount == 2 {
                         lastBobToAlice = "B->A"
-                        try await self._recipientMaxSkipSession.writeTextMessage(
+                        try await self._recipientMaxSkipSession.send(
                             recipient: .nickname("alice"),
                             text: "B->A")
                     }
                     //
                     if bobMessageCount == 3 {
                         lastBobToAlice = "B2->A2"
-                        try await self._recipientMaxSkipSession.writeTextMessage(
+                        try await self._recipientMaxSkipSession.send(
                             recipient: .nickname("alice"),
                             text: "B2->A2")
                     }
@@ -7675,19 +7583,19 @@ actor EndToEndTests {
                         try await _recipientMaxSkipSession.rotateKeysOnPotentialCompromise()
                         try await Task.sleep(until: .now + .seconds(1))
                         lastBobToAlice = "B3->A3"
-                        try await self._recipientMaxSkipSession.writeTextMessage(
+                        try await self._recipientMaxSkipSession.send(
                             recipient: .nickname("alice"),
                             text: "B3->A3")
                     }
                 } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
                     if received.sender == "alice", !lastAliceToBob.isEmpty {
-                        try? await self._senderMaxSkipSession.writeTextMessage(
+                        try? await self._senderMaxSkipSession.send(
                             recipient: .nickname("bob"),
                             text: lastAliceToBob)
                     }
-                } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+                } catch let sessionError as PQSError where sessionError == .invalidSignature {
                     if received.sender == "alice", !lastAliceToBob.isEmpty {
-                        try? await self._senderMaxSkipSession.writeTextMessage(
+                        try? await self._senderMaxSkipSession.send(
                             recipient: .nickname("bob"),
                             text: lastAliceToBob)
                     }
@@ -7712,26 +7620,26 @@ actor EndToEndTests {
                         try await _senderMaxSkipSession.rotateKeysOnPotentialCompromise()
                         try await Task.sleep(until: .now + .seconds(1))
                         lastAliceToBob = "A2->B2"
-                        try await self._senderMaxSkipSession.writeTextMessage(
+                        try await self._senderMaxSkipSession.send(
                             recipient: .nickname("bob"),
                             text: "A2->B2")
                     }
                     
                     if aliceMessageCount == 3 {
                         lastAliceToBob = "A3->B3"
-                        try await self._senderMaxSkipSession.writeTextMessage(
+                        try await self._senderMaxSkipSession.send(
                             recipient: .nickname("bob"),
                             text: "A3->B3")
                     }
                 } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
                     if received.sender == "bob", !lastBobToAlice.isEmpty {
-                        try? await self._recipientMaxSkipSession.writeTextMessage(
+                        try? await self._recipientMaxSkipSession.send(
                             recipient: .nickname("alice"),
                             text: lastBobToAlice)
                     }
-                } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+                } catch let sessionError as PQSError where sessionError == .invalidSignature {
                     if received.sender == "bob", !lastBobToAlice.isEmpty {
-                        try? await self._recipientMaxSkipSession.writeTextMessage(
+                        try? await self._recipientMaxSkipSession.send(
                             recipient: .nickname("alice"),
                             text: lastBobToAlice)
                     }
@@ -7741,7 +7649,7 @@ actor EndToEndTests {
             }
         }
         
-        try await self._senderMaxSkipSession.writeTextMessage(
+        try await self._senderMaxSkipSession.send(
             recipient: .nickname("bob"),
             text: lastAliceToBob)
         
@@ -7753,7 +7661,7 @@ actor EndToEndTests {
         }
         
         // Expect at least 2 messages per side; one may be dropped due to maxSkippedHeadersExceeded
-        // or initialMessageNotReceived after key rotations.
+        // after key rotations.
         #expect(bobMessageCount >= 2, "Bob should receive at least 2 messages (got \(bobMessageCount))")
         #expect(aliceMessageCount >= 2, "Alice should receive at least 2 messages (got \(aliceMessageCount))")
         aliceTransport.continuation?.finish()
@@ -7849,20 +7757,20 @@ actor EndToEndTests {
             let initialAliceCallCount = await aliceTransport.updateOneTimeKeysCallCount
             let initialBobCallCount = await bobTransport.updateOneTimeKeysCallCount
             
-            try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "initial message")
+            try await _senderSession.send(recipient: .nickname("bob"), text: "initial message")
             try await Task.sleep(until: .now + .milliseconds(200))
             
             // Step 2: Send multiple messages after session is established
             // These should NOT trigger updateOneTimeKeys calls
             let messagesToSend = 10
             for i in 1...messagesToSend {
-                try await _senderSession.writeTextMessage(recipient: .nickname("bob"), text: "message \(i)")
+                try await _senderSession.send(recipient: .nickname("bob"), text: "message \(i)")
                 try await Task.sleep(until: .now + .milliseconds(50))
             }
             
             // Step 3: Send messages from Bob to Alice as well
             for i in 1...5 {
-                try await _recipientSession.writeTextMessage(recipient: .nickname("alice"), text: "bob message \(i)")
+                try await _recipientSession.send(recipient: .nickname("alice"), text: "bob message \(i)")
                 try await Task.sleep(until: .now + .milliseconds(50))
             }
             
@@ -7956,7 +7864,7 @@ actor EndToEndTests {
                 let ratchetMessage = try BinaryDecoder().decode(RatchetMessage.self, from: signed.data)
                 guard let encryptedData = Mirror(reflecting: ratchetMessage)
                     .children
-                    .first(where: { $0.label == "encryptedData" })?
+                    .first(where: { $0.label == "ciphertext" })?
                     .value as? Data
                 else {
                     throw TestError.invalidRatchetHeader
@@ -7974,7 +7882,7 @@ actor EndToEndTests {
                 )
                 let forgedRatchetMessage = RatchetMessage(
                     header: forgedHeader,
-                    encryptedData: encryptedData
+                    ciphertext: encryptedData
                 )
                 let forged = try SignedRatchetMessage(
                     message: forgedRatchetMessage,
@@ -7995,7 +7903,7 @@ actor EndToEndTests {
             let receiverMessageCountBefore = await senderStore.createdMessages.count
             let receiverIdentityCountBefore = await senderStore.identities.count
 
-            try await _recipientSession.writeTextMessage(
+            try await _recipientSession.send(
                 recipient: .nickname(sMockUserData.ssn),
                 text: "broken"
             )
@@ -8101,11 +8009,12 @@ actor EndToEndTests {
                     switch event {
                     case .sessionReestablishment:
                         await probe.markRecoveryStarted()
-                    case .requestMessageResend(_):
-                        await probe.markRecoveryStarted()
                     default:
                         break
                     }
+                }
+                if received.oobResendRequest != nil {
+                    await probe.markRecoveryStarted()
                 }
                 _ = try? await self.receiveIgnoringRecoverableErrors(
                     self._senderSession,
@@ -8116,7 +8025,7 @@ actor EndToEndTests {
 
         bobTask = Task {
             for await received in bobStream {
-                guard received.transportEvent == nil else {
+                guard received.isContentMessage else {
                     _ = try? await self.receiveIgnoringRecoverableErrors(
                         self._recipientSession,
                         received: received
@@ -8178,13 +8087,13 @@ actor EndToEndTests {
         // verification passes but ratchet body decryption produces a CryptoKitError.
         aliceTransport.transformOutgoing = { received in
             guard await probe.consumeArmed() else { return received }
-            guard received.transportEvent == nil else { return received }
+            guard received.isContentMessage else { return received }
             guard let signed = received.message.signed else { return received }
 
             let ratchetMessage = try BinaryDecoder().decode(RatchetMessage.self, from: signed.data)
             guard let encryptedData = Mirror(reflecting: ratchetMessage)
                 .children
-                .first(where: { $0.label == "encryptedData" })?
+                .first(where: { $0.label == "ciphertext" })?
                 .value as? Data,
                 !encryptedData.isEmpty
             else { return received }
@@ -8194,7 +8103,7 @@ actor EndToEndTests {
 
             let corruptedMessage = RatchetMessage(
                 header: ratchetMessage.header,
-                encryptedData: corrupted
+                ciphertext: corrupted
             )
             let reSigned = try SignedRatchetMessage(
                 message: corruptedMessage,
@@ -8213,7 +8122,7 @@ actor EndToEndTests {
         }
 
         // Baseline: establish ratchet state with a clean message
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "baseline"
         )
@@ -8221,7 +8130,7 @@ actor EndToEndTests {
 
         // Arm corruption and send a message whose body will be unreadable
         await probe.arm()
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "this will be corrupted"
         )
@@ -8249,7 +8158,7 @@ actor EndToEndTests {
 
         try await Task.sleep(for: .milliseconds(500))
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "clean after recovery"
         )
@@ -8314,8 +8223,7 @@ actor EndToEndTests {
 
         aliceTask = Task {
             for await received in aliceStream {
-                if let event = received.transportEvent,
-                   case .requestMessageResend(let request) = event {
+                if let request = received.oobResendRequest {
                     await probe.mark(request.failedSharedMessageId)
                 }
                 _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -8391,7 +8299,7 @@ actor EndToEndTests {
             failedMessageId: successfulInboundDrainedSharedId,
             failureClass: "test.successfulInbound")
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "successful inbound after reestablishment")
 
@@ -8474,8 +8382,7 @@ actor EndToEndTests {
 
         aliceTask = Task {
             for await received in aliceStream {
-                if let transportEvent = received.transportEvent,
-                   case .requestMessageResend = transportEvent {
+                if received.oobResendRequest != nil {
                     await resendProbe.markResendRequest()
                 }
                 _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -8492,7 +8399,7 @@ actor EndToEndTests {
             }
         }
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "baseline before archived response")
 
@@ -8505,8 +8412,12 @@ actor EndToEndTests {
             return
         }
         bobTask?.cancel()
+        _ = await bobTask?.value
         bobTask = nil
-        try await Task.sleep(for: .milliseconds(200))
+        // Friendship + baseline inbound can still be in MessagePipeline after the
+        // first persist. Drain those jobs before seeding the deferred resend so a
+        // leftover successful-inbound drain cannot submit it.
+        await _recipientSession.waitForOutboundJobDrain()
         _ = await _recipientSession.takePendingResendsAfterReestablishment(
             sender: "alice",
             deviceId: aliceDeviceId)
@@ -8555,8 +8466,8 @@ actor EndToEndTests {
             guard var props = await identity.props(symmetricKey: bobSymKey) else { continue }
             guard props.secretName == "alice" else { continue }
             guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
-            props.state = nil
-            try await identity.updateIdentityProps(symmetricKey: bobSymKey, props: props)
+            props.clearRatchetState()
+            try await identity.update(props, symmetricKey: bobSymKey)
             try await bobCache.updateSessionIdentity(identity)
         }
         await _recipientSession.removeIdentity(with: "alice")
@@ -8737,7 +8648,7 @@ actor EndToEndTests {
             }
         }
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "baseline before control replay")
 
@@ -8814,7 +8725,7 @@ actor EndToEndTests {
             !(await linkedProbe.shouldDropFirstMatchingControl(received))
         }
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             transportInfo: reprovisioningMetadata)
 
@@ -8955,7 +8866,7 @@ actor EndToEndTests {
         )
 
         // Baseline: establish ratchet state with a delivered message.
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "baseline"
         )
@@ -8969,11 +8880,11 @@ actor EndToEndTests {
         // before the baseline cannot consume the probe's message index.
         aliceTransport.shouldDeliver = { received in
             guard received.sender == "alice", received.recipient == "bob" else { return true }
-            guard received.transportEvent == nil else { return true }
+            guard received.isContentMessage else { return true }
             await probe.capture(received)
             return false
         }
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "old in-flight message"
         )
@@ -9010,63 +8921,37 @@ actor EndToEndTests {
         // archive path the test is intended to exercise.
         let aliceCache = await _senderSession.cache!
         let aliceSymKey = try await _senderSession.getDatabaseSymmetricKey()
-        var incompatibleStateCandidate: RatchetState?
+        var incompatibleDonor: SessionIdentity.UnwrappedProps?
         for identity in try await aliceCache.fetchSessionIdentities() {
             guard let props = await identity.props(symmetricKey: aliceSymKey) else { continue }
             guard props.secretName == rMockUserData.rsn else { continue }
             guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
-            if let state = props.state {
-                incompatibleStateCandidate = state
+            if props.hasRatchetState {
+                incompatibleDonor = props
                 break
             }
         }
-        let incompatibleState = try #require(incompatibleStateCandidate)
+        let incompatibleProps = try #require(incompatibleDonor)
 
         let bobCache = await _recipientSession.cache!
         let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
-        func canonicalStateData(_ state: RatchetState?) throws -> Data {
-            func normalized(_ value: Any) throws -> Any {
-                if let dictionary = value as? [String: Any] {
-                    return try dictionary.mapValues { try normalized($0) }
-                }
-                if let array = value as? [Any] {
-                    let values = try array.map { try normalized($0) }
-                    let keyed = try values.map { value in
-                        let data = try JSONSerialization.data(
-                            withJSONObject: value,
-                            options: [.sortedKeys, .fragmentsAllowed])
-                        return (data.base64EncodedString(), value)
-                    }
-                    return keyed.sorted { $0.0 < $1.0 }.map(\.1)
-                }
-                return value
-            }
-
-            let encoded = try JSONEncoder().encode(state)
-            let object = try JSONSerialization.jsonObject(
-                with: encoded,
-                options: [.fragmentsAllowed])
-            return try JSONSerialization.data(
-                withJSONObject: normalized(object),
-                options: [.sortedKeys, .fragmentsAllowed])
-        }
         var clearedActiveIdentityIds = Set<UUID>()
         var failedActiveBaselineState = [UUID: Data]()
         for identity in try await bobCache.fetchSessionIdentities() {
             guard var props = await identity.props(symmetricKey: bobSymKey) else { continue }
             guard props.secretName == sMockUserData.ssn else { continue }
             guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
-            guard props.state != nil else { continue }
-            props.state = incompatibleState
-            try await identity.updateIdentityProps(symmetricKey: bobSymKey, props: props)
+            guard props.hasRatchetState else { continue }
+            props.copyRatchetState(from: incompatibleProps)
+            try await identity.update(props, symmetricKey: bobSymKey)
             try await bobCache.updateSessionIdentity(identity)
             clearedActiveIdentityIds.insert(identity.id)
-            failedActiveBaselineState[identity.id] = try canonicalStateData(props.state)
+            failedActiveBaselineState[identity.id] = props.ratchetSnapshotData
         }
-        let recipientProcessor = await _recipientSession.taskProcessor
+        let recipientProcessor = await _recipientSession.messagePipeline
         let recipientRatchetManager = await recipientProcessor.ratchetManager
         for identityId in clearedActiveIdentityIds {
-            await recipientRatchetManager.evictSessionConfiguration(identityId)
+            await recipientRatchetManager.discardCachedLane(identityId)
         }
         // Clear only memoized selection so the next access re-reads from cache.
         // Account-wide removal would destroy the archive this test is proving.
@@ -9099,7 +8984,7 @@ actor EndToEndTests {
         for identity in try await bobCache.fetchSessionIdentities() {
             guard clearedActiveIdentityIds.contains(identity.id) else { continue }
             guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
-            if try canonicalStateData(props.state) != failedActiveBaselineState[identity.id] {
+            if props.ratchetSnapshotData != failedActiveBaselineState[identity.id] {
                 activeStateWasMutated = true
             }
         }
@@ -9117,7 +9002,7 @@ actor EndToEndTests {
             guard props.secretName == sMockUserData.ssn else { continue }
             guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
             else { continue }
-            if props.state != nil {
+            if props.hasRatchetState {
                 promotedActiveWithState = true
             }
         }
@@ -9181,7 +9066,7 @@ actor EndToEndTests {
                 forceRefresh: true,
                 sendOneTimeIdentities: true
             )
-            try await _recipientSession.writeTextMessage(
+            try await _recipientSession.send(
                 recipient: .nickname(sMockUserData.ssn),
                 text: "establish state"
             )
@@ -9214,7 +9099,7 @@ actor EndToEndTests {
 
             let controlMetadata = try BinaryEncoder().encode(TransportEvent.refreshOneTimeKeys)
             let senderIdentityCountBeforeRefresh = await senderStore.identities.count
-            try await _recipientSession.writeTextMessage(
+            try await _recipientSession.send(
                 recipient: .nickname(sMockUserData.ssn),
                 transportInfo: controlMetadata
             )
@@ -9294,7 +9179,7 @@ actor EndToEndTests {
 
             let metadata = try BinaryEncoder().encode(TransportEvent.refreshOneTimeKeys)
             let senderMessageCountBefore = await recipientStore.createdMessages.count
-            try await _recipientSession.writeTextMessage(
+            try await _recipientSession.send(
                 recipient: .nickname(sMockUserData.ssn),
                 transportInfo: metadata
             )
@@ -9467,7 +9352,7 @@ actor EndToEndTests {
                 sendOneTimeIdentities: true)
 
             // Baseline: establish ratchet state with a delivered message.
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "baseline")
             try await Task.sleep(for: .milliseconds(500))
@@ -9475,11 +9360,11 @@ actor EndToEndTests {
             // Capture a message (not delivered to Bob).
             aliceTransport.shouldDeliver = { received in
                 guard received.sender == "alice", received.recipient == "bob" else { return true }
-                guard received.transportEvent == nil else { return true }
+                guard received.isContentMessage else { return true }
                 await probe.capture(received)
                 return false
             }
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "in-flight message before OTK drain")
             for _ in 0..<40 {
@@ -9503,9 +9388,9 @@ actor EndToEndTests {
                 guard var props = await identity.props(symmetricKey: bobSymKey) else { continue }
                 guard props.secretName == sMockUserData.ssn else { continue }
                 guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
-                guard props.state != nil else { continue }
-                props.state = nil
-                try await identity.updateIdentityProps(symmetricKey: bobSymKey, props: props)
+                guard props.hasRatchetState else { continue }
+                props.clearRatchetState()
+                try await identity.update(props, symmetricKey: bobSymKey)
                 try await bobCache.updateSessionIdentity(identity)
             }
             await _recipientSession.removeIdentity(with: sMockUserData.ssn)
@@ -9655,13 +9540,13 @@ actor EndToEndTests {
                 sendOneTimeIdentities: true)
 
             // Establish ratchet
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "baseline")
             try await Task.sleep(for: .milliseconds(500))
 
             // Send a message while Bob is blocked
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "message during identity churn")
             try await Task.sleep(for: .milliseconds(200))
@@ -9776,8 +9661,7 @@ actor EndToEndTests {
 
             aliceTask = Task {
                 for await received in aliceStream {
-                    if let transportEvent = received.transportEvent,
-                       case .requestMessageResend = transportEvent {
+                    if received.oobResendRequest != nil {
                         await repairProbe.markResendRequest()
                     }
                     _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -9799,7 +9683,7 @@ actor EndToEndTests {
             // Alice sends a message -- Bob will hit sessionDecryptionError internally.
             // The ratchet succeeds, payload decode fails once, and recovery should request resend
             // without rotating local identity material.
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "trigger decode failure")
 
@@ -9822,7 +9706,7 @@ actor EndToEndTests {
             let msgCountBefore = await recipientStore.createdMessages.count
 
             // Send a follow-up message to verify the session recovers
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "post-recovery message")
 
@@ -9884,7 +9768,7 @@ actor ContinuationSignal {
 
 // MARK: - Supporting Types
 
-struct SessionDelegate: PQSSessionDelegate {
+struct SessionDelegate: MessagingPolicy, RecoveryObserver {
     
     let session: PQSSession
     let compromiseProbe: LinkedDeviceCompromiseProbe?
@@ -9909,7 +9793,7 @@ struct SessionDelegate: PQSSessionDelegate {
         sharedIdentifier: String,
         metadata: Data
     ) async throws {
-        try await session.writeTextMessage(
+        try await session.send(
             recipient: recipient,
             text: sharedIdentifier,
             metadata: metadata)
@@ -9921,7 +9805,7 @@ struct SessionDelegate: PQSSessionDelegate {
         metadata: Data,
         currentState: SessionModels.FriendshipMetadata.State
     ) async throws {
-        try await session.writeTextMessage(
+        try await session.send(
             recipient: recipient,
             metadata: metadata)
     }
@@ -9929,12 +9813,13 @@ struct SessionDelegate: PQSSessionDelegate {
     func deliveryStateChanged(
         recipient _: SessionModels.MessageRecipient, metadata _: Data
     ) async throws {}
-    func contactCreated(recipient _: SessionModels.MessageRecipient) async throws {}
+    func createdContact(recipient _: SessionModels.MessageRecipient) async throws {}
     func requestMetadata(recipient _: SessionModels.MessageRecipient) async throws {}
     func editMessage(recipient _: SessionModels.MessageRecipient, metadata _: Data)
     async throws
     {}
     func shouldPersist(transportInfo _: Data?) -> Bool { true }
+    func shouldReplayNonPersistentOutbound(transportInfo _: Data?) -> Bool { false }
     func retrieveUserInfo(_: Data?) async -> (secretName: String, deviceId: String)? {
         forcedRetrieveUserInfo
     }
@@ -9960,11 +9845,7 @@ struct SessionDelegate: PQSSessionDelegate {
                     break
                 case .publishedOneTimeKeysReplenished:
                     break
-                case .requestMessageResend(_):
-                    break
                 case .linkedDeviceReprovisioning(_):
-                    break
-                case .messageResendUnavailable(_):
                     break
                 }
             }
@@ -10011,6 +9892,30 @@ struct SessionDelegate: PQSSessionDelegate {
         }
         return true
     }
+
+    func shouldSendAutomaticDeliveryReceipts() async -> Bool { true }
+
+    func inboundRecoveryDeferred(
+        senderSecretName _: String,
+        senderDeviceId _: UUID,
+        failedSharedMessageId _: String,
+        failureClass _: String
+    ) async {}
+    func inboundMessagePendingRecovery(
+        senderSecretName _: String,
+        senderDeviceId _: UUID,
+        sharedMessageId _: String
+    ) async {}
+    func inboundCiphertextAccepted(sharedMessageId _: String) async {}
+    func inboundContentUnrecoverable(
+        senderSecretName _: String,
+        senderDeviceId _: UUID,
+        sharedMessageId _: String
+    ) async {}
+    func outboundMessageUnrecoverable(sharedMessageId _: String, reason _: String) async {}
+    func reestablishmentEpisodeDidEnd(senderSecretName _: String, senderDeviceId _: UUID) async {}
+    func shouldSuppressInboundRecoveryFromSender(_: String) async -> Bool { false }
+    func preferredOnlinePeerDeviceId(for _: String) async -> UUID? { nil }
 
     func linkedDeviceReportedPotentialCompromise(deviceId: UUID, intentId: UUID?) async {
         await compromiseProbe?.mark(deviceId: deviceId)
@@ -10064,57 +9969,59 @@ final class MockDeviceLinkingDelegate: DeviceLinkingDelegate, @unchecked Sendabl
     }
 }
 
-final class MockSessionIdentityTransport: SessionTransport, @unchecked Sendable {
+final class MockSessionIdentityTransport: PQSTransport, PQSKeyDirectory, PQSRecoveryTransport, @unchecked Sendable {
 
     var configurations: [String: UserConfiguration] = [:]
     var oneTimeKeys: [String: OneTimeKeys] = [:]
     var shouldThrowError = false
     
     func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys {
-        if shouldThrowError { throw PQSSession.SessionErrors.userNotFound }
-        return oneTimeKeys[secretName] ?? OneTimeKeys(curve: nil, mlKEM: nil)
+        if shouldThrowError { throw PQSError.userNotFound }
+        return oneTimeKeys[secretName] ?? OneTimeKeys(x25519: nil, mlKEM: nil)
     }
     
-    func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] { [] }
+    func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeyKind) async throws -> [UUID] { [] }
     func publishUserConfiguration(_ configuration: SessionModels.UserConfiguration, recipient secretName: String, recipient identity: UUID) async throws {}
     func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {}
     
     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
-        if shouldThrowError { throw PQSSession.SessionErrors.userNotFound }
+        if shouldThrowError { throw PQSError.userNotFound }
         guard let config = configurations[secretName] else {
-            throw PQSSession.SessionErrors.userNotFound
+            throw PQSError.userNotFound
         }
         return config
     }
     
     func findUserConfiguration(secretName: String) async throws -> UserConfiguration {
-        if shouldThrowError { throw PQSSession.SessionErrors.configurationError }
+        if shouldThrowError { throw PQSError.configurationError }
         guard let config = configurations[secretName] else {
-            throw PQSSession.SessionErrors.configurationError
+            throw PQSError.configurationError
         }
         return config
     }
     
-    // Required SessionTransport methods
+    // Required PQSNetworkHost methods
     func updateOneTimeKeys(
         for secretName: String, deviceId: String, keys: [UserConfiguration.SignedOneTimePublicKey]
     ) async throws {}
     func updateOneTimeMLKEMKeys(
         for secretName: String, deviceId: String, keys: [UserConfiguration.SignedMLKEMOneTimeKey]
     ) async throws {}
-    func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType)
+    func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeyKind)
     async throws
     {}
-    func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
+    func deleteOneTimeKeys(for secretName: String, with id: String, type: KeyKind) async throws {}
     func publishRotatedKeys(for secretName: String, deviceId: String, rotated keys: RotatedPublicKeys) async throws {
         
     }
     func createUploadPacket(
         secretName: String, deviceId: UUID, recipient: MessageRecipient, metadata: Data
     ) async throws {}
+    func sendOutOfBandResendRequest(failedEnvelopeMessageIds: [String], to secretName: String, deviceId: UUID, requestingDeviceId: UUID) async throws {}
+    func sendOutOfBandResendUnavailable(unavailableEnvelopeMessageIds: [String], to secretName: String, deviceId: UUID, respondingDeviceId: UUID) async throws {}
 }
 
-actor ReceiverDelegate: EventReceiver {
+actor ReceiverDelegate: MessageStoreObserver {
     
     let session: PQSSession
     
@@ -10139,18 +10046,8 @@ actor ReceiverDelegate: EventReceiver {
     func createdChannel(_ model: SessionModels.BaseCommunication) async {}
     func synchronize(
         contact: Contact,
-        requestFriendship: Bool
-    ) async throws {
-        try await synchronize(
-            contact: contact,
-            requestFriendship: requestFriendship,
-            notifyPeerOfCreation: true)
-    }
-
-    func synchronize(
-        contact: Contact,
         requestFriendship: Bool,
-        notifyPeerOfCreation: Bool = true
+        notifyPeerOfCreation: Bool
     ) async throws {
         if requestFriendship {
             // Mirror the production receiver: re-add of an already-accepted /
@@ -10183,6 +10080,8 @@ struct ReceivedMessage {
     let messageId: String
     let logicalMessageId: String?
     let transportEvent: TransportEvent?
+    let oobResendRequest: ResendRequest?
+    let oobUnavailableNotice: MessageResendUnavailableNotice?
 
     init(
         message: SignedRatchetMessage,
@@ -10192,7 +10091,9 @@ struct ReceivedMessage {
         recipientDeviceId: UUID? = nil,
         messageId: String,
         logicalMessageId: String? = nil,
-        transportEvent: TransportEvent?
+        transportEvent: TransportEvent?,
+        oobResendRequest: ResendRequest? = nil,
+        oobUnavailableNotice: MessageResendUnavailableNotice? = nil
     ) {
         self.message = message
         self.sender = sender
@@ -10202,6 +10103,13 @@ struct ReceivedMessage {
         self.messageId = messageId
         self.logicalMessageId = logicalMessageId
         self.transportEvent = transportEvent
+        self.oobResendRequest = oobResendRequest
+        self.oobUnavailableNotice = oobUnavailableNotice
+    }
+
+    /// Double Ratchet user content — not a TransportEvent control and not OOB retry.
+    var isContentMessage: Bool {
+        transportEvent == nil && oobResendRequest == nil && oobUnavailableNotice == nil
     }
 }
 
@@ -10267,9 +10175,9 @@ actor TransportStore {
             }) else { fatalError() }
         
         var oneTimeKeyPair = oneTimePublicKeyPairs[oneTimeKeyPairIndex]
-        guard let lastCurveKey = oneTimeKeyPair.keys.last,
-              let publicKey = try? lastCurveKey.verified(using: signingKey) else {
-            return SessionModels.OneTimeKeys(curve: nil, mlKEM: nil)
+        guard let lastX25519Key = oneTimeKeyPair.keys.last,
+              let publicKey = try? lastX25519Key.verified(using: signingKey) else {
+            return SessionModels.OneTimeKeys(x25519: nil, mlKEM: nil)
         }
         oneTimeKeyPair.keys.removeAll(where: { $0.id == publicKey.id })
         oneTimePublicKeyPairs[oneTimeKeyPairIndex] = oneTimeKeyPair
@@ -10280,27 +10188,27 @@ actor TransportStore {
         var mlKEMKeyPair = mlKEMOneTimeKeyPairs[mlKEMKeyPairIndex]
         guard let lastMLKEMKey = mlKEMKeyPair.keys.last,
               let mlKEMKey = try? lastMLKEMKey.verified(using: signingKey) else {
-            return SessionModels.OneTimeKeys(curve: nil, mlKEM: nil)
+            return SessionModels.OneTimeKeys(x25519: nil, mlKEM: nil)
         }
         
         mlKEMKeyPair.keys.removeAll(where: { $0.id == mlKEMKey.id })
         mlKEMOneTimeKeyPairs[mlKEMKeyPairIndex] = mlKEMKeyPair
         
-        return SessionModels.OneTimeKeys(curve: publicKey, mlKEM: mlKEMKey)
+        return SessionModels.OneTimeKeys(x25519: publicKey, mlKEM: mlKEMKey)
         
     }
     
-    func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] {
+    func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeyKind) async throws -> [UUID] {
         let config = userConfigurations.first(where: { $0.secretName == secretName })
         guard let signingKeyData = config?.config.signingPublicKey else { fatalError() }
         let signingKey = try Curve25519.Signing.PublicKey(rawRepresentation: signingKeyData)
-        let filteredCurve = oneTimePublicKeyPairs.filter { $0.id == secretName }
+        let filteredX25519 = oneTimePublicKeyPairs.filter { $0.id == secretName }
         let filteredMLKEM = mlKEMOneTimeKeyPairs.filter { $0.id == secretName }
         var verifiedIDs: [UUID] = []
 
         switch type {
-        case .curve:
-            for key in filteredCurve {
+        case .x25519:
+            for key in filteredX25519 {
                 for oneTimeKey in key.keys {
                     if let verifiedKey = try? oneTimeKey.verified(using: signingKey) {
                         verifiedIDs.append(verifiedKey.id)
@@ -10347,9 +10255,9 @@ actor TransportStore {
         }
     }
 
-    func batchDeleteOneTimeKeys(for secretName: String, with _: String, type: KeysType) async throws {
+    func batchDeleteOneTimeKeys(for secretName: String, with _: String, type: KeyKind) async throws {
         switch type {
-        case .curve:
+        case .x25519:
             if let index = oneTimePublicKeyPairs.firstIndex(where: { $0.id == secretName }) {
                 oneTimePublicKeyPairs[index].keys.removeAll()
             }
@@ -10360,11 +10268,11 @@ actor TransportStore {
         }
     }
 
-    func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {
+    func deleteOneTimeKeys(for secretName: String, with id: String, type: KeyKind) async throws {
         guard let keyId = UUID(uuidString: id) else { return }
 
         switch type {
-        case .curve:
+        case .x25519:
             if let index = oneTimePublicKeyPairs.firstIndex(where: { $0.id == secretName }) {
                 oneTimePublicKeyPairs[index].keys.removeAll(where: { $0.id == keyId })
             }
@@ -10393,7 +10301,7 @@ actor TransportStore {
             let userConfiguration = userConfigurations.first(where: { $0.secretName == secretName }
             )?.config
         else {
-            throw PQSSession.SessionErrors.userNotFound
+            throw PQSError.userNotFound
         }
         return userConfiguration
     }
@@ -10403,7 +10311,7 @@ actor TransportStore {
             let userConfiguration = userConfigurations.first(where: { $0.secretName == secretName }
             )?.config
         else {
-            throw PQSSession.SessionErrors.configurationError
+            throw PQSError.configurationError
         }
         return userConfiguration
     }
@@ -10571,7 +10479,7 @@ actor TransportStore {
 
 
 
-final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
+final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTransport, @unchecked Sendable {
     
     var continuation: AsyncStream<ReceivedMessage>.Continuation?
     let session: PQSSession
@@ -10609,7 +10517,7 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
     /// If set, OTK curve uploads will throw on the first N calls then succeed.
     /// Thread-safe via OTKErrorInjector actor.
     private let otkErrorInjector = OTKErrorInjector()
-    func setOTKUploadFailCount(_ count: Int, error: PQSSession.SessionErrors = .oneTimeKeyUploadFailed) async {
+    func setOTKUploadFailCount(_ count: Int, error: PQSError = .oneTimeKeyUploadFailed) async {
         await otkErrorInjector.configure(failCount: count, error: error)
     }
     var otkUploadAttemptCount: Int {
@@ -10668,7 +10576,7 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
         try await store.fetchOneTimeKeys(for: secretName, deviceId: deviceId)
     }
     
-    func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] {
+    func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeyKind) async throws -> [UUID] {
         try await store.fetchOneTimeKeyIdentities(for: secretName, deviceId: deviceId, type: type)
     }
     
@@ -10694,15 +10602,15 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
             deviceId: deviceId.uuidString,
             keyCount: failedEnvelopeMessageIds.count)
         guard let sessionContext = await session.sessionContext else { return }
-        let request = FailedMessageResendRequest(
+        let request = ResendRequest(
             failedSharedMessageIds: failedEnvelopeMessageIds,
             requestingDeviceId: requestingDeviceId)
         try await deliverOutOfBandControl(
             to: secretName,
             recipientDeviceId: deviceId,
             messageId: failedEnvelopeMessageIds.first ?? "",
-            transportEvent: .requestMessageResend(request),
-            senderContext: sessionContext)
+            senderContext: sessionContext,
+            oobResendRequest: request)
     }
 
     func sendOutOfBandResendUnavailable(
@@ -10719,16 +10627,17 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
             to: secretName,
             recipientDeviceId: deviceId,
             messageId: unavailableEnvelopeMessageIds.first ?? "",
-            transportEvent: .messageResendUnavailable(notice),
-            senderContext: sessionContext)
+            senderContext: sessionContext,
+            oobUnavailableNotice: notice)
     }
 
     private func deliverOutOfBandControl(
         to secretName: String,
         recipientDeviceId: UUID,
         messageId: String,
-        transportEvent: TransportEvent,
-        senderContext: SessionContext
+        senderContext: SessionContext,
+        oobResendRequest: ResendRequest? = nil,
+        oobUnavailableNotice: MessageResendUnavailableNotice? = nil
     ) async throws {
         let received = ReceivedMessage(
             message: SignedRatchetMessage(),
@@ -10737,7 +10646,9 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
             deviceId: senderContext.sessionUser.deviceId,
             recipientDeviceId: recipientDeviceId,
             messageId: messageId,
-            transportEvent: transportEvent
+            transportEvent: nil,
+            oobResendRequest: oobResendRequest,
+            oobUnavailableNotice: oobUnavailableNotice
         )
         let finalReceived: ReceivedMessage
         if let transformOutgoing {
@@ -10836,12 +10747,12 @@ final class _MockTransportDelegate: SessionTransport, @unchecked Sendable {
         try await otkErrorInjector.checkAndThrow()
         try await store.updateOneTimeMLKEMKeys(for: secretName, deviceId: deviceId, keys: keys)
     }
-    func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: SessionModels.KeysType)
+    func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: SessionModels.KeyKind)
     async throws
     {
         try await store.batchDeleteOneTimeKeys(for: secretName, with: id, type: type)
     }
-    func deleteOneTimeKeys(for secretName: String, with id: String, type: SessionModels.KeysType)
+    func deleteOneTimeKeys(for secretName: String, with id: String, type: SessionModels.KeyKind)
     async throws
     {
         try await store.deleteOneTimeKeys(for: secretName, with: id, type: type)
@@ -10860,10 +10771,10 @@ private actor RotationTracker {
 
 private actor OTKErrorInjector {
     private var remainingFailures: Int = 0
-    private var error: PQSSession.SessionErrors = .oneTimeKeyUploadFailed
+    private var error: PQSError = .oneTimeKeyUploadFailed
     private(set) var attemptCount: Int = 0
 
-    func configure(failCount: Int, error: PQSSession.SessionErrors) {
+    func configure(failCount: Int, error: PQSError) {
         remainingFailures = failCount
         self.error = error
         attemptCount = 0
@@ -10878,7 +10789,7 @@ private actor OTKErrorInjector {
     }
 }
 
-actor MockIdentityStore: PQSSessionStore {
+actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     // MARK: - Properties
     let id = UUID()
     var sessionContext: Data?
@@ -10892,6 +10803,7 @@ actor MockIdentityStore: PQSSessionStore {
     var encyrptedConfigurationForTesting = Data()
     var createdMessages = [EncryptedMessage]()
     var contacts = [ContactModel]()
+    let recoveryLedger = InMemoryRecoveryLedger()
     /// Disk-persistence boundary spy: jobs currently retained by the store.
     var persistedJobs = [JobModel]()
     /// Cumulative createJob successes (not cleared by deleteJob) for enqueue proofs.
@@ -10914,7 +10826,7 @@ actor MockIdentityStore: PQSSessionStore {
     func createLocalSessionContext(_ data: Data) async throws { sessionContext = data }
     func fetchLocalSessionContext() async throws -> Data {
         guard let context = sessionContext else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
         return context
     }
@@ -10936,7 +10848,7 @@ actor MockIdentityStore: PQSSessionStore {
         identities.append(session)
     }
     func fetchLocalDeviceSalt() async throws -> String {
-        guard let salt = localDeviceSalt else { throw PQSSession.SessionErrors.saltError }
+        guard let salt = localDeviceSalt else { throw PQSError.saltError }
         return salt
     }
     
@@ -10997,6 +10909,44 @@ actor MockIdentityStore: PQSSessionStore {
         return try .init(
             id: UUID(), communicationId: UUID(), sessionContextId: 1, sharedId: "123",
             sequenceNumber: 1, data: Data())
+    }
+
+    func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage? {
+        createdMessages.first(where: { $0.sharedId == sharedId })
+    }
+
+    func updateSessionIdentity(_ session: SessionIdentity, andPreparedJob job: JobModel) async throws {
+        try await updateSessionIdentity(session)
+        try await updateJob(job)
+    }
+
+    func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws {
+        recoveryLedger.upsertOutboundDeviceSendRecord(record)
+    }
+    func fetchOutboundDeviceSendRecord(sharedId: String, recipientDeviceId: UUID) async throws -> OutboundDeviceSendRecord? {
+        recoveryLedger.fetchOutboundDeviceSendRecord(sharedId: sharedId, recipientDeviceId: recipientDeviceId)
+    }
+    func fetchOutboundDeviceSendRecord(envelopeMessageId: String) async throws -> OutboundDeviceSendRecord? {
+        recoveryLedger.fetchOutboundDeviceSendRecord(envelopeMessageId: envelopeMessageId)
+    }
+    func deleteOutboundDeviceSendRecords(sharedId: String) async throws {
+        recoveryLedger.deleteOutboundDeviceSendRecords(sharedId: sharedId)
+    }
+    func upsertAcceptedEnvelope(_ record: AcceptedEnvelopeRecord) async throws {
+        recoveryLedger.upsertAcceptedEnvelope(record)
+    }
+    func fetchAcceptedEnvelope(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        envelopeMessageId: String
+    ) async throws -> AcceptedEnvelopeRecord? {
+        recoveryLedger.fetchAcceptedEnvelope(
+            senderSecretName: senderSecretName,
+            senderDeviceId: senderDeviceId,
+            envelopeMessageId: envelopeMessageId)
+    }
+    func pruneAcceptedEnvelopes(olderThan date: Date) async throws -> Int {
+        recoveryLedger.pruneAcceptedEnvelopes(olderThan: date)
     }
     
     func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {

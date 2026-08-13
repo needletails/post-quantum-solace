@@ -53,16 +53,16 @@ actor PerDeviceIdentityTests {
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: ReceiverDelegate(session: session))
 
-        await session.setViability(true)
+        await session.setConnectivity(true)
         await store.setPublishableName(mockUserData.ssn)
 
-        session = try await session.createSession(
+        session = try await session.createAccount(
             secretName: mockUserData.ssn,
             appPassword: mockUserData.sap
         ) {}
 
         await session.setAppPassword(mockUserData.sap)
-        session = try await session.startSession(appPassword: mockUserData.sap)
+        session = try await session.unlock(appPassword: mockUserData.sap)
 
         return (transport, cacheStore)
     }
@@ -98,19 +98,19 @@ actor PerDeviceIdentityTests {
         guard let signedSelf = context.activeUserConfiguration.signedDevices.first(where: {
             $0.id == context.sessionUser.deviceId
         }), let device = try signedSelf.verified(using: accountKey) else {
-            throw PQSSession.SessionErrors.invalidDeviceIdentity
+            throw PQSError.invalidDeviceIdentity
         }
         return device
     }
 
     private func persist(context: SessionContext) async throws {
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
         await session.setSessionContext(context)
         let encoded = try BinaryEncoder().encode(context)
         guard let encrypted = try await crypto.encrypt(data: encoded, symmetricKey: session.getAppSymmetricKey()) else {
-            throw PQSSession.SessionErrors.sessionEncryptionError
+            throw PQSError.sessionEncryptionError
         }
         try await cache.updateLocalSessionContext(encrypted)
     }
@@ -457,7 +457,7 @@ actor PerDeviceIdentityTests {
         do {
             try await session.installLinkedDeviceReprovisioningBundle(bundle)
             Issue.record("Expected install to throw deviceIdentityCorrupted for foreign-key bundle")
-        } catch let error as PQSSession.SessionErrors {
+        } catch let error as PQSError {
             #expect(error == .deviceIdentityCorrupted,
                    "Foreign-key bundles must surface as .deviceIdentityCorrupted; got \(error)")
         }
@@ -547,8 +547,8 @@ actor PerDeviceIdentityTests {
         await session.shutdown()
     }
 
-    @Test("startSession tolerates per-device signingPrivateKey divergence (diagnostic-only)")
-    func startSessionTolerantOfDivergedDeviceIdentity() async throws {
+    @Test("unlock tolerates per-device signingPrivateKey divergence (diagnostic-only)")
+    func unlockTolerantOfDivergedDeviceIdentity() async throws {
         _ = try await setupRotatableSession()
 
         guard var context = await session.sessionContext else {
@@ -559,7 +559,7 @@ actor PerDeviceIdentityTests {
         // The historical write-master-key-onto-child overwrite is now blocked at the source
         // (private setter on `DeviceKeys.signingPrivateKey`, no private key on the
         // `LinkedDeviceReprovisioningBundle` wire format, and an explicit foreign-key rejection
-        // inside `installLinkedDeviceReprovisioningBundle`). The remaining startSession check
+        // inside `installLinkedDeviceReprovisioningBundle`). The remaining unlock check
         // is intentionally non-fatal so legitimate transient post-link states do not block
         // recovery; this test pins that contract.
         let foreignKey = Curve25519.Signing.PrivateKey()
@@ -576,14 +576,14 @@ actor PerDeviceIdentityTests {
         try await persist(context: context)
 
         let appPassword = await session.appPassword
-        _ = try await session.startSession(appPassword: appPassword)
+        _ = try await session.unlock(appPassword: appPassword)
 
         guard let postContext = await session.sessionContext else {
             Issue.record("Session context should still be loaded after diagnostic-only divergence")
             return
         }
         #expect(postContext.sessionUser.deviceKeys.signingPrivateKey == foreignKey.rawRepresentation,
-               "startSession must not silently rewrite the persisted local signing key")
+               "unlock must not silently rewrite the persisted local signing key")
 
         await session.shutdown()
     }
@@ -598,7 +598,7 @@ actor PerDeviceIdentityTests {
         var result: [UUID: Data] = [:]
         for signed in config.signedDevices {
             guard let verified = try signed.verified(using: accountKey) else {
-                throw PQSSession.SessionErrors.invalidSignature
+                throw PQSError.invalidSignature
             }
             result[verified.deviceId] = verified.signingPublicKey
         }

@@ -20,8 +20,9 @@ import SessionModels
 import Crypto
 import DoubleRatchetKit
 import BinaryCodable
+import NeedleTailLogger
 
-extension TaskProcessor {
+extension MessagePipeline {
     
     // MARK: - Atomic sequence
     
@@ -32,13 +33,13 @@ extension TaskProcessor {
     
     // MARK: - Public API
     
-    public func feedTask(
+    func enqueue(
         _ task: EncryptableTask,
         session: PQSSession
     ) async throws {
         
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
         
         let seq = incrementId()
@@ -75,7 +76,7 @@ extension TaskProcessor {
             return
         }
         
-        // Important: `feedTask` can be called while the processor is already running.
+        // Important: `enqueue` can be called while the processor is already running.
         // Persisting to cache alone is not enough because the active processing loop consumes
         // from `jobConsumer`. If we don't enqueue here, the job may not run until a future
         // cache reload happens (which can look like the task processor "stalled").
@@ -125,7 +126,7 @@ extension TaskProcessor {
 
             try await cache.deleteJob(job)
             supersededIds.insert(job.id)
-            PQSAuditLog.log(.send, "pqs.send.jobSuperseded coalescingKey=\(key) staleSharedId=\(pending.sharedId) newSharedId=\(newOutbound.sharedId) sessionIdentityId=\(pending.recipientIdentity.id.uuidString) jobId=\(job.id)",
+            audit(.send, "pqs.send.jobSuperseded coalescingKey=\(key) staleSharedId=\(pending.sharedId) newSharedId=\(newOutbound.sharedId) sessionIdentityId=\(pending.recipientIdentity.id.uuidString) jobId=\(job.id)",
                 level: .info)
         }
 
@@ -134,7 +135,7 @@ extension TaskProcessor {
         }
     }
 
-    public func loadTasks(
+    func loadTasks(
         _ job: JobModel? = nil,
         cache: SessionCache,
         symmetricKey: SymmetricKey,
@@ -203,7 +204,7 @@ extension TaskProcessor {
         }.value
 
         // A paused job stays durable but must wait for a concrete future event
-        // (`feedTask`, `resumeJobQueue`, viability/writer readiness). Immediately
+        // (`enqueue`, `resumeJobQueue`, viability/writer readiness). Immediately
         // reloading it here turns CancellationError into a tight cache/crypto loop.
         guard loopExit == .drained else {
             return
@@ -232,7 +233,7 @@ extension TaskProcessor {
 
     private func processingLoop(_ session: PQSSession) async throws -> ProcessingLoopExit {
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
 
         guard await session.isViable else {
@@ -637,7 +638,7 @@ extension TaskProcessor {
                     logger.log(
                         level: .info,
                         message: "pqs.recovery.resendAwaitingSender failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=orphanResendOwnsSharedId")
-                    PQSAuditLog.log(.recovery, "pqs.recovery.otkBootstrapDeferredToOrphanResend sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
+                    audit(.recovery, "pqs.recovery.otkBootstrapDeferredToOrphanResend sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
                     try await cache.deleteJob(job)
                     return .deleted
                 }
@@ -704,7 +705,7 @@ extension TaskProcessor {
                     deviceId: message.senderDeviceId,
                     sharedId: message.sharedMessageId)
                 if newlyTerminal {
-                    PQSAuditLog.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=missingOneTimeKeyDeadEpoch")
+                    audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=missingOneTimeKeyDeadEpoch")
                     await session.sessionDelegate?.inboundContentUnrecoverable(
                         senderSecretName: message.senderSecretName,
                         senderDeviceId: message.senderDeviceId,
@@ -785,11 +786,11 @@ extension TaskProcessor {
                         // Audit-level so device captures show whether the heal
                         // signal reached the wire; the info logger is filtered
                         // out on devices, which left this step invisible.
-                        PQSAuditLog.log(.recovery, "pqs.recovery.reestablishmentEmitOutcome kind=peerRefresh outcome=\(emitted ? "queued" : "suppressed") failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) sharedId=\(sharedMessageId)")
+                        session.auditSink.log(.recovery, "pqs.recovery.reestablishmentEmitOutcome kind=peerRefresh outcome=\(emitted ? "queued" : "suppressed") failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) sharedId=\(sharedMessageId)")
                         logger.log(
                             level: .info,
                             message: "pqs.recovery.reestablishmentQueued kind=peerRefresh failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId) sharedId=\(sharedMessageId)")
-                    } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
+                    } catch let sessionError as PQSError where sessionError == .peerSigningKeyOutOfSync {
                         await self.reportPeerSigningKeyOutOfSync(message: message, session: session)
                     } catch {
                         // Terminal for this episode: nothing is on the wire, so keeping
@@ -844,7 +845,7 @@ extension TaskProcessor {
                 await noteResendReplayDropped(sharedId: message.sharedId, reason: "cryptoKitError")
                 try await cache.deleteJob(job)
             }
-        } catch let sessionError as PQSSession.SessionErrors where sessionError == .sessionDecryptionError {
+        } catch let sessionError as PQSError where sessionError == .sessionDecryptionError {
             switch props.task.task {
             case .streamMessage(let message):
                 
@@ -863,7 +864,7 @@ extension TaskProcessor {
                 await noteResendReplayDropped(sharedId: message.sharedId, reason: "sessionDecryptionError")
                 try await cache.deleteJob(job)
             }
-        } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
+        } catch let sessionError as PQSError where sessionError == .peerSigningKeyOutOfSync {
             switch props.task.task {
             case .streamMessage(let message):
                 
@@ -881,7 +882,7 @@ extension TaskProcessor {
             }
             try await cache.deleteJob(job)
             return .deleted
-        } catch let sessionError as PQSSession.SessionErrors where sessionError == .signingKeyOutOfSync {
+        } catch let sessionError as PQSError where sessionError == .signingKeyOutOfSync {
             logger.log(level: .error, message: "signingKeyOutOfSync during job processing; child device likely needs reprovisioning from master")
             switch props.task.task {
             case .streamMessage:
@@ -899,7 +900,7 @@ extension TaskProcessor {
                 break
             }
             try await cache.deleteJob(job)
-        } catch let sessionError as PQSSession.SessionErrors where sessionError == .invalidSignature {
+        } catch let sessionError as PQSError where sessionError == .invalidSignature {
             switch props.task.task {
             case .streamMessage(let message):
                 
@@ -966,7 +967,7 @@ extension TaskProcessor {
                 let senderSecretName = inbound.senderSecretName
                 let senderDeviceId = inbound.senderDeviceId
                 let sharedMessageId = inbound.sharedMessageId
-                PQSAuditLog.log(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
+                audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
                 await session.scheduleTransportProtocolWork {
                     await delegate?.inboundRecoveryDeferred(
                         senderSecretName: senderSecretName,
@@ -1002,11 +1003,11 @@ extension TaskProcessor {
     enum JobProcessorErrors: Error, LocalizedError {
         case missingIdentity
         
-        public var errorDescription: String? {
+        var errorDescription: String? {
             "Job references a missing session identity"
         }
         
-        public var recoverySuggestion: String? {
+        var recoverySuggestion: String? {
             "Ensure the session identity exists before processing the job"
         }
     }
@@ -1123,7 +1124,7 @@ extension TaskProcessor {
             deviceId: message.senderDeviceId,
             sharedId: message.sharedMessageId)
         {
-            PQSAuditLog.log(.recovery, "pqs.recovery.redeliveryDropped reason=terminalContentUnrecoverable failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
+            audit(.recovery, "pqs.recovery.redeliveryDropped reason=terminalContentUnrecoverable failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
             try await cache.deleteJob(job)
             return .deleted
         }
@@ -1169,7 +1170,7 @@ extension TaskProcessor {
             _ = try? await session.demoteZombieStateLessActives(
                 secretName: message.senderSecretName,
                 deviceId: message.senderDeviceId)
-            PQSAuditLog.log(.recovery, "pqs.recovery.orphanReplayPreferredCleared sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId)")
+            audit(.recovery, "pqs.recovery.orphanReplayPreferredCleared sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId)")
         }
         // Resolve live heal ownership before deciding whether recovery control may
         // mint. A live orphan/recovery lane always owns subsequent control delivery.
@@ -1231,7 +1232,7 @@ extension TaskProcessor {
                     deviceId: message.senderDeviceId,
                     sharedId: message.sharedMessageId)
                 if newlyTerminal {
-                    PQSAuditLog.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
+                    audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
                     await session.sessionDelegate?.inboundContentUnrecoverable(
                         senderSecretName: message.senderSecretName,
                         senderDeviceId: message.senderDeviceId,
@@ -1292,7 +1293,7 @@ extension TaskProcessor {
             _ = await session.tryBeginReestablishmentEpisode(
                 sender: message.senderSecretName,
                 deviceId: message.senderDeviceId)
-            PQSAuditLog.log(.recovery, "pqs.recovery.undecryptableLaneSaturated sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId) awaitingSenderOrphanResend=true")
+            audit(.recovery, "pqs.recovery.undecryptableLaneSaturated sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId) awaitingSenderOrphanResend=true")
             auditInboundDecryptFailure(
                 message: message,
                 failureClass: failureClass,
@@ -1323,12 +1324,11 @@ extension TaskProcessor {
             message: message,
             failureClass: failureClass,
             session: session,
-            forceFreshControlLane: false,
             frameFingerprint: frameFingerprint)
         var action = didRequestResend ? "resendRequested" : "resendSkipped"
         if laneSaturated {
             action = didRequestResend ? "resendRequested.lane" : "resendSkipped.lane"
-            PQSAuditLog.log(.recovery, "pqs.recovery.undecryptableLaneSaturated sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId) awaitingSenderOrphanResend=true")
+            audit(.recovery, "pqs.recovery.undecryptableLaneSaturated sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId) awaitingSenderOrphanResend=true")
         }
         auditInboundDecryptFailure(
             message: message,
@@ -1350,7 +1350,7 @@ extension TaskProcessor {
     }
 
     private func isConnectionNonViableError(_ error: Error) -> Bool {
-        if let sessionError = error as? PQSSession.SessionErrors {
+        if let sessionError = error as? PQSError {
             switch sessionError {
             case .connectionIsNonViable, .cannotFindUserConfiguration:
                 // Config/lookup failures are connectivity-shaped: park outbound
@@ -1418,9 +1418,6 @@ extension TaskProcessor {
         isPausedUntilTransportReady = true
         _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
         try await cache.updateJob(job)
-        // DEAD LEGACY: encrypted TransportEvent.requestMessageResend no longer spends
-        // attempt counters on DR transport. OOB submit owns attempt bookkeeping.
-        // if case .writeMessage(...), case .requestMessageResend(let request) = ... { ... }
         let logMessage: String
         if let recoveryLog = recoveryTransportSendFailureLog(
             props: props,
@@ -1451,9 +1448,6 @@ extension TaskProcessor {
         switch transportEvent {
         case .sessionReestablishment(let envelope):
             return "pqs.recovery.reestablishmentSendFailed sharedId=\(outboundTask.sharedId) kind=\(envelope.kind.rawValue) response=\(envelope.isResponse) epoch=\(envelope.epoch) intent=\(envelope.intentId?.uuidString ?? "nil") retryAttempt=\(attempt) error=\(error)"
-        case .requestMessageResend, .messageResendUnavailable:
-            // DEAD LEGACY: encrypted retry send-failure audits. Confirm unused, then delete.
-            return nil
         case .linkedDeviceReprovisioning(let bundle):
             return "pqs.recovery.linkedDeviceReprovisioningSendFailed sharedId=\(outboundTask.sharedId) targetDeviceId=\(bundle.targetDeviceId) retryAttempt=\(attempt) error=\(error)"
         case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished:
@@ -1486,7 +1480,6 @@ extension TaskProcessor {
         // Inbound: these are routed to orphan-resend (not receive-side ASR).
         // Outbound: still use handleFreshOutboundRepair to insert an initiating row.
         [
-            .initialMessageNotReceived,
             .rootKeyIsNil,
             .missingCipherText,
             .sendingKeyIsNil
@@ -1503,8 +1496,6 @@ extension TaskProcessor {
 
     private func freshSessionFailureClass(_ error: RatchetError) -> String {
         switch error {
-        case .initialMessageNotReceived:
-            return "ratchet.initialMessageNotReceived"
         case .rootKeyIsNil:
             return "ratchet.rootKeyIsNil"
         case .missingCipherText:
@@ -1535,7 +1526,6 @@ extension TaskProcessor {
         message: InboundTaskMessage,
         failureClass: String,
         session: PQSSession,
-        forceFreshControlLane: Bool = false,
         frameFingerprint: Data? = nil
     ) async -> Bool {
         guard await session.isViable else {
@@ -1563,7 +1553,7 @@ extension TaskProcessor {
                 deviceId: message.senderDeviceId,
                 sharedId: message.sharedMessageId)
             if newlyTerminal {
-                PQSAuditLog.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
+                audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
                 await session.sessionDelegate?.inboundContentUnrecoverable(
                     senderSecretName: message.senderSecretName,
                     senderDeviceId: message.senderDeviceId,
@@ -1587,8 +1577,7 @@ extension TaskProcessor {
             try await session.requestMessageResend(
                 sharedMessageId: message.sharedMessageId,
                 senderName: message.senderSecretName,
-                senderDeviceId: message.senderDeviceId,
-                forceFreshControlLane: forceFreshControlLane)
+                senderDeviceId: message.senderDeviceId)
             await session.markPeerResendRequestSent(
                 sender: message.senderSecretName,
                 deviceId: message.senderDeviceId,
@@ -1711,7 +1700,7 @@ extension TaskProcessor {
                         level: .info,
                         message: "pqs.recovery.reestablishmentSuppressed reason=coalescedPending failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId)")
                 }
-            } catch let sessionError as PQSSession.SessionErrors where sessionError == .peerSigningKeyOutOfSync {
+            } catch let sessionError as PQSError where sessionError == .peerSigningKeyOutOfSync {
                 await reportPeerSigningKeyOutOfSync(message: message, session: session)
             } catch {
                 await session.endReestablishmentEpisode(
@@ -1824,7 +1813,7 @@ extension TaskProcessor {
             }
             logger.log(level: .warning, message: "Suppressing repeated fresh outbound repair for \(props.secretName) (\(props.deviceId))")
             // Failed repair must not leave a state-less preferred zombie (dogfood poison).
-            try? await session.demoteZombieStateLessActives(
+            _ = try? await session.demoteZombieStateLessActives(
                 secretName: props.secretName,
                 deviceId: props.deviceId)
             await noteResendReplayDropped(sharedId: message.sharedId, reason: "outboundRepairSuppressed")
@@ -1887,7 +1876,7 @@ extension TaskProcessor {
                 priority: .urgent)
 
             try await cache.deleteJob(job)
-            try await feedTask(retry, session: session)
+            try await enqueue(retry, session: session)
             return .deleted
         } catch {
             if isRecoveryCriticalControl {
@@ -1896,7 +1885,7 @@ extension TaskProcessor {
                     deviceId: props.deviceId)
             }
             logger.log(level: .error, message: "Fresh outbound repair failed for \(props.secretName) (\(props.deviceId)): \(error)")
-            try? await session.demoteZombieStateLessActives(
+            _ = try? await session.demoteZombieStateLessActives(
                 secretName: props.secretName,
                 deviceId: props.deviceId)
             await noteResendReplayDropped(sharedId: message.sharedId, reason: "outboundRepairFailed")
@@ -1915,15 +1904,13 @@ extension TaskProcessor {
         switch event {
         case .sessionReestablishment:
             return true
-        case .requestMessageResend, .messageResendUnavailable:
-            // DEAD LEGACY: encrypted retry is no longer a recovery-critical DR control.
-            // Confirm unused, then delete these arms / TransportEvent cases.
-            return false
         // OTK handshake is the gate for delete→re-add. A single failed encrypt must
         // not burn the outbound repair cooldown and leave bootstrap stranded.
         case .synchronizeOneTimeKeys:
             return true
-        case .linkedDeviceReprovisioning, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished:
+        case .linkedDeviceReprovisioning,
+             .refreshOneTimeKeys,
+             .publishedOneTimeKeysReplenished:
             return false
         }
     }
@@ -1954,7 +1941,7 @@ extension TaskProcessor {
 /// - Note: This protocol is `Sendable` to ensure thread safety when used
 ///   across concurrent contexts. Implementations must be thread-safe.
 ///
-/// - Important: The default implementation in `TaskProcessor` handles most
+/// - Important: The default implementation in `MessagePipeline` handles most
 ///   production use cases. Custom delegates are typically only needed for:
 ///   - Unit testing and mocking
 ///   - Specialized task processing requirements
@@ -1978,7 +1965,7 @@ extension TaskProcessor {
 ///   ```
 ///
 /// - Thread Safety: Implementations must be thread-safe as this protocol
-///   may be called from concurrent contexts within the `TaskProcessor`.
+///   may be called from concurrent contexts within the `MessagePipeline`.
 protocol TaskSequenceDelegate: Sendable {
     
     /// Performs the ratchet operation for a given task within the session context.
@@ -2005,7 +1992,7 @@ protocol TaskSequenceDelegate: Sendable {
     ///   calling thread. Long-running operations should be properly awaited.
     ///
     /// - Important: Implementations should ensure proper error propagation
-    ///   to allow the `TaskProcessor` to handle failures appropriately.
+    ///   to allow the `MessagePipeline` to handle failures appropriately.
     ///   Errors thrown from this method will be caught and handled by the
     ///   task processing loop.
     ///
@@ -2016,7 +2003,7 @@ protocol TaskSequenceDelegate: Sendable {
     ///       case .writeMessage(let writeTask):
     ///           // Validate the task
     ///           guard let recipient = writeTask.recipientIdentity else {
-    ///               throw TaskProcessor.JobProcessorErrors.missingIdentity
+    ///               throw MessagePipeline.JobProcessorErrors.missingIdentity
     ///           }
     ///
     ///           // Perform the ratchet operation

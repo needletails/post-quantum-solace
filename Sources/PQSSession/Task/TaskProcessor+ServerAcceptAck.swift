@@ -4,8 +4,9 @@
 //
 
 import Foundation
+import NeedleTailLogger
 
-extension TaskProcessor {
+extension MessagePipeline {
     func registerUnackedServerAccept(
         pending: PendingOutboundTransport,
         localId: UUID,
@@ -31,7 +32,7 @@ extension TaskProcessor {
             return
         }
         unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)?.cancel()
-        PQSAuditLog.log(
+        audit(
             .send,
             "pqs.send.serverAccepted envelopeMessageId=\(envelopeMessageId) sharedId=\(entry.sharedId)",
             level: .info)
@@ -93,7 +94,7 @@ extension TaskProcessor {
             }
 
             guard let transportDelegate = await session.transportDelegate else {
-                PQSAuditLog.log(
+                audit(
                     .send,
                     "pqs.send.resendEpoch transportMissing envelopeMessageId=\(envelopeMessageId) reason=\(reason)",
                     level: .error)
@@ -107,12 +108,12 @@ extension TaskProcessor {
                 unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
                 unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)?.cancel()
                 startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
-                PQSAuditLog.log(
+                audit(
                     .send,
                     "pqs.send.resendEpoch envelopeMessageId=\(envelopeMessageId) sharedId=\(entry.sharedId) epoch=\(currentEpoch) attempt=\(entry.resendAttempts) reason=\(reason)",
                     level: .info)
             } catch {
-                PQSAuditLog.log(
+                audit(
                     .send,
                     "pqs.send.resendEpoch failed envelopeMessageId=\(envelopeMessageId) reason=\(reason) error=\(error)",
                     level: .error)
@@ -130,7 +131,7 @@ extension TaskProcessor {
         // Detach the map slot only — do **not** cancel. This function runs inside that
         // deadline Task; cancelling it makes the in-place resend throw CancellationError.
         _ = unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)
-        PQSAuditLog.log(
+        audit(
             .send,
             "pqs.send.ackOverdue envelopeMessageId=\(envelopeMessageId) sharedId=\(entry.sharedId) attempt=\(entry.resendAttempts)",
             level: .warning)
@@ -148,7 +149,7 @@ extension TaskProcessor {
                     localMessageId: entry.localId,
                     reason: "serverAcceptExhausted")
             }
-            PQSAuditLog.log(
+            audit(
                 .send,
                 "pqs.send.ackOverdueExhausted envelopeMessageId=\(envelopeMessageId) sharedId=\(entry.sharedId)",
                 level: .warning)
@@ -158,7 +159,7 @@ extension TaskProcessor {
         guard let transportDelegate = await session.transportDelegate else {
             // Keep waiting on the same envelope; re-arm so a later writer can recover.
             startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
-            PQSAuditLog.log(
+            audit(
                 .send,
                 "pqs.send.ackOverdueResend transportMissing envelopeMessageId=\(envelopeMessageId)",
                 level: .error)
@@ -172,7 +173,7 @@ extension TaskProcessor {
             entry.resendAttempts += 1
             unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
             startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
-            PQSAuditLog.log(
+            audit(
                 .send,
                 "pqs.send.ackOverdueResend envelopeMessageId=\(envelopeMessageId) sharedId=\(entry.sharedId) attempt=\(entry.resendAttempts)",
                 level: .info)
@@ -180,14 +181,14 @@ extension TaskProcessor {
             // External cancel (e.g. teardown) — only re-arm if still awaiting accept.
             guard unackedServerAcceptByEnvelopeId[envelopeMessageId] != nil else { return }
             startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
-            PQSAuditLog.log(
+            audit(
                 .send,
                 "pqs.send.ackOverdueResend cancelled envelopeMessageId=\(envelopeMessageId)",
                 level: .info)
         } catch {
             guard unackedServerAcceptByEnvelopeId[envelopeMessageId] != nil else { return }
             startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
-            PQSAuditLog.log(
+            audit(
                 .send,
                 "pqs.send.ackOverdueResend failed envelopeMessageId=\(envelopeMessageId) error=\(error)",
                 level: .error)
@@ -219,14 +220,14 @@ extension TaskProcessor {
                 unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
                 unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)?.cancel()
                 startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
-                PQSAuditLog.log(
+                audit(
                     .send,
                     "pqs.send.retryFailedServerAccept envelopeMessageId=\(envelopeMessageId) sharedId=\(entry.sharedId)",
                     level: .info)
                 didSend = true
             } catch {
                 unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
-                PQSAuditLog.log(
+                audit(
                     .send,
                     "pqs.send.retryFailedServerAccept failed envelopeMessageId=\(envelopeMessageId) error=\(error)",
                     level: .error)

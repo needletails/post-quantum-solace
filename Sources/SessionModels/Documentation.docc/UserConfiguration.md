@@ -38,11 +38,11 @@ Every "signed" container verifies the inner payload against
 
 - ``UserConfiguration/signedOneTimePublicKeys``
 - ``UserConfiguration/signedMLKEMOneTimePublicKeys``
-- ``UserConfiguration/getVerifiedCurveKeys(deviceId:)``
+- ``UserConfiguration/getVerifiedX25519Keys(deviceId:)``
 - ``UserConfiguration/getVerifiedMLKEMKeys(deviceId:)``
 - ``OneTimeKeys``
 - ``RotatedPublicKeys``
-- ``KeysType``
+- ``KeyKind``
 
 ### Signed containers
 
@@ -60,7 +60,7 @@ let devices = try config.getVerifiedDevices()
 
 // Per-device prekey buckets.
 for device in devices {
-    let curveKeys = try config.getVerifiedCurveKeys(deviceId: device.deviceId)
+    let x25519Keys = try config.getVerifiedX25519Keys(deviceId: device.deviceId)
     let kemKeys = try config.getVerifiedMLKEMKeys(deviceId: device.deviceId)
     // ... pick a key, send a message
 }

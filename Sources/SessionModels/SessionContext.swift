@@ -39,6 +39,8 @@ public struct SessionContext: Codable & Sendable, Equatable {
         case registrationState = "e" // Key for the registration state
         /// Opaque host-local policy blob (e.g. NudgeKit tombstones). Optional for back-compat.
         case hostLocalPolicyData = "f"
+        /// Persisted schema version. Missing on schema-1 contexts (decode as 1).
+        case schemaVersion = "g"
     }
 
     /// The session user associated with this context.
@@ -80,6 +82,9 @@ public struct SessionContext: Codable & Sendable, Equatable {
     /// older contexts; treat as empty.
     public var hostLocalPolicyData: Data?
 
+    /// On-disk schema version for this context. Schema-1 blobs omit the field.
+    public var schemaVersion: Int
+
     /// Initializes a new instance of `SessionContext`.
     ///
     /// - Parameters:
@@ -98,7 +103,8 @@ public struct SessionContext: Codable & Sendable, Equatable {
         sessionContextId: Int,
         activeUserConfiguration: UserConfiguration,
         registrationState: RegistrationState,
-        hostLocalPolicyData: Data? = nil
+        hostLocalPolicyData: Data? = nil,
+        schemaVersion: Int = 2
     ) {
         self.sessionUser = sessionUser
         databaseEncryptionKey = data
@@ -106,6 +112,29 @@ public struct SessionContext: Codable & Sendable, Equatable {
         self.activeUserConfiguration = activeUserConfiguration
         self.registrationState = registrationState
         self.hostLocalPolicyData = hostLocalPolicyData
+        self.schemaVersion = schemaVersion
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        sessionUser = try container.decode(SessionUser.self, forKey: .sessionUser)
+        databaseEncryptionKey = try container.decode(Data.self, forKey: .databaseEncryptionKey)
+        sessionContextId = try container.decode(Int.self, forKey: .sessionContextId)
+        activeUserConfiguration = try container.decode(UserConfiguration.self, forKey: .activeUserConfiguration)
+        registrationState = try container.decode(RegistrationState.self, forKey: .registrationState)
+        hostLocalPolicyData = try container.decodeIfPresent(Data.self, forKey: .hostLocalPolicyData)
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(sessionUser, forKey: .sessionUser)
+        try container.encode(databaseEncryptionKey, forKey: .databaseEncryptionKey)
+        try container.encode(sessionContextId, forKey: .sessionContextId)
+        try container.encode(activeUserConfiguration, forKey: .activeUserConfiguration)
+        try container.encode(registrationState, forKey: .registrationState)
+        try container.encodeIfPresent(hostLocalPolicyData, forKey: .hostLocalPolicyData)
+        try container.encode(schemaVersion, forKey: .schemaVersion)
     }
 
     /// Updates the session user with a new value.

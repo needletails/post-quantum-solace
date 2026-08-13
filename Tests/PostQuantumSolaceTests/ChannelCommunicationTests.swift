@@ -42,20 +42,20 @@ actor ChannelCommunicationTests {
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: ReceiverDelegate(session: session))
 
-        await session.setViability(true)
+        await session.setConnectivity(true)
         await store.setPublishableName(mockUserData.ssn)
 
-        session = try await session.createSession(
+        session = try await session.createAccount(
             secretName: mockUserData.ssn,
             appPassword: mockUserData.sap
         ) {}
 
         await session.setAppPassword(mockUserData.sap)
-        session = try await session.startSession(appPassword: mockUserData.sap)
+        session = try await session.unlock(appPassword: mockUserData.sap)
 
         guard let cache = await session.cache else {
             Issue.record("Session cache should be initialized")
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
 
         let symmetricKey = try await session.getDatabaseSymmetricKey()
@@ -68,8 +68,8 @@ actor ChannelCommunicationTests {
     func testCreateChannelCommunication_invalidMemberCount() async throws {
         let (cache, symmetricKey) = try await setupSession()
 
-        await #expect(throws: PQSSession.SessionErrors.invalidMemberCount.self) {
-            try await session.taskProcessor.createChannelCommunication(
+        await #expect(throws: PQSError.invalidMemberCount.self) {
+            try await session.messagePipeline.createChannelCommunication(
                 sender: "alice",
                 recipient: .channel("general"),
                 channelName: "general",
@@ -94,7 +94,7 @@ actor ChannelCommunicationTests {
         let initialCommunications = try await cache.fetchCommunications()
         let initialCount = initialCommunications.count
 
-        try await session.taskProcessor.createChannelCommunication(
+        try await session.messagePipeline.createChannelCommunication(
             sender: "alice",
             recipient: .channel("general"),
             channelName: "general",
@@ -126,7 +126,7 @@ actor ChannelCommunicationTests {
                 members: ["alice", "bob"],
                 operators: ["alice"]))
 
-        try await session.taskProcessor.createChannelCommunication(
+        try await session.messagePipeline.createChannelCommunication(
             sender: "alice",
             recipient: .channel("general"),
             channelName: "general",
@@ -139,7 +139,7 @@ actor ChannelCommunicationTests {
             metadata: metadata,
             shouldSynchronize: false)
 
-        try await session.taskProcessor.updateChannelMembership(
+        try await session.messagePipeline.updateChannelMembership(
             channelName: "general",
             administrator: "alice",
             members: ["alice", "bob", "carol"],
@@ -149,7 +149,7 @@ actor ChannelCommunicationTests {
             cache: cache,
             shouldSynchronize: false)
 
-        let communication = try await session.taskProcessor.findCommunicationType(
+        let communication = try await session.messagePipeline.conversation(
             cache: cache,
             communicationType: .channel("general"),
             session: session)
