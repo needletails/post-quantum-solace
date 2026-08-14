@@ -1034,6 +1034,15 @@ public actor PQSSession: SessionCacheSynchronizer {
         }
     }
 
+    /// Attaches a persistence host so unlock and password checks can read salt and session context.
+    ///
+    /// Hosts that construct with ``init(configuration:ratchetConfiguration:)`` already have a store.
+    /// Call this when a bare ``PQSSession`` must verify or unlock against an existing local store
+    /// before full transport/observer wiring.
+    public func attachPersistenceHost(_ store: any PQSPersistenceHost) async {
+        await setDatabaseDelegate(conformer: store)
+    }
+
     /// Sets (or clears) the application-facing event receiver.
     ///
     /// The receiver hears about lifecycle changes — created/updated/deleted

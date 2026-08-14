@@ -63,6 +63,7 @@ public struct MessageMetadata: Sendable, Codable {
         case userMarkedRead
         case userMarkedArchived
         case userMarkedHidden
+        case unreadCount
     }
 
     /// A Boolean value indicating whether the user has marked the message as pinned.
@@ -85,6 +86,10 @@ public struct MessageMetadata: Sendable, Codable {
     /// When `true`, the conversation is hidden from the main list until the Hidden filter is shown and selected (local UI only).
     public var userMarkedHidden: Bool
 
+    /// Stored unread for this conversation. Increment on inbound, clear on open.
+    /// The home-screen icon is the sum of these counters; delivery receipts stay separate.
+    public var unreadCount: Int
+
     /// Initializes a new instance of `MessageMetadata`.
     ///
     /// - Parameters:
@@ -94,16 +99,19 @@ public struct MessageMetadata: Sendable, Codable {
     ///     Defaults to `false` for new messages.
     ///   - userMarkedArchived: Archived sidebar state. Defaults to `false`.
     ///   - userMarkedHidden: Hidden sidebar state. Defaults to `false`.
+    ///   - unreadCount: Conversation unread counter. Defaults to `0`.
     public init(
         userMarkedPinned: Bool = false,
         userMarkedRead: Bool = false,
         userMarkedArchived: Bool = false,
-        userMarkedHidden: Bool = false
+        userMarkedHidden: Bool = false,
+        unreadCount: Int = 0
     ) {
         self.userMarkedPinned = userMarkedPinned
         self.userMarkedRead = userMarkedRead
         self.userMarkedArchived = userMarkedArchived
         self.userMarkedHidden = userMarkedHidden
+        self.unreadCount = max(0, unreadCount)
     }
 
     /// Decodes a `MessageMetadata`, supplying defaults for fields that
@@ -119,6 +127,7 @@ public struct MessageMetadata: Sendable, Codable {
         userMarkedRead = try c.decodeIfPresent(Bool.self, forKey: .userMarkedRead) ?? false
         userMarkedArchived = try c.decodeIfPresent(Bool.self, forKey: .userMarkedArchived) ?? false
         userMarkedHidden = try c.decodeIfPresent(Bool.self, forKey: .userMarkedHidden) ?? false
+        unreadCount = max(0, try c.decodeIfPresent(Int.self, forKey: .unreadCount) ?? 0)
     }
 
     /// Encodes every flag explicitly so on-disk rows always carry the
@@ -130,6 +139,7 @@ public struct MessageMetadata: Sendable, Codable {
         try c.encode(userMarkedRead, forKey: .userMarkedRead)
         try c.encode(userMarkedArchived, forKey: .userMarkedArchived)
         try c.encode(userMarkedHidden, forKey: .userMarkedHidden)
+        try c.encode(unreadCount, forKey: .unreadCount)
     }
 
     /// Creates a copy of the current metadata with updated pinned state.
@@ -141,7 +151,8 @@ public struct MessageMetadata: Sendable, Codable {
             userMarkedPinned: isPinned,
             userMarkedRead: userMarkedRead,
             userMarkedArchived: userMarkedArchived,
-            userMarkedHidden: userMarkedHidden
+            userMarkedHidden: userMarkedHidden,
+            unreadCount: unreadCount
         )
     }
 
@@ -154,7 +165,8 @@ public struct MessageMetadata: Sendable, Codable {
             userMarkedPinned: userMarkedPinned,
             userMarkedRead: isRead,
             userMarkedArchived: userMarkedArchived,
-            userMarkedHidden: userMarkedHidden
+            userMarkedHidden: userMarkedHidden,
+            unreadCount: isRead ? 0 : max(1, unreadCount)
         )
     }
 
@@ -167,7 +179,8 @@ public struct MessageMetadata: Sendable, Codable {
             userMarkedPinned: userMarkedPinned,
             userMarkedRead: userMarkedRead,
             userMarkedArchived: isArchived,
-            userMarkedHidden: userMarkedHidden
+            userMarkedHidden: userMarkedHidden,
+            unreadCount: unreadCount
         )
     }
 
@@ -180,7 +193,29 @@ public struct MessageMetadata: Sendable, Codable {
             userMarkedPinned: userMarkedPinned,
             userMarkedRead: userMarkedRead,
             userMarkedArchived: userMarkedArchived,
-            userMarkedHidden: isHidden
+            userMarkedHidden: isHidden,
+            unreadCount: unreadCount
         )
+    }
+
+    /// +1 (or more) on an inbound message. Marks the conversation unread.
+    public func incrementingUnread(by count: Int = 1) -> MessageMetadata {
+        MessageMetadata(
+            userMarkedPinned: userMarkedPinned,
+            userMarkedRead: false,
+            userMarkedArchived: userMarkedArchived,
+            userMarkedHidden: userMarkedHidden,
+            unreadCount: max(0, unreadCount + count)
+        )
+    }
+
+    /// Open / mark read: clear the conversation counter.
+    public func markingRead() -> MessageMetadata {
+        updatingReadState(true)
+    }
+
+    /// Manual mark unread: keep an existing count, otherwise seed 1.
+    public func markingUnread() -> MessageMetadata {
+        updatingReadState(false)
     }
 }

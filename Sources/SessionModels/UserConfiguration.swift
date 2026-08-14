@@ -197,7 +197,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         /// - Throws: An error if verification fails.
         public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> UserDeviceConfiguration? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BinaryDecoder().decode(UserDeviceConfiguration.self, from: data)
+            return try? BinaryDecoder().decode(UserDeviceConfiguration.self, from: data)
         }
     }
 
@@ -249,7 +249,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
 
         public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> DeviceKeyBundle? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BinaryDecoder().decode(DeviceKeyBundle.self, from: data)
+            return try? BinaryDecoder().decode(DeviceKeyBundle.self, from: data)
         }
     }
 
@@ -293,6 +293,13 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             signature = try signingKey.signature(for: encoded)
         }
 
+        init(id: UUID, deviceId: UUID, data: Data, signature: Data) {
+            self.id = id
+            self.deviceId = deviceId
+            self.data = data
+            self.signature = signature
+        }
+
         /// Verifies the signature of the public one-time key data.
         ///
         /// - Parameter publicKey: The public signing key used for verification.
@@ -300,7 +307,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         /// - Throws: An error if verification fails.
         public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> X25519PublicKey? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BinaryDecoder().decode(X25519PublicKey.self, from: data)
+            return X25519KeyDecoding.publicKey(from: data)
         }
     }
 
@@ -351,7 +358,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         /// - Throws: An error if verification fails.
         public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> MLKEMPublicKey? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BinaryDecoder().decode(MLKEMPublicKey.self, from: data)
+            return try? BinaryDecoder().decode(MLKEMPublicKey.self, from: data)
         }
     }
 

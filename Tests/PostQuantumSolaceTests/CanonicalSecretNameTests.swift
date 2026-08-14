@@ -39,6 +39,14 @@ struct CanonicalSecretNameTests {
         #expect(SecretName("[mix]\\Of~All").rawValue == "{mix}|of^all")
     }
 
+    @Test("areEqual folds case and IRC-equivalent characters")
+    func areEqualFoldsIdentity() {
+        #expect(SecretName.areEqual("Alice", "alice"))
+        #expect(SecretName.areEqual("Foo[bar]", "foo{bar}"))
+        #expect(!SecretName.areEqual("alice", "bob"))
+        #expect(!SecretName.areEqual("", "bob"))
+    }
+
     @Test("Normalization is idempotent")
     func normalizationIsIdempotent() {
         let inputs = [

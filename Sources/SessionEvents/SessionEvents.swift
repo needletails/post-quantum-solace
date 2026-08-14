@@ -468,6 +468,11 @@ package extension ContactService {
         let contacts = try await cache.fetchContacts()
 
         for contactInfo in contactInfos {
+            // Linked-device contact sync can include the local account. Skip it
+            // so one self row cannot abort the rest of the batch with error 8.
+            if SecretName.areEqual(contactInfo.secretName, mySecretName) {
+                continue
+            }
             let contactAlreadyExists = await contacts.asyncContains { contact in
                 await contact.props(symmetricKey: symmetricKey)?.secretName == contactInfo.secretName
             }
@@ -613,9 +618,12 @@ package extension ContactService {
         // characters (`[`, `]`, `\`, `~`). Plain `lowercased()` would silently
         // disagree with the stored value in that case.
         let newContactSecretName = SecretName(secretName).rawValue
-        let mySecretName = sessionContext.sessionUser.secretName
-        
-        guard newContactSecretName != mySecretName else {
+        let storedMySecretName = sessionContext.sessionUser.secretName
+        let mySecretName = SecretName(storedMySecretName).rawValue
+        guard !mySecretName.isEmpty else {
+            throw PQSError.sessionNotInitialized
+        }
+        guard !newContactSecretName.isEmpty, newContactSecretName != mySecretName else {
             throw PQSError.invalidSecretName
         }
         
@@ -688,7 +696,7 @@ package extension ContactService {
             // Repair the communication shell before notifying the UI or starting
             // friendship synchronization.
             _ = try await updateOrCreateCommunication(
-                mySecretName: mySecretName,
+                mySecretName: storedMySecretName,
                 recipient: .nickname(newContactSecretName),
                 cache: cache,
                 receiver: receiver,
@@ -738,7 +746,7 @@ package extension ContactService {
             try await cache.createContact(contactModel)
             
             _ = try await updateOrCreateCommunication(
-                mySecretName: mySecretName,
+                mySecretName: storedMySecretName,
                 recipient: .nickname(newContactSecretName),
                 cache: cache,
                 receiver: receiver,
@@ -794,7 +802,8 @@ package extension ContactService {
         
         switch recipient {
         case .nickname(let theirSecretName):
-            guard theirSecretName != mySecretName else {
+            guard !SecretName(theirSecretName).rawValue.isEmpty,
+                  !SecretName.areEqual(theirSecretName, mySecretName) else {
                 throw PQSError.invalidSecretName
             }
             members = [mySecretName, theirSecretName]

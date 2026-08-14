@@ -158,7 +158,7 @@ public extension PQSSession {
     ///   receiving messages from the network. It handles all the cryptographic processing automatically.
     /// - Note: The method automatically refreshes keys when needed, ensuring continuous communication
     ///   capability without manual intervention.
-    func receiveMessage(
+    public func receiveMessage(
         message: SignedRatchetMessage,
         sender: String,
         deviceId: UUID,
@@ -367,7 +367,7 @@ public extension PQSSession {
             logger: logger)
     }
     
-    func createConversation(
+    public func createConversation(
         sender: String,
         recipient: MessageRecipient,
         channelName: String,

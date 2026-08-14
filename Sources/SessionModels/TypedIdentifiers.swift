@@ -82,4 +82,9 @@ public struct SecretName: RawRepresentable, Hashable, Sendable, Codable {
             .replacingOccurrences(of: "~", with: "^")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    /// Identity comparison after the same fold `createContact` and transport lookups use.
+    public static func areEqual(_ lhs: String, _ rhs: String) -> Bool {
+        SecretName(lhs).rawValue == SecretName(rhs).rawValue
+    }
 }

@@ -234,7 +234,7 @@ public extension PQSSession {
         let hasValidIdentities = await hasValidIdentitiesForRecipient(existingIdentities, secretName: secretName)
         
         // Extract synchronization keys if available
-        let syncKeys = try await extractSynchronizationKeys()
+        let syncKeys = await extractSynchronizationKeys()
         
         // Determine if refresh is needed
         let needsRefresh = forceRefresh || !hasValidIdentities
@@ -673,13 +673,20 @@ public extension PQSSession {
 
     /// Extracts synchronization keys from adding contact data if available
     /// - Returns: Optional tuple containing curve and mlKEM key IDs
-    private func extractSynchronizationKeys() async throws -> (x25519Id: String?, mlKEMId: String?)? {
+    private func extractSynchronizationKeys() async -> (x25519Id: String?, mlKEMId: String?)? {
         guard let addingContactData else { return nil }
 
-        let keys = try BinaryDecoder().decode(SynchronizationKeyIdentities.self, from: addingContactData)
-        await setAddingContact(nil)
-
-        return (x25519Id: keys.senderX25519Id, mlKEMId: keys.senderMLKEMId)
+        do {
+            let keys = try BinaryDecoder().decode(SynchronizationKeyIdentities.self, from: addingContactData)
+            await setAddingContact(nil)
+            return (x25519Id: keys.senderX25519Id, mlKEMId: keys.senderMLKEMId)
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "extractSynchronizationKeys: ignoring undecodable addingContactData bytes=\(addingContactData.count) error=\(error)")
+            await setAddingContact(nil)
+            return nil
+        }
     }
 
     /// Whether an established inbound ratchet exists for traffic from the given peer
@@ -2146,8 +2153,17 @@ public extension PQSSession {
 
         for device in verifiedDevices {
             do {
-                _ = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
                 let currentDevice = try configuration.deviceWithCurrentKeyBundle(device)
+                // Child-link QR membership is published with empty Curve keys; real
+                // material arrives on `.syncNewDevice`. Unlink force-refresh still
+                // sees that placeholder — skip it without a CryptoKit size error.
+                if currentDevice.signingPublicKey.isEmpty || currentDevice.longTermPublicKey.isEmpty {
+                    logger.log(
+                        level: .debug,
+                        message: "Skipping provisional \(source) device during identity refresh for \(secretName): deviceId=\(device.deviceId), signingBytes=\(currentDevice.signingPublicKey.count), longTermBytes=\(currentDevice.longTermPublicKey.count)")
+                    continue
+                }
+                _ = try Curve25519.Signing.PublicKey(rawRepresentation: currentDevice.signingPublicKey)
                 _ = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: currentDevice.longTermPublicKey)
                 _ = try MLKEMPublicKey(
                     id: currentDevice.finalMLKEMPublicKey.id,
