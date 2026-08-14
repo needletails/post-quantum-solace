@@ -37,8 +37,8 @@ actor SessionTests {
 
     struct KeyPair {
         let id: UUID
-        let publicKey: CurvePublicKey
-        let privateKey: CurvePrivateKey
+        let publicKey: X25519PublicKey
+        let privateKey: X25519PrivateKey
     }
 
     // MARK: - Cached Key Pairs
@@ -158,7 +158,7 @@ actor SessionTests {
             // Public keys are pruned to the server list, while private keys are
             // retained for in-flight messages that may still need to decrypt.
             let partialKeys = Array(validKeys.prefix(10)).map(\.id)
-            _ = try await self.session.synchronizeLocalKeys(cache: self.session.cache!, keys: partialKeys, type: .curve)
+            _ = try await self.session.synchronizeLocalKeys(cache: self.session.cache!, keys: partialKeys, type: .x25519)
 
             let updatedData = try await store.fetchLocalSessionContext()
             let decrypted = try self.crypto.decrypt(data: updatedData, symmetricKey: symmetricKey)
@@ -167,7 +167,7 @@ actor SessionTests {
             #expect(decoded.activeUserConfiguration.signedOneTimePublicKeys.count == 10, "Should keep only the matching public keys.")
 
             // Second Test Case: Remote list has no matching keys.
-            _ = try await self.session.synchronizeLocalKeys(cache: self.session.cache!, keys: badKeys.map(\.id), type: .curve)
+            _ = try await self.session.synchronizeLocalKeys(cache: self.session.cache!, keys: badKeys.map(\.id), type: .x25519)
 
             let updatedDataFinal = try await store.fetchLocalSessionContext()
             let decryptedFinal = try self.crypto.decrypt(data: updatedDataFinal, symmetricKey: symmetricKey)
@@ -247,7 +247,7 @@ actor SessionTests {
         let retainedCount = try await session.synchronizeLocalKeys(
             cache: session.cache!,
             keys: retainedLocalKeyIds,
-            type: .curve
+            type: .x25519
         )
 
         let updatedData = try await store.fetchLocalSessionContext()
@@ -314,7 +314,7 @@ actor SessionTests {
             let foundContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
 
             // Run
-            try await session.refreshOneTimeKeys(refreshType: .curve)
+            try await session.refreshOneTimeKeys(refreshType: .x25519)
 
             #expect(foundContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == 100)
             #expect(foundContext.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
@@ -323,7 +323,7 @@ actor SessionTests {
                 let prvSgnKey = try Curve25519.Signing.PrivateKey(rawRepresentation: foundContext.sessionUser.deviceKeys.signingPrivateKey)
                 let id = UUID()
                 let privateKey = self.crypto.generateCurve25519PrivateKey()
-                let publicKey = try CurvePublicKey(id: id, privateKey.publicKey.rawRepresentation)
+                let publicKey = try X25519PublicKey(id: id, privateKey.publicKey.rawRepresentation)
                 let newOneTimeKey = try UserConfiguration.SignedOneTimePublicKey(key: publicKey, deviceId: foundContext.sessionUser.deviceId, signingKey: prvSgnKey)
                 _ = try await mockTransport.fetchOneTimeKey(for: "u1", deviceId: sessionUser.deviceId.uuidString, senderSecretName: "", sender: "")
                 _ = try await mockTransport.updateOneTimeKeys(for: "u1", deviceId: sessionUser.deviceId.uuidString, keys: [newOneTimeKey])
@@ -341,7 +341,7 @@ actor SessionTests {
             #expect(foundContext.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
             await #expect(mockTransport.publicKeys.count == 105)
 
-            try await session.refreshOneTimeKeys(refreshType: .curve)
+            try await session.refreshOneTimeKeys(refreshType: .x25519)
             #expect(foundContext.activeUserConfiguration.signedOneTimePublicKeys.count == 100)
 
             let config2 = try await mockCache.fetchLocalSessionContext()
@@ -416,7 +416,7 @@ actor SessionTests {
     }
 
     @Test
-    func refreshOneTimeKeys_doesNotPersistGeneratedCurveKeys_whenUploadFails() async throws {
+    func refreshOneTimeKeys_doesNotPersistGeneratedX25519Keys_whenUploadFails() async throws {
         let mockCache = MockCache()
         let appSymmetricKey = await self.crypto.deriveStrictSymmetricKey(
             data: "secret".data(using: .utf8)!,
@@ -446,8 +446,8 @@ actor SessionTests {
             publicKeys: bundle.userConfiguration.signedOneTimePublicKeys
         )
         let retainedIds = Array(bundle.userConfiguration.signedOneTimePublicKeys.prefix(10).map(\.id))
-        await mockTransport.setKeyIdentityOverride(curve: retainedIds)
-        await mockTransport.setCurveUpdateError(.oneTimeKeyUploadFailed)
+        await mockTransport.setKeyIdentityOverride(x25519: retainedIds)
+        await mockTransport.setX25519UpdateError(.oneTimeKeyUploadFailed)
 
         let data = try BinaryEncoder().encode(sessionContext)
         let encrypted = try self.crypto.encrypt(data: data, symmetricKey: appSymmetricKey)!
@@ -457,8 +457,8 @@ actor SessionTests {
         await session.setDatabaseDelegate(conformer: mockCache)
         await session.setAppPassword("secret")
 
-        await #expect(throws: PQSSession.SessionErrors.self) {
-            try await self.session.refreshOneTimeKeys(refreshType: .curve)
+        await #expect(throws: PQSError.self) {
+            try await self.session.refreshOneTimeKeys(refreshType: .x25519)
         }
 
         let refreshedData = try await mockCache.fetchLocalSessionContext()
@@ -505,7 +505,7 @@ actor SessionTests {
             publicKeys: bundle.userConfiguration.signedOneTimePublicKeys
         )
         let retainedIds = Array(bundle.userConfiguration.signedOneTimePublicKeys.prefix(15).map(\.id))
-        await mockTransport.setKeyIdentityOverride(curve: retainedIds)
+        await mockTransport.setKeyIdentityOverride(x25519: retainedIds)
 
         let data = try BinaryEncoder().encode(sessionContext)
         let encrypted = try self.crypto.encrypt(data: data, symmetricKey: appSymmetricKey)!
@@ -515,7 +515,7 @@ actor SessionTests {
         await session.setDatabaseDelegate(conformer: mockCache)
         await session.setAppPassword("secret")
 
-        try await session.refreshOneTimeKeys(refreshType: .curve, policy: .automatic)
+        try await session.refreshOneTimeKeys(refreshType: .x25519, policy: .automatic)
 
         let midData = try await mockCache.fetchLocalSessionContext()
         let midDecrypted = try self.crypto.decrypt(data: midData, symmetricKey: appSymmetricKey)!
@@ -523,7 +523,7 @@ actor SessionTests {
         #expect(midContext.activeUserConfiguration.signedOneTimePublicKeys.count == 15)
         #expect(midContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == bundle.deviceKeys.oneTimePrivateKeys.count)
 
-        try await session.refreshOneTimeKeys(refreshType: .curve, policy: .replenishBatch)
+        try await session.refreshOneTimeKeys(refreshType: .x25519, policy: .replenishBatch)
 
         let finalData = try await mockCache.fetchLocalSessionContext()
         let finalDecrypted = try self.crypto.decrypt(data: finalData, symmetricKey: appSymmetricKey)!
@@ -537,8 +537,9 @@ actor SessionTests {
 
 // MARK: - Mock Classes
 
-actor MockCache: PQSSessionStore {
+actor MockCache: PQSStore, PQSRecoveryStore {
     var localSessionData: Data = .init()
+    let recoveryLedger = InMemoryRecoveryLedger()
 
     // MARK: - Session Context Methods
 
@@ -597,6 +598,42 @@ actor MockCache: PQSSessionStore {
         try .init(id: UUID(), communicationId: UUID(), sessionContextId: 0, sharedId: "", sequenceNumber: 0, data: Data())
     }
 
+    func fetchMessageIfExists(sharedId _: String) async throws -> SessionModels.EncryptedMessage? { nil }
+
+    func updateSessionIdentity(_ session: DoubleRatchetKit.SessionIdentity, andPreparedJob job: SessionModels.JobModel) async throws {
+        try await updateSessionIdentity(session)
+        try await updateJob(job)
+    }
+
+    func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws {
+        recoveryLedger.upsertOutboundDeviceSendRecord(record)
+    }
+    func fetchOutboundDeviceSendRecord(sharedId: String, recipientDeviceId: UUID) async throws -> OutboundDeviceSendRecord? {
+        recoveryLedger.fetchOutboundDeviceSendRecord(sharedId: sharedId, recipientDeviceId: recipientDeviceId)
+    }
+    func fetchOutboundDeviceSendRecord(envelopeMessageId: String) async throws -> OutboundDeviceSendRecord? {
+        recoveryLedger.fetchOutboundDeviceSendRecord(envelopeMessageId: envelopeMessageId)
+    }
+    func deleteOutboundDeviceSendRecords(sharedId: String) async throws {
+        recoveryLedger.deleteOutboundDeviceSendRecords(sharedId: sharedId)
+    }
+    func upsertAcceptedEnvelope(_ record: AcceptedEnvelopeRecord) async throws {
+        recoveryLedger.upsertAcceptedEnvelope(record)
+    }
+    func fetchAcceptedEnvelope(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        envelopeMessageId: String
+    ) async throws -> AcceptedEnvelopeRecord? {
+        recoveryLedger.fetchAcceptedEnvelope(
+            senderSecretName: senderSecretName,
+            senderDeviceId: senderDeviceId,
+            envelopeMessageId: envelopeMessageId)
+    }
+    func pruneAcceptedEnvelopes(olderThan date: Date) async throws -> Int {
+        recoveryLedger.pruneAcceptedEnvelopes(olderThan: date)
+    }
+
     func createMessage(_: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws {}
     func updateMessage(_: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws {}
     func deleteMessage(_: SessionModels.EncryptedMessage) async throws {}
@@ -627,18 +664,18 @@ actor MockCache: PQSSessionStore {
     func deleteMediaJob(_: UUID) async throws {}
 }
 
-actor MockTransport: SessionTransport {
+actor MockTransport: PQSTransport, PQSKeyDirectory, PQSRecoveryTransport {
     let crypto = NeedleTailCrypto()
     let cache: MockCache
     let appKey: SymmetricKey
     var publicKeys: [UserConfiguration.SignedOneTimePublicKey]
-    var curveKeyIdentityOverride: [UUID]?
+    var x25519KeyIdentityOverride: [UUID]?
     var mlKEMKeyIdentityOverride: [UUID]?
-    var curveUpdateError: PQSSession.SessionErrors?
-    var mlKEMUpdateError: PQSSession.SessionErrors?
+    var x25519UpdateError: PQSError?
+    var mlKEMUpdateError: PQSError?
 
     // Generate 100 private one-time key pairs
-    let privateOneTimeKeyPairs: [PQSSession.KeyPair<CurvePublicKey, CurvePrivateKey>]
+    let privateOneTimeKeyPairs: [PQSSession.KeyPair<X25519PublicKey, X25519PrivateKey>]
     let mlKEMOneTimeKeyPairs: [PQSSession.KeyPair<MLKEMPublicKey, MLKEMPrivateKey>]
 
     init(cache: MockCache, appKey: SymmetricKey, publicKeys: [UserConfiguration.SignedOneTimePublicKey]) {
@@ -650,8 +687,8 @@ actor MockTransport: SessionTransport {
             let crypto = NeedleTailCrypto()
             let id = UUID()
             let privateKey = crypto.generateCurve25519PrivateKey()
-            let privateKeyRep = try CurvePrivateKey(id: id, privateKey.rawRepresentation)
-            let publicKey = try CurvePublicKey(id: id, privateKey.publicKey.rawRepresentation)
+            let privateKeyRep = try X25519PrivateKey(id: id, privateKey.rawRepresentation)
+            let publicKey = try X25519PublicKey(id: id, privateKey.publicKey.rawRepresentation)
             return PQSSession.KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
         }
 
@@ -665,16 +702,16 @@ actor MockTransport: SessionTransport {
         }
     }
 
-    func setKeyIdentityOverride(curve: [UUID]? = nil, mlKEM: [UUID]? = nil) {
-        curveKeyIdentityOverride = curve
+    func setKeyIdentityOverride(x25519: [UUID]? = nil, mlKEM: [UUID]? = nil) {
+        x25519KeyIdentityOverride = x25519
         mlKEMKeyIdentityOverride = mlKEM
     }
 
-    func setCurveUpdateError(_ error: PQSSession.SessionErrors?) {
-        curveUpdateError = error
+    func setX25519UpdateError(_ error: PQSError?) {
+        x25519UpdateError = error
     }
 
-    func setMLKEMUpdateError(_ error: PQSSession.SessionErrors?) {
+    func setMLKEMUpdateError(_ error: PQSError?) {
         mlKEMUpdateError = error
     }
 
@@ -699,7 +736,7 @@ actor MockTransport: SessionTransport {
         publicKeys.map(\.id)
     }
 
-    func fetchOneTimeKey(for _: String, deviceId _: String, senderSecretName _: String, sender _: String) async throws -> DoubleRatchetKit.CurvePublicKey {
+    func fetchOneTimeKey(for _: String, deviceId _: String, senderSecretName _: String, sender _: String) async throws -> DoubleRatchetKit.X25519PublicKey {
         let context = try await cache.fetchLocalSessionContext()
         let decrypted = try crypto.decrypt(data: context, symmetricKey: appKey)
         let decoded = try BinaryDecoder().decode(SessionContext.self, from: decrypted!)
@@ -708,25 +745,25 @@ actor MockTransport: SessionTransport {
     }
 
     func updateOneTimeKeys(for _: String, deviceId _: String, keys: [SessionModels.UserConfiguration.SignedOneTimePublicKey]) async throws {
-        if let curveUpdateError {
-            throw curveUpdateError
+        if let x25519UpdateError {
+            throw x25519UpdateError
         }
         publicKeys.append(contentsOf: keys)
     }
 
     func deleteOneTimeKeys(for _: String, with _: String) async throws {}
-    func batchDeleteOneTimeKeys(for _: String, with _: String, type _: SessionModels.KeysType) async throws {}
+    func batchDeleteOneTimeKeys(for _: String, with _: String, type _: SessionModels.KeyKind) async throws {}
 
     func fetchOneTimeKeys(for _: String, deviceId _: String) async throws -> SessionModels.OneTimeKeys {
         guard let privateKey = privateOneTimeKeyPairs.last else { fatalError() }
         guard let privateMLKEMKey = mlKEMOneTimeKeyPairs.last else { fatalError() }
-        return SessionModels.OneTimeKeys(curve: privateKey.publicKey, mlKEM: privateMLKEMKey.publicKey)
+        return SessionModels.OneTimeKeys(x25519: privateKey.publicKey, mlKEM: privateMLKEMKey.publicKey)
     }
 
-    func fetchOneTimeKeyIdentities(for _: String, deviceId _: String, type: KeysType) async throws -> [UUID] {
+    func fetchOneTimeKeyIdentities(for _: String, deviceId _: String, type: KeyKind) async throws -> [UUID] {
         switch type {
-        case .curve:
-            return curveKeyIdentityOverride ?? privateOneTimeKeyPairs.map(\.publicKey.id)
+        case .x25519:
+            return x25519KeyIdentityOverride ?? privateOneTimeKeyPairs.map(\.publicKey.id)
         case .mlKEM:
             return mlKEMKeyIdentityOverride ?? mlKEMOneTimeKeyPairs.map(\.publicKey.id)
         }
@@ -737,7 +774,9 @@ actor MockTransport: SessionTransport {
             throw mlKEMUpdateError
         }
     }
-    func deleteOneTimeKeys(for _: String, with _: String, type _: KeysType) async throws {}
+    func deleteOneTimeKeys(for _: String, with _: String, type _: KeyKind) async throws {}
+    func sendOutOfBandResendRequest(failedEnvelopeMessageIds: [String], to secretName: String, deviceId: UUID, requestingDeviceId: UUID) async throws {}
+    func sendOutOfBandResendUnavailable(unavailableEnvelopeMessageIds: [String], to secretName: String, deviceId: UUID, respondingDeviceId: UUID) async throws {}
 }
 
 // MARK: - OTK Race Condition Proof
@@ -857,7 +896,7 @@ actor OTKSyncRaceTests {
         _ = try await session.synchronizeLocalKeys(
             cache: session.cache!,
             keys: Array(serverList),
-            type: .curve
+            type: .x25519
         )
 
         // ── Step 4: Prove the consumed key's private counterpart was deleted ──

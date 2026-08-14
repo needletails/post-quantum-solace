@@ -1,4 +1,5 @@
 import Foundation
+import NeedleTailCrypto
 import Testing
 @testable import PQSSession
 
@@ -42,7 +43,7 @@ struct SessionConcurrencyHardeningTests {
         #expect(await session.lifecyclePhase == .shutDown)
     }
 
-    @Test("successful startSession revives runtime after shutdown")
+    @Test("successful unlock revives runtime after shutdown")
     func successfulStartSessionRevivesRuntimeAfterShutdown() async throws {
         let session = PQSSession()
         let user = MockUserData(session: session)
@@ -59,12 +60,12 @@ struct SessionConcurrencyHardeningTests {
         await session.setTransportDelegate(conformer: transport)
         await session.setReceiverDelegate(conformer: receiver)
         await session.setPQSSessionDelegate(conformer: sessionDelegate)
-        await session.setViability(true)
-        _ = try await session.createSession(
+        await session.setConnectivity(true)
+        _ = try await session.createAccount(
             secretName: user.ssn,
             appPassword: user.sap
         ) {}
-        _ = try await session.startSession(appPassword: user.sap)
+        _ = try await session.unlock(appPassword: user.sap)
 
         await session.shutdown()
         #expect(await session.lifecyclePhase == .shutDown)
@@ -72,14 +73,14 @@ struct SessionConcurrencyHardeningTests {
             await session.scheduleTransportProtocolWork {} == .rejected,
             "Shutdown must remain terminal until explicit session restoration")
 
-        // Host reconfiguration precedes startSession on relaunch. The restored
+        // Host reconfiguration precedes unlock on relaunch. The restored
         // session must replace its terminal ratchet processor and work tree.
         await session.setDatabaseDelegate(conformer: identityStore)
         await session.setTransportDelegate(conformer: transport)
         await session.setReceiverDelegate(conformer: receiver)
         await session.setPQSSessionDelegate(conformer: sessionDelegate)
-        await session.setViability(true)
-        _ = try await session.startSession(appPassword: user.sap)
+        await session.setConnectivity(true)
+        _ = try await session.unlock(appPassword: user.sap)
 
         #expect(await session.lifecyclePhase == .running)
         actor Counter {
@@ -97,6 +98,64 @@ struct SessionConcurrencyHardeningTests {
             try? await Task.sleep(for: .milliseconds(10))
         }
         #expect(await counter.value == 1)
+    }
+
+    @Test("failed ratchet persistence retains processor until revive retry succeeds")
+    func failedRatchetPersistenceRetainsProcessorUntilRetrySucceeds() async throws {
+        let session = PQSSession()
+        let user = MockUserData(session: session)
+        let identityStore = user.identityStore(isSender: true)
+        let transportStore = TransportStore()
+        let transport = _MockTransportDelegate(session: session, store: transportStore)
+        let receiver = ReceiverDelegate(session: session)
+        let sessionDelegate = SessionDelegate(session: session)
+
+        await identityStore.setLocalSalt("restart-after-failed-ratchet-persistence")
+        await transportStore.setPublishableName(user.ssn)
+        await session.setDatabaseDelegate(conformer: identityStore)
+        await session.setTransportDelegate(conformer: transport)
+        await session.setReceiverDelegate(conformer: receiver)
+        await session.setPQSSessionDelegate(conformer: sessionDelegate)
+        await session.setConnectivity(true)
+        _ = try await session.createAccount(
+            secretName: user.ssn,
+            appPassword: user.sap
+        ) {}
+        _ = try await session.unlock(appPassword: user.sap)
+
+        let originalProcessor = await session.messagePipeline
+        let ratchetManager = await originalProcessor.ratchetManager
+        let persistence = ControlledRatchetPersistence()
+        let fixture = try makeShutdownRatchetFixture()
+        await ratchetManager.setDelegate(persistence)
+        try await ratchetManager.initiateSession(
+            sessionIdentity: fixture.identity,
+            sessionSymmetricKey: fixture.symmetricKey,
+            remoteKeys: fixture.remoteKeys,
+            localKeys: fixture.localKeys)
+
+        await persistence.setShouldFail(true)
+        await session.shutdown()
+        #expect(await session.lifecyclePhase == .shutDown)
+
+        await session.setDatabaseDelegate(conformer: identityStore)
+        await session.setTransportDelegate(conformer: transport)
+        await session.setReceiverDelegate(conformer: receiver)
+        await session.setPQSSessionDelegate(conformer: sessionDelegate)
+        await session.setConnectivity(true)
+
+        await #expect(throws: ControlledRatchetPersistence.PersistenceError.self) {
+            _ = try await session.unlock(appPassword: user.sap)
+        }
+        #expect(await session.messagePipeline === originalProcessor)
+        #expect(await session.lifecyclePhase == .shutDown)
+
+        await persistence.setShouldFail(false)
+        _ = try await session.unlock(appPassword: user.sap)
+        #expect(await session.messagePipeline !== originalProcessor)
+        #expect(await session.lifecyclePhase == .running)
+
+        await session.shutdown()
     }
 
     @Test("transport protocol items admitted while running complete exactly once")
@@ -208,12 +267,12 @@ struct SessionConcurrencyHardeningTests {
     func setViabilityCoalescesResume() async {
         let session = PQSSession()
         defer { Task { await session.shutdown() } }
-        await session.setViability(false)
-        await session.setViability(true)
-        await session.setViability(true)
+        await session.setConnectivity(false)
+        await session.setConnectivity(true)
+        await session.setConnectivity(true)
         #expect(await session.isViable)
-        await session.setViability(false)
-        #expect(await !session.isViable)
+        await session.setConnectivity(false)
+        #expect(await session.isViable == false)
     }
 
     /// Friendship recovery / spool ACKs must keep moving while contact outbound is parked.
@@ -222,7 +281,7 @@ struct SessionConcurrencyHardeningTests {
         let session = PQSSession()
         defer { Task { await session.shutdown() } }
         await session.beginSessionLifecycleIfNeeded()
-        await session.setViability(false)
+        await session.setConnectivity(false)
 
         actor Counter {
             var background = 0
@@ -252,7 +311,7 @@ struct SessionConcurrencyHardeningTests {
         #expect(snap.0 == 0, "Gated background work must not run while non-viable (parked contact/friendship)")
         #expect(snap.1 == 1, "Transport protocol work must run while non-viable (recovery / spool ACK)")
 
-        await session.setViability(true)
+        await session.setConnectivity(true)
         let bg2 = await session.scheduleBackgroundWork {
             await counter.bumpBackground()
         }
@@ -291,4 +350,94 @@ struct SessionConcurrencyHardeningTests {
         // Neither waiter should hang past timeout; both must complete.
         _ = results
     }
+}
+
+private actor ControlledRatchetPersistence: SessionIdentityDelegate {
+    enum PersistenceError: Error {
+        case forced
+    }
+
+    private var shouldFail = false
+
+    func setShouldFail(_ shouldFail: Bool) {
+        self.shouldFail = shouldFail
+    }
+
+    func updateSessionIdentity(_ identity: SessionIdentity) async throws {
+        if shouldFail {
+            throw PersistenceError.forced
+        }
+    }
+
+    func fetchOneTimePrivateKey(_ id: UUID?) async throws -> X25519PrivateKey? {
+        nil
+    }
+
+    func updateOneTimeKey(remove id: UUID) async {}
+}
+
+private func makeShutdownRatchetFixture() throws -> (
+    identity: SessionIdentity,
+    symmetricKey: SymmetricKey,
+    remoteKeys: RemoteKeys,
+    localKeys: LocalKeys
+) {
+    let crypto = NeedleTailCrypto()
+    let symmetricKey = SymmetricKey(size: .bits256)
+
+    let remoteLongTerm = crypto.generateCurve25519PrivateKey()
+    let remoteOneTime = crypto.generateCurve25519PrivateKey()
+    let remoteSigning = crypto.generateCurve25519SigningPrivateKey()
+    let remoteKEM = try crypto.generateMLKem1024PrivateKey()
+    let remoteLongTermID = UUID()
+    let remoteOneTimeID = UUID()
+    let remoteKEMID = UUID()
+
+    let localLongTerm = crypto.generateCurve25519PrivateKey()
+    let localOneTime = crypto.generateCurve25519PrivateKey()
+    let localKEM = try crypto.generateMLKem1024PrivateKey()
+    let localLongTermID = UUID()
+    let localOneTimeID = UUID()
+    let localKEMID = UUID()
+
+    let identity = try SessionIdentity(
+        id: UUID(),
+        props: .init(
+            secretName: "shutdown-persistence-peer",
+            deviceId: UUID(),
+            sessionContextId: 1,
+            longTermPublicKey: remoteLongTerm.publicKey.rawRepresentation,
+            signingPublicKey: remoteSigning.publicKey.rawRepresentation,
+            mlKEMPublicKey: MLKEMPublicKey(
+                id: remoteKEMID,
+                remoteKEM.publicKey.rawRepresentation),
+            oneTimePublicKey: X25519PublicKey(
+                id: remoteOneTimeID,
+                remoteOneTime.publicKey.rawRepresentation),
+            deviceName: "Shutdown Persistence Peer",
+            isMasterDevice: true),
+        symmetricKey: symmetricKey)
+
+    let remoteKeys = try RemoteKeys(
+        longTerm: X25519PublicKey(
+            id: remoteLongTermID,
+            remoteLongTerm.publicKey.rawRepresentation),
+        oneTime: X25519PublicKey(
+            id: remoteOneTimeID,
+            remoteOneTime.publicKey.rawRepresentation),
+        mlKEM: MLKEMPublicKey(
+            id: remoteKEMID,
+            remoteKEM.publicKey.rawRepresentation))
+    let localKeys = try LocalKeys(
+        longTerm: X25519PrivateKey(
+            id: localLongTermID,
+            localLongTerm.rawRepresentation),
+        oneTime: X25519PrivateKey(
+            id: localOneTimeID,
+            localOneTime.rawRepresentation),
+        mlKEM: MLKEMPrivateKey(
+            id: localKEMID,
+            localKEM.encode()))
+
+    return (identity, symmetricKey, remoteKeys, localKeys)
 }

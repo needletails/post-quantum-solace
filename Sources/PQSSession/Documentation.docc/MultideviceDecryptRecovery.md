@@ -23,11 +23,10 @@ when its active SessionID still equals the orphaned one, and resends
 under a **new** envelope MessageID.
 
 **Legacy (pre-strict):** encrypted NACK riding a surgical control lane
-(`ControlDeliveryLanePolicy` / episode reuse). Emission and inbound
-servicing of encrypted `TransportEvent.requestMessageResend` /
-`messageResendUnavailable` are **commented out / stubbed** (`DEAD LEGACY`
-markers) pending dogfood confirmation, then delete. Wire enum cases and
-codecs stay only so leftover ciphertext cannot crash decode.
+(`ControlDeliveryLanePolicy` / episode reuse). Those emission and inbound
+paths are gone. `TransportEvent.requestMessageResend` /
+`messageResendUnavailable` remain only so leftover queued jobs still decode
+until schema 2 deletes the cases.
 
 Related path: undecryptable inbound → OOB `requestMessageResend` →
 sender orphan-resend.
@@ -40,7 +39,7 @@ sender orphan-resend.
 | Receive by `(senderUserID, senderDeviceID)` | §3.4 | Device-scoped try-all | S16 / `EnvelopeMessageIdTests` |
 | Activate inactive session only on decrypt success | §3.4 | `activateSessionIdentityAfterInboundDecrypt` | S16 |
 | Discard all state changes on decrypt failure | §3.4 | Snapshot rollback | S16 |
-| Retry request is unencrypted | §4.1 | `SessionTransport.sendOutOfBandResendRequest` | S1, S7, S13 |
+| Retry request is unencrypted | §4.1 | `PQSRecoveryTransport.sendOutOfBandResendRequest` | S1, S7, S13 |
 | Retry cites unique MessageID of failed envelope | §4.1 | `failedEnvelopeMessageIds` | S11–S13 |
 | MessageRecord per (device, envelope), new ID on resend | §4.1 | `OutboundDeviceSendRecord` envelope index | S11, S12 |
 | Remint only when active SessionID matches MessageRecord | §4.1 | `OrphanResendRemintPolicy` | S15 |
@@ -70,12 +69,12 @@ resend. Retry *requests* must not select a DR session at all.
 | Gate | Status |
 | ---- | ------ |
 | Capable clients emit OOB only (`requestMessageResend` → `sendOutOfBandResendRequest`) | Done |
-| Encrypted NACK **emission** / surgical mint for retry | Disabled (`DEAD LEGACY` stubs) |
-| Encrypted NACK **inbound service** | Disabled (`DEAD LEGACY` stubs; ignore after decode) |
+| Encrypted NACK **emission** / surgical mint for retry | Deleted (OOB only) |
+| Encrypted NACK **inbound service** | Deleted (ignore leftover frames until schema 2) |
 | OOB path services via `serviceAuthenticatedResendRequest` | Done |
 | `post-quantum-solace` full suite | Green |
 | Focused nudge-kit offline/replay suites | Green |
-| Delete encrypted retry stubs / TransportEvent cases | Pending dogfood unused confirmation |
+| Delete encrypted retry TransportEvent cases | Schema 2 (PQS 4.0 Phase 2) |
 
 ## Scenario catalog
 

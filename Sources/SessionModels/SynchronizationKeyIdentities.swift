@@ -15,6 +15,7 @@
 //
 
 import Foundation
+import BinaryCodable
 
 /// A structure representing cryptographic key identities for synchronization operations.
 ///
@@ -30,9 +31,9 @@ import Foundation
 /// ## Usage
 /// ```swift
 /// let keyIds = SynchronizationKeyIdentities(
-///     senderCurveId: "curve-sender-123",
+///     senderX25519Id: "curve-sender-123",
 ///     senderMLKEMId: "mlKEM-sender-456",
-///     recipientCurveId: "curve-recipient-789",
+///     recipientX25519Id: "curve-recipient-789",
 ///     recipientMLKEMId: "mlKEM-recipient-012"
 /// )
 /// ```
@@ -50,7 +51,7 @@ public struct SynchronizationKeyIdentities: Sendable, Codable {
     /// This identifier is used to track the specific Curve25519 key used by the sender
     /// for message encryption. It may be `nil` if the sender's key is not yet established
     /// or if using a different key type.
-    public var senderCurveId: String?
+    public var senderX25519Id: String?
 
     /// Optional identifier for the sender's MLKEM public key.
     ///
@@ -63,7 +64,7 @@ public struct SynchronizationKeyIdentities: Sendable, Codable {
     ///
     /// This identifier is used to identify the specific Curve25519 key that the recipient
     /// should use for message decryption. It is required for proper message routing.
-    public let recipientCurveId: String
+    public let recipientX25519Id: String
 
     /// Required identifier for the recipient's MLKEM public key.
     ///
@@ -73,28 +74,28 @@ public struct SynchronizationKeyIdentities: Sendable, Codable {
 
     /// Coding keys for Binary serialization with obfuscated field names.
     private enum CodingKeys: String, CodingKey, Codable, Sendable {
-        case senderCurveId = "a"
+        case senderX25519Id = "a"
         case senderMLKEMId = "b"
-        case recipientCurveId = "c"
+        case recipientX25519Id = "c"
         case recipientMLKEMId = "d"
     }
 
     /// Initializes a new instance of `SynchronizationKeyIdentities`.
     ///
     /// - Parameters:
-    ///   - senderCurveId: Optional identifier for the sender's Curve25519 key
+    ///   - senderX25519Id: Optional identifier for the sender's Curve25519 key
     ///   - senderMLKEMId: Optional identifier for the sender's MLKEM key
-    ///   - recipientCurveId: Required identifier for the recipient's Curve25519 key
+    ///   - recipientX25519Id: Required identifier for the recipient's Curve25519 key
     ///   - recipientMLKEMId: Required identifier for the recipient's MLKEM key
     public init(
-        senderCurveId: String? = nil,
+        senderX25519Id: String? = nil,
         senderMLKEMId: String? = nil,
-        recipientCurveId: String,
+        recipientX25519Id: String,
         recipientMLKEMId: String
     ) {
-        self.senderCurveId = senderCurveId
+        self.senderX25519Id = senderX25519Id
         self.senderMLKEMId = senderMLKEMId
-        self.recipientCurveId = recipientCurveId
+        self.recipientX25519Id = recipientX25519Id
         self.recipientMLKEMId = recipientMLKEMId
     }
 }
@@ -103,28 +104,6 @@ public enum SessionReestablishmentKind: String, Sendable, Codable {
     case peerRefresh = "a"
     case linkedDeviceRepair = "b"
     case linkedDeviceCompromiseObserved = "c"
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if let legacyValue = try? container.decode(Bool.self) {
-            self = legacyValue ? .linkedDeviceRepair : .peerRefresh
-            return
-        }
-
-        let rawValue = try container.decode(String.self)
-        guard let value = SessionReestablishmentKind(rawValue: rawValue) else {
-            throw DecodingError.dataCorruptedError(
-                in: container,
-                debugDescription: "Invalid session reestablishment kind"
-            )
-        }
-        self = value
-    }
-
-    public func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
-        try container.encode(rawValue)
-    }
 }
 
 /// Wire envelope for `SessionReestablishmentKind` carrying coalescing/idempotency metadata.
@@ -133,21 +112,17 @@ public enum SessionReestablishmentKind: String, Sendable, Codable {
 /// events that pile up in offline mailboxes and to coalesce same-episode re-emissions into
 /// a single application-level reaction (e.g. one compromise prompt instead of N).
 ///
-/// ## Compatibility
-/// The custom `init(from:)` accepts both the new keyed encoding and a legacy bare
-/// `SessionReestablishmentKind` payload, allowing in-flight messages from older SDK
-/// versions to deserialize without metadata.
+/// Schema 2 rejects bare-kind payloads and the retired `requiresPreDecryptionReset` flag.
+/// Stragglers reestablish.
 public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
     /// The semantic action requested by the sender.
     public let kind: SessionReestablishmentKind
 
     /// Stable identifier shared across every emission within a single sender-side episode.
-    /// `nil` when decoded from a legacy bare-kind payload.
     public let intentId: UUID?
 
     /// Sender-side monotonically increasing counter (per-kind) for ordering and dedup.
     /// Receivers drop strictly-older epochs and treat equal epochs as duplicates.
-    /// `0` when decoded from a legacy bare-kind payload.
     public let epoch: UInt64
 
     /// Sender's wall-clock at the moment this envelope was constructed.
@@ -159,13 +134,8 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
     public let isResponse: Bool
 
     /// Concrete recipient device for device-scoped recovery. `nil` preserves
-    /// compatibility with legacy account-wide refresh controls.
+    /// account-wide refresh controls.
     public let targetDeviceId: UUID?
-
-    /// Legacy wire field. Always `false` on new emits. Kept for BinaryCodable
-    /// decode of older clients that set a pre-decryption bootstrap flag; receivers
-    /// ignore it (try-all sessions + promote — no peer wipe before decrypt).
-    public let requiresPreDecryptionReset: Bool
 
     public init(
         kind: SessionReestablishmentKind,
@@ -173,8 +143,7 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
         epoch: UInt64 = 0,
         emittedAt: Date = Date(),
         isResponse: Bool = false,
-        targetDeviceId: UUID? = nil,
-        requiresPreDecryptionReset: Bool = false
+        targetDeviceId: UUID? = nil
     ) {
         self.kind = kind
         self.intentId = intentId
@@ -182,9 +151,6 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
         self.emittedAt = emittedAt
         self.isResponse = isResponse
         self.targetDeviceId = targetDeviceId
-        // Never honor pre-decrypt wipe on new traffic (parameter retained for API compat).
-        _ = requiresPreDecryptionReset
-        self.requiresPreDecryptionReset = false
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -198,43 +164,24 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
         case emittedAt = "t"
         case isResponse = "r"
         case targetDeviceId = "d"
-        case requiresPreDecryptionReset = "p"
     }
 
     public init(from decoder: Decoder) throws {
-        if let container = try? decoder.container(keyedBy: CodingKeys.self),
-           let rawKind = try? container.decode(String.self, forKey: .rawKind),
-           let kind = SessionReestablishmentKind(rawValue: rawKind) {
-            self.kind = kind
-            self.intentId = try? container.decodeIfPresent(UUID.self, forKey: .intentId)
-            self.epoch = (try? container.decode(UInt64.self, forKey: .epoch)) ?? 0
-            self.emittedAt = (try? container.decode(Date.self, forKey: .emittedAt)) ?? Date()
-            self.isResponse = (try? container.decode(Bool.self, forKey: .isResponse)) ?? false
-            self.targetDeviceId = try? container.decodeIfPresent(UUID.self, forKey: .targetDeviceId)
-            // Decode the legacy flag for wire compat, then discard it.
-            _ = try? container.decode(Bool.self, forKey: .requiresPreDecryptionReset)
-            self.requiresPreDecryptionReset = false
-            return
-        }
-        // Legacy fallback for serializers that handed us a bare `SessionReestablishmentKind`.
-        // In-flight pre-envelope payloads from older SDK builds land here.
-        if let single = try? decoder.singleValueContainer(),
-           let kind = try? single.decode(SessionReestablishmentKind.self) {
-            self.kind = kind
-            self.intentId = nil
-            self.epoch = 0
-            self.emittedAt = Date()
-            self.isResponse = false
-            self.targetDeviceId = nil
-            self.requiresPreDecryptionReset = false
-            return
-        }
-        throw DecodingError.dataCorrupted(
-            DecodingError.Context(
-                codingPath: decoder.codingPath,
-                debugDescription: "Unrecognised SessionReestablishmentEnvelope payload"
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let rawKind = try container.decode(String.self, forKey: .rawKind)
+        guard let kind = SessionReestablishmentKind(rawValue: rawKind) else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .rawKind,
+                in: container,
+                debugDescription: "Invalid session reestablishment kind"
             )
-        )
+        }
+        self.kind = kind
+        self.intentId = try container.decodeIfPresent(UUID.self, forKey: .intentId)
+        self.epoch = try container.decodeIfPresent(UInt64.self, forKey: .epoch) ?? 0
+        self.emittedAt = try container.decodeIfPresent(Date.self, forKey: .emittedAt) ?? Date()
+        self.isResponse = try container.decodeIfPresent(Bool.self, forKey: .isResponse) ?? false
+        self.targetDeviceId = try container.decodeIfPresent(UUID.self, forKey: .targetDeviceId)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -245,8 +192,12 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
         try container.encode(emittedAt, forKey: .emittedAt)
         try container.encode(isResponse, forKey: .isResponse)
         try container.encodeIfPresent(targetDeviceId, forKey: .targetDeviceId)
-        try container.encode(requiresPreDecryptionReset, forKey: .requiresPreDecryptionReset)
     }
+}
+
+public enum TransportEventDecodeError: Error, Equatable {
+    /// Schema-1 encrypted-retry cases `"e"` / `"g"`. Unlock deletes leftover jobs.
+    case retiredEncryptedRetry
 }
 
 public enum TransportEvent: Sendable, Codable {
@@ -254,26 +205,108 @@ public enum TransportEvent: Sendable, Codable {
     case linkedDeviceReprovisioning(LinkedDeviceReprovisioningBundle)
     case synchronizeOneTimeKeys(SynchronizationKeyIdentities)
     case refreshOneTimeKeys
-    case requestMessageResend(FailedMessageResendRequest)
     /// Peer acknowledges that a published OTK replenish batch is on the server.
     case publishedOneTimeKeysReplenished
-    /// Responder tells a resend requester that these sharedIds can never be
-    /// replayed (not persisted locally, unreadable, or stale controls). The
-    /// requester must stop re-requesting them and treat the content as lost.
-    case messageResendUnavailable(MessageResendUnavailableNotice)
-    
+
     enum CodingKeys: String, CodingKey {
         case sessionReestablishment = "a"
         case linkedDeviceReprovisioning = "b"
         case synchronizeOneTimeKeys = "c"
         case refreshOneTimeKeys = "d"
-        case requestMessageResend = "e"
+        case retiredRequestMessageResend = "e"
         case publishedOneTimeKeysReplenished = "f"
-        case messageResendUnavailable = "g"
+        case retiredMessageResendUnavailable = "g"
+    }
+
+    /// Synthesized-enum associated-value key. Remaining cases must stay
+    /// byte-identical to the v1 goldens; only `"e"` / `"g"` are rejected.
+    private enum AssociatedValueKey: String, CodingKey {
+        case _0
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.retiredRequestMessageResend)
+            || container.contains(.retiredMessageResendUnavailable) {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: TransportEvent.retiredEncryptedRetryMarker
+                )
+            )
+        }
+        if container.contains(.sessionReestablishment) {
+            let nested = try container.nestedContainer(
+                keyedBy: AssociatedValueKey.self, forKey: .sessionReestablishment)
+            self = .sessionReestablishment(try nested.decode(SessionReestablishmentEnvelope.self, forKey: ._0))
+        } else if container.contains(.linkedDeviceReprovisioning) {
+            let nested = try container.nestedContainer(
+                keyedBy: AssociatedValueKey.self, forKey: .linkedDeviceReprovisioning)
+            self = .linkedDeviceReprovisioning(
+                try nested.decode(LinkedDeviceReprovisioningBundle.self, forKey: ._0))
+        } else if container.contains(.synchronizeOneTimeKeys) {
+            let nested = try container.nestedContainer(
+                keyedBy: AssociatedValueKey.self, forKey: .synchronizeOneTimeKeys)
+            self = .synchronizeOneTimeKeys(
+                try nested.decode(SynchronizationKeyIdentities.self, forKey: ._0))
+        } else if container.contains(.refreshOneTimeKeys) {
+            self = .refreshOneTimeKeys
+        } else if container.contains(.publishedOneTimeKeysReplenished) {
+            self = .publishedOneTimeKeysReplenished
+        } else {
+            throw DecodingError.dataCorrupted(
+                DecodingError.Context(
+                    codingPath: decoder.codingPath,
+                    debugDescription: "Unrecognised TransportEvent payload"
+                )
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .sessionReestablishment(let envelope):
+            var nested = container.nestedContainer(
+                keyedBy: AssociatedValueKey.self, forKey: .sessionReestablishment)
+            try nested.encode(envelope, forKey: ._0)
+        case .linkedDeviceReprovisioning(let bundle):
+            var nested = container.nestedContainer(
+                keyedBy: AssociatedValueKey.self, forKey: .linkedDeviceReprovisioning)
+            try nested.encode(bundle, forKey: ._0)
+        case .synchronizeOneTimeKeys(let info):
+            var nested = container.nestedContainer(
+                keyedBy: AssociatedValueKey.self, forKey: .synchronizeOneTimeKeys)
+            try nested.encode(info, forKey: ._0)
+        case .refreshOneTimeKeys:
+            _ = container.nestedContainer(
+                keyedBy: AssociatedValueKey.self, forKey: .refreshOneTimeKeys)
+        case .publishedOneTimeKeysReplenished:
+            _ = container.nestedContainer(
+                keyedBy: AssociatedValueKey.self, forKey: .publishedOneTimeKeysReplenished)
+        }
+    }
+
+    static let retiredEncryptedRetryMarker = "PQS_RETIRED_ENCRYPTED_RETRY"
+
+    public static func isRetiredEncryptedRetry(_ error: Error) -> Bool {
+        String(describing: error).contains(retiredEncryptedRetryMarker)
+    }
+
+    /// True when `data` is a BinaryCodable `TransportEvent` whose case is the
+    /// retired encrypted-retry pair (`"e"` / `"g"`).
+    public static func carriesRetiredEncryptedRetry(_ data: Data) -> Bool {
+        do {
+            _ = try BinaryDecoder().decode(TransportEvent.self, from: data)
+            return false
+        } catch {
+            return isRetiredEncryptedRetry(error)
+        }
     }
 }
 
-public struct FailedMessageResendRequest: Sendable, Codable {
+/// Internal DTO used when servicing authenticated OOB retry. Not a TransportEvent.
+public struct ResendRequest: Sendable, Codable {
     /// Maximum number of failed message ids carried in a single resend request.
     /// Enforced on both encode (init) and decode so a hostile peer cannot amplify
     /// replay work on the receiver with an oversized batch.
@@ -347,14 +380,12 @@ public struct FailedMessageResendRequest: Sendable, Codable {
     }
 }
 
-/// Terminal answer to a `FailedMessageResendRequest`: the responding device has
-/// no replayable frame for these sharedIds and never will (content was never
-/// persisted, is unreadable, or is a stale control). Receiving this clears the
-/// requester's pending resend state so it stops re-requesting on every drain.
+/// Terminal answer to a `ResendRequest`: the responding device has
+/// no replayable frame for these ids and never will.
 public struct MessageResendUnavailableNotice: Sendable, Codable, Equatable {
-    /// Same batch cap as `FailedMessageResendRequest`, enforced on encode and
+    /// Same batch cap as `ResendRequest`, enforced on encode and
     /// decode so a hostile peer cannot clear an unbounded amount of state.
-    public static let maxBatchedIds = FailedMessageResendRequest.maxBatchedIds
+    public static let maxBatchedIds = ResendRequest.maxBatchedIds
 
     public let respondingDeviceId: UUID
     public let unavailableSharedMessageIds: [String]

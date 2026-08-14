@@ -27,7 +27,7 @@ protocol SessionCacheSynchronizer: Sendable {
 /// An actor that manages session caching and synchronization.
 ///
 /// This actor provides a two-tier caching system with in-memory cache and persistent store.
-/// It implements the `PQSSessionStore` protocol with consistent naming conventions and
+/// It implements the `PQSPersistenceHost` protocol with consistent naming conventions and
 /// additional cache management capabilities.
 ///
 /// ## Key Features
@@ -57,10 +57,10 @@ protocol SessionCacheSynchronizer: Sendable {
 /// await cache.clearCache()
 /// try await cache.refreshCache()
 /// ```
-public actor SessionCache: PQSSessionStore {
+actor SessionCache: PQSStore, PQSRecoveryStore {
     // MARK: - Properties
 
-    private let store: any PQSSessionStore
+    private let store: any PQSPersistenceHost
     private var sessionIdentities = [SessionIdentity]()
     private var messages = [EncryptedMessage]()
     private var contacts = [ContactModel]()
@@ -73,7 +73,7 @@ public actor SessionCache: PQSSessionStore {
 
     // MARK: - Initializer
 
-    public init(store: any PQSSessionStore) {
+    init(store: any PQSPersistenceHost) {
         self.store = store
     }
 
@@ -97,7 +97,7 @@ public actor SessionCache: PQSSessionStore {
     /// Creates a local device configuration and caches it.
     /// - Parameter data: The configuration data to be cached.
     /// - Throws: An error if the creation fails.
-    public func createLocalSessionContext(_ data: Data) async throws {
+    func createLocalSessionContext(_ data: Data) async throws {
         guard !data.isEmpty else {
             throw CacheErrors.invalidData
         }
@@ -109,7 +109,7 @@ public actor SessionCache: PQSSessionStore {
     /// Fetches the local device configuration, either from cache or the store.
     /// - Returns: The cached or fetched configuration data.
     /// - Throws: An error if the configuration cannot be found.
-    public func fetchLocalSessionContext() async throws -> Data {
+    func fetchLocalSessionContext() async throws -> Data {
         if let localDeviceConfiguration {
             return localDeviceConfiguration
         } else {
@@ -122,7 +122,7 @@ public actor SessionCache: PQSSessionStore {
     /// Updates the local device configuration and refreshes the cache.
     /// - Parameter data: The new configuration data.
     /// - Throws: An error if the update fails.
-    public func updateLocalSessionContext(_ data: Data) async throws {
+    func updateLocalSessionContext(_ data: Data) async throws {
         try await setLocalDeviceConfiguration(data)
         try await store.deleteLocalSessionContext()
         try await createLocalSessionContext(data)
@@ -130,7 +130,7 @@ public actor SessionCache: PQSSessionStore {
 
     /// Deletes the local device configuration and clears the cache.
     /// - Throws: An error if the deletion fails.
-    public func deleteLocalSessionContext() async throws {
+    func deleteLocalSessionContext() async throws {
         try await store.deleteLocalSessionContext()
         localDeviceConfiguration = nil
     }
@@ -140,7 +140,7 @@ public actor SessionCache: PQSSessionStore {
     /// Fetches the local device salt, either from cache or the store.
     /// - Returns: The cached or fetched salt.
     /// - Throws: An error if the salt cannot be found.
-    public func fetchLocalDeviceSalt(keyData: Data) async throws -> Data {
+    func fetchLocalDeviceSalt(keyData: Data) async throws -> Data {
         if let cachedSalt = localDeviceSalt {
             return cachedSalt
         } else {
@@ -152,7 +152,7 @@ public actor SessionCache: PQSSessionStore {
         }
     }
 
-    public func deleteLocalDeviceSalt() async throws {
+    func deleteLocalDeviceSalt() async throws {
         try await store.deleteLocalDeviceSalt()
         localDeviceSalt = nil
     }
@@ -162,7 +162,7 @@ public actor SessionCache: PQSSessionStore {
     /// Creates a new session identity and caches it.
     /// - Parameter session: The session identity to be created.
     /// - Throws: An error if the creation fails.
-    public func createSessionIdentity(_ session: SessionIdentity) async throws {
+    func createSessionIdentity(_ session: SessionIdentity) async throws {
         try await store.createSessionIdentity(session)
         sessionIdentities.append(session)
     }
@@ -170,7 +170,7 @@ public actor SessionCache: PQSSessionStore {
     /// Fetches all session identities from the store and updates the cache.
     /// - Returns: An array of session identities.
     /// - Throws: An error if fetching fails.
-    public func fetchSessionIdentities() async throws -> [SessionIdentity] {
+    func fetchSessionIdentities() async throws -> [SessionIdentity] {
         if !sessionIdentities.isEmpty {
             return sessionIdentities
         } else {
@@ -183,7 +183,7 @@ public actor SessionCache: PQSSessionStore {
     /// Updates an existing session identity.
     /// - Parameter session: The session identity to be updated.
     /// - Throws: An error if the update fails.
-    public func updateSessionIdentity(_ session: SessionIdentity) async throws {
+    func updateSessionIdentity(_ session: SessionIdentity) async throws {
         if sessionIdentities.isEmpty {
             let identities = try await store.fetchSessionIdentities()
             sessionIdentities = identities // Update the cache
@@ -196,10 +196,14 @@ public actor SessionCache: PQSSessionStore {
         }
     }
 
+    func updateSessionIdentity(_ session: SessionIdentity, andPreparedJob job: JobModel) async throws {
+        try await store.updateSessionIdentity(session, andPreparedJob: job)
+    }
+
     /// Removes a session identity from the cache and store.
     /// - Parameter id: The session identity to be removed.
     /// - Throws: An error if the removal fails.
-    public func deleteSessionIdentity(_ id: UUID) async throws {
+    func deleteSessionIdentity(_ id: UUID) async throws {
         do {
             try await store.deleteSessionIdentity(id)
             sessionIdentities.removeAll(where: { $0.id == id })
@@ -219,7 +223,7 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter messageId: The ID of the message to fetch.
     /// - Returns: The fetched message.
     /// - Throws: An error if fetching fails.
-    public func fetchMessage(id: UUID) async throws -> EncryptedMessage {
+    func fetchMessage(id: UUID) async throws -> EncryptedMessage {
         if let message = messages.first(where: { $0.id == id }) {
             return message
         } else {
@@ -237,7 +241,7 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter sharedMessageId: The shared message ID of the message to fetch.
     /// - Returns: The fetched message.
     /// - Throws: An error if fetching fails.
-    public func fetchMessage(sharedId: String) async throws -> EncryptedMessage {
+    func fetchMessage(sharedId: String) async throws -> EncryptedMessage {
         if let message = messages.first(where: { $0.sharedId == sharedId }) {
             return message
         } else {
@@ -256,7 +260,7 @@ public actor SessionCache: PQSSessionStore {
     /// expected miss as a store failure.
     /// - Parameter sharedId: The shared message ID of the message to fetch.
     /// - Returns: The fetched message, or `nil` if no message exists for the shared ID.
-    public func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage? {
+    func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage? {
         if let message = messages.first(where: { $0.sharedId == sharedId }) {
             return message
         }
@@ -271,7 +275,7 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter predicate: A closure that takes a message and returns an optional message if it matches the criteria.
     /// - Returns: The first message that matches the predicate, or nil if none found.
     @Sendable
-    public func fetchMessage(matching predicate: @escaping @Sendable (EncryptedMessage) async -> EncryptedMessage?) async throws -> EncryptedMessage? {
+    func fetchMessage(matching predicate: @escaping @Sendable (EncryptedMessage) async -> EncryptedMessage?) async throws -> EncryptedMessage? {
         for message in messages {
             if let found = await predicate(message) {
                 return found
@@ -280,14 +284,14 @@ public actor SessionCache: PQSSessionStore {
         return nil
     }
 
-    public func fetchMessages(sharedCommunicationId: UUID) async throws -> [MessageRecord] {
+    func fetchMessages(sharedCommunicationId: UUID) async throws -> [MessageRecord] {
         try await store.fetchMessages(sharedCommunicationId: sharedCommunicationId)
     }
 
     /// Creates a new message and caches it.
     /// - Parameter message: The message to be created.
     /// - Throws: An error if the creation fails.
-    public func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {
+    func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {
         try await store.createMessage(message, symmetricKey: symmetricKey)
         messages.append(message)
     }
@@ -295,7 +299,7 @@ public actor SessionCache: PQSSessionStore {
     /// Updates an existing message.
     /// - Parameter message: The message to be updated.
     /// - Throws: An error if the update fails.
-    public func updateMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {
+    func updateMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {
         if let index = messages.firstIndex(where: { $0.id == message.id }) {
             messages[index] = message
         }
@@ -305,17 +309,17 @@ public actor SessionCache: PQSSessionStore {
     /// Removes a message from the cache and store.
     /// - Parameter message: The message to be removed.
     /// - Throws: An error if the removal fails.
-    public func deleteMessage(_ message: EncryptedMessage) async throws {
+    func deleteMessage(_ message: EncryptedMessage) async throws {
         messages.removeAll(where: { $0.id == message.id })
         try await store.deleteMessage(message)
         try await store.deleteOutboundDeviceSendRecords(sharedId: message.sharedId)
     }
 
-    public func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws {
+    func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws {
         try await store.upsertOutboundDeviceSendRecord(record)
     }
 
-    public func fetchOutboundDeviceSendRecord(
+    func fetchOutboundDeviceSendRecord(
         sharedId: String,
         recipientDeviceId: UUID
     ) async throws -> OutboundDeviceSendRecord? {
@@ -324,21 +328,21 @@ public actor SessionCache: PQSSessionStore {
             recipientDeviceId: recipientDeviceId)
     }
 
-    public func fetchOutboundDeviceSendRecord(
+    func fetchOutboundDeviceSendRecord(
         envelopeMessageId: String
     ) async throws -> OutboundDeviceSendRecord? {
         try await store.fetchOutboundDeviceSendRecord(envelopeMessageId: envelopeMessageId)
     }
 
-    public func deleteOutboundDeviceSendRecords(sharedId: String) async throws {
+    func deleteOutboundDeviceSendRecords(sharedId: String) async throws {
         try await store.deleteOutboundDeviceSendRecords(sharedId: sharedId)
     }
 
-    public func upsertAcceptedEnvelope(_ record: AcceptedEnvelopeRecord) async throws {
+    func upsertAcceptedEnvelope(_ record: AcceptedEnvelopeRecord) async throws {
         try await store.upsertAcceptedEnvelope(record)
     }
 
-    public func fetchAcceptedEnvelope(
+    func fetchAcceptedEnvelope(
         senderSecretName: String,
         senderDeviceId: UUID,
         envelopeMessageId: String
@@ -349,14 +353,14 @@ public actor SessionCache: PQSSessionStore {
             envelopeMessageId: envelopeMessageId)
     }
 
-    public func pruneAcceptedEnvelopes(olderThan: Date) async throws -> Int {
+    func pruneAcceptedEnvelopes(olderThan: Date) async throws -> Int {
         try await store.pruneAcceptedEnvelopes(olderThan: olderThan)
     }
 
     /// Inserts a message into the cache with proper ordering.
     /// - Parameter message: The message to be inserted.
     /// - Throws: An error if the insertion fails.
-    public func insertMessage(_ message: EncryptedMessage) async throws {
+    func insertMessage(_ message: EncryptedMessage) async throws {
         if !messages.contains(where: { $0.id == message.id }) {
             messages.append(message)
             messages.sort(by: { $0.sequenceNumber < $1.sequenceNumber })
@@ -367,14 +371,14 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter sharedId: The shared ID to filter messages by.
     /// - Returns: An array of cached messages.
     /// - Throws: An error if fetching fails.
-    public func fetchCachedMessages(sharedId: String) async throws -> [EncryptedMessage] {
+    func fetchCachedMessages(sharedId: String) async throws -> [EncryptedMessage] {
         messages.filter { $0.sharedId == sharedId }
     }
 
     /// Gets the count of messages for a specific communication.
     /// - Parameter communicationId: The communication ID to count messages for.
     /// - Returns: The number of messages.
-    public func messageCount(communicationId: UUID) -> Int {
+    func messageCount(communicationId: UUID) -> Int {
         messages.count(where: { $0.communicationId == communicationId })
     }
 
@@ -382,7 +386,7 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter sharedIdentifier: The shared identifier to stream messages for.
     /// - Returns: A tuple containing the stream and its continuation.
     /// - Throws: An error if streaming fails.
-    public func streamMessages(sharedIdentifier: UUID) async throws -> (AsyncThrowingStream<EncryptedMessage, Error>, AsyncThrowingStream<EncryptedMessage, Error>.Continuation?) {
+    func streamMessages(sharedIdentifier: UUID) async throws -> (AsyncThrowingStream<EncryptedMessage, Error>, AsyncThrowingStream<EncryptedMessage, Error>.Continuation?) {
         try await store.streamMessages(sharedIdentifier: sharedIdentifier)
     }
 
@@ -390,7 +394,7 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter sharedIdentifier: The shared identifier to count messages for.
     /// - Returns: The number of messages.
     /// - Throws: An error if counting fails.
-    public func messageCount(sharedIdentifier: UUID) async throws -> Int {
+    func messageCount(sharedIdentifier: UUID) async throws -> Int {
         try await store.messageCount(sharedIdentifier: sharedIdentifier)
     }
 
@@ -399,7 +403,7 @@ public actor SessionCache: PQSSessionStore {
     /// Fetches all contacts from the cache or store.
     /// - Returns: An array of contacts.
     /// - Throws: An error if fetching fails.
-    public func fetchContacts() async throws -> [ContactModel] {
+    func fetchContacts() async throws -> [ContactModel] {
         if contacts.isEmpty {
             contacts = try await store.fetchContacts()
         }
@@ -409,7 +413,7 @@ public actor SessionCache: PQSSessionStore {
     /// Creates a new contact and caches it.
     /// - Parameter contact: The contact to be created.
     /// - Throws: An error if the creation fails.
-    public func createContact(_ contact: ContactModel) async throws {
+    func createContact(_ contact: ContactModel) async throws {
         try await store.createContact(contact)
         contacts.append(contact) // Cache the new contact
     }
@@ -417,7 +421,7 @@ public actor SessionCache: PQSSessionStore {
     /// Updates an existing contact in the cache and store.
     /// - Parameter contact: The contact to be updated.
     /// - Throws: An error if the update fails.
-    public func updateContact(_ contact: ContactModel) async throws {
+    func updateContact(_ contact: ContactModel) async throws {
         if let index = contacts.firstIndex(where: { $0.id == contact.id }) {
             contacts[index] = contact
             try await store.updateContact(contact)
@@ -437,7 +441,7 @@ public actor SessionCache: PQSSessionStore {
     /// Removes a contact from the cache and store.
     /// - Parameter id: The contact ID to be removed.
     /// - Throws: An error if the removal fails.
-    public func deleteContact(_ id: UUID) async throws {
+    func deleteContact(_ id: UUID) async throws {
         contacts.removeAll(where: { $0.id == id })
         try await store.deleteContact(id)
     }
@@ -447,7 +451,7 @@ public actor SessionCache: PQSSessionStore {
     /// Fetches all communication types from the cache or store.
     /// - Returns: An array of communication types.
     /// - Throws: An error if fetching fails.
-    public func fetchCommunications() async throws -> [BaseCommunication] {
+    func fetchCommunications() async throws -> [BaseCommunication] {
         if communicationTypes.isEmpty {
             communicationTypes = try await store.fetchCommunications()
         }
@@ -457,7 +461,7 @@ public actor SessionCache: PQSSessionStore {
     /// Creates a new communication type and caches it.
     /// - Parameter type: The communication type to be created.
     /// - Throws: An error if the creation fails.
-    public func createCommunication(_ type: BaseCommunication) async throws {
+    func createCommunication(_ type: BaseCommunication) async throws {
         try await store.createCommunication(type)
         communicationTypes.append(type) // Cache the new communication type
     }
@@ -465,7 +469,7 @@ public actor SessionCache: PQSSessionStore {
     /// Updates an existing communication type in the cache and store.
     /// - Parameter type: The communication type to be updated.
     /// - Throws: An error if the update fails.
-    public func updateCommunication(_ type: BaseCommunication) async throws {
+    func updateCommunication(_ type: BaseCommunication) async throws {
         if let index = communicationTypes.firstIndex(where: { $0.id == type.id }) {
             communicationTypes[index] = type
             try await store.updateCommunication(type)
@@ -477,7 +481,7 @@ public actor SessionCache: PQSSessionStore {
     /// Removes a communication type from the cache and store.
     /// - Parameter communication: The communication type to be removed.
     /// - Throws: An error if the removal fails.
-    public func deleteCommunication(_ communication: BaseCommunication) async throws {
+    func deleteCommunication(_ communication: BaseCommunication) async throws {
         communicationTypes.removeAll(where: { $0.id == communication.id })
         try await store.deleteCommunication(communication)
     }
@@ -487,7 +491,7 @@ public actor SessionCache: PQSSessionStore {
     /// Fetches all jobs from the cache or store.
     /// - Returns: An array of jobs.
     /// - Throws: An error if fetching fails.
-    public func fetchJobs() async throws -> [JobModel] {
+    func fetchJobs() async throws -> [JobModel] {
         // If the jobs cache is empty, fetch from the store
         if jobs.isEmpty {
             jobs = try await store.fetchJobs()
@@ -498,7 +502,7 @@ public actor SessionCache: PQSSessionStore {
     /// Creates a new job and caches it.
     /// - Parameter job: The job to be created.
     /// - Throws: An error if the creation fails.
-    public func createJob(_ job: JobModel) async throws {
+    func createJob(_ job: JobModel) async throws {
         try await store.createJob(job) // Persist the job in the store
         jobs.append(job) // Cache the new job
     }
@@ -506,7 +510,7 @@ public actor SessionCache: PQSSessionStore {
     /// Updates an existing job in the cache and store.
     /// - Parameter job: The job to be updated.
     /// - Throws: An error if the update fails.
-    public func updateJob(_ job: JobModel) async throws {
+    func updateJob(_ job: JobModel) async throws {
         if let index = jobs.firstIndex(where: { $0.id == job.id }) {
             try await store.updateJob(job) // Persist the updated job in the store
             jobs[index] = job // Publish only after persistence succeeds
@@ -517,7 +521,7 @@ public actor SessionCache: PQSSessionStore {
 
     /// Publishes the encrypted ratchet checkpoint and prepared transport payload
     /// only after the backing store has committed both atomically.
-    public func commitPreparedOutbound(
+    func commitPreparedOutbound(
         sessionIdentity: SessionIdentity,
         job: JobModel
     ) async throws {
@@ -537,7 +541,7 @@ public actor SessionCache: PQSSessionStore {
     /// Removes a job from the cache and store.
     /// - Parameter job: The job to be removed.
     /// - Throws: An error if the removal fails.
-    public func deleteJob(_ job: JobModel) async throws {
+    func deleteJob(_ job: JobModel) async throws {
         // Store first: `fetchJobs()` reloads from the store when the in-memory
         // list is empty. Clearing memory before the store lets a concurrent
         // fetch resurrect the row that is still being deleted.
@@ -550,7 +554,7 @@ public actor SessionCache: PQSSessionStore {
     /// Creates a new media job and caches it.
     /// - Parameter packet: The `DataPacket` representing the media job to be created.
     /// - Throws: An error if the creation fails in the store.
-    public func createMediaJob(_ packet: DataPacket) async throws {
+    func createMediaJob(_ packet: DataPacket) async throws {
         try await store.createMediaJob(packet) // Persist the media job in the store
         mediaJobs.append(packet) // Cache the new media job
     }
@@ -558,7 +562,7 @@ public actor SessionCache: PQSSessionStore {
     /// Fetches all media jobs from the cache or store.
     /// - Returns: An array of `DataPacket` representing all media jobs.
     /// - Throws: An error if fetching fails from the store.
-    public func fetchAllMediaJobs() async throws -> [DataPacket] {
+    func fetchAllMediaJobs() async throws -> [DataPacket] {
         if mediaJobs.isEmpty {
             mediaJobs = try await store.fetchAllMediaJobs() // Fetch from the store if cache is empty
         }
@@ -569,7 +573,7 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter id: The unique identifier of the media job to fetch.
     /// - Returns: An optional `DataPacket` representing the media job if found, or `nil` if not found.
     /// - Throws: An error if fetching fails from the store.
-    public func fetchMediaJob(id: UUID) async throws -> DataPacket? {
+    func fetchMediaJob(id: UUID) async throws -> DataPacket? {
         if let job = mediaJobs.first(where: { $0.id == id }) {
             return job // Return from cache if found
         }
@@ -584,18 +588,18 @@ public actor SessionCache: PQSSessionStore {
         }
     }
 
-    public func fetchMediaJobs(recipient: String, symmetricKey: SymmetricKey) async throws -> [DataPacket] {
+    func fetchMediaJobs(recipient: String, symmetricKey: SymmetricKey) async throws -> [DataPacket] {
         try await store.fetchMediaJobs(recipient: recipient, symmetricKey: symmetricKey)
     }
 
-    public func fetchMediaJob(synchronizationIdentifier: String, symmetricKey: SymmetricKey) async throws -> DataPacket? {
+    func fetchMediaJob(synchronizationIdentifier: String, symmetricKey: SymmetricKey) async throws -> DataPacket? {
         try await store.fetchMediaJob(synchronizationIdentifier: synchronizationIdentifier, symmetricKey: symmetricKey)
     }
 
     /// Deletes a media job from both the cache and the store.
     /// - Parameter id: The unique identifier of the media job to be removed.
     /// - Throws: An error if the removal fails in the store.
-    public func deleteMediaJob(_ id: UUID) async throws {
+    func deleteMediaJob(_ id: UUID) async throws {
         mediaJobs.removeAll(where: { $0.id == id }) // Remove from cache
         try await store.deleteMediaJob(id) // Remove from the store
     }
@@ -604,7 +608,7 @@ public actor SessionCache: PQSSessionStore {
 
     /// Clears all cached data, including session identities, messages, contacts, communications, jobs, media jobs, and local device configuration/salt.
     /// Use this to reset the in-memory cache without affecting the persistent store.
-    public func clearCache() async {
+    func clearCache() async {
         sessionIdentities.removeAll()
         messages.removeAll()
         contacts.removeAll()
@@ -618,7 +622,7 @@ public actor SessionCache: PQSSessionStore {
     /// Refreshes the cache by fetching fresh data from the persistent store for all major entities.
     /// - Throws: An error if any fetch operation from the store fails.
     /// Use this to synchronize the in-memory cache with the latest data from the store.
-    public func refreshCache() async throws {
+    func refreshCache() async throws {
         sessionIdentities = try await store.fetchSessionIdentities()
         contacts = try await store.fetchContacts()
         communicationTypes = try await store.fetchCommunications()
@@ -629,7 +633,7 @@ public actor SessionCache: PQSSessionStore {
     /// Returns statistics about the current state of the cache.
     /// - Returns: A `CacheStats` struct containing counts for each cached entity and flags for local device configuration/salt.
     /// Use this to monitor cache usage and health.
-    public func getCacheStats() -> CacheStats {
+    func getCacheStats() -> CacheStats {
         CacheStats(
             sessionIdentityCount: sessionIdentities.count,
             messageCount: messages.count,
@@ -646,7 +650,7 @@ public actor SessionCache: PQSSessionStore {
     /// - Parameter item: The item to check (must be one of the supported types: EncryptedMessage, ContactModel, JobModel, DataPacket).
     /// - Returns: `true` if the item is cached, `false` otherwise.
     /// Use this to quickly determine if an entity is already cached.
-    public func isCached(_ item: some Any) -> Bool {
+    func isCached(_ item: some Any) -> Bool {
         switch item {
         case let message as EncryptedMessage:
             messages.contains { $0.id == message.id }
@@ -665,25 +669,25 @@ public actor SessionCache: PQSSessionStore {
 
     /// A struct containing statistics about the cache.
     /// Provides counts for each major cached entity and flags for local device configuration and salt.
-    public struct CacheStats {
+    struct CacheStats {
         /// The number of session identities in the cache.
-        public let sessionIdentityCount: Int
+        let sessionIdentityCount: Int
         /// The number of messages in the cache.
-        public let messageCount: Int
+        let messageCount: Int
         /// The number of contacts in the cache.
-        public let contactCount: Int
+        let contactCount: Int
         /// The number of communication types in the cache.
-        public let communicationCount: Int
+        let communicationCount: Int
         /// The number of jobs in the cache.
-        public let jobCount: Int
+        let jobCount: Int
         /// The number of media jobs in the cache.
-        public let mediaJobCount: Int
+        let mediaJobCount: Int
         /// Whether a local device configuration is cached.
-        public let hasLocalDeviceConfiguration: Bool
+        let hasLocalDeviceConfiguration: Bool
         /// Whether a local device salt is cached.
-        public let hasLocalDeviceSalt: Bool
+        let hasLocalDeviceSalt: Bool
 
-        public init(
+        init(
             sessionIdentityCount: Int,
             messageCount: Int,
             contactCount: Int,
@@ -706,7 +710,7 @@ public actor SessionCache: PQSSessionStore {
 
     // MARK: - Error Handling
 
-    public enum CacheErrors: Error, LocalizedError {
+    enum CacheErrors: Error, LocalizedError {
         case localDeviceConfigurationIsNil
         case localDeviceSaltIsNil
         case sessionIdentityNotFound
@@ -718,7 +722,7 @@ public actor SessionCache: PQSSessionStore {
         case synchronizationFailed
         case invalidData
 
-        public var errorDescription: String? {
+        var errorDescription: String? {
             switch self {
             case .localDeviceConfigurationIsNil:
                 return "Local device configuration is nil"
@@ -743,7 +747,7 @@ public actor SessionCache: PQSSessionStore {
             }
         }
 
-        public var failureReason: String? {
+        var failureReason: String? {
             switch self {
             case .localDeviceConfigurationIsNil:
                 return "The local device configuration was not properly initialized"
@@ -768,7 +772,7 @@ public actor SessionCache: PQSSessionStore {
             }
         }
 
-        public var recoverySuggestion: String? {
+        var recoverySuggestion: String? {
             switch self {
             case .localDeviceConfigurationIsNil:
                 return "Try creating a new local session context"

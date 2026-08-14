@@ -23,7 +23,7 @@ to every published device leaves the live peer without a usable inbound session
 and this device with `ratchet.stateUninitialized` on re-add. 3.2.0 scopes the
 handshake to a **bootstrap-target** device chosen by
 ``PQSSession`` (see below) and optional host presence via
-``PQSSessionDelegate/preferredOnlinePeerDeviceId(for:)``.
+`RecoveryObserver.preferredOnlinePeerDeviceId(for:)`.
 
 ## Purposes
 
@@ -36,16 +36,16 @@ handshake to a **bootstrap-target** device chosen by
 
 Accept must **not** always reset and re-notify. After a live inbound request
 decrypt, this device often already has outbound state (e.g. from
-`contactCreated` / sibling sync). Forcing a fresh OTK races the peer’s inbound
+`createdContact` / sibling sync). Forcing a fresh OTK races the peer’s inbound
 state and can drop `.accepted`.
 
 ## Bootstrap-target device selection
 
 Internal `peerMasterDevice(for:)` preference order:
 
-1. Host-reported online device (``PQSSessionDelegate/preferredOnlinePeerDeviceId(for:)``) that can supply a curve OTK
-2. Master-flagged device that can supply a curve OTK
-3. Any peer device that can supply a curve OTK
+1. Host-reported online device (`RecoveryObserver.preferredOnlinePeerDeviceId(for:)`) that can supply an X25519 OTK
+2. Master-flagged device that can supply an X25519 OTK
+3. Any peer device that can supply an X25519 OTK
 4. Online / master / first peer as a last resort
 
 Outbound-ready checks
@@ -55,7 +55,7 @@ A ghost master row must not veto a live device that already has ratchet state.
 
 ## Friendship `blockData` and server delivery
 
-``SessionEvents/requestFriendshipStateChange(state:contact:cache:receiver:sessionDelegate:symmetricKey:logger:)``
+The internal contact service's `requestFriendshipStateChange`
 derives the server block/unblock flag from the **requested transition**:
 
 - `.blocked` → `blockData=true`
@@ -111,11 +111,11 @@ bootstrap primitives.
 
 ### 4. Suppress recovery for deleted peers (optional)
 
-``PQSSessionDelegate/shouldSuppressInboundRecoveryFromSender(_:)`` (default
+`RecoveryObserver.shouldSuppressInboundRecoveryFromSender(_:)` (default
 `false`) lets hosts drop inbound decrypt recovery for senders that were locally
 deleted so late packets do not trigger OTK replacement storms.
 
-## TaskProcessor behavior (3.2.0)
+## Message pipeline behavior
 
 - `.synchronizeOneTimeKeys` encrypt jobs are filtered to the bootstrap-target
   device (not every master-flagged / preserved ghost row).
@@ -139,7 +139,7 @@ deleted so late packets do not trigger OTK replacement storms.
 - ``PQSSession/bootstrapPeerContactSession(secretName:purpose:)``
 - ``PQSSession/peerNeedsOutboundBootstrap(_:)``
 - ``PeerContactBootstrapPurpose``
-- ``PQSSessionDelegate/preferredOnlinePeerDeviceId(for:)``
-- ``PQSSessionDelegate/requestFriendshipStateChange(recipient:blockData:metadata:currentState:)``
+- `RecoveryObserver.preferredOnlinePeerDeviceId(for:)`
+- `MessagingPolicy.requestFriendshipStateChange(recipient:blockData:metadata:currentState:)`
 - ``FriendshipMetadata``
 - <doc:ControlEventCoalescing>

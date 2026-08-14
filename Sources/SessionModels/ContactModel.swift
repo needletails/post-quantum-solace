@@ -145,7 +145,7 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     ///   - id: The unique identifier for the contact model. Should be a valid UUID.
     ///   - props: The unwrapped properties to be encrypted. Contains all contact information.
     ///   - symmetricKey: The symmetric key used for encryption. Must be kept secure.
-    /// - Throws: `CryptoError.encryptionFailed` if the encryption process fails.
+    /// - Throws: `PQSError.encryptionFailed` if the encryption process fails.
     public init(
         id: UUID,
         props: UnwrappedProps,
@@ -154,7 +154,7 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         self.id = id
         let data = try BinaryEncoder().encode(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-            throw CryptoError.encryptionFailed
+            throw PQSError.encryptionFailed
         }
         self.data = encryptedData
     }
@@ -184,13 +184,13 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     /// - Parameter symmetricKey: The symmetric key used for decryption. Must be the same key
     ///   that was used for encryption.
     /// - Returns: The decrypted properties as `UnwrappedProps` containing all contact information.
-    /// - Throws: `CryptoError.decryptionFailed` if decryption fails, or a decoding error if
+    /// - Throws: `PQSError.decryptionFailed` if decryption fails, or a decoding error if
     ///   the decrypted data cannot be deserialized.
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         try lock.withLock { [weak self] in
-            guard let self else { throw CryptoError.encryptionFailed }
+            guard let self else { throw PQSError.encryptionFailed }
             guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
-                throw CryptoError.decryptionFailed
+                throw PQSError.decryptionFailed
             }
             return try BinaryDecoder().decode(UnwrappedProps.self, from: decrypted)
         }
@@ -205,15 +205,15 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     ///   - symmetricKey: The symmetric key used for encryption. Must be kept secure.
     ///   - props: The new unwrapped properties to be set. Replaces all existing properties.
     /// - Returns: The updated decrypted properties as `UnwrappedProps` for verification.
-    /// - Throws: `CryptoError.encryptionFailed` if encryption fails, or other errors from
+    /// - Throws: `PQSError.encryptionFailed` if encryption fails, or other errors from
     ///   the serialization process.
     public func updateProps(symmetricKey: SymmetricKey, props: UnwrappedProps) async throws -> UnwrappedProps? {
         let data = try BinaryEncoder().encode(props)
         do {
             try lock.withLock { [weak self] in
-                guard let self else { throw CryptoError.encryptionFailed }
+                guard let self else { throw PQSError.encryptionFailed }
                 guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-                    throw CryptoError.encryptionFailed
+                    throw PQSError.encryptionFailed
                 }
                 self.data = encryptedData
             }

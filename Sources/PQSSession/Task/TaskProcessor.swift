@@ -22,6 +22,7 @@ import SessionModels
 import Crypto
 import BinaryCodable
 import AsyncAlgorithms
+import NeedleTailLogger
 
 enum DeviceTargetedIdentityFilter {
     static func select(
@@ -36,7 +37,7 @@ enum DeviceTargetedIdentityFilter {
     }
 }
 
-/// `TaskProcessor` manages the asynchronous execution of encryption and decryption tasks
+/// `MessagePipeline` manages the asynchronous execution of encryption and decryption tasks
 /// using Double Ratchet and other cryptographic mechanisms. It handles inbound and outbound
 /// messaging for sessions, including persistence, identity resolution, and communication state.
 ///
@@ -59,7 +60,7 @@ enum DeviceTargetedIdentityFilter {
 ///
 /// ## Usage
 /// ```swift
-/// let processor = TaskProcessor(logger: customLogger)
+/// let processor = MessagePipeline(logger: customLogger)
 /// try await processor.outboundTask(message, cache: cache, symmetricKey: key, ...)
 /// ```
 ///
@@ -69,7 +70,7 @@ enum DeviceTargetedIdentityFilter {
 /// - Keys are managed securely and never persisted in plain text
 /// - Message ordering is preserved to maintain cryptographic properties
 /// - Actor isolation prevents concurrent access to mutable state
-public actor TaskProcessor {
+actor MessagePipeline {
     // MARK: - Properties
 
     /// Executor for running cryptographic tasks on a serial queue.
@@ -99,13 +100,22 @@ public actor TaskProcessor {
     /// The serial executor exposed to allow `Sendable` access to async work.
     /// External code can use this to schedule work on the cryptographic executor
     /// while maintaining actor isolation for the processor's state.
-    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+    nonisolated var unownedExecutor: UnownedSerialExecutor {
         cryptoExecutor.asUnownedSerialExecutor()
     }
 
     /// The currently active session.
     /// This is set by the session manager and contains the current cryptographic context.
     var session: PQSSession?
+
+    func audit(
+        _ channel: PQSAuditLog.Channel,
+        _ message: @autoclosure () -> String,
+        level: Level = .warning,
+        on session: PQSSession? = nil
+    ) {
+        (session ?? self.session)?.auditSink.log(channel, message(), level: level)
+    }
 
     /// Handles cryptographic operations (e.g. encryption/decryption).
     /// Provides a unified interface for all cryptographic primitives used by the processor.
@@ -121,7 +131,7 @@ public actor TaskProcessor {
 
     /// Manages the Double Ratchet state for secure messaging.
     /// Handles key derivation, message encryption/decryption, and ratchet advancement.
-    let ratchetManager: DoubleRatchetStateManager<SHA256>
+    let ratchetManager: MessageRatchet
 
     /// Internal message sequence tracker for job ordering.
     /// Ensures that jobs are processed in the correct order to maintain cryptographic properties.
@@ -172,7 +182,7 @@ public actor TaskProcessor {
 
     /// Delegate responsible for transport-level session communication.
     /// Handles the actual sending and receiving of encrypted messages over the network.
-    var delegate: (any SessionTransport)?
+    var delegate: (any PQSNetworkHost)?
     
     var taskDelegate: TaskSequenceDelegate?
 
@@ -233,7 +243,7 @@ public actor TaskProcessor {
         let metadata: SignedRatchetMessageMetadata
         let sessionIdentityId: UUID
         let needsRemoteDeletion: Bool
-        let curveOneTimeKeyId: String?
+        let x25519OneTimeKeyId: String?
         let mlKEMOneTimeKeyId: String
         let createdAt: Date
     }
@@ -264,6 +274,28 @@ public actor TaskProcessor {
     var pendingOutboundTransportBySharedId: [String: PendingOutboundTransport] = [:]
     let pendingOutboundTransportTTL: TimeInterval = 60 * 10
     let pendingOutboundTransportLimit = 256
+
+    /// A durable outbound envelope that has reached the local transport but has
+    /// not yet been accepted by the server.
+    struct UnackedOutboundEnvelope: Sendable {
+        var pending: PendingOutboundTransport
+        let localId: UUID
+        let sharedId: String
+        /// When false, `localId` is not a message-store row (control / ephemeral traffic).
+        let isPersistedOutbound: Bool
+        var connectionEpoch: UInt64
+        var resendAttempts: Int
+    }
+
+    var unackedServerAcceptByEnvelopeId: [String: UnackedOutboundEnvelope] = [:]
+    var unackedServerAcceptDeadlineTasks: [String: Task<Void, Never>] = [:]
+    var messagingConnectionEpoch: UInt64 = 0
+    let unackedServerAcceptTTL: TimeInterval = 60 * 10
+    let unackedServerAcceptLimit = 256
+    /// Overridable internally so tests can exercise the deadline without waiting ten seconds.
+    var serverAcceptAckDeadlineNanosecondsOverride: UInt64?
+    let serverAcceptAckDeadlineNanoseconds: UInt64 = 10_000_000_000
+    let maxServerAcceptResendAttempts = 5
 
     /// Jobs currently entering the ratchet, keyed by their logical shared id.
     var processingOutboundJobBySharedId: [String: JobModel] = [:]
@@ -316,7 +348,7 @@ public actor TaskProcessor {
     ///
     /// - Note: This struct is `Sendable` and `Hashable` for safe use in concurrent collections.
     /// - Warning: Stashed tasks should be processed promptly to avoid memory accumulation.
-    public struct StashedTask: Hashable, Sendable {
+    struct StashedTask: Hashable, Sendable {
         /// Unique identifier for the stashed task.
         /// Used for deduplication and task tracking.
         let id = UUID()
@@ -330,13 +362,13 @@ public actor TaskProcessor {
         ///   - lhs: Left-hand side of the comparison
         ///   - rhs: Right-hand side of the comparison
         /// - Returns: `true` if the tasks have the same ID, `false` otherwise
-        public static func == (lhs: TaskProcessor.StashedTask, rhs: TaskProcessor.StashedTask) -> Bool {
+        static func == (lhs: MessagePipeline.StashedTask, rhs: MessagePipeline.StashedTask) -> Bool {
             lhs.id == rhs.id
         }
 
         /// Generates a hash value for the task.
         /// - Parameter hasher: The hasher to use for generating the hash value
-        public func hash(into hasher: inout Hasher) {
+        func hash(into hasher: inout Hasher) {
             hasher.combine(id)
         }
     }
@@ -352,9 +384,9 @@ public actor TaskProcessor {
     /// - Parameter logger: Custom logger instance, defaults to a basic logger.
     ///   The logger is used for debugging, telemetry, and audit trails.
     /// - Note: The processor is not ready for use until a session is set and the delegate is configured.
-    public init(logger: NeedleTailLogger = NeedleTailLogger(), ratchetConfiguration: RatchetConfiguration? = nil) {
+    init(logger: NeedleTailLogger = NeedleTailLogger(), ratchetConfiguration: RatchetConfiguration? = nil) {
         self.logger = logger
-        ratchetManager = DoubleRatchetStateManager<SHA256>(
+        ratchetManager = MessageRatchet(
             executor: cryptoExecutor,
             logger: logger,
             ratchetConfiguration: ratchetConfiguration)
@@ -366,9 +398,9 @@ public actor TaskProcessor {
     /// The transport delegate is responsible for handling the actual network communication
     /// of encrypted messages. This must be set before the processor can send or receive messages.
     ///
-    /// - Parameter delegate: An object conforming to `SessionTransport` for handling transport-level communication.
+    /// - Parameter delegate: An object conforming to `PQSNetworkHost` for handling transport-level communication.
     ///   Pass `nil` to remove the current delegate.
-    public func setDelegate(_ delegate: (any SessionTransport)?) {
+    func setDelegate(_ delegate: (any PQSNetworkHost)?) {
         self.delegate = delegate
     }
     
@@ -376,7 +408,7 @@ public actor TaskProcessor {
         self.taskDelegate = delegate
     }
     
-    public func setLogLevel(_ level: Level) async {
+    func setLogLevel(_ level: Level) async {
         logger.setLogLevel(level)
         await ratchetManager.setLogLevel(level)
     }
@@ -419,7 +451,7 @@ public actor TaskProcessor {
     ///   - logger: Logger instance for debug logging. Sensitive data is filtered before logging.
     /// - Throws: Errors related to identity resolution, encryption, persistence, or job scheduling.
     ///   Common errors include missing identities, encryption failures, and database errors.
-    public func outboundTask(
+    func outboundTask(
         message: CryptoMessage,
         cache: SessionCache,
         symmetricKey: SymmetricKey,
@@ -429,10 +461,12 @@ public actor TaskProcessor {
         sharedIdOverride: String? = nil,
         targetDeviceId: UUID? = nil,
         shouldPersist: Bool,
+        coalescingKey: String? = nil,
         logger: NeedleTailLogger
     ) async throws {
         var identities = [SessionIdentity]()
         var recipients = Set<String>()
+        var prePersistedMessage: EncryptedMessage?
         // Friendship / OTK bootstrap must avoid ghost non-master rows in published
         // peer configs. Normal DMs, channels, and sibling sync must keep every
         // linked device — otherwise child devices can send but never receive.
@@ -476,6 +510,33 @@ public actor TaskProcessor {
                 restrictPeerFanoutToMasterDevices = true
             }
 
+            recipients.formUnion([sender, nickname])
+
+            let hasTargetedTransportIdentity: Bool
+            if let (_, deviceId) = await session.sessionDelegate?.retrieveUserInfo(message.transportInfo) {
+                hasTargetedTransportIdentity = !deviceId.isEmpty
+            } else {
+                hasTargetedTransportIdentity = false
+            }
+            let hasActiveLocalLane =
+                try await session.hasActiveChatLane(secretName: nickname)
+            let canPersistBeforeRemoteLookup = shouldPersist
+                && targetDeviceId == nil
+                && !hasTargetedTransportIdentity
+                && !forceIdentityRefresh
+                && !sendOneTimeIdentities
+                && createIdentity
+                && hasActiveLocalLane
+            if canPersistBeforeRemoteLookup {
+                prePersistedMessage = try await persistOutboundMessage(
+                    message: message,
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey,
+                    recipients: recipients,
+                    sharedIdOverride: sharedIdOverride)
+            }
+
             // Friendship / OTK bootstrap keep the master-scoped gather path.
             // Persistable chat uses verified-device fan-out: one active lane per device.
             if forceIdentityRefresh || sendOneTimeIdentities || !createIdentity {
@@ -490,7 +551,16 @@ public actor TaskProcessor {
                 // offlineOutboundPersist / queueOutboundDespiteConfigurationLookupFailure:
                 // chat fan-out falls back to local lanes when live findConfiguration fails
                 // so compose can persist and drain on resume (offline-first).
-                identities = try await session.sessionIdentitiesForChatFanout(secretName: nickname)
+                do {
+                    identities = try await session.sessionIdentitiesForChatFanout(
+                        secretName: nickname)
+                } catch {
+                    await markPrePersistedIdentityResolutionFailure(
+                        prePersistedMessage,
+                        recipient: message.recipient,
+                        session: session)
+                    throw error
+                }
                 logger.log(
                     level: .info,
                     message: "Gathered \(identities.count) chat fan-out Session Identities for \(nickname)")
@@ -550,11 +620,33 @@ public actor TaskProcessor {
                 }
             }
             
-            recipients.formUnion([sender, nickname])
-            
         case .channel:
             do {
-                
+                if shouldPersist, targetDeviceId == nil {
+                    let communication = try await conversation(
+                        cache: cache,
+                        communicationType: type,
+                        session: session)
+                    if let props = await communication.props(symmetricKey: symmetricKey) {
+                        let peerMembers = props.members.filter { $0 != sender }
+                        var hasLocalLanesForEveryPeer = !peerMembers.isEmpty
+                        for member in peerMembers where hasLocalLanesForEveryPeer {
+                            hasLocalLanesForEveryPeer =
+                                try await session.hasActiveChatLane(secretName: member)
+                        }
+                        if hasLocalLanesForEveryPeer {
+                            recipients.formUnion(props.members)
+                            prePersistedMessage = try await persistOutboundMessage(
+                                message: message,
+                                cache: cache,
+                                session: session,
+                                symmetricKey: symmetricKey,
+                                recipients: recipients,
+                                sharedIdOverride: sharedIdOverride)
+                        }
+                    }
+                }
+
                 let (channelIdentities, members) = try await gatherChannelIdentities(
                     cache: cache,
                     session: session,
@@ -565,7 +657,8 @@ public actor TaskProcessor {
                 identities = channelIdentities
                 recipients.formUnion(members)
                 
-            } catch let sessionError as PQSSession.SessionErrors where sessionError == .cannotFindCommunication {
+            } catch let sessionError as PQSError where
+                sessionError == .cannotFindCommunication && prePersistedMessage == nil {
                 
                 let info = try BinaryDecoder().decode(ChannelInfo.self, from: message.metadata)
 
@@ -592,6 +685,10 @@ public actor TaskProcessor {
                 recipients.formUnion(gatheredMembers)
                 
             } catch {
+                await markPrePersistedIdentityResolutionFailure(
+                    prePersistedMessage,
+                    recipient: message.recipient,
+                    session: session)
                 throw error
             }
         case .broadcast:
@@ -614,7 +711,7 @@ public actor TaskProcessor {
             targetDeviceId: targetDeviceId,
             symmetricKey: symmetricKey)
         if targetDeviceId != nil, identities.isEmpty {
-            throw PQSSession.SessionErrors.invalidDeviceIdentity
+            throw PQSError.invalidDeviceIdentity
         }
 
         /// Utility for selecting matching identities by secret name and device ID.
@@ -676,7 +773,7 @@ public actor TaskProcessor {
                     } else {
                         logger.log(level: .error, message: "Missing Offer Identity: \(lookupSecretName)")
                         // Never report success with zero jobs when a targeted device was required.
-                        throw PQSSession.SessionErrors.missingSessionIdentity
+                        throw PQSError.missingSessionIdentity
                     }
                 }
             }
@@ -700,6 +797,7 @@ public actor TaskProcessor {
                     recipients: Set([sender, peer]),
                     sharedIdOverride: sharedIdOverride,
                     shouldPersist: shouldPersist,
+                    coalescingKey: coalescingKey,
                     logger: logger)
             }
             return
@@ -715,10 +813,75 @@ public actor TaskProcessor {
             recipients: recipients,
             sharedIdOverride: sharedIdOverride,
             shouldPersist: shouldPersist,
+            prePersistedMessage: prePersistedMessage,
+            coalescingKey: coalescingKey,
             logger: logger)
     }
+
+    /// Persists a user-visible outbound row before remote identity refresh.
+    ///
+    /// This is used only when active local recipient lanes already prove the chat is
+    /// established. Encryption and durable per-device jobs still use the normal
+    /// `createEncryptableTask` path after fan-out resolution.
+    private func persistOutboundMessage(
+        message: CryptoMessage,
+        cache: SessionCache,
+        session: PQSSession,
+        symmetricKey: SymmetricKey,
+        recipients: Set<String>,
+        sharedIdOverride: String?
+    ) async throws -> EncryptedMessage {
+        var communicationModel: BaseCommunication
+        var shouldUpdateCommunication: Bool
+
+        do {
+            communicationModel = try await conversation(
+                cache: cache,
+                communicationType: message.recipient,
+                session: session)
+            guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
+                throw PQSError.propsError
+            }
+            props.messageCount += 1
+            _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
+            shouldUpdateCommunication = true
+        } catch {
+            communicationModel = try await createCommunicationModel(
+                recipients: recipients,
+                communicationType: message.recipient,
+                metadata: message.metadata,
+                symmetricKey: symmetricKey)
+            shouldUpdateCommunication = false
+            await session.receiverDelegate?.updatedCommunication(
+                communicationModel,
+                members: recipients)
+        }
+
+        let savedMessage = try await createOutboundMessageModel(
+            message: message,
+            communication: communicationModel,
+            session: session,
+            symmetricKey: symmetricKey,
+            members: recipients,
+            sharedId: sharedIdOverride ?? UUID().uuidString,
+            shouldUpdateCommunication: shouldUpdateCommunication)
+        await session.receiverDelegate?.createdMessage(savedMessage)
+        return savedMessage
+    }
+
+    private func markPrePersistedIdentityResolutionFailure(
+        _ message: EncryptedMessage?,
+        recipient: MessageRecipient,
+        session: PQSSession
+    ) async {
+        guard let message else { return }
+        try? await session.updateMessageDeliveryState(
+            message,
+            deliveryState: .failed("identityResolution"),
+            messageRecipient: recipient)
+    }
     
-    public func createChannelCommunication(
+    func createChannelCommunication(
         sender: String,
         recipient: MessageRecipient,
         channelName: String,
@@ -736,17 +899,17 @@ public actor TaskProcessor {
         members.insert(sender)
         operators.insert(sender)
         guard !members.isEmpty else {
-            throw PQSSession.SessionErrors.missingMetadata
+            throw PQSError.missingMetadata
         }
         guard !operators.isEmpty else {
-            throw PQSSession.SessionErrors.missingMetadata
+            throw PQSError.missingMetadata
         }
 
         guard operators.count >= PQSSessionConstants.minimumChannelOperators else {
-            throw PQSSession.SessionErrors.invalidOperatorCount
+            throw PQSError.invalidOperatorCount
         }
         guard members.count >= PQSSessionConstants.minimumChannelMembers else {
-            throw PQSSession.SessionErrors.invalidMemberCount
+            throw PQSError.invalidMemberCount
         }
 
         if try await cache.fetchCommunications().async.first(where: {
@@ -785,7 +948,7 @@ public actor TaskProcessor {
     }
 
     /// Expands an existing channel communication roster and optionally re-synchronizes encryption state.
-    public func updateChannelMembership(
+    func updateChannelMembership(
         channelName: String,
         administrator: String,
         members: Set<String>,
@@ -800,13 +963,13 @@ public actor TaskProcessor {
         members.insert(administrator)
         operators.insert(administrator)
 
-        let communicationModel = try await findCommunicationType(
+        let communicationModel = try await conversation(
             cache: cache,
             communicationType: .channel(channelName),
             session: session)
 
         guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
-            throw PQSSession.SessionErrors.missingMetadata
+            throw PQSError.missingMetadata
         }
 
         let wireInfo = ChannelInfo(
@@ -959,18 +1122,41 @@ public actor TaskProcessor {
         type: MessageRecipient,
         logger: NeedleTailLogger
     ) async throws -> ([SessionIdentity], Set<String>) {
-        let communicationModel = try await findCommunicationType(cache: cache, communicationType: type, session: session)
+        let communicationModel = try await conversation(cache: cache, communicationType: type, session: session)
         guard let props = await communicationModel.props(symmetricKey: symmetricKey) else {
-            throw PQSSession.SessionErrors.propsError
+            throw PQSError.propsError
         }
 
         let members = props.members
         var identities = Set<SessionIdentity>()
+        var activeMembers = Set<String>()
         for member in members {
-            try await identities.formUnion(session.refreshIdentities(secretName: member))
+            do {
+                let memberIdentities = try await session.refreshIdentities(secretName: member)
+                // Deleted accounts linger in channel `members` until roster repair.
+                // refreshIdentities returns no lanes for tombstoned accounts (graceful
+                // contract); exclude them from activeMembers too so recipients metadata
+                // does not carry ghost names. Members with empty lanes for any *other*
+                // reason (e.g. transient refresh failure) keep the legacy behavior.
+                if memberIdentities.isEmpty,
+                   await session.knownDeletedAccountSecretNames.contains(member) {
+                    logger.log(
+                        level: .info,
+                        message: "Skipping channel member with deleted account secretName=\(member)")
+                    continue
+                }
+                identities.formUnion(memberIdentities)
+                activeMembers.insert(member)
+            } catch PQSError.userNotFound {
+                // Defense-in-depth if a future refresh path surfaces userNotFound again.
+                logger.log(
+                    level: .info,
+                    message: "Skipping channel member with deleted account secretName=\(member)")
+                continue
+            }
         }
         logger.log(level: .info, message: "Gathered \(identities.count) Channel Session Identities")
-        return (Array(identities), members)
+        return (Array(identities), activeMembers)
     }
 
     // MARK: - Message Encryption
@@ -1017,6 +1203,8 @@ public actor TaskProcessor {
         recipients: Set<String>,
         sharedIdOverride: String? = nil,
         shouldPersist: Bool,
+        prePersistedMessage: EncryptedMessage? = nil,
+        coalescingKey: String? = nil,
         logger: NeedleTailLogger
     ) async throws {
 
@@ -1030,49 +1218,26 @@ public actor TaskProcessor {
             // control events (non-persisted) are a no-op, and persisted notes-to-self
             // fall through below so they are stored locally and marked delivered.
             guard message.recipient == .personalMessage else {
-                throw PQSSession.SessionErrors.missingSessionIdentity
+                await markPrePersistedIdentityResolutionFailure(
+                    prePersistedMessage,
+                    recipient: message.recipient,
+                    session: session)
+                throw PQSError.missingSessionIdentity
             }
             guard shouldPersist else { return }
         }
 
         var task: EncryptableTask
-        var encryptableMessage: EncryptedMessage?
+        var encryptableMessage = prePersistedMessage
 
-        if shouldPersist {
-            var communicationModel: BaseCommunication
-            var shouldUpdateCommunication = false
-
-            do {
-                communicationModel = try await findCommunicationType(
-                    cache: cache,
-                    communicationType: message.recipient,
-                    session: session)
-                
-                guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
-                    throw PQSSession.SessionErrors.propsError
-                }
-                props.messageCount += 1
-                _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
-                shouldUpdateCommunication = true
-            } catch {
-                communicationModel = try await createCommunicationModel(
-                    recipients: recipients,
-                    communicationType: message.recipient,
-                    metadata: message.metadata,
-                    symmetricKey: symmetricKey)
-                await session.receiverDelegate?.updatedCommunication(communicationModel, members: recipients)
-            }
-
-            let savedMessage = try await createOutboundMessageModel(
+        if shouldPersist, encryptableMessage == nil {
+            encryptableMessage = try await persistOutboundMessage(
                 message: message,
-                communication: communicationModel,
+                cache: cache,
                 session: session,
                 symmetricKey: symmetricKey,
-                members: recipients,
-                sharedId: sharedIdOverride ?? UUID().uuidString,
-                shouldUpdateCommunication: shouldUpdateCommunication)
-            await session.receiverDelegate?.createdMessage(savedMessage)
-            encryptableMessage = savedMessage
+                recipients: recipients,
+                sharedIdOverride: sharedIdOverride)
         }
 
         if !hasRecipientIdentities {
@@ -1099,7 +1264,7 @@ public actor TaskProcessor {
 
         if shouldPersist {
             guard encryptableMessage != nil else {
-                throw PQSSession.SessionErrors.missingMessage
+                throw PQSError.missingMessage
             }
             guard persistedMessageProps != nil else {
                 if let savedMessage = encryptableMessage {
@@ -1108,12 +1273,12 @@ public actor TaskProcessor {
                         deliveryState: .failed("propsError"),
                         messageRecipient: message.recipient)
                 }
-                throw PQSSession.SessionErrors.propsError
+                throw PQSError.propsError
             }
         }
 
         let fanoutSharedId = encryptableMessage?.sharedId ?? sharedIdOverride ?? "ephemeral"
-        PQSAuditLog.log(.send, "pqs.send.attempt sharedId=\(fanoutSharedId) recipient=\(message.recipient.auditRecipientTag) deviceCount=\(sessionIdentities.count) persist=\(shouldPersist) members=\(recipients.sorted().joined(separator: ","))",
+        audit(.send, "pqs.send.attempt sharedId=\(fanoutSharedId) recipient=\(message.recipient.auditRecipientTag) deviceCount=\(sessionIdentities.count) persist=\(shouldPersist) members=\(recipients.sorted().joined(separator: ","))",
             level: .info)
 
         var queuedRequiredDeviceIds = Set<UUID>()
@@ -1135,7 +1300,7 @@ public actor TaskProcessor {
 
                 guard let identityProps = await identity.props(symmetricKey: symmetricKey) else {
                     logger.log(level: .warning, message: "Skipping outbound task for unreadable recipient identity \(identity.id)")
-                    PQSAuditLog.log(.send, "pqs.send.deviceSkipped sharedId=\(fanoutSharedId) sessionIdentityId=\(identity.id.uuidString) reason=unreadableIdentity",
+                    audit(.send, "pqs.send.deviceSkipped sharedId=\(fanoutSharedId) sessionIdentityId=\(identity.id.uuidString) reason=unreadableIdentity",
                         level: .info)
                     if shouldPersist {
                         // Without props we cannot classify sibling vs peer; persistable fan-out
@@ -1173,10 +1338,10 @@ public actor TaskProcessor {
                 let queuedSharedId: String
                 if shouldPersist {
                     guard let encryptableMessage else {
-                        throw PQSSession.SessionErrors.missingMessage
+                        throw PQSError.missingMessage
                     }
                     guard let messageProps = persistedMessageProps else {
-                        throw PQSSession.SessionErrors.propsError
+                        throw PQSError.propsError
                     }
                     logger.log(level: .debug, message: "Obtained encryptable message props for recipient \(identity)")
                     queuedSharedId = encryptableMessage.sharedId
@@ -1194,7 +1359,7 @@ public actor TaskProcessor {
                         guard !message.text.isEmpty else { return }
 
                         logger.log(level: .debug, message: "Requester Synchronizing Communication Message")
-                        let communicationModel = try await findCommunicationType(
+                        let communicationModel = try await conversation(
                             cache: cache,
                             communicationType: message.recipient,
                             session: session)
@@ -1208,21 +1373,24 @@ public actor TaskProcessor {
                     }
 
                     queuedSharedId = sharedIdOverride ?? UUID().uuidString
+                    // Coalescing applies only to ephemeral state publishes; persisted
+                    // user messages above never carry a key and are never superseded.
                     task = EncryptableTask(
                         task: .writeMessage(OutboundTaskMessage(
                             message: message,
                             recipientIdentity: identity,
                             localId: UUID(),
                             sharedId: queuedSharedId,
-                            isPersistedOutbound: false
+                            isPersistedOutbound: false,
+                            coalescingKey: coalescingKey
                         )),
                         priority: taskPriority
                     )
                 }
-                PQSAuditLog.log(.send, "pqs.send.deviceQueued sharedId=\(queuedSharedId) recipientSecret=\(identityProps.secretName) recipientDeviceId=\(identityProps.deviceId.uuidString) sessionIdentityId=\(identity.id.uuidString) self=\(isSelfRecipient) priority=\(String(describing: taskPriority))",
+                audit(.send, "pqs.send.deviceQueued sharedId=\(queuedSharedId) recipientSecret=\(identityProps.secretName) recipientDeviceId=\(identityProps.deviceId.uuidString) sessionIdentityId=\(identity.id.uuidString) self=\(isSelfRecipient) priority=\(String(describing: taskPriority))",
                     level: .info)
-                // Count queued only after feedTask returns (proves cache.createJob completed).
-                try await feedTask(task, session: session)
+                // Count queued only after enqueue returns (proves cache.createJob completed).
+                try await enqueue(task, session: session)
                 if isRequiredTarget {
                     queuedRequiredDeviceIds.insert(identityProps.deviceId)
                 } else {
@@ -1233,7 +1401,7 @@ public actor TaskProcessor {
                 logger.log(
                     level: .warning,
                     message: "pqs.send.deviceSkipped recipientDevice=\(identity.id) error=\(error)")
-                PQSAuditLog.log(.send, "pqs.send.deviceSkipped sharedId=\(fanoutSharedId) sessionIdentityId=\(identity.id.uuidString) error=\(String(describing: error))")
+                audit(.send, "pqs.send.deviceSkipped sharedId=\(fanoutSharedId) sessionIdentityId=\(identity.id.uuidString) error=\(String(describing: error))")
                 if let identityProps = await identity.props(symmetricKey: symmetricKey) {
                     let isSelfRecipient = identityProps.secretName == sender
                     let isRequiredTarget: Bool = {
@@ -1291,7 +1459,7 @@ public actor TaskProcessor {
                 } else {
                     failureDetail = "zeroRequiredJobs"
                 }
-                PQSAuditLog.log(.send, "pqs.send.enqueueIncomplete sharedId=\(fanoutSharedId) queued=\(queuedRequiredDeviceIds.count) required=\(requiredTargetDeviceIds.count) detail=\(failureDetail)",
+                audit(.send, "pqs.send.enqueueIncomplete sharedId=\(fanoutSharedId) queued=\(queuedRequiredDeviceIds.count) required=\(requiredTargetDeviceIds.count) detail=\(failureDetail)",
                     level: .error)
                 if let savedMessage = encryptableMessage {
                     try? await session.updateMessageDeliveryState(
@@ -1299,7 +1467,7 @@ public actor TaskProcessor {
                         deliveryState: .failed("outboundEnqueueIncomplete:\(failureDetail)"),
                         messageRecipient: message.recipient)
                 }
-                throw PQSSession.SessionErrors.outboundEnqueueIncomplete
+                throw PQSError.outboundEnqueueIncomplete
             }
         }
     }
@@ -1333,24 +1501,12 @@ public actor TaskProcessor {
     ///     Provides the cryptographic context needed for decryption.
     /// - Throws: Errors from task scheduling or job queue management.
     ///   Decryption errors are handled by the job processor.
-    public func inboundTask(_ message: InboundTaskMessage, session: PQSSession) async throws {
+    func inboundTask(_ message: InboundTaskMessage, session: PQSSession) async throws {
         // User ciphertext is urgent so deferred archive try-all (.background) cannot
         // head-of-line block fresher active-lane frames (dogfood C2).
-        try await feedTask(
+        try await enqueue(
             EncryptableTask(task: .streamMessage(message), priority: .urgent),
             session: session
         )
-    }
-}
-
-extension SessionIdentity: @retroactive Equatable {}
-extension SessionIdentity: @retroactive Hashable {
-    
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-    
-    public static func == (lhs: DoubleRatchetKit.SessionIdentity, rhs: DoubleRatchetKit.SessionIdentity) -> Bool {
-        lhs.id == rhs.id
     }
 }

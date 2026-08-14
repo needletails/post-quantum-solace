@@ -21,7 +21,7 @@ extension EndToEndTests {
     // MARK: - N1: warm send must not block on hanging findConfiguration
 
     /// CHILD_DEVICE_2: after traffic has already warmed peer lanes, a staging API hang on
-    /// `find-configuration` must not strand `writeTextMessage` for minutes.
+    /// `find-configuration` must not strand `send` for minutes.
     ///
     /// Desired: warm chat fan-out uses `lastVerifiedDeviceIdsBySecretName` and completes
     /// without awaiting a hung `findConfiguration`.
@@ -82,7 +82,7 @@ extension EndToEndTests {
             rsd: rsd)
 
         // Warm peer lanes + verified-device cache (friendship + one delivered text).
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "warm-baseline",
             sharedIdOverride: "dogfood-n1-warm-\(UUID().uuidString)")
@@ -103,7 +103,7 @@ extension EndToEndTests {
 
         let warmSharedId = "dogfood-n1-warm-send-\(UUID().uuidString)"
         let sendTask = Task {
-            try await self._senderSession.writeTextMessage(
+            try await self._senderSession.send(
                 recipient: .nickname("bob"),
                 text: "must-not-hang-on-find-configuration",
                 sharedIdOverride: warmSharedId)
@@ -135,7 +135,7 @@ extension EndToEndTests {
         #expect(
             completed,
             """
-            BUG (CHILD_DEVICE_2): warm writeTextMessage blocked on hanging findConfiguration. \
+            BUG (CHILD_DEVICE_2): warm send blocked on hanging findConfiguration. \
             Expected encrypt path to avoid awaiting live config when verified device cache \
             already matches. findConfigurationCallCount=\(findConfigurationCallCount)
             """)
@@ -146,6 +146,91 @@ extension EndToEndTests {
         }
     }
 
+    @Test("persist-first: established DM row exists before remote configuration lookup")
+    func establishedDMPersistsBeforeRemoteConfigurationLookup() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        let aliceStore = createSenderStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        let aliceStream = AsyncStream<ReceivedMessage> { bobTransport.continuation = $0 }
+        let bobStream = AsyncStream<ReceivedMessage> { aliceTransport.continuation = $0 }
+
+        try await createSenderSession(
+            store: aliceStore,
+            transport: aliceTransport,
+            sessionDelegate: sd)
+        try await createRecipientSession(
+            store: createRecipientStore(),
+            transport: bobTransport,
+            sessionDelegate: rsd)
+
+        aliceTask = Task {
+            for await received in aliceStream {
+                _ = try? await self._senderSession.receiveMessage(
+                    message: received.message,
+                    sender: received.sender,
+                    deviceId: received.deviceId,
+                    messageId: received.messageId,
+                    logicalMessageId: received.logicalMessageId)
+            }
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                _ = try? await self._recipientSession.receiveMessage(
+                    message: received.message,
+                    sender: received.sender,
+                    deviceId: received.deviceId,
+                    messageId: received.messageId,
+                    logicalMessageId: received.logicalMessageId)
+            }
+        }
+
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        let localBobLanes = try await _senderSession.getSessionIdentities(with: "bob")
+        #expect(!localBobLanes.isEmpty, "Precondition: established bob lanes")
+        await _senderSession.test_removeLastVerifiedDeviceIds(for: "bob")
+
+        let sharedId = "persist-before-config-\(UUID().uuidString)"
+        let observation = CallTracker()
+        aliceTransport.beforeFindConfiguration = { secretName in
+            guard secretName == "bob" else { return }
+            let persisted = await aliceStore.createdMessages.contains {
+                $0.sharedId == sharedId
+            }
+            await observation.record(
+                secretName: secretName,
+                deviceId: "",
+                keyCount: persisted ? 1 : 0)
+        }
+
+        try await _senderSession.send(
+            recipient: .nickname("bob"),
+            text: "persist before config",
+            sharedIdOverride: sharedId)
+
+        let calls = await observation.calls
+        #expect(!calls.isEmpty, "Cold verified memo should exercise remote configuration")
+        #expect(
+            calls.allSatisfy { $0.keyCount == 1 },
+            "The local message row must exist before findConfiguration starts")
+    }
+
     // MARK: - N1b: cold findConfiguration timeout fails fast when no local lanes
 
     /// When there are no local recipient lanes and live `findConfiguration` times out,
@@ -154,10 +239,8 @@ extension EndToEndTests {
     /// by dogfood N3.
     @Test("dogfood N1b: findConfiguration timedOut fails send within one second")
     func dogfoodN1b_findConfigurationTimedOutFailsSendWithinOneSecond() async throws {
-        var aliceTask: Task<Void, Never>?
         defer {
             Task {
-                aliceTask?.cancel()
                 await shutdownSessions()
             }
         }
@@ -183,7 +266,7 @@ extension EndToEndTests {
         do {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask {
-                    try await self._senderSession.writeTextMessage(
+                    try await self._senderSession.send(
                         recipient: .nickname("bob"),
                         text: "cold-find-should-fail-fast",
                         sharedIdOverride: "dogfood-n1b-\(UUID().uuidString)")
@@ -283,7 +366,7 @@ extension EndToEndTests {
             bobSession: _recipientSession,
             rsd: rsd)
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "warm-before-offline",
             sharedIdOverride: "dogfood-n3-warm-\(UUID().uuidString)")
@@ -301,14 +384,14 @@ extension EndToEndTests {
         // Clearing the verified-id memo forces chat fan-out onto live findConfiguration
         // (CHILD_DEVICE_2 -1001 / cannotFindUserConfiguration path).
         await _senderSession.test_removeLastVerifiedDeviceIds(for: "bob")
-        await _senderSession.setViability(false)
+        await _senderSession.setConnectivity(false)
         aliceTransport.findConfigurationError = URLError(.timedOut)
         aliceTransport.findConfigurationFaultSecretNames = ["bob", "alice"]
 
         let offlineSharedId = "dogfood-n3-offline-\(UUID().uuidString)"
         var composeError: Error?
         do {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "composed while offline / API timed out",
                 sharedIdOverride: offlineSharedId)
@@ -341,7 +424,7 @@ extension EndToEndTests {
         aliceTransport.findConfigurationError = nil
         aliceTransport.findConfigurationHang = nil
         aliceTransport.findConfigurationFaultSecretNames = nil
-        await _senderSession.setViability(true)
+        await _senderSession.setConnectivity(true)
         try await _senderSession.resumeJobQueue()
 
         func waitUntil(
@@ -558,7 +641,7 @@ extension EndToEndTests {
             "Friendship ratchet must be ready before personal gap-drop")
 
         // Baseline personal sync before arming drops.
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "personal-baseline-before-gap",
             sharedIdOverride: "dogfood-c1-baseline-\(UUID().uuidString)")
@@ -567,7 +650,7 @@ extension EndToEndTests {
         await gate.arm()
 
         for i in 0..<13 {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "personal-gap-\(i)",
                 sharedIdOverride: "dogfood-c1-gap-\(i)-\(UUID().uuidString)")
@@ -591,7 +674,7 @@ extension EndToEndTests {
 
         // New traffic after the failure window must still sync to the linked child.
         let freshSharedId = "dogfood-c1-fresh-\(UUID().uuidString)"
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "personal-after-heal",
             sharedIdOverride: freshSharedId)

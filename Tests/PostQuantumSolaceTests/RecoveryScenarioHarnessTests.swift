@@ -43,22 +43,41 @@ private actor RecoveryEventGate<Event: Hashable & Sendable> {
     }
 }
 
-private actor PreparedTransportProbe: SessionTransport {
+actor PreparedTransportProbe: PQSTransport, PQSKeyDirectory, PQSRecoveryTransport {
     enum ProbeError: Error {
         case unsupported
     }
 
     private var payloads: [Data] = []
+    private var envelopeMessageIds: [String] = []
+    private var sendWaiters: [CheckedContinuation<Void, Never>] = []
 
     func sendMessage(
         _ message: SignedRatchetMessage,
         metadata: SignedRatchetMessageMetadata
     ) async throws {
         payloads.append(message.signed?.data ?? Data())
+        envelopeMessageIds.append(metadata.envelopeMessageId)
+        let waiters = sendWaiters
+        sendWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    /// Suspends until at least `count` sends were captured. Event-driven so tests never
+    /// race real code against a fixed sleep (deadline resends land whenever the actor
+    /// hop completes, not on a stopwatch).
+    func waitForCapturedSends(atLeast count: Int) async {
+        while payloads.count < count {
+            await withCheckedContinuation { sendWaiters.append($0) }
+        }
     }
 
     func capturedPayloads() -> [Data] {
         payloads
+    }
+
+    func capturedEnvelopeMessageIds() -> [String] {
+        envelopeMessageIds
     }
 
     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
@@ -80,7 +99,7 @@ private actor PreparedTransportProbe: SessionTransport {
     func fetchOneTimeKeyIdentities(
         for secretName: String,
         deviceId: String,
-        type: KeysType
+        type: KeyKind
     ) async throws -> [UUID] {
         throw ProbeError.unsupported
     }
@@ -104,7 +123,7 @@ private actor PreparedTransportProbe: SessionTransport {
     func batchDeleteOneTimeKeys(
         for secretName: String,
         with id: String,
-        type: KeysType
+        type: KeyKind
     ) async throws {
         throw ProbeError.unsupported
     }
@@ -112,7 +131,7 @@ private actor PreparedTransportProbe: SessionTransport {
     func deleteOneTimeKeys(
         for secretName: String,
         with id: String,
-        type: KeysType
+        type: KeyKind
     ) async throws {
         throw ProbeError.unsupported
     }
@@ -130,6 +149,24 @@ private actor PreparedTransportProbe: SessionTransport {
         deviceId: UUID,
         recipient: MessageRecipient,
         metadata: Data
+    ) async throws {
+        throw ProbeError.unsupported
+    }
+
+    func sendOutOfBandResendRequest(
+        failedEnvelopeMessageIds: [String],
+        to secretName: String,
+        deviceId: UUID,
+        requestingDeviceId: UUID
+    ) async throws {
+        throw ProbeError.unsupported
+    }
+
+    func sendOutOfBandResendUnavailable(
+        unavailableEnvelopeMessageIds: [String],
+        to secretName: String,
+        deviceId: UUID,
+        respondingDeviceId: UUID
     ) async throws {
         throw ProbeError.unsupported
     }
@@ -233,7 +270,7 @@ struct RecoveryScenarioHarnessTests {
         let signed = try SignedRatchetMessage(
             message: RatchetMessage(
                 header: encryptedHeader,
-                encryptedData: Data([0xA1, 0xB2, 0xC3])),
+                ciphertext: Data([0xA1, 0xB2, 0xC3])),
             signingPrivateKey: signingKey.rawRepresentation)
         let sessionIdentityId = UUID()
         let deviceId = UUID()
@@ -244,10 +281,11 @@ struct RecoveryScenarioHarnessTests {
             recipient: .nickname("bob"),
             transportMetadata: Data([0x01, 0x02]),
             sharedMessageId: "shared-id",
+            envelopeMessageId: "shared-id",
             transportEvent: nil,
             sessionIdentityId: sessionIdentityId,
             needsRemoteDeletion: true,
-            curveOneTimeKeyId: "curve-id",
+            x25519OneTimeKeyId: "curve-id",
             mlKEMOneTimeKeyId: "mlkem-id")
 
         let encoded = try BinaryEncoder().encode(prepared)
@@ -261,7 +299,7 @@ struct RecoveryScenarioHarnessTests {
         #expect(decoded.sharedMessageId == "shared-id")
         #expect(decoded.sessionIdentityId == sessionIdentityId)
         #expect(decoded.needsRemoteDeletion)
-        #expect(decoded.curveOneTimeKeyId == "curve-id")
+        #expect(decoded.x25519OneTimeKeyId == "curve-id")
         #expect(decoded.mlKEMOneTimeKeyId == "mlkem-id")
     }
 
@@ -283,7 +321,7 @@ struct RecoveryScenarioHarnessTests {
         let signed = try SignedRatchetMessage(
             message: RatchetMessage(
                 header: header,
-                encryptedData: Data([0x36, 0x37])),
+                ciphertext: Data([0x36, 0x37])),
             signingPrivateKey: signingKey.rawRepresentation)
         let identityId = UUID()
         let deviceId = UUID()
@@ -294,10 +332,11 @@ struct RecoveryScenarioHarnessTests {
             recipient: .nickname("bob"),
             transportMetadata: nil,
             sharedMessageId: "relaunch-shared-id",
+            envelopeMessageId: "relaunch-shared-id",
             transportEvent: nil,
             sessionIdentityId: identityId,
             needsRemoteDeletion: false,
-            curveOneTimeKeyId: nil,
+            x25519OneTimeKeyId: nil,
             mlKEMOneTimeKeyId: mlKEMId.uuidString)
         let outbound = OutboundTaskMessage(
             message: CryptoMessage(
@@ -314,18 +353,18 @@ struct RecoveryScenarioHarnessTests {
         let transport = PreparedTransportProbe()
         await session.setTransportDelegate(conformer: transport)
 
-        let beforeRelaunch = TaskProcessor()
+        let beforeRelaunch = MessagePipeline()
         try await beforeRelaunch.sendPreparedOutbound(
             prepared,
             outboundTask: outbound,
             session: session)
-        try await beforeRelaunch.ratchetManager.shutdown()
-        let afterRelaunch = TaskProcessor()
+        try await beforeRelaunch.ratchetManager.flushAndClose()
+        let afterRelaunch = MessagePipeline()
         try await afterRelaunch.sendPreparedOutbound(
             prepared,
             outboundTask: outbound,
             session: session)
-        try await afterRelaunch.ratchetManager.shutdown()
+        try await afterRelaunch.ratchetManager.flushAndClose()
 
         let payloads = await transport.capturedPayloads()
         #expect(payloads.count == 2)

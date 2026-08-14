@@ -21,74 +21,6 @@ import Crypto
 import BinaryCodable
 
 
-/// An enumeration representing various errors that can occur in session events.
-enum EventErrors: Error, LocalizedError {
-    /// Indicates that the session has not been initialized.
-    case sessionNotInitialized
-    
-    /// Indicates that the database has not been initialized.
-    case databaseNotInitialized
-    
-    /// Indicates that the transport layer has not been initialized.
-    case transportNotInitialized
-    
-    /// Indicates a generic properties error.
-    case propsError
-    
-    /// Indicates that the provided secret name is invalid.
-    case invalidSecretName
-    
-    /// Indicates that required metadata is missing.
-    case missingMetadata
-    
-    /// Indicates that a communication could not be found.
-    case cannotFindCommunication
-    
-    /// Indicates that a contact could not be found.
-    case cannotFindContact
-    
-    /// Indicates that the user is blocked.
-    case userIsBlocked
-    
-    public var errorDescription: String? {
-        switch self {
-        case .sessionNotInitialized:
-            return "Session has not been initialized"
-        case .databaseNotInitialized:
-            return "Database has not been initialized"
-        case .transportNotInitialized:
-            return "Transport layer has not been initialized"
-        case .propsError:
-            return "Properties error"
-        case .invalidSecretName:
-            return "Invalid secret name"
-        case .missingMetadata:
-            return "Required metadata is missing"
-        case .cannotFindCommunication:
-            return "Cannot find communication"
-        case .cannotFindContact:
-            return "Cannot find contact"
-        case .userIsBlocked:
-            return "The user is blocked"
-        }
-    }
-    
-    public var recoverySuggestion: String? {
-        switch self {
-        case .sessionNotInitialized:
-            return "Ensure the session is properly initialized before use"
-        case .databaseNotInitialized:
-            return "Configure the database delegate"
-        case .transportNotInitialized:
-            return "Configure the transport delegate"
-        case .missingMetadata:
-            return "Provide the required metadata"
-        default:
-            return nil
-        }
-    }
-}
-
 /// Returns the more "settled" of two `FriendshipMetadata` records when reconciling
 /// concurrent updates (e.g. an out-of-order `synchronizeContacts` carrying stale
 /// `pending`/`requested` state arriving after a faster `friendshipStateRequest`
@@ -200,7 +132,7 @@ public enum FriendshipMetadataConflictPolicy: Sendable {
 
 /// A protocol that defines methods for handling session events in a post-quantum secure messaging system.
 ///
-/// The `SessionEvents` protocol provides a comprehensive interface for managing session-related operations
+/// The `ContactService` protocol provides a comprehensive interface for managing session-related operations
 /// including contact management, friendship state changes, message delivery tracking, and communication
 /// synchronization. This protocol is designed to work with encrypted, secure messaging systems that
 /// implement post-quantum cryptography.
@@ -244,7 +176,7 @@ public enum FriendshipMetadataConflictPolicy: Sendable {
 /// ## Error Handling
 /// All methods in this protocol can throw errors. Implement proper error handling to manage
 /// failures gracefully. Common errors include initialization failures, missing data, and network issues.
-public protocol SessionEvents: Sendable {
+package protocol ContactService: Sendable {
     /// Adds contacts to the session and establishes communication channels.
     ///
     /// This method processes an array of contact information, filters out existing contacts,
@@ -265,13 +197,13 @@ public protocol SessionEvents: Sendable {
     ///     Each contact info should include a unique secret name and metadata.
     ///   - sessionContext: The context of the current session, providing user-specific information
     ///     including the current user's secret name and session configuration.
-    ///   - cache: The `PQSSessionStore` used for caching contacts and communications.
+    ///   - cache: The `PQSPersistenceHost` used for caching contacts and communications.
     ///     This provides persistent storage for contact and communication data.
-    ///   - transport: The `SessionTransport` used for communication with other devices.
+    ///   - transport: The `PQSNetworkHost` used for communication with other devices.
     ///     This handles network operations and user configuration retrieval.
-    ///   - receiver: The `EventReceiver` that will handle events related to contact creation
+    ///   - receiver: The `MessageStoreObserver` that will handle events related to contact creation
     ///     and updates. This notifies the UI layer of changes.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks
+    ///   - sessionDelegate: The `PQSHostDelegate` for managing session-related tasks
     ///     such as metadata requests and communication synchronization.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///     This ensures all stored data is properly encrypted.
@@ -279,8 +211,8 @@ public protocol SessionEvents: Sendable {
     ///     This helps with troubleshooting and monitoring.
     ///
     /// - Throws:
-    ///   - `EventErrors.propsError` if there is an issue with the properties of the communication model.
-    ///   - `EventErrors.invalidSecretName` if any contact has an invalid secret name.
+    ///   - `PQSError.propsError` if there is an issue with the properties of the communication model.
+    ///   - `PQSError.invalidSecretName` if any contact has an invalid secret name.
     ///   - Any other error that may occur during the process, such as network issues or database errors.
     ///
     /// - Note: This method automatically requests the current user's metadata after adding new contacts.
@@ -288,10 +220,10 @@ public protocol SessionEvents: Sendable {
     func addContacts(
         _ contactInfos: [SharedContactInfo],
         sessionContext: SessionContext,
-        cache: PQSSessionStore,
-        transport: SessionTransport,
-        receiver: EventReceiver,
-        sessionDelegate: PQSSessionDelegate,
+        cache: PQSPersistenceHost,
+        transport: PQSNetworkHost,
+        receiver: MessageStoreObserver,
+        sessionDelegate: PQSHostDelegate,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws
@@ -301,25 +233,26 @@ public protocol SessionEvents: Sendable {
     ///   - secretName: The secret name of the contact.
     ///   - metadata: The metadata associated with the contact.
     ///   - requestFriendship: A boolean indicating whether to request friendship.
-    ///   - notifyPeerOfCreation: When `requestFriendship` is `false`, whether to send
-    ///     a `.contactCreated` acknowledgment via `receiver.synchronize`.
     ///   - sessionContext: The context of the current session.
-    ///   - cache: The `PQSSessionStore` used for caching.
-    ///   - transport: The `SessionTransport` used for communication.
-    ///   - receiver: The `EventReceiver` that will handle events.
+    ///   - cache: The `PQSPersistenceHost` used for caching.
+    ///   - transport: The `PQSNetworkHost` used for communication.
+    ///   - receiver: The `MessageStoreObserver` that will handle events.
     ///   - symmetricKey: The symmetric key used for encryption.
     ///   - logger: The logger for logging events.
     /// - Returns: A `ContactModel` representing the updated or created contact.
     /// - Throws: An error if the operation fails.
+    ///
+    /// Prefer the extension overload that accepts `notifyPeerOfCreation` when the
+    /// host must suppress `.contactCreated` (e.g. official inbox ensure).
     func createContact(
         secretName: String,
         metadata: Data,
         friendshipMetadata: FriendshipMetadata?,
         requestFriendship: Bool,
         sessionContext: SessionContext,
-        cache: PQSSessionStore,
-        transport: SessionTransport,
-        receiver: EventReceiver,
+        cache: PQSPersistenceHost,
+        transport: PQSNetworkHost,
+        receiver: MessageStoreObserver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws -> ContactModel
@@ -328,9 +261,9 @@ public protocol SessionEvents: Sendable {
     /// - Parameters:
     ///   - secretName: The secret name of the contact.
     ///   - sessionContext: The context of the current session.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
-    ///   - cache: The `PQSSessionStore` used for caching.
-    ///   - receiver: The `EventReceiver` that will handle events.
+    ///   - sessionDelegate: The `PQSHostDelegate` for session management.
+    ///   - cache: The `PQSPersistenceHost` used for caching.
+    ///   - receiver: The `MessageStoreObserver` that will handle events.
     ///   - symmetricKey: The symmetric key used for encryption.
     ///   - logger: The logger for logging events.
     /// - Throws: An error if the operation fails.
@@ -338,9 +271,9 @@ public protocol SessionEvents: Sendable {
         recipient: MessageRecipient,
         metadata: Data,
         sessionContext: SessionContext,
-        sessionDelegate: PQSSessionDelegate,
-        cache: PQSSessionStore,
-        receiver: EventReceiver,
+        sessionDelegate: PQSHostDelegate,
+        cache: PQSPersistenceHost,
+        receiver: MessageStoreObserver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws
@@ -375,18 +308,18 @@ public protocol SessionEvents: Sendable {
     ///     - `.blocked`: Indicates that the contact should be blocked.
     ///     - `.unblocked`: Indicates that the contact should be unblocked.
     ///   - contact: The `Contact` object representing the contact whose friendship state is being changed.
-    ///   - cache: The `PQSSessionStore` used for caching contact data.
-    ///   - receiver: The `EventReceiver` that will handle contact update events.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
+    ///   - cache: The `PQSPersistenceHost` used for caching contact data.
+    ///   - receiver: The `MessageStoreObserver` that will handle contact update events.
+    ///   - sessionDelegate: The `PQSHostDelegate` for managing session-related tasks.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Throws:
-    ///   - `EventErrors.databaseNotInitialized`: If the cache is not initialized.
-    ///   - `EventErrors.sessionNotInitialized`: If the session context is not initialized.
-    ///   - `EventErrors.cannotFindContact`: If the specified contact cannot be found in the cache.
-    ///   - `EventErrors.propsError`: If there is an error updating the contact's properties.
-    ///   - `EventErrors.userIsBlocked`: If the current user is blocked and cannot perform the action.
+    ///   - `PQSError.databaseNotInitialized`: If the cache is not initialized.
+    ///   - `PQSError.sessionNotInitialized`: If the session context is not initialized.
+    ///   - `PQSError.cannotFindContact`: If the specified contact cannot be found in the cache.
+    ///   - `PQSError.propsError`: If there is an error updating the contact's properties.
+    ///   - `PQSError.userIsBlocked`: If the current user is blocked and cannot perform the action.
     ///   - Any other errors that may occur during the process, such as encoding errors or network issues.
     ///
     /// - Important:
@@ -398,9 +331,9 @@ public protocol SessionEvents: Sendable {
     func requestFriendshipStateChange(
         state: FriendshipMetadata.State,
         contact: Contact,
-        cache: PQSSessionStore,
-        receiver: EventReceiver,
-        sessionDelegate: PQSSessionDelegate,
+        cache: PQSPersistenceHost,
+        receiver: MessageStoreObserver,
+        sessionDelegate: PQSHostDelegate,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws
@@ -411,9 +344,9 @@ public protocol SessionEvents: Sendable {
     ///   - deliveryState: The new delivery state of the message.
     ///   - messageRecipient: The recipient of the message.
     ///   - allowExternalUpdate: A boolean indicating whether external updates are allowed.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
-    ///   - cache: The `PQSSessionStore` used for caching.
-    ///   - receiver: The `EventReceiver` that will handle events.
+    ///   - sessionDelegate: The `PQSHostDelegate` for session management.
+    ///   - cache: The `PQSPersistenceHost` used for caching.
+    ///   - receiver: The `MessageStoreObserver` that will handle events.
     ///   - symmetricKey: The symmetric key used for encryption.
     /// - Throws: An error if the operation fails.
     func updateMessageDeliveryState(
@@ -421,43 +354,43 @@ public protocol SessionEvents: Sendable {
         deliveryState: DeliveryState,
         messageRecipient: MessageRecipient,
         allowExternalUpdate: Bool,
-        sessionDelegate: PQSSessionDelegate,
-        cache: PQSSessionStore,
-        receiver: EventReceiver,
+        sessionDelegate: PQSHostDelegate,
+        cache: PQSPersistenceHost,
+        receiver: MessageStoreObserver,
         symmetricKey: SymmetricKey
     ) async throws
     
     /// Sends an acknowledgment that a contact was created.
     /// - Parameters:
     ///   - secretName: The secret name of the recipient contact.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
+    ///   - sessionDelegate: The `PQSHostDelegate` for session management.
     ///   - logger: The logger for logging events.
     /// - Throws: An error if the operation fails.
     func sendContactCreatedAcknowledgment(
         recipient secretName: String,
-        sessionDelegate: PQSSessionDelegate,
+        sessionDelegate: PQSHostDelegate,
         logger: NeedleTailLogger
     ) async throws
     
     /// Requests metadata from a contact.
     /// - Parameters:
     ///   - secretName: The secret name of the contact from whom to request metadata.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
+    ///   - sessionDelegate: The `PQSHostDelegate` for session management.
     ///   - logger: The logger for logging events.
     /// - Throws: An error if the operation fails.
     func requestMetadata(
         from secretName: String,
-        sessionDelegate: PQSSessionDelegate,
+        sessionDelegate: PQSHostDelegate,
         logger: NeedleTailLogger
     ) async throws
     
     /// Requests the metadata for the current user.
     /// - Parameters:
-    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
+    ///   - sessionDelegate: The `PQSHostDelegate` for session management.
     ///   - logger: The logger for logging events.
     /// - Throws: An error if the operation fails.
     func requestMyMetadata(
-        sessionDelegate: PQSSessionDelegate,
+        sessionDelegate: PQSHostDelegate,
         logger: NeedleTailLogger
     ) async throws
     
@@ -465,18 +398,18 @@ public protocol SessionEvents: Sendable {
     /// - Parameters:
     ///   - message: The `EncryptedMessage` to be edited.
     ///   - newText: The new text for the message.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for session management.
-    ///   - cache: The `PQSSessionStore` used for caching.
-    ///   - receiver: The `EventReceiver` that will handle events.
+    ///   - sessionDelegate: The `PQSHostDelegate` for session management.
+    ///   - cache: The `PQSPersistenceHost` used for caching.
+    ///   - receiver: The `MessageStoreObserver` that will handle events.
     ///   - symmetricKey: The symmetric key used for encryption.
     ///   - logger: The logger for logging events.
     /// - Throws: An error if the operation fails.
     func editCurrentMessage(
         _ message: EncryptedMessage,
         newText: String,
-        sessionDelegate: PQSSessionDelegate,
-        cache: PQSSessionStore,
-        receiver: EventReceiver,
+        sessionDelegate: PQSHostDelegate,
+        cache: PQSPersistenceHost,
+        receiver: MessageStoreObserver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws
@@ -484,18 +417,20 @@ public protocol SessionEvents: Sendable {
     /// Finds a communication for a specific message recipient.
     /// - Parameters:
     ///   - messageRecipient: The recipient of the message.
-    ///   - cache: The `PQSSessionStore` used for caching.
+    ///   - cache: The `PQSPersistenceHost` used for caching.
     ///   - symmetricKey: The symmetric key used for encryption.
     /// - Returns: A `BaseCommunication` instance associated with the recipient.
     /// - Throws: An error if the operation fails.
-    func findCommunication(
+    func conversation(
         for messageRecipient: MessageRecipient,
-        cache: PQSSessionStore,
+        cache: PQSPersistenceHost,
         symmetricKey: SymmetricKey
     ) async throws -> BaseCommunication
 }
 
-public extension SessionEvents {
+package typealias FriendshipService = ContactService
+
+package extension ContactService {
     /// Adds contacts to the session and synchronizes communication.
     ///
     /// This method processes an array of `SharedContactInfo`, filtering out any contacts that already exist in the cache.
@@ -506,15 +441,15 @@ public extension SessionEvents {
     /// - Parameters:
     ///   - contactInfos: An array of `SharedContactInfo` containing the contact information to be added.
     ///   - sessionContext: The context of the current session, providing user-specific information.
-    ///   - cache: The `PQSSessionStore` used for caching contacts and communications.
-    ///   - transport: The `SessionTransport` used for communication with other devices.
-    ///   - receiver: The `EventReceiver` that will handle events related to contact creation.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
+    ///   - cache: The `PQSPersistenceHost` used for caching contacts and communications.
+    ///   - transport: The `PQSNetworkHost` used for communication with other devices.
+    ///   - receiver: The `MessageStoreObserver` that will handle events related to contact creation.
+    ///   - sessionDelegate: The `PQSHostDelegate` for managing session-related tasks.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Throws:
-    ///   - `EventErrors.propsError` if there is an issue with the properties of the communication model.
+    ///   - `PQSError.propsError` if there is an issue with the properties of the communication model.
     ///   - Any other error that may occur during the process, such as issues with fetching contacts,
     ///     creating contacts, or sending requests.
     ///
@@ -522,10 +457,10 @@ public extension SessionEvents {
     func addContacts(
         _ contactInfos: [SharedContactInfo],
         sessionContext: SessionContext,
-        cache: PQSSessionStore,
-        transport: SessionTransport,
-        receiver: EventReceiver,
-        sessionDelegate: PQSSessionDelegate,
+        cache: PQSPersistenceHost,
+        transport: PQSNetworkHost,
+        receiver: MessageStoreObserver,
+        sessionDelegate: PQSHostDelegate,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws {
@@ -533,6 +468,11 @@ public extension SessionEvents {
         let contacts = try await cache.fetchContacts()
 
         for contactInfo in contactInfos {
+            // Linked-device contact sync can include the local account. Skip it
+            // so one self row cannot abort the rest of the batch with error 8.
+            if SecretName.areEqual(contactInfo.secretName, mySecretName) {
+                continue
+            }
             let contactAlreadyExists = await contacts.asyncContains { contact in
                 await contact.props(symmetricKey: symmetricKey)?.secretName == contactInfo.secretName
             }
@@ -625,15 +565,18 @@ public extension SessionEvents {
     /// - Returns: A `ContactModel` representing the created or updated contact.
     ///
     /// - Throws: An error if the operation fails due to issues such as invalid parameters or database errors.
+    /// Protocol-witnessing entry point (3.2.x signature). Forwards with
+    /// `notifyPeerOfCreation: true` so existing `ContactService` conformers keep
+    /// compiling without adopting the new overload.
     func createContact(
         secretName: String,
         metadata: Data = .init(),
         friendshipMetadata: FriendshipMetadata?,
         requestFriendship: Bool,
         sessionContext: SessionContext,
-        cache: PQSSessionStore,
-        transport: SessionTransport,
-        receiver: EventReceiver,
+        cache: PQSPersistenceHost,
+        transport: PQSNetworkHost,
+        receiver: MessageStoreObserver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws -> ContactModel {
@@ -642,6 +585,7 @@ public extension SessionEvents {
             metadata: metadata,
             friendshipMetadata: friendshipMetadata,
             requestFriendship: requestFriendship,
+            notifyPeerOfCreation: true,
             sessionContext: sessionContext,
             cache: cache,
             transport: transport,
@@ -652,15 +596,18 @@ public extension SessionEvents {
         )
     }
 
+    /// Extension overload: threads `notifyPeerOfCreation` into
+    /// `receiver.synchronize`. Not a protocol requirement — additive for 3.3.x.
     func createContact(
         secretName: String,
         metadata: Data = .init(),
         friendshipMetadata: FriendshipMetadata?,
         requestFriendship: Bool,
+        notifyPeerOfCreation: Bool = true,
         sessionContext: SessionContext,
-        cache: PQSSessionStore,
-        transport: SessionTransport,
-        receiver: EventReceiver,
+        cache: PQSPersistenceHost,
+        transport: PQSNetworkHost,
+        receiver: MessageStoreObserver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger,
         friendshipMetadataConflictPolicy: FriendshipMetadataConflictPolicy = .preferSettled
@@ -670,17 +617,20 @@ public extension SessionEvents {
         // can't miss records whose `secretName` contains IRC-equivalent
         // characters (`[`, `]`, `\`, `~`). Plain `lowercased()` would silently
         // disagree with the stored value in that case.
-        let newContactSecretName = secretName.pqsCanonicalSecretName
-        let mySecretName = sessionContext.sessionUser.secretName
-        
-        guard newContactSecretName != mySecretName else {
-            throw EventErrors.invalidSecretName
+        let newContactSecretName = SecretName(secretName).rawValue
+        let storedMySecretName = sessionContext.sessionUser.secretName
+        let mySecretName = SecretName(storedMySecretName).rawValue
+        guard !mySecretName.isEmpty else {
+            throw PQSError.sessionNotInitialized
+        }
+        guard !newContactSecretName.isEmpty, newContactSecretName != mySecretName else {
+            throw PQSError.invalidSecretName
         }
         
         // Check if the contact already exists
         if let foundContact = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.secretName == newContactSecretName }) {
             guard let props = await foundContact.props(symmetricKey: symmetricKey) else {
-                throw EventErrors.propsError
+                throw PQSError.propsError
             }
             
             // Simplified metadata handling
@@ -719,7 +669,7 @@ public extension SessionEvents {
                 with: "friendshipMetadata")
             
             guard let updatedMetadata = updatedProps?.metadata else {
-                throw EventErrors.propsError
+                throw PQSError.propsError
             }
             
             let updatedContact = Contact(
@@ -746,7 +696,7 @@ public extension SessionEvents {
             // Repair the communication shell before notifying the UI or starting
             // friendship synchronization.
             _ = try await updateOrCreateCommunication(
-                mySecretName: mySecretName,
+                mySecretName: storedMySecretName,
                 recipient: .nickname(newContactSecretName),
                 cache: cache,
                 receiver: receiver,
@@ -762,7 +712,8 @@ public extension SessionEvents {
             if requestFriendship {
                 try await receiver.synchronize(
                     contact: updatedContact,
-                    requestFriendship: true)
+                    requestFriendship: true,
+                    notifyPeerOfCreation: notifyPeerOfCreation)
             }
             return contactModel
         } else {
@@ -795,7 +746,7 @@ public extension SessionEvents {
             try await cache.createContact(contactModel)
             
             _ = try await updateOrCreateCommunication(
-                mySecretName: mySecretName,
+                mySecretName: storedMySecretName,
                 recipient: .nickname(newContactSecretName),
                 cache: cache,
                 receiver: receiver,
@@ -808,7 +759,8 @@ public extension SessionEvents {
             
             try await receiver.synchronize(
                 contact: contact,
-                requestFriendship: requestFriendship)
+                requestFriendship: requestFriendship,
+                notifyPeerOfCreation: notifyPeerOfCreation)
             
             return contactModel
         }
@@ -825,21 +777,21 @@ public extension SessionEvents {
     /// - Parameters:
     ///   - mySecretName: The secret name of the current user.
     ///   - theirSecretName: The secret name of the contact with whom to synchronize communication.
-    ///   - cache: The `PQSSessionStore` used for caching communication models.
-    ///   - receiver: The `EventReceiver` that will handle events related to communication updates.
+    ///   - cache: The `PQSPersistenceHost` used for caching communication models.
+    ///   - receiver: The `MessageStoreObserver` that will handle events related to communication updates.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Returns: An optional `String` representing the shared identifier if it was created; otherwise, `nil`.
     /// - Throws:
-    ///   - `EventErrors.cannotFindCommunication` if the communication model cannot be found or created.
-    ///   - `EventErrors.propsError` if there is an issue with the properties of the communication model.
+    ///   - `PQSError.cannotFindCommunication` if the communication model cannot be found or created.
+    ///   - `PQSError.propsError` if there is an issue with the properties of the communication model.
     private func updateOrCreateCommunication(
         mySecretName: String,
         recipient: MessageRecipient,
         preferredSharedIdentifier: UUID? = nil,
-        cache: PQSSessionStore,
-        receiver: EventReceiver,
+        cache: PQSPersistenceHost,
+        receiver: MessageStoreObserver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws -> String? {
@@ -850,8 +802,9 @@ public extension SessionEvents {
         
         switch recipient {
         case .nickname(let theirSecretName):
-            guard theirSecretName != mySecretName else {
-                throw EventErrors.invalidSecretName
+            guard !SecretName(theirSecretName).rawValue.isEmpty,
+                  !SecretName.areEqual(theirSecretName, mySecretName) else {
+                throw PQSError.invalidSecretName
             }
             members = [mySecretName, theirSecretName]
             membersToUpdate = Set(members.filter { $0 != mySecretName })
@@ -861,7 +814,7 @@ public extension SessionEvents {
             return nil
         }
         do {
-            communicationModel = try await findCommunicationType(
+            communicationModel = try await conversation(
                 cache: cache,
                 communicationType: recipient,
                 symmetricKey: symmetricKey)
@@ -877,10 +830,10 @@ public extension SessionEvents {
         }
         
         guard let communicationModel else {
-            throw EventErrors.cannotFindCommunication
+            throw PQSError.cannotFindCommunication
         }
         guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
-            throw EventErrors.propsError
+            throw PQSError.propsError
         }
         
         if case .channel(_) = recipient {
@@ -918,22 +871,22 @@ public extension SessionEvents {
     /// - Parameters:
     ///   - secretName: The secret name of the contact to synchronize communication with.
     ///   - sessionContext: The context of the current session, providing user-specific information.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
-    ///   - cache: The `PQSSessionStore` used for caching communication models.
-    ///   - receiver: The `EventReceiver` that will handle events related to communication updates.
+    ///   - sessionDelegate: The `PQSHostDelegate` for managing session-related tasks.
+    ///   - cache: The `PQSPersistenceHost` used for caching communication models.
+    ///   - receiver: The `MessageStoreObserver` that will handle events related to communication updates.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Throws:
-    ///   - `EventErrors.invalidSecretName` if the provided secret name matches the current user's secret name.
+    ///   - `PQSError.invalidSecretName` if the provided secret name matches the current user's secret name.
     ///   - Any error that may occur during the process, such as issues with updating or creating the communication model.
     func sendCommunicationSynchronization(
         recipient: MessageRecipient,
         metadata: Data = .init(),
         sessionContext: SessionContext,
-        sessionDelegate: PQSSessionDelegate,
-        cache: PQSSessionStore,
-        receiver: EventReceiver,
+        sessionDelegate: PQSHostDelegate,
+        cache: PQSPersistenceHost,
+        receiver: MessageStoreObserver,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws {
@@ -988,18 +941,18 @@ public extension SessionEvents {
     ///     - `.blocked`: Indicates that the contact should be blocked.
     ///     - `.unblocked`: Indicates that the contact should be unblocked.
     ///   - contact: The `Contact` object representing the contact whose friendship state is being changed.
-    ///   - cache: The `PQSSessionStore` used for caching contact data.
-    ///   - receiver: The `EventReceiver` that will handle contact update events.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
+    ///   - cache: The `PQSPersistenceHost` used for caching contact data.
+    ///   - receiver: The `MessageStoreObserver` that will handle contact update events.
+    ///   - sessionDelegate: The `PQSHostDelegate` for managing session-related tasks.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Throws:
-    ///   - `EventErrors.databaseNotInitialized`: If the cache is not initialized.
-    ///   - `EventErrors.sessionNotInitialized`: If the session context is not initialized.
-    ///   - `EventErrors.cannotFindContact`: If the specified contact cannot be found in the cache.
-    ///   - `EventErrors.propsError`: If there is an error updating the contact's properties.
-    ///   - `EventErrors.userIsBlocked`: If the current user is blocked and cannot perform the action.
+    ///   - `PQSError.databaseNotInitialized`: If the cache is not initialized.
+    ///   - `PQSError.sessionNotInitialized`: If the session context is not initialized.
+    ///   - `PQSError.cannotFindContact`: If the specified contact cannot be found in the cache.
+    ///   - `PQSError.propsError`: If there is an error updating the contact's properties.
+    ///   - `PQSError.userIsBlocked`: If the current user is blocked and cannot perform the action.
     ///   - Any other errors that may occur during the process, such as encoding errors or network issues.
     ///
     /// - Important:
@@ -1011,15 +964,15 @@ public extension SessionEvents {
     func requestFriendshipStateChange(
         state: FriendshipMetadata.State,
         contact: Contact,
-        cache: PQSSessionStore,
-        receiver: EventReceiver,
-        sessionDelegate: PQSSessionDelegate,
+        cache: PQSPersistenceHost,
+        receiver: MessageStoreObserver,
+        sessionDelegate: PQSHostDelegate,
         symmetricKey: SymmetricKey,
         logger: NeedleTailLogger
     ) async throws {
         logger.log(level: .info, message: "Requesting friendship state change for \(contact.secretName) to state \(state).")
         
-        guard let foundContact = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.secretName == contact.secretName }) else { throw EventErrors.cannotFindContact }
+        guard let foundContact = try await cache.fetchContacts().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.secretName == contact.secretName }) else { throw PQSError.cannotFindContact }
         
         var currentMetadata: FriendshipMetadata?
         // Prefer cache metadata so we branch from DB truth; the UI `contact` can lag behind.
@@ -1090,7 +1043,7 @@ public extension SessionEvents {
             with: "friendshipMetadata")
         
         guard let updatedProps else {
-            throw EventErrors.propsError
+            throw PQSError.propsError
         }
 
         // `updatePropsMetadata` mutated `foundContact` in place (reference type),
@@ -1164,24 +1117,24 @@ public extension SessionEvents {
     ///   - deliveryState: The new delivery state to be set for the message.
     ///   - messageRecipient: The recipient of the message.
     ///   - allowExternalUpdate: A boolean indicating whether external updates are allowed (default is `false`).
-    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
-    ///   - cache: The `PQSSessionStore` used for caching messages.
-    ///   - receiver: The `EventReceiver` that will handle events related to message updates.
+    ///   - sessionDelegate: The `PQSHostDelegate` for managing session-related tasks.
+    ///   - cache: The `PQSPersistenceHost` used for caching messages.
+    ///   - receiver: The `MessageStoreObserver` that will handle events related to message updates.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///
     /// - Throws:
-    ///   - `EventErrors.propsError` if there is an issue retrieving the message properties.
+    ///   - `PQSError.propsError` if there is an issue retrieving the message properties.
     func updateMessageDeliveryState(
         _ message: EncryptedMessage,
         deliveryState: DeliveryState,
         messageRecipient: MessageRecipient,
         allowExternalUpdate: Bool = false,
-        sessionDelegate: PQSSessionDelegate,
-        cache: PQSSessionStore,
-        receiver: EventReceiver,
+        sessionDelegate: PQSHostDelegate,
+        cache: PQSPersistenceHost,
+        receiver: MessageStoreObserver,
         symmetricKey: SymmetricKey
     ) async throws {
-        guard var props = await message.props(symmetricKey: symmetricKey) else { throw EventErrors.propsError }
+        guard var props = await message.props(symmetricKey: symmetricKey) else { throw PQSError.propsError }
         guard props.deliveryState != deliveryState else {
             // Already in target state; skip update and avoid sending duplicate receipt.
             return
@@ -1203,17 +1156,17 @@ public extension SessionEvents {
     ///
     /// - Parameters:
     ///   - secretName: The secret name of the recipient contact.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
+    ///   - sessionDelegate: The `PQSHostDelegate` for managing session-related tasks.
     ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Throws: Any error that may occur during the process of sending the acknowledgment.
     func sendContactCreatedAcknowledgment(
         recipient secretName: String,
-        sessionDelegate: PQSSessionDelegate,
+        sessionDelegate: PQSHostDelegate,
         logger: NeedleTailLogger
     ) async throws {
         logger.log(level: .debug, message: "Sending Contact Created Acknowledgment")
-        try await sessionDelegate.contactCreated(recipient: .nickname(secretName))
+        try await sessionDelegate.createdContact(recipient: .nickname(secretName))
         logger.log(level: .debug, message: "Sent Contact Created Acknowledgment")
     }
     
@@ -1223,13 +1176,13 @@ public extension SessionEvents {
     ///
     /// - Parameters:
     ///   - secretName: The secret name of the contact from whom to request metadata.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
+    ///   - sessionDelegate: The `PQSHostDelegate` for managing session-related tasks.
     ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Throws: Any error that may occur during the process of requesting metadata.
     func requestMetadata(
         from secretName: String,
-        sessionDelegate: PQSSessionDelegate,
+        sessionDelegate: PQSHostDelegate,
         logger: NeedleTailLogger
     ) async throws {
         logger.log(level: .debug, message: "Requesting metadata from \(secretName)")
@@ -1242,12 +1195,12 @@ public extension SessionEvents {
     /// This method sends a request for the current user's metadata.
     ///
     /// - Parameters:
-    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
+    ///   - sessionDelegate: The `PQSHostDelegate` for managing session-related tasks.
     ///   - logger: The logger for logging events and debugging information.
     ///
     /// - Throws: Any error that may occur during the process of requesting metadata.
     func requestMyMetadata(
-        sessionDelegate: PQSSessionDelegate,
+        sessionDelegate: PQSHostDelegate,
         logger: NeedleTailLogger
     ) async throws {
         logger.log(level: .debug, message: "Requesting my metadata")
@@ -1262,9 +1215,9 @@ public extension SessionEvents {
     /// - Parameters:
     ///   - message: The `EncryptedMessage` to be edited.
     ///   - newText: The new text to set for the message.
-    ///   - sessionDelegate: The `PQSSessionDelegate` for managing session-related tasks.
-    ///   - cache: The `PQSSessionStore` used for caching messages.
-    ///   - receiver: The `EventReceiver` that will handle events related to message updates.
+    ///   - sessionDelegate: The `PQSHostDelegate` for managing session-related tasks.
+    ///   - cache: The `PQSPersistenceHost` used for caching messages.
+    ///   - receiver: The `MessageStoreObserver` that will handle events related to message updates.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///   - logger: The logger for logging events and debugging information.
     ///
@@ -1273,9 +1226,9 @@ public extension SessionEvents {
     func editCurrentMessage(
         _ message: EncryptedMessage,
         newText: String,
-        sessionDelegate: PQSSessionDelegate,
-        cache: PQSSessionStore,
-        receiver: EventReceiver,
+        sessionDelegate: PQSHostDelegate,
+        cache: PQSPersistenceHost,
+        receiver: MessageStoreObserver,
         symmetricKey: SymmetricKey,
         logger _: NeedleTailLogger
     ) async throws {
@@ -1299,18 +1252,18 @@ public extension SessionEvents {
     ///
     /// - Parameters:
     ///   - messageRecipient: The recipient of the message for which to find the communication model.
-    ///   - cache: The `PQSSessionStore` used for caching communication models.
+    ///   - cache: The `PQSPersistenceHost` used for caching communication models.
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///
     /// - Returns: A `BaseCommunication` instance associated with the specified message recipient.
     /// - Throws:
     ///   - Any error that may occur during the process, such as issues with fetching the communication model.
-    func findCommunication(
+    func conversation(
         for messageRecipient: MessageRecipient,
-        cache: PQSSessionStore,
+        cache: PQSPersistenceHost,
         symmetricKey: SymmetricKey
     ) async throws -> BaseCommunication {
-        try await findCommunicationType(
+        try await conversation(
             cache: cache,
             communicationType: messageRecipient,
             symmetricKey: symmetricKey
@@ -1322,15 +1275,15 @@ public extension SessionEvents {
     /// This method retrieves the communication model associated with the specified communication type from the cache.
     ///
     /// - Parameters:
-    ///   - cache: The `PQSSessionStore` used for caching communication models.
+    ///   - cache: The `PQSPersistenceHost` used for caching communication models.
     ///   - communicationType: The type of communication to find (e.g., nickname).
     ///   - symmetricKey: The symmetric key used for encryption and decryption of sensitive data.
     ///
     /// - Returns: A `BaseCommunication` instance associated with the specified communication type.
     /// - Throws:
-    ///   - `EventErrors.cannotFindCommunication` if no communication model of the specified type is found.
-    func findCommunicationType(
-        cache: PQSSessionStore,
+    ///   - `PQSError.cannotFindCommunication` if no communication model of the specified type is found.
+    func conversation(
+        cache: PQSPersistenceHost,
         communicationType: MessageRecipient,
         symmetricKey: SymmetricKey
     ) async throws -> BaseCommunication {
@@ -1343,7 +1296,7 @@ public extension SessionEvents {
                 return false
             }
         }) else {
-            throw EventErrors.cannotFindCommunication
+            throw PQSError.cannotFindCommunication
         }
         
         return foundCommunication

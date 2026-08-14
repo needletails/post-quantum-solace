@@ -75,6 +75,9 @@ public struct SignedRatchetMessageMetadata: Sendable {
     ///
     public let transportEvent: TransportEvent?
 
+    /// Whether the transport must request a server acceptance acknowledgment for this envelope.
+    public let requiresServerAck: Bool
+
     /// Initializes a new instance of `SignedRatchetMessageMetadata`.
     ///
     /// - Parameters:
@@ -85,200 +88,69 @@ public struct SignedRatchetMessageMetadata: Sendable {
     ///   - sharedMessageId: Logical shared identifier (stable across devices/resends)
     ///   - envelopeMessageId: Unique envelope MessageID for this encrypted envelope
     ///   - transportEvent: Optional transport event
+    ///   - requiresServerAck: Whether the transport should request a server acceptance acknowledgment
     public init(
         secretName: String,
         deviceId: UUID,
         recipient: MessageRecipient,
         transportMetadata: Data?,
         sharedMessageId: String,
-        envelopeMessageId: String? = nil,
-        transportEvent: TransportEvent?
+        envelopeMessageId: String,
+        transportEvent: TransportEvent?,
+        requiresServerAck: Bool = false
     ) {
         self.secretName = secretName
         self.deviceId = deviceId
         self.recipient = recipient
         self.transportMetadata = transportMetadata
         self.sharedMessageId = sharedMessageId
-        self.envelopeMessageId = envelopeMessageId ?? sharedMessageId
+        self.envelopeMessageId = envelopeMessageId
         self.transportEvent = transportEvent
+        self.requiresServerAck = requiresServerAck
     }
 }
 
-/// A protocol defining the interface for secure session transport operations.
-///
-/// This protocol provides methods for sending encrypted messages, managing user configurations,
-/// and handling cryptographic key operations in a post-quantum secure messaging system.
-/// All operations are asynchronous and thread-safe, supporting concurrent execution.
-///
-/// ## Usage
-/// Implement this protocol to provide transport layer functionality for the secure
-/// messaging system. This typically involves network communication, database operations,
-/// and cryptographic key management.
-///
-/// ```swift
-/// class NetworkTransport: SessionTransport {
-///     func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
-///         // Implement message sending logic
-///     }
-///
-///     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
-///         // Implement configuration retrieval logic
-///     }
-///     // ... implement other required methods
-/// }
-/// ```
-///
-/// ## Thread Safety
-/// All methods in this protocol are marked as `async` and should be implemented
-/// with thread safety in mind. The protocol conforms to `Sendable` to support
-/// concurrent execution contexts.
-public protocol SessionTransport: Sendable {
-    /// Sends a signed ratchet message to the network with associated metadata.
-    ///
-    /// This method is responsible for transmitting encrypted messages to the specified
-    /// recipient. The message contains the encrypted payload, while the metadata
-    /// provides routing and processing information.
-    ///
-    /// - Parameters:
-    ///   - message: The signed ratchet message containing the encrypted payload
-    ///   - metadata: Metadata containing recipient information and routing details
-    /// - Throws: An error if the message could not be sent (e.g., network failure, invalid recipient)
+/// Ciphertext send path. Hosts typically also conform to ``PQSKeyDirectory`` and
+/// ``PQSRecoveryTransport`` on the same type.
+public protocol PQSTransport: Sendable {
     func sendMessage(_ message: SignedRatchetMessage,
                      metadata: SignedRatchetMessageMetadata) async throws
 
-    /// Retrieves the user configuration for a given secret name from the network.
-    ///
-    /// This method fetches the complete user configuration including device information,
-    /// cryptographic keys, and user preferences. The configuration is used to establish
-    /// secure communication channels and verify user identities.
-    ///
-    /// - Parameter secretName: The secret name of the user whose configuration to retrieve
-    /// - Returns: The complete user configuration containing device and key information
-    /// - Throws: An error if the configuration could not be found or retrieved
-    func findConfiguration(for secretName: String) async throws -> UserConfiguration
-
-    /// Publishes a user configuration to the network for device synchronization.
-    ///
-    /// This method is called for master devices and when updating device bundles with
-    /// new devices. It ensures that all devices associated with a user have access
-    /// to the latest configuration information.
-    ///
-    /// - Parameters:
-    ///   - configuration: The user configuration to be published to the network
-    ///   - identity: The UUID of the recipient identity for the configuration
-    /// - Throws: An error if the configuration could not be published
-    func publishUserConfiguration(_ configuration: UserConfiguration, recipient secretName: String, recipient identity: UUID) async throws
-
-    /// Fetches one-time keys for a specific user and device.
-    ///
-    /// Retrieves the available one-time keys that can be used for establishing
-    /// secure communication sessions. These keys are used in the Double Ratchet
-    /// protocol for forward secrecy.
-    ///
-    /// - Parameters:
-    ///   - secretName: The secret name of the user
-    ///   - deviceId: The device identifier for which to fetch keys
-    /// - Returns: A collection of one-time keys available for the specified device
-    /// - Throws: An error if the keys could not be retrieved
-    func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys
-
-    /// Fetches the identities of one-time keys for a specific user and device.
-    ///
-    /// Retrieves the UUIDs of available one-time keys without the actual key data.
-    /// This is useful for key discovery and management operations.
-    ///
-    /// - Parameters:
-    ///   - secretName: The secret name of the user
-    ///   - deviceId: The device identifier for which to fetch key identities
-    ///   - type: The type of keys to fetch (e.g., Curve25519, MLKEM)
-    /// - Returns: An array of UUIDs representing the available one-time key identities
-    /// - Throws: An error if the key identities could not be retrieved
-    func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID]
-
-    /// Updates the one-time keys for a specific user and device.
-    ///
-    /// Adds new Curve25519 one-time keys to the user's key bundle. These keys
-    /// are used for establishing secure communication sessions and providing
-    /// forward secrecy.
-    ///
-    /// - Parameters:
-    ///   - secretName: The secret name of the user
-    ///   - deviceId: The device identifier for which to update keys
-    ///   - keys: An array of signed one-time public keys to add
-    /// - Throws: An error if the keys could not be updated
-    func updateOneTimeKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedOneTimePublicKey]) async throws
-
-    /// Updates the post-quantum KEM one-time keys for a specific user and device.
-    ///
-    /// Adds new post-quantum KEM one-time keys to the user's key bundle. These keys
-    /// provide quantum-resistant security for future-proof communication.
-    ///
-    /// - Parameters:
-    ///   - secretName: The secret name of the user
-    ///   - deviceId: The device identifier for which to update keys
-    ///   - keys: An array of signed post-quantum KEM one-time keys to add
-    /// - Throws: An error if the keys could not be updated
-    func updateOneTimeMLKEMKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedMLKEMOneTimeKey]) async throws
-
-    /// Deletes multiple one-time keys in a batch operation.
-    ///
-    /// Removes multiple one-time keys of the specified type for a user. This is
-    /// typically used when keys have been consumed or are no longer needed.
-    ///
-    /// - Parameters:
-    ///   - secretName: The secret name of the user
-    ///   - id: The identifier for the batch of keys to delete
-    ///   - type: The type of keys to delete (e.g., Curve25519, MLKEM)
-    /// - Throws: An error if the keys could not be deleted
-    func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
-
-    /// Deletes a specific one-time key.
-    ///
-    /// Removes a single one-time key of the specified type for a user. This is
-    /// typically used when a key has been consumed or is no longer valid.
-    ///
-    /// - Parameters:
-    ///   - secretName: The secret name of the user
-    ///   - id: The identifier of the specific key to delete
-    ///   - type: The type of key to delete (e.g., Curve25519, MLKEM)
-    /// - Throws: An error if the key could not be deleted
-    func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws
-
-    /// Publishes rotated cryptographic keys to the network.
-    ///
-    /// Announces new rotated keys to other users in the system. Key rotation
-    /// is a security practice that limits the impact of key compromise.
-    ///
-    /// - Parameters:
-    ///   - secretName: The secret name of the user whose keys are being rotated
-    ///   - deviceId: The device identifier for which keys are being rotated
-    ///   - keys: The new rotated public keys to publish
-    /// - Throws: An error if the keys could not be published
-    func publishRotatedKeys(
-        for secretName: String,
-        deviceId: String,
-        rotated keys: RotatedPublicKeys
-    ) async throws
-
-    /// Creates an upload packet for secure data transmission.
-    ///
-    /// Prepares a data packet for secure upload to the network. This method
-    /// is used for transmitting large files or media content securely.
-    ///
-    /// - Parameters:
-    ///   - secretName: The secret name of the user creating the upload packet
-    ///   - deviceId: The device identifier creating the upload packet
-    ///   - recipient: The intended recipient of the upload packet
-    ///   - metadata: Additional metadata describing the upload packet contents
-    /// - Throws: An error if the upload packet could not be created
     func createUploadPacket(
         secretName: String,
         deviceId: UUID,
         recipient: MessageRecipient,
         metadata: Data
     ) async throws
+}
 
-    /// Sends an authenticated out-of-band §4.1 retry request (not Double Ratchet).
+/// Published configuration and one-time-key directory.
+public protocol PQSKeyDirectory: Sendable {
+    func findConfiguration(for secretName: String) async throws -> UserConfiguration
+
+    func publishUserConfiguration(_ configuration: UserConfiguration, recipient secretName: String, recipient identity: UUID) async throws
+
+    func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys
+
+    func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeyKind) async throws -> [UUID]
+
+    func updateOneTimeKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedOneTimePublicKey]) async throws
+
+    func updateOneTimeMLKEMKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedMLKEMOneTimeKey]) async throws
+
+    func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeyKind) async throws
+
+    func deleteOneTimeKeys(for secretName: String, with id: String, type: KeyKind) async throws
+
+    func publishRotatedKeys(
+        for secretName: String,
+        deviceId: String,
+        rotated keys: RotatedPublicKeys
+    ) async throws
+}
+
+/// Authenticated out-of-band resend. Hosts must implement these; there is no silent no-op.
+public protocol PQSRecoveryTransport: Sendable {
     func sendOutOfBandResendRequest(
         failedEnvelopeMessageIds: [String],
         to secretName: String,
@@ -286,7 +158,6 @@ public protocol SessionTransport: Sendable {
         requestingDeviceId: UUID
     ) async throws
 
-    /// Sends an authenticated out-of-band notice that envelopes are unrecoverable.
     func sendOutOfBandResendUnavailable(
         unavailableEnvelopeMessageIds: [String],
         to secretName: String,
@@ -295,20 +166,5 @@ public protocol SessionTransport: Sendable {
     ) async throws
 }
 
-public extension SessionTransport {
-    /// Default no-op for transports that do not implement authenticated OOB retry.
-    func sendOutOfBandResendRequest(
-        failedEnvelopeMessageIds: [String],
-        to secretName: String,
-        deviceId: UUID,
-        requestingDeviceId: UUID
-    ) async throws {}
-
-    /// Default no-op for transports that do not implement authenticated OOB retry.
-    func sendOutOfBandResendUnavailable(
-        unavailableEnvelopeMessageIds: [String],
-        to secretName: String,
-        deviceId: UUID,
-        respondingDeviceId: UUID
-    ) async throws {}
-}
+/// Typical host transport: send + directory + OOB on one object.
+public typealias PQSNetworkHost = PQSTransport & PQSKeyDirectory & PQSRecoveryTransport

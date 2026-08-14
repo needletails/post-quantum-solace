@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import SessionEvents
 import Testing
 @testable import PQSSession
 
@@ -106,69 +107,37 @@ struct OrphanOwnershipHealPolicyTests {
 /// 2. Owner only: `orphanResend` / `orphanResendRetransport` + MessageRecord=recovery
 /// 3. After failed retransport: `orphanReplayPreferredCleared`
 /// 4. Next fresh personal sharedId decrypts — not repeated dead preferred maxSkipped
-@Suite("Orphan ownership heal source contracts")
+///
+/// Covered by OrphanOwnershipHealPolicyTests (this file), StrictOOBRetryTests
+/// (OOB `sendOutOfBandResendRequest`), OutboundOrphanSessionSelectionPolicy tests
+/// above, and RecentOutboundReplayStoreTests (peek `contains` before `consume`).
+@Suite("Orphan ownership heal contracts")
 struct OrphanOwnershipHealSourceTests {
-    @Test("dogfood log checklist audit strings are wired")
-    func dogfoodLogChecklistAuditStringsWired() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let ratchet = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/Task/TaskProcessor+Ratchet.swift"),
-            encoding: .utf8)
-        let sequence = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/Task/TaskProcessor+Sequence.swift"),
-            encoding: .utf8)
-        let events = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/PQSSession+Events.swift"),
-            encoding: .utf8)
-
-        #expect(ratchet.contains("orphanResendDeferredNotContentOwner"))
-        #expect(ratchet.contains("orphanResendRetransport"))
-        #expect(ratchet.contains("feedDeviceScopedControlWrite("))
-        #expect(events.contains("sendOutOfBandResendRequest("))
-        #expect(sequence.contains("orphanReplayPreferredCleared"))
-        #expect(ratchet.contains("OutboundOrphanSessionSelectionPolicy.decision"))
-        #expect(ratchet.contains("OrphanResendOwnershipPolicy.decision"))
-        #expect(ratchet.contains("orphanResendRecoverySessionId"))
-        #expect(ratchet.contains("demotePriorOrphanMessageRecordSession")
-            || ratchet.contains("demoteProveFailedActive"))
-        #expect(sequence.contains("proveFailedActiveDemoted")
-            || ratchet.contains("proveFailedActiveDemoted")
-            || sequence.contains("demoteProveFailedActive"))
+    @Test("ownership and outbound selection policies remain callable")
+    func ownershipAndOutboundSelectionPoliciesRemainCallable() {
+        _ = OrphanResendOwnershipPolicy.decision
+        _ = OutboundOrphanSessionSelectionPolicy.decision
+        let oob: (any PQSNetworkHost, [String], String, UUID, UUID) async throws -> Void = {
+            try await $0.sendOutOfBandResendRequest(
+                failedEnvelopeMessageIds: $1,
+                to: $2,
+                deviceId: $3,
+                requestingDeviceId: $4)
+        }
+        _ = oob
     }
 
+    /// Covered by RecentOutboundReplayStoreTests.availabilityChecksDoNotConsumeReplayCredit.
     @Test("inbound resend peeks recent replay before consuming one credit")
-    func inboundResendPeeksBeforeConsumingOneCredit() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let ratchet = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/Task/TaskProcessor+Ratchet.swift"),
-            encoding: .utf8)
-        let processor = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/Task/TaskProcessor.swift"),
-            encoding: .utf8)
-        let store = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/Task/RecentOutboundReplayStore.swift"),
-            encoding: .utf8)
-
-        #expect(processor.contains("ttl: 60 * 10"))
-        #expect(processor.contains("limit: 256"))
-        #expect(processor.contains("maxReplays: 5"))
-        #expect(store.contains("func contains("))
-        #expect(store.contains("func consume("))
-        #expect(ratchet.contains("let hasRecentReplay ="))
-        #expect(ratchet.contains("hasRecentOutboundReplay(sharedId:"))
-        #expect(ratchet.contains("if let replay = recentOutboundReplayMessage(sharedId:"))
-        #expect(ratchet.contains("hasRecentOutboundReplay: hasRecentReplay"))
+    func inboundResendPeeksBeforeConsumingOneCredit() {
+        var store = RecentOutboundReplayStore<String>(ttl: 600, limit: 256, maxReplays: 5)
+        let now = Date(timeIntervalSince1970: 1_000)
+        store.remember("payload", sharedId: "control", now: now)
+        let firstPeek = store.contains(sharedId: "control", now: now)
+        let secondPeek = store.contains(sharedId: "control", now: now)
+        #expect(firstPeek)
+        #expect(secondPeek)
+        let replay = store.consume(sharedId: "control", now: now)
+        #expect(replay?.message == "payload")
     }
 }

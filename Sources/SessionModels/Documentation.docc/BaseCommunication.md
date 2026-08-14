@@ -47,7 +47,7 @@ most application code consumes after decryption.
 
 ### Errors
 
-- ``CryptoError``
+- ``PQSError``
 
 ## Working with communications
 
@@ -98,4 +98,4 @@ For channel-specific stored data and per-device overlays, see
 - ``MessageRecipient``
 - ``EncryptedMessage``
 - ``ChannelInfo``
-- ``CryptoError``
+- ``PQSError``

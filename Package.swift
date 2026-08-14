@@ -1,19 +1,7 @@
 // swift-tools-version: 6.3
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
-import Foundation
 import PackageDescription
-
-// PQSAuditLog file trails (recovery + send/recv path, per-channel files).
-// Local / staging: defined (Release staging builds keep audits).
-// Public App Store / customer Release: export PQS_STRIP_AUDIT_LOG=1.
-private let stripPQSAuditLog =
-    ProcessInfo.processInfo.environment["PQS_STRIP_AUDIT_LOG"] == "1"
-
-private var pqsSessionSwiftSettings: [SwiftSetting] {
-    guard !stripPQSAuditLog else { return [] }
-    return [.define("PQS_AUDIT_LOG")]
-}
 
 let package = Package(
     name: "post-quantum-solace",
@@ -27,13 +15,21 @@ let package = Package(
             name: "PostQuantumSolace",
             targets: ["PQSSession"]
         ),
+        .library(
+            name: "PQSModels",
+            targets: ["SessionModels"]
+        ),
+    ],
+    traits: [
+        .trait(
+            name: "PQSAuditLog",
+            description: "Write PQS send/recv/recovery audit trails to NeedleTailLogger files."
+        ),
+        .default(enabledTraits: ["PQSAuditLog"]),
     ],
     dependencies: [
         .package(url: "https://github.com/needletails/binary-codable.git", from: "1.0.5"),
-        // TODO: Before release, revert to the versioned dependency once the
-        // RatchetState.receivedMessagesCount accessor ships in a tagged DRK release.
-        // .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "3.2.0"),
-        .package(path: "../double-ratchet-kit"),
+        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "4.0.0"),
         .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.5"),
         .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.5")
     ],
@@ -46,7 +42,9 @@ let package = Package(
                 .product(name: "DoubleRatchetKit", package: "double-ratchet-kit"),
                 .product(name: "NeedleTailLogger", package: "needletail-logger")
             ],
-            swiftSettings: pqsSessionSwiftSettings
+            swiftSettings: [
+                .define("PQS_AUDIT_LOG", .when(traits: ["PQSAuditLog"]))
+            ]
         ),
         .target(name: "SessionEvents", dependencies: [
             "SessionModels",
@@ -61,7 +59,10 @@ let package = Package(
             name: "PostQuantumSolaceTests",
             dependencies: [
                 "PQSSession",
-                .product(name: "BinaryCodable", package: "binary-codable")
+                "SessionEvents",
+                "SessionModels",
+                .product(name: "BinaryCodable", package: "binary-codable"),
+                .product(name: "DoubleRatchetKit", package: "double-ratchet-kit"),
             ]
         ),
     ]

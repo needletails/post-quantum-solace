@@ -174,69 +174,13 @@ struct OrphanInPlaceHealTests {
                 remintsAfterRetransportProveFail: 0))
     }
 
-    // MARK: - P4: non-regression source contracts
+    // MARK: - P4: former source contracts (covered by P0–P3 / P5)
 
-    @Test("P4: blankForHeaderExists gate remains wired; escape is policy remint not bypass")
-    func p4_blankForHeaderExistsNotBypassed() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let ratchet = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/Task/TaskProcessor+Ratchet.swift"),
-            encoding: .utf8)
-        let policy = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/Task/OrphanResendRemintPolicy.swift"),
-            encoding: .utf8)
-        let slotPolicy = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/Task/InboundInitiatingSlotPolicy.swift"),
-            encoding: .utf8)
-
-        #expect(ratchet.contains("blankForHeaderExists"))
-        #expect(ratchet.contains("inboundInitiatingSlotEnsureSkipped reason=blankForHeaderExists"))
-        #expect(ratchet.contains("InboundInitiatingSlotPolicy.shouldEnsureInboundBlank"))
-        #expect(slotPolicy.contains("shouldEnsureInboundBlank"))
-        #expect(policy.contains("mintFreshAfterRetransportProveFailed"))
-        #expect(policy.contains("exhaustedUnrecoverable"))
-        #expect(ratchet.contains("mintFreshAfterRetransportProveFailed")
-            || ratchet.contains("orphanResendRemintAfterProveFail"))
-        #expect(ratchet.contains("exhaustedUnrecoverable"))
-        #expect(ratchet.contains("orphanResendHealExhausted")
-            || ratchet.contains("markResendUnavailable"))
-        #expect(ratchet.contains("demotePriorOrphanMessageRecordSession")
-            || ratchet.contains("demoteProveFailedActive"))
-        // Escape candidates ordered first; remint stays in the per-id switch (no preflight mint).
-        #expect(ratchet.contains("needsEscapeRemintAfterRetransportProveFail"))
-        #expect(ratchet.contains("escapeFirst"))
-        #expect(ratchet.contains("performOrphanEscapeRemint"))
-        #expect(!ratchet.contains("orphanResendWaveEscapeRemint"))
-        // MessageRecord owner (not same-account-only) consults priorRetransportCount.
-        #expect(ratchet.contains("if hasMessageRecord"))
-        #expect(
-            ratchet.contains("priorRetransportCount")
-                && ratchet.contains("orphanResendOwnerMissingPlaintext"),
-            "BUG: owner-without-plaintext path must consult remint counters (dogfood C8E1)")
-        // Must not delete the dedupe gate.
-        #expect(!ratchet.contains("blankForHeaderExists = false"))
-        // Demoted header-matched blank must be tried before ensure-skip (not bypass).
-        #expect(ratchet.contains("archivedHeaderMatch"))
-        #expect(ratchet.contains("headerMatchedArchivedBlank"))
-        #expect(ratchet.contains("shouldTryArchivedHeaderMatchBeforeEnsureSkip"))
-        // Exhausted path must not remint / reset the recovery lane.
-        guard let exhaustedRange = ratchet.range(of: "case .exhaustedUnrecoverable") else {
-            Issue.record("missing exhaustedUnrecoverable switch case")
-            return
-        }
-        let afterExhausted = String(ratchet[exhaustedRange.lowerBound...])
-        let nextCaseOffset = afterExhausted.range(of: "\n                            case .")?.lowerBound
-            ?? afterExhausted.index(afterExhausted.startIndex, offsetBy: min(1200, afterExhausted.count))
-        let exhaustedBody = String(afterExhausted[..<nextCaseOffset])
-        #expect(!exhaustedBody.contains("resetSessionIdentityForFreshSession("))
-        #expect(exhaustedBody.contains("unavailableIds.append"))
-        #expect(exhaustedBody.contains("markResendUnavailable"))
-        #expect(exhaustedBody.contains("orphanResendHealExhausted"))
-    }
+    // Covered by:
+    // - OrphanInPlaceHealTests.p1_blankForHeaderBlocksEnsure / p1b_archivedHeaderMatchBeforeEnsureSkip
+    // - OrphanInPlaceHealTests.p3_boundedRemintAfterRetransportProveFail / p3b / p3c / p5
+    // - DogfoodLogReplayTests C3a / C3b / C3c
+    // - OrphanOwnershipHealPolicyTests (owner vs non-owner)
+    // P4 uniquely pinned wiring of those policies into MessagePipeline+Ratchet;
+    // renaming the policy APIs fails the P0–P3 / P5 tests in this file.
 }

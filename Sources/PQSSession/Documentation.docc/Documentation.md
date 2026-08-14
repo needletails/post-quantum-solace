@@ -16,15 +16,16 @@ each handshake.
 
 The SDK is designed around three jobs:
 
-- **`PQSSession`** — the singleton actor that owns session state, drives
+- **`PQSSession`** — the session actor that owns session state, drives
   encryption / decryption, schedules key rotation, and coordinates all other
-  components.
-- **`SessionEvents` / transport / store / receiver protocols** — the four
-  delegate surfaces an application implements to plug the SDK into its
-  network, database, and UI.
+  components. You construct one with a ``SessionConfiguration``.
+- **`SessionEvents` (host protocols)** — the surfaces an application
+  implements to plug the SDK into its network, database, and UI:
+  `PQSNetworkHost` (transport), `PQSPersistenceHost` (store),
+  `MessageStoreObserver` (events), and the optional `PQSHostDelegate`.
 - **`SessionModels`** — the on-disk and on-the-wire data types
   (`UserConfiguration`, `EncryptedMessage`, `BaseCommunication`,
-  `SecurityIdentity`, etc.) that move between those pieces.
+  `SecurityIdentity`, `PQSError`, etc.) that move between those pieces.
 
 ## Topics
 
@@ -38,6 +39,7 @@ The SDK is designed around three jobs:
 - <doc:ControlEventCoalescing>
 - <doc:FriendshipContactBootstrap>
 - <doc:MultideviceDecryptRecovery>
+- <doc:DeferredOTKConsumption>
 
 ### Core entry point
 
@@ -47,10 +49,9 @@ The SDK is designed around three jobs:
 
 ### Lifecycle & configuration
 
-- ``PQSSession/shared``
-- ``PQSSession/configure(with:)``
-- ``PQSSession/createSession(secretName:appPassword:createInitialTransport:)``
-- ``PQSSession/startSession(appPassword:)``
+- ``PQSSession/init(configuration:ratchetConfiguration:)``
+- ``PQSSession/createAccount(secretName:appPassword:createInitialTransport:)``
+- ``PQSSession/unlock(appPassword:)``
 - ``PQSSession/linkDevice(bundle:password:)``
 - ``PQSSession/shutdown()``
 - ``PQSSession/resumeJobQueue()``
@@ -64,15 +65,15 @@ The SDK is designed around three jobs:
 - ``PQSSession/adoptVerifiedUserConfiguration(_:)``
 - ``PQSSession/acknowledgeAccountIdentityChange(_:)``
 - ``PQSSession/updateUserConfiguration(_:)``
-- ``PQSSession/updateUseroneTimePublicKeys(_:)``
+- ``PQSSession/updateUserOneTimePublicKeys(_:)``
 - ``PQSSession/createDeviceCryptographicBundle(isMaster:)``
 - ``PQSSession/CryptographicBundle``
 
 ### Messaging & contacts
 
-- ``PQSSession/writeTextMessage(recipient:text:transportInfo:metadata:destructionTime:sharedIdOverride:)``
+- ``PQSSession/send(recipient:text:transportInfo:metadata:destructionTime:sharedIdOverride:shouldPersistOverride:targetDeviceId:coalescingKey:)``
 - ``PQSSession/receiveMessage(message:sender:deviceId:messageId:)``
-- ``PQSSession/findCommunication(for:)``
+- ``PQSSession/conversation(for:)``
 - ``PQSSession/addContacts(_:)``
 - ``PQSSession/createContact(secretName:metadata:friendshipMetadata:requestFriendship:)``
 - ``PQSSession/sendCommunicationSynchronization(contact:)``
@@ -100,20 +101,21 @@ The SDK is designed around three jobs:
 
 ### Errors
 
-- ``PQSSession/SessionErrors``
+All public throws are cases of the unified `PQSError` enum, defined in
+`SessionModels`.
 
-### Delegate surfaces
+### Host protocol surfaces
 
-- ``SessionTransport``
-- ``PQSSessionStore``
-- ``EventReceiver``
-- ``PQSSessionDelegate``
-- ``SessionEvents``
+Defined in the `SessionEvents` module:
+
+- `PQSNetworkHost` = `PQSTransport & PQSKeyDirectory & PQSRecoveryTransport`
+- `PQSPersistenceHost` = `PQSStore & PQSRecoveryStore`
+- `MessageStoreObserver`
+- `PQSHostDelegate` = `MessagingPolicy & RecoveryObserver` (optional)
 
 ### Internal building blocks
 
-- ``TaskProcessor``
-- ``SessionCache``
+- <doc:MessagePipeline>
 
 ## Security model
 
@@ -126,7 +128,7 @@ verification:
    `signingPublicKey` is pinned the first time it is set. Any subsequent
    server-supplied `UserConfiguration` whose account signing key differs from
    the pin is rejected by ``PQSSession/adoptVerifiedUserConfiguration(_:)``
-   with ``PQSSession/SessionErrors/signingKeyOutOfSync``. Legitimate
+   with `PQSError.signingKeyOutOfSync`. Legitimate
    rotations install via authenticated channels (master rotation,
    linked-device reprovisioning) that update the pin first, so a subsequent
    refresh sees a matching key.
@@ -153,10 +155,10 @@ device and re-link from the master).
 Every device owns a stable per-device signing key for the lifetime of its
 `DeviceID`. Master rotations distribute a new account-level signing key, but
 they never replace a child's per-device key. Startup
-(``PQSSession/startSession(appPassword:)``) performs a non-fatal diagnostic
+(``PQSSession/unlock(appPassword:)``) performs a non-fatal diagnostic
 check for cached divergence so fresh re-link flows can finish. Reprovisioning
 and key-rotation paths enforce the invariant and emit
-``PQSSession/SessionErrors/deviceIdentityCorrupted`` if a bundle tries to
+`PQSError.deviceIdentityCorrupted` if a bundle tries to
 re-attest a child device with a foreign per-device key; that device should be
 re-linked.
 
@@ -165,23 +167,21 @@ re-linked.
 ```swift
 import PQSSession
 
-let session = PQSSession.shared
-
-try await session.configure(with: SessionConfiguration(
+let session = await PQSSession(configuration: SessionConfiguration(
     transport: myTransport,
     store: myStore,
-    receiver: myReceiver,
+    observer: myReceiver,
     delegate: mySessionDelegate           // optional
 ))
 
-try await session.createSession(
+try await session.createAccount(
     secretName: "alice",
     appPassword: "correct horse battery staple",
     createInitialTransport: setupNetworkTransport
 )
-try await session.startSession(appPassword: "correct horse battery staple")
+try await session.unlock(appPassword: "correct horse battery staple")
 
-try await session.writeTextMessage(
+try await session.send(
     recipient: .nickname("bob"),
     text: "Hello, world!",
     metadata: Data() // any application-defined Binary blob
@@ -190,15 +190,16 @@ try await session.writeTextMessage(
 
 ## Error handling
 
-All public error types conform to `LocalizedError`:
+All public SDK throws are cases of the unified `PQSError` enum
+(defined in `SessionModels`):
 
 ```swift
 do {
-    try await session.writeTextMessage(
+    try await session.send(
         recipient: .nickname("bob"),
         text: "Hello, world!"
     )
-} catch let error as PQSSession.SessionErrors {
+} catch let error as PQSError {
     switch error {
     case .signingKeyOutOfSync:
         await presentAccountIdentityRecovery()        // see GettingStarted
@@ -214,36 +215,32 @@ do {
         break
 
     default:
-        await showError(error.errorDescription, error.recoverySuggestion)
+        await showError("\(error)")
     }
 }
 ```
-
-### Error types
-
-- ``PQSSession/SessionErrors`` — session lifecycle and operation errors.
-- ``SessionCache/CacheErrors`` — cache/storage failures.
-- `CryptoError` — encryption/decryption failures (re-exported from
-  `SessionModels`).
 
 ## Thread safety
 
 - ``PQSSession`` is an `actor` — every public method is async and serializes
   on the actor's executor.
 - All persisted/transmitted models conform to `Sendable`.
-- `TaskProcessor` runs cryptographic work on dedicated executors so heavy
-  encrypt/decrypt work does not contend with the rest of the app.
+- The internal message pipeline runs cryptographic work on dedicated
+  executors so heavy encrypt/decrypt work does not contend with the rest of
+  the app (see <doc:MessagePipeline>).
 
 ## Integration
 
-- **Transport** — implement ``SessionTransport`` to send signed ratchet
-  messages and to publish/fetch `UserConfiguration` and one-time keys.
-- **Store** — implement ``PQSSessionStore`` for encrypted persistence of
-  contexts, messages, contacts, communications, and queued jobs.
-- **Receiver** — implement ``EventReceiver`` to react to message and
+- **Transport** — implement `PQSNetworkHost` to send signed ratchet
+  messages, publish/fetch `UserConfiguration` and one-time keys, and provide
+  authenticated out-of-band resend.
+- **Store** — implement `PQSPersistenceHost` for encrypted persistence of
+  contexts, messages, contacts, communications, queued jobs, and recovery
+  ledgers.
+- **Observer** — implement `MessageStoreObserver` to react to message and
   contact lifecycle changes in your UI.
-- **Optional delegate** — implement ``PQSSessionDelegate`` to participate
+- **Optional delegate** — implement `PQSHostDelegate` to participate
   in metadata redaction, transport routing, compromise notifications, and
-  (for multi-device hosts) ``PQSSessionDelegate/preferredOnlinePeerDeviceId(for:)``
+  (for multi-device hosts) `RecoveryObserver.preferredOnlinePeerDeviceId(for:)`
   so friendship OTK bootstrap targets a live peer device. See
   <doc:FriendshipContactBootstrap>.

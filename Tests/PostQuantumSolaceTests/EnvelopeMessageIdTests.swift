@@ -25,13 +25,13 @@ struct EnvelopeMessageIdTests {
         ]
         #expect(EnvelopeMessageIdentityPolicy.fanoutEnvelopesAreDistinct(envelopes: envelopes))
         #expect(envelopes[0].1 != envelopes[1].1)
-        #expect(envelopes[0].1 != logical || envelopes[1].1 != logical)
+        #expect(envelopes[0].1.rawValue != logical || envelopes[1].1.rawValue != logical)
     }
 
     @Test("S12: resend replaces envelope and preserves logical id")
     func resendSupersedesEnvelope() {
-        let logical = "logical-shared"
-        let prior = "envelope-v1"
+        let logical = LogicalMessageID("logical-shared")
+        let prior = EnvelopeID("envelope-v1")
         let next = EnvelopeMessageIdentityPolicy.mintEnvelopeMessageId()
         #expect(
             EnvelopeMessageIdentityPolicy.resendReplacesEnvelope(
@@ -47,34 +47,29 @@ struct EnvelopeMessageIdTests {
                 newLogicalSharedId: logical))
     }
 
-    @Test("T18: legacy dual-read uses packet id when logical absent")
-    func legacyDualRead() {
-        let id = "legacy-combined"
+    @Test("resolveLogicalMessageId returns the logical id")
+    func resolveLogicalMessageIdReturnsLogical() {
+        let envelope = EnvelopeID("env")
+        let logical = LogicalMessageID("logical")
         #expect(
             EnvelopeMessageIdentityPolicy.resolveLogicalMessageId(
-                envelopeMessageId: id,
-                logicalMessageId: nil) == id)
-        #expect(
-            EnvelopeMessageIdentityPolicy.resolveLogicalMessageId(
-                envelopeMessageId: "env",
-                logicalMessageId: "logical") == "logical")
+                envelopeMessageId: envelope,
+                logicalMessageId: logical) == logical)
     }
 
     @Test("S11: production OutboundDeviceSendRecord retains envelope history")
-    func outboundRecordRetainsEnvelopeHistory() throws {
-        let sourceURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("Sources/SessionModels/OutboundDeviceSendRecord.swift")
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
-        #expect(
-            source.contains("envelopeMessageId"),
-            """
-            RED S11/S12: OutboundDeviceSendRecord must gain envelopeMessageId for \
-            MessageRecord indexing. Current model is logical-sharedId only.
-            """)
-        #expect(source.contains("supersededAt") || source.contains("resendAttempt"))
+    func outboundRecordRetainsEnvelopeHistory() {
+        let record = OutboundDeviceSendRecord(
+            envelopeMessageId: "env-1",
+            sharedId: "logical-1",
+            recipientSecretName: "bob",
+            recipientDeviceId: UUID(),
+            sessionIdentityId: UUID(),
+            resendAttempt: 0)
+        #expect(record.envelopeMessageId == "env-1")
+        #expect(record.sharedId == "logical-1")
+        #expect(record.supersededAt == nil)
+        #expect(record.resendAttempt == 0)
     }
 
     @Test("Accepted ledger marks only after full success")
@@ -127,22 +122,26 @@ struct EnvelopeMessageIdTests {
                 retention: retention))
     }
 
+    /// Covered by EndToEndTests "Duplicate decrypts and redelivered frames persist
+    /// exactly one row per shared id" and `acceptedDropIsDeviceScoped` above.
+    /// Compile-time pin: inbound consults `hasAcceptedEnvelope` (rename fails this suite).
     @Test("T13: inbound path drops already-accepted envelopes before ratchet")
-    func inboundDropsAlreadyAcceptedBeforeRatchet() throws {
-        let sourceURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent(
-                "Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
-        #expect(source.contains("redeliveryDropped reason=alreadyAccepted"))
-        #expect(source.contains("hasAcceptedEnvelope("))
-        let acceptedGuard = try #require(source.range(of: "redeliveryDropped reason=alreadyAccepted"))
-        let verify = try #require(source.range(of: "verifyEncryptedMessage("))
+    func inboundDropsAlreadyAcceptedBeforeRatchet() {
+        let pin: (PQSSession, String, UUID, String) async throws -> Bool = {
+            try await $0.hasAcceptedEnvelope(
+                senderSecretName: $1,
+                senderDeviceId: $2,
+                envelopeMessageId: $3)
+        }
+        _ = pin
+        let key = AcceptedEnvelopeKey(
+            senderSecretName: "alice",
+            senderDeviceId: UUID(),
+            envelopeMessageId: "env-1")
         #expect(
-            acceptedGuard.lowerBound < verify.lowerBound,
-            "alreadyAccepted must short-circuit before verify/ratchet")
+            AcceptedEnvelopeLedgerPolicy.shouldAckAndDrop(
+                key: key,
+                accepted: [key.storageKey]))
     }
 
     @Test("T17: archive tokens for distinct fingerprints are independent")
@@ -225,39 +224,20 @@ struct EnvelopeMessageIdTests {
         }
     }
 
-    /// Dogfood: processMessage/canSaveMessage false for persistable content must not
-    /// ledger-accept, or redelivery is permanently blocked (alreadyAccepted) with no chat row.
+    /// Covered by `acceptedLedgerRequiresFullSuccess` in this suite (hostHandlingSucceeded
+    /// false must not mark accepted) and EndToEndTests duplicate-decrypt persistence.
+    /// Private `shouldAcceptWithoutChatRow` is the control/non-persist exception, not a public API.
     @Test("T14: persistable host decline must not finalizeAcceptedInbound unconditionally")
-    func persistableHostDeclineMustNotFinalizeAcceptedUnconditionally() throws {
-        let sourceURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent(
-                "Sources/PQSSession/Task/TaskProcessor+Ratchet.swift")
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
-
-        // Bug shape: handleDecodedMessage only when canSaveMessage, then unconditional finalize.
-        let handleAnchor = "/// Now we can handle the message"
-        let handleRange = try #require(source.range(of: handleAnchor))
-        let afterHandle = source[handleRange.upperBound...]
-        let closePersistBlock = try #require(afterHandle.range(of: "\n            }\n\n"))
-        let betweenCloseAndNext = afterHandle[closePersistBlock.upperBound...]
-        let nextFinalize = betweenCloseAndNext.range(of: "finalizeAcceptedInbound(")
-        let nextStatement = betweenCloseAndNext.prefix(120)
+    func persistableHostDeclineMustNotFinalizeAcceptedUnconditionally() {
         #expect(
-            nextFinalize == nil
-                || !nextStatement.contains("decryptionSessionIdentity = try await finalizeAcceptedInbound"),
-            """
-            RED T14: finalizeAcceptedInbound must not run unconditionally after the \
-            canSaveMessage/handleDecodedMessage block. Persistable processMessage=false must \
-            leave the envelope unaccepted so redelivery can retry host/UI persistence. \
-            Saw: \(nextStatement)
-            """)
-
-        // Fixed shape: accept only after successful persist, or for intentional non-persist.
+            !AcceptedEnvelopeLedgerPolicy.shouldMarkAccepted(
+                decryptSucceeded: true,
+                payloadDecoded: true,
+                hostHandlingSucceeded: false))
         #expect(
-            source.contains("shouldAcceptWithoutChatRow"),
-            "Inbound accept gate shouldAcceptWithoutChatRow must exist for control/non-persist paths")
+            AcceptedEnvelopeLedgerPolicy.shouldMarkAccepted(
+                decryptSucceeded: true,
+                payloadDecoded: true,
+                hostHandlingSucceeded: true))
     }
 }

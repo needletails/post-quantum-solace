@@ -37,16 +37,16 @@ actor AccountIdentityPinningTests {
         await session.setPQSSessionDelegate(conformer: SessionDelegate(session: session))
         await session.setReceiverDelegate(conformer: ReceiverDelegate(session: session))
 
-        await session.setViability(true)
+        await session.setConnectivity(true)
         await store.setPublishableName(secretName)
 
-        session = try await session.createSession(
+        session = try await session.createAccount(
             secretName: secretName,
             appPassword: password
         ) {}
 
         await session.setAppPassword(password)
-        session = try await session.startSession(appPassword: password)
+        session = try await session.unlock(appPassword: password)
     }
 
     /// Build a structurally-valid but cryptographically-foreign `UserConfiguration`:
@@ -86,7 +86,7 @@ actor AccountIdentityPinningTests {
 
         let intruder = foreignConfiguration()
 
-        await #expect(throws: PQSSession.SessionErrors.signingKeyOutOfSync) {
+        await #expect(throws: PQSError.signingKeyOutOfSync) {
             try await session.adoptVerifiedUserConfiguration(intruder)
         }
 

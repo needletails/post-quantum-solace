@@ -43,7 +43,7 @@ The SDK enforces trust in two complementary layers:
 - **TOFU (automatic).** The SDK pins each peer's
   `signingPublicKey` per account on first sight and rejects silent
   server-side rotations. A change manifests at runtime as
-  ``PQSSession/SessionErrors/signingKeyOutOfSync`` (for the local
+  `PQSError.signingKeyOutOfSync` (for the local
   account) or as a `PeerIdentityRefreshAssessment` failure (for a
   remote peer).
 
@@ -97,4 +97,4 @@ let badge = remote.shortFingerprintHex()      // e.g. "A1:B2:C3:D4:E5:F6:07:08"
 
 - ``UserConfiguration``
 - <doc:AccountIdentityRecovery>
-- ``PQSSession/SessionErrors/signingKeyOutOfSync``
+- `PQSError.signingKeyOutOfSync`

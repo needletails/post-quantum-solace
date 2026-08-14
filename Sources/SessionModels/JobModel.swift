@@ -46,12 +46,21 @@ public struct OutboundTaskMessage: Codable & Sendable {
     /// In that case `localId` is not meaningful for `fetchMessage(id:)` and must not be used to update delivery state.
     public let isPersistedOutbound: Bool
 
+    /// Opaque host-supplied supersede key for ephemeral state publishes
+    /// (e.g. transport consent blobs, schedule syncs) that are regenerated on
+    /// every registration. A keyed enqueue replaces the pending job with the
+    /// same key on the same recipient identity lane instead of accumulating
+    /// behind it. `nil` (the default) preserves full queue durability.
+    /// Only meaningful when `isPersistedOutbound == false`.
+    public let coalescingKey: String?
+
     private enum CodingKeys: String, CodingKey {
         case message
         case recipientIdentity
         case localId
         case sharedId
         case isPersistedOutbound
+        case coalescingKey
     }
 
     /// Initializes a new instance of `OutboundTaskMessage`.
@@ -61,18 +70,21 @@ public struct OutboundTaskMessage: Codable & Sendable {
     ///   - localId: A unique identifier for the local message.
     ///   - sharedId: A shared identifier for the message.
     ///   - isPersistedOutbound: Whether this send corresponds to a row in local message storage (`localId` is the row id).
+    ///   - coalescingKey: Optional supersede key for ephemeral state publishes.
     public init(
         message: CryptoMessage,
         recipientIdentity: SessionIdentity,
         localId: UUID,
         sharedId: String,
-        isPersistedOutbound: Bool = true
+        isPersistedOutbound: Bool = true,
+        coalescingKey: String? = nil
     ) {
         self.message = message
         self.recipientIdentity = recipientIdentity
         self.localId = localId
         self.sharedId = sharedId
         self.isPersistedOutbound = isPersistedOutbound
+        self.coalescingKey = coalescingKey
     }
 
     public init(from decoder: Decoder) throws {
@@ -82,6 +94,7 @@ public struct OutboundTaskMessage: Codable & Sendable {
         localId = try c.decode(UUID.self, forKey: .localId)
         sharedId = try c.decode(String.self, forKey: .sharedId)
         isPersistedOutbound = try c.decodeIfPresent(Bool.self, forKey: .isPersistedOutbound) ?? true
+        coalescingKey = try c.decodeIfPresent(String.self, forKey: .coalescingKey)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -91,6 +104,7 @@ public struct OutboundTaskMessage: Codable & Sendable {
         try c.encode(localId, forKey: .localId)
         try c.encode(sharedId, forKey: .sharedId)
         try c.encode(isPersistedOutbound, forKey: .isPersistedOutbound)
+        try c.encodeIfPresent(coalescingKey, forKey: .coalescingKey)
     }
 }
 
@@ -111,7 +125,7 @@ public struct InboundTaskMessage: Codable & Sendable {
     /// A shared identifier for the message that can be used across devices.
     /// Wire / envelope MessageID (`MessagePacket.id`).
     public let sharedMessageId: String
-    /// Logical application id when distinct from the envelope; nil means legacy combined id.
+    /// Logical application id when distinct from the envelope; nil for packets that omit it.
     public let logicalSharedId: String?
 
     /// Logical id used for chat persist / delivery aggregation.
@@ -126,13 +140,13 @@ public struct InboundTaskMessage: Codable & Sendable {
     ///   - senderSecretName: The secret name of the sender.
     ///   - senderDeviceId: The unique identifier for the sender's device.
     ///   - sharedMessageId: Envelope MessageID from the wire packet.
-    ///   - logicalSharedId: Optional logical shared id (dual-read).
+    ///   - logicalSharedId: Logical shared id. Callers must pass it; there is no init default.
     public init(
         message: SignedRatchetMessage,
         senderSecretName: String,
         senderDeviceId: UUID,
         sharedMessageId: String,
-        logicalSharedId: String? = nil
+        logicalSharedId: String?
     ) {
         self.message = message
         self.senderSecretName = senderSecretName
@@ -328,9 +342,11 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         /// envelope MessageID for this prepared envelope; defaults to sharedMessageId for legacy rows.
         public let envelopeMessageId: String
         public let transportEvent: TransportEvent?
+        /// Whether the transport should request a server acceptance acknowledgment.
+        public let requiresServerAck: Bool
         public let sessionIdentityId: UUID
         public let needsRemoteDeletion: Bool
-        public let curveOneTimeKeyId: String?
+        public let x25519OneTimeKeyId: String?
         public let mlKEMOneTimeKeyId: String
         public let createdAt: Date
 
@@ -341,11 +357,12 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             recipient: MessageRecipient,
             transportMetadata: Data?,
             sharedMessageId: String,
-            envelopeMessageId: String? = nil,
+            envelopeMessageId: String,
             transportEvent: TransportEvent?,
+            requiresServerAck: Bool = false,
             sessionIdentityId: UUID,
             needsRemoteDeletion: Bool,
-            curveOneTimeKeyId: String?,
+            x25519OneTimeKeyId: String?,
             mlKEMOneTimeKeyId: String,
             createdAt: Date = Date()
         ) {
@@ -355,11 +372,12 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             self.recipient = recipient
             self.transportMetadata = transportMetadata
             self.sharedMessageId = sharedMessageId
-            self.envelopeMessageId = envelopeMessageId ?? sharedMessageId
+            self.envelopeMessageId = envelopeMessageId
             self.transportEvent = transportEvent
+            self.requiresServerAck = requiresServerAck
             self.sessionIdentityId = sessionIdentityId
             self.needsRemoteDeletion = needsRemoteDeletion
-            self.curveOneTimeKeyId = curveOneTimeKeyId
+            self.x25519OneTimeKeyId = x25519OneTimeKeyId
             self.mlKEMOneTimeKeyId = mlKEMOneTimeKeyId
             self.createdAt = createdAt
         }
@@ -367,7 +385,9 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         enum CodingKeys: String, CodingKey {
             case signedMessage, secretName, deviceId, recipient, transportMetadata
             case sharedMessageId, envelopeMessageId, transportEvent, sessionIdentityId
-            case needsRemoteDeletion, curveOneTimeKeyId, mlKEMOneTimeKeyId, createdAt
+            case requiresServerAck, needsRemoteDeletion, mlKEMOneTimeKeyId, createdAt
+            // Pinned to the 3.x on-disk key; renaming it would break persisted jobs.
+            case x25519OneTimeKeyId = "curveOneTimeKeyId"
         }
 
         public init(from decoder: Decoder) throws {
@@ -379,10 +399,19 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             transportMetadata = try c.decodeIfPresent(Data.self, forKey: .transportMetadata)
             sharedMessageId = try c.decode(String.self, forKey: .sharedMessageId)
             envelopeMessageId = try c.decodeIfPresent(String.self, forKey: .envelopeMessageId) ?? sharedMessageId
-            transportEvent = try c.decodeIfPresent(TransportEvent.self, forKey: .transportEvent)
+            do {
+                transportEvent = try c.decodeIfPresent(TransportEvent.self, forKey: .transportEvent)
+            } catch {
+                if TransportEvent.isRetiredEncryptedRetry(error) {
+                    transportEvent = nil
+                } else {
+                    throw error
+                }
+            }
+            requiresServerAck = try c.decodeIfPresent(Bool.self, forKey: .requiresServerAck) ?? false
             sessionIdentityId = try c.decode(UUID.self, forKey: .sessionIdentityId)
             needsRemoteDeletion = try c.decode(Bool.self, forKey: .needsRemoteDeletion)
-            curveOneTimeKeyId = try c.decodeIfPresent(String.self, forKey: .curveOneTimeKeyId)
+            x25519OneTimeKeyId = try c.decodeIfPresent(String.self, forKey: .x25519OneTimeKeyId)
             mlKEMOneTimeKeyId = try c.decode(String.self, forKey: .mlKEMOneTimeKeyId)
             createdAt = try c.decode(Date.self, forKey: .createdAt)
         }
@@ -397,9 +426,10 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             try c.encode(sharedMessageId, forKey: .sharedMessageId)
             try c.encode(envelopeMessageId, forKey: .envelopeMessageId)
             try c.encodeIfPresent(transportEvent, forKey: .transportEvent)
+            try c.encode(requiresServerAck, forKey: .requiresServerAck)
             try c.encode(sessionIdentityId, forKey: .sessionIdentityId)
             try c.encode(needsRemoteDeletion, forKey: .needsRemoteDeletion)
-            try c.encodeIfPresent(curveOneTimeKeyId, forKey: .curveOneTimeKeyId)
+            try c.encodeIfPresent(x25519OneTimeKeyId, forKey: .x25519OneTimeKeyId)
             try c.encode(mlKEMOneTimeKeyId, forKey: .mlKEMOneTimeKeyId)
             try c.encode(createdAt, forKey: .createdAt)
         }
@@ -420,7 +450,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         let crypto = NeedleTailCrypto()
         let data = try BinaryEncoder().encode(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-            throw CryptoError.encryptionFailed
+            throw PQSError.encryptionFailed
         }
         self.data = encryptedData
     }
@@ -441,7 +471,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         let crypto = NeedleTailCrypto()
         guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
-            throw CryptoError.decryptionFailed
+            throw PQSError.decryptionFailed
         }
         return try BinaryDecoder().decode(UnwrappedProps.self, from: decrypted)
     }
@@ -456,7 +486,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         let crypto = NeedleTailCrypto()
         let data = try BinaryEncoder().encode(props)
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
-            throw CryptoError.encryptionFailed
+            throw PQSError.encryptionFailed
         }
         self.data = encryptedData
         return try await decryptProps(symmetricKey: symmetricKey)

@@ -111,7 +111,7 @@ Pattern-match exhaustively when rendering UI.
 
 ## Errors
 
-Encryption and decryption surface ``CryptoError``. The most common
+Encryption and decryption surface ``PQSError``. The most common
 cause for a `nil` from ``EncryptedMessage/props(symmetricKey:)`` is a
 key mismatch — typically a stale ``SessionContext/databaseEncryptionKey``
 or a wrong app-symmetric-key derivation.
@@ -121,4 +121,4 @@ or a wrong app-symmetric-key derivation.
 - ``CryptoMessage``
 - ``DeliveryState``
 - ``BaseCommunication``
-- ``CryptoError``
+- ``PQSError``

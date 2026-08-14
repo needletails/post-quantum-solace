@@ -19,10 +19,10 @@ import Foundation
 import SessionModels
 import Crypto
 
-/// Extension providing cache management and model creation capabilities for the TaskProcessor.
+/// Extension providing cache management and model creation capabilities for the MessagePipeline.
 /// This extension handles the creation and management of communication models, message models,
 /// and job models used throughout the cryptographic session lifecycle.
-extension TaskProcessor {
+extension MessagePipeline {
     /// Creates a new communication model including optional administrator and operators for roles.
     ///
     /// - Parameters:
@@ -33,7 +33,7 @@ extension TaskProcessor {
     ///   - metadata: Additional communication metadata stored as a Foundation Data
     ///   - symmetricKey: The key used to encrypt communication data.
     /// - Returns: A new `BaseCommunication` object.
-    /// - Throws: `CryptoError` if encryption fails.
+    /// - Throws: `PQSError` if encryption fails.
     func createCommunicationModel(
         administrator: String? = nil,
         operators: Set<String>? = nil,
@@ -69,7 +69,7 @@ extension TaskProcessor {
     ///
     /// ## Usage Example
     /// ```swift
-    /// let communication = try await taskProcessor.createCommunicationModel(
+    /// let communication = try await messagePipeline.createCommunicationModel(
     ///     recipients: ["user1", "user2"],
     ///     communicationType: .personalMessage,
     ///     metadata: ["admin": "user1"],
@@ -87,7 +87,7 @@ extension TaskProcessor {
     ///   - symmetricKey: The key used to encrypt communication data. Must be the same
     ///                   key used for all operations within this session.
     /// - Returns: A new `BaseCommunication` object ready to be stored or used.
-    /// - Throws: `CryptoError` if encryption fails, `BinaryCodableError` if metadata encoding fails.
+    /// - Throws: `PQSError` if encryption fails, `BinaryCodableError` if metadata encoding fails.
     // (Note: the simplified createCommunicationModel signature is merged into the overload above)
 
     /// Creates a message model from a received and decrypted message.
@@ -121,7 +121,7 @@ extension TaskProcessor {
     ///   - sessionIdentity: Identity model for the sender used to extract session context.
     /// - Returns: An `EncryptedMessage` object ready for persistence or processing.
     /// - Throws: `JobProcessorErrors.missingIdentity` if sender identity cannot be resolved,
-    ///           `PQSSession.SessionErrors.propsError` if communication properties cannot be decrypted.
+    ///           `PQSError.propsError` if communication properties cannot be decrypted.
     func createInboundMessageModel(
         decodedMessage: CryptoMessage,
         inboundTask: InboundTaskMessage,
@@ -138,7 +138,7 @@ extension TaskProcessor {
         }
 
         guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else {
-            throw PQSSession.SessionErrors.propsError
+            throw PQSError.propsError
         }
 
         let newMessageCount = communicationProps.messageCount + 1
@@ -190,7 +190,7 @@ extension TaskProcessor {
     ///
     /// ## Usage Example
     /// ```swift
-    /// let messageModel = try await taskProcessor.createOutboundMessageModel(
+    /// let messageModel = try await messagePipeline.createOutboundMessageModel(
     ///     message: cryptoMessage,
     ///     communication: communication,
     ///     session: session,
@@ -213,9 +213,9 @@ extension TaskProcessor {
     ///   - shouldUpdateCommunication: If true, updates and persists the communication props
     ///                                and notifies delegates of changes.
     /// - Returns: A persistable `EncryptedMessage` object ready for transmission.
-    /// - Throws: `PQSSession.SessionErrors.sessionNotInitialized` if session context is missing,
-    ///           `PQSSession.SessionErrors.propsError` if communication properties cannot be decrypted,
-    ///           `PQSSession.SessionErrors.databaseNotInitialized` if cache is unavailable.
+    /// - Throws: `PQSError.sessionNotInitialized` if session context is missing,
+    ///           `PQSError.propsError` if communication properties cannot be decrypted,
+    ///           `PQSError.databaseNotInitialized` if cache is unavailable.
     func createOutboundMessageModel(
         message: CryptoMessage,
         communication: BaseCommunication,
@@ -226,13 +226,13 @@ extension TaskProcessor {
         shouldUpdateCommunication: Bool = false
     ) async throws -> EncryptedMessage {
         guard let sessionContext = await session.sessionContext else {
-            throw PQSSession.SessionErrors.sessionNotInitialized
+            throw PQSError.sessionNotInitialized
         }
 
         let sessionUser = sessionContext.sessionUser
 
         guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else {
-            throw PQSSession.SessionErrors.propsError
+            throw PQSError.propsError
         }
         let messageId = UUID()
         let messageModel = try EncryptedMessage(
@@ -252,7 +252,7 @@ extension TaskProcessor {
             symmetricKey: symmetricKey)
         
         guard let cache = await session.cache else {
-            throw PQSSession.SessionErrors.databaseNotInitialized
+            throw PQSError.databaseNotInitialized
         }
 
         if shouldUpdateCommunication {
@@ -284,7 +284,7 @@ extension TaskProcessor {
     ///
     /// ## Usage Example
     /// ```swift
-    /// let job = try taskProcessor.createJobModel(
+    /// let job = try messagePipeline.createJobModel(
     ///     sequenceId: 123,
     ///     task: encryptableTask,
     ///     symmetricKey: sessionKey
@@ -297,7 +297,7 @@ extension TaskProcessor {
     ///   - task: The encryptable task to execute, containing the actual work to be performed.
     ///   - symmetricKey: Key used to encrypt job metadata and task data.
     /// - Returns: A `JobModel` suitable for enqueuing in the `AsyncConsumer`.
-    /// - Throws: `CryptoError` if encryption fails, `BinaryCodableError` if task encoding fails.
+    /// - Throws: `PQSError` if encryption fails, `BinaryCodableError` if task encoding fails.
     func createJobModel(
         sequenceId: Int,
         task: EncryptableTask,
@@ -340,7 +340,7 @@ extension TaskProcessor {
     ///
     /// ## Usage Example
     /// ```swift
-    /// let communication = try await taskProcessor.findCommunicationType(
+    /// let communication = try await messagePipeline.conversation(
     ///     cache: sessionCache,
     ///     communicationType: .personalMessage,
     ///     session: session
@@ -353,9 +353,9 @@ extension TaskProcessor {
     ///                        the type stored in the communication model.
     ///   - session: The current session used for decryption and key management.
     /// - Returns: A matching `BaseCommunication` if found.
-    /// - Throws: `PQSSession.SessionErrors.cannotFindCommunication` if no matching
-    ///           communication is found, `CryptoError` if decryption fails.
-    func findCommunicationType(
+    /// - Throws: `PQSError.cannotFindCommunication` if no matching
+    ///           communication is found, `PQSError` if decryption fails.
+    func conversation(
         cache: SessionCache,
         communicationType: MessageRecipient,
         session: PQSSession
@@ -371,7 +371,7 @@ extension TaskProcessor {
                 return false
             }
         }) else {
-            throw PQSSession.SessionErrors.cannotFindCommunication
+            throw PQSError.cannotFindCommunication
         }
 
         return foundCommunication

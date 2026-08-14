@@ -89,7 +89,7 @@ extension EndToEndTests {
             rsd: rsd)
 
         // Warm a lane so chat fan-out has bob identities, then force a missing offer target.
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "warmup-before-missing-offer",
             sharedIdOverride: "enqueue-warmup-\(UUID().uuidString)")
@@ -102,7 +102,7 @@ extension EndToEndTests {
         let sharedId = "missing-offer-\(UUID().uuidString)"
         var thrown: Error?
         do {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "should not silently succeed",
                 sharedIdOverride: sharedId)
@@ -111,7 +111,7 @@ extension EndToEndTests {
         }
 
         #expect(
-            thrown as? PQSSession.SessionErrors == .missingSessionIdentity,
+            thrown as? PQSError == .missingSessionIdentity,
             "Missing offer identity must throw missingSessionIdentity so ChatBar restores the draft")
 
         let cache = try #require(await _senderSession.cache)
@@ -188,7 +188,7 @@ extension EndToEndTests {
             rsd: rsd)
 
         let sharedId = "durable-dm-\(UUID().uuidString)"
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "durable enqueue proof",
             sharedIdOverride: sharedId)
@@ -209,7 +209,7 @@ extension EndToEndTests {
             "Disk-boundary createJob must persist at least one job for the peer device")
     }
 
-    @Test("createJob persistence failure surfaces to writeTextMessage and fails local row")
+    @Test("createJob persistence failure surfaces to send and fails local row")
     func createJobFailureThrowsAndDoesNotClaimSuccess() async throws {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
@@ -268,18 +268,18 @@ extension EndToEndTests {
             rsd: rsd)
 
         // Warm lanes with a successful send first.
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "warmup-before-createJob-failure",
             sharedIdOverride: "enqueue-jobfail-warmup-\(UUID().uuidString)")
         try? await Task.sleep(for: .milliseconds(200))
 
-        await aliceStore.setCreateJobError(PQSSession.SessionErrors.databaseNotInitialized)
+        await aliceStore.setCreateJobError(PQSError.databaseNotInitialized)
 
         let sharedId = "createjob-fail-\(UUID().uuidString)"
         var thrown: Error?
         do {
-            try await _senderSession.writeTextMessage(
+            try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "must surface store failure",
                 sharedIdOverride: sharedId)
@@ -289,8 +289,8 @@ extension EndToEndTests {
 
         #expect(thrown != nil, "createJob failure must not return success")
         #expect(
-            thrown as? PQSSession.SessionErrors == .outboundEnqueueIncomplete
-                || thrown as? PQSSession.SessionErrors == .databaseNotInitialized,
+            thrown as? PQSError == .outboundEnqueueIncomplete
+                || thrown as? PQSError == .databaseNotInitialized,
             "Expected enqueue incomplete or the underlying store error, got \(String(describing: thrown))")
 
         let cache = try #require(await _senderSession.cache)
@@ -368,17 +368,17 @@ extension EndToEndTests {
             bobSession: _recipientSession,
             rsd: rsd)
 
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "warmup-before-nonviable",
             sharedIdOverride: "enqueue-nonviable-warmup-\(UUID().uuidString)")
         try? await Task.sleep(for: .milliseconds(200))
 
         let sendsBefore = await aliceTransport.sendMessageCallCount
-        await _senderSession.setViability(false)
+        await _senderSession.setConnectivity(false)
 
         let sharedId = "nonviable-enqueue-\(UUID().uuidString)"
-        try await _senderSession.writeTextMessage(
+        try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "queued while nonviable",
             sharedIdOverride: sharedId)

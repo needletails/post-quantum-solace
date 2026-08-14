@@ -103,4 +103,4 @@ rebuild — the SDK reads them directly from the type's static storage.
 - ``SessionReestablishmentKind``
 - ``SessionReestablishmentEnvelope``
 - ``PQSSessionConstants``
-- ``TaskProcessor``
+- <doc:MessagePipeline>

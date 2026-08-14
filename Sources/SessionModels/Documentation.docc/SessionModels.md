@@ -23,7 +23,7 @@ obfuscate on-disk layout.
 - ``UserConfiguration/SignedDeviceConfiguration``
 - ``UserConfiguration/SignedOneTimePublicKey``
 - ``UserConfiguration/SignedMLKEMOneTimeKey``
-- ``KeysType``
+- ``KeyKind``
 
 ### Session state
 
@@ -90,7 +90,7 @@ is covered in <doc:FriendshipContactBootstrap>.
 
 ### Errors
 
-- ``CryptoError``
+- ``PQSError``
 
 ## Design notes
 
@@ -106,7 +106,7 @@ Every secure model in this module
    `SymmetricKey` derived from ``SessionContext/databaseEncryptionKey``.
 3. `props(symmetricKey:)` returns the decrypted props, or `nil` if the
    key is wrong or the blob is corrupted; `decryptProps(symmetricKey:)`
-   throws ``CryptoError/decryptionFailed`` instead.
+   throws ``PQSError/decryptionFailed`` instead.
 4. `updateProps(symmetricKey:props:)` atomically re-encrypts.
 
 ### Coding-key obfuscation
@@ -121,4 +121,4 @@ removes obvious labels from on-disk and on-wire blobs.
 - ``SessionConfiguration``
 - ``PQSSession``
 - ``SecurityIdentity``
-- ``CryptoError``
+- ``PQSError``

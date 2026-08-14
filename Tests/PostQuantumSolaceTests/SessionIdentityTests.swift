@@ -35,7 +35,7 @@ actor SessionIdentityTests {
     
     // MARK: - Mock Store
     
-    final class MockSessionIdentityStore: PQSSessionStore, @unchecked Sendable {
+    final class MockSessionIdentityStore: PQSStore, PQSRecoveryStore, @unchecked Sendable {
         enum MockError: Error {
             case forcedDelete
             case forcedUpdate
@@ -44,6 +44,7 @@ actor SessionIdentityTests {
         var sessionContext: Data?
         var identities = [SessionIdentity]()
         var contacts = [ContactModel]()
+        let recoveryLedger = InMemoryRecoveryLedger()
         var failNextSessionIdentityDelete = false
         var failNextSessionIdentityUpdate = false
         
@@ -51,7 +52,7 @@ actor SessionIdentityTests {
         func createLocalSessionContext(_ data: Data) async throws { sessionContext = data }
         func fetchLocalSessionContext() async throws -> Data { 
             guard let context = sessionContext else {
-                throw PQSSession.SessionErrors.databaseNotInitialized
+                throw PQSError.databaseNotInitialized
             }
             return context
         }
@@ -111,6 +112,39 @@ actor SessionIdentityTests {
         func fetchMessage(sharedId _: String) async throws -> EncryptedMessage {
             try .init(id: UUID(), communicationId: UUID(), sessionContextId: 1, sharedId: "123", sequenceNumber: 1, data: Data())
         }
+        func fetchMessageIfExists(sharedId _: String) async throws -> EncryptedMessage? { nil }
+        func updateSessionIdentity(_ session: SessionIdentity, andPreparedJob job: JobModel) async throws {
+            try await updateSessionIdentity(session)
+            try await updateJob(job)
+        }
+        func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws {
+            recoveryLedger.upsertOutboundDeviceSendRecord(record)
+        }
+        func fetchOutboundDeviceSendRecord(sharedId: String, recipientDeviceId: UUID) async throws -> OutboundDeviceSendRecord? {
+            recoveryLedger.fetchOutboundDeviceSendRecord(sharedId: sharedId, recipientDeviceId: recipientDeviceId)
+        }
+        func fetchOutboundDeviceSendRecord(envelopeMessageId: String) async throws -> OutboundDeviceSendRecord? {
+            recoveryLedger.fetchOutboundDeviceSendRecord(envelopeMessageId: envelopeMessageId)
+        }
+        func deleteOutboundDeviceSendRecords(sharedId: String) async throws {
+            recoveryLedger.deleteOutboundDeviceSendRecords(sharedId: sharedId)
+        }
+        func upsertAcceptedEnvelope(_ record: AcceptedEnvelopeRecord) async throws {
+            recoveryLedger.upsertAcceptedEnvelope(record)
+        }
+        func fetchAcceptedEnvelope(
+            senderSecretName: String,
+            senderDeviceId: UUID,
+            envelopeMessageId: String
+        ) async throws -> AcceptedEnvelopeRecord? {
+            recoveryLedger.fetchAcceptedEnvelope(
+                senderSecretName: senderSecretName,
+                senderDeviceId: senderDeviceId,
+                envelopeMessageId: envelopeMessageId)
+        }
+        func pruneAcceptedEnvelopes(olderThan date: Date) async throws -> Int {
+            recoveryLedger.pruneAcceptedEnvelopes(olderThan: date)
+        }
         func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {}
         func updateMessage(_: EncryptedMessage, symmetricKey: SymmetricKey) async throws {}
         func removeMessage(_: EncryptedMessage) async throws {}
@@ -134,44 +168,46 @@ actor SessionIdentityTests {
     
     // MARK: - Mock Transport
     
-    final class MockSessionIdentityTransport: SessionTransport, @unchecked Sendable {
+    final class MockSessionIdentityTransport: PQSTransport, PQSKeyDirectory, PQSRecoveryTransport, @unchecked Sendable {
 
         var configurations: [String: UserConfiguration] = [:]
         var oneTimeKeys: [String: OneTimeKeys] = [:]
         var shouldThrowError = false
         
         func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys {
-            if shouldThrowError { throw PQSSession.SessionErrors.userNotFound }
-            return oneTimeKeys[secretName] ?? OneTimeKeys(curve: nil, mlKEM: nil)
+            if shouldThrowError { throw PQSError.userNotFound }
+            return oneTimeKeys[secretName] ?? OneTimeKeys(x25519: nil, mlKEM: nil)
         }
         
-        func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeysType) async throws -> [UUID] { [] }
+        func fetchOneTimeKeyIdentities(for secretName: String, deviceId: String, type: KeyKind) async throws -> [UUID] { [] }
         func publishUserConfiguration(_ configuration: SessionModels.UserConfiguration, recipient secretName: String, recipient identity: UUID) async throws {}
         func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {}
         
         func findConfiguration(for secretName: String) async throws -> UserConfiguration {
-            if shouldThrowError { throw PQSSession.SessionErrors.userNotFound }
+            if shouldThrowError { throw PQSError.userNotFound }
             guard let config = configurations[secretName] else {
-                throw PQSSession.SessionErrors.userNotFound
+                throw PQSError.userNotFound
             }
             return config
         }
         
         func findUserConfiguration(secretName: String) async throws -> UserConfiguration {
-            if shouldThrowError { throw PQSSession.SessionErrors.configurationError }
+            if shouldThrowError { throw PQSError.configurationError }
             guard let config = configurations[secretName] else {
-                throw PQSSession.SessionErrors.configurationError
+                throw PQSError.configurationError
             }
             return config
         }
         
-        // Required SessionTransport methods
+        // Required PQSNetworkHost methods
         func updateOneTimeKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedOneTimePublicKey]) async throws {}
         func updateOneTimeMLKEMKeys(for secretName: String, deviceId: String, keys: [UserConfiguration.SignedMLKEMOneTimeKey]) async throws {}
-        func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
-        func deleteOneTimeKeys(for secretName: String, with id: String, type: KeysType) async throws {}
+        func batchDeleteOneTimeKeys(for secretName: String, with id: String, type: KeyKind) async throws {}
+        func deleteOneTimeKeys(for secretName: String, with id: String, type: KeyKind) async throws {}
         func publishRotatedKeys(for secretName: String, deviceId: String, rotated keys: RotatedPublicKeys) async throws {}
         func createUploadPacket(secretName: String, deviceId: UUID, recipient: MessageRecipient, metadata: Data) async throws {}
+        func sendOutOfBandResendRequest(failedEnvelopeMessageIds: [String], to secretName: String, deviceId: UUID, requestingDeviceId: UUID) async throws {}
+        func sendOutOfBandResendUnavailable(unavailableEnvelopeMessageIds: [String], to secretName: String, deviceId: UUID, respondingDeviceId: UUID) async throws {}
     }
 
     @Test("SessionCache keeps memory and disk aligned when delete persistence fails")
@@ -190,6 +226,18 @@ actor SessionIdentityTests {
         let cached = try await cache.fetchSessionIdentities()
         #expect(cached.contains(where: { $0.id == identity.id }))
         #expect(store.identities.contains(where: { $0.id == identity.id }))
+        await session.shutdown()
+    }
+
+    @Test("SessionCache delete is idempotent when the row is already absent")
+    func testSessionCacheDeleteIsIdempotentWhenRowIsAlreadyAbsent() async throws {
+        let store = MockSessionIdentityStore()
+        let cache = SessionCache(store: store)
+        store.failNextSessionIdentityDelete = true
+        let missing = UUID()
+        try await cache.deleteSessionIdentity(missing)
+        let cached = try await cache.fetchSessionIdentities()
+        #expect(!cached.contains(where: { $0.id == missing }))
         await session.shutdown()
     }
 
@@ -267,7 +315,7 @@ actor SessionIdentityTests {
         let signingPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: bundle.userConfiguration.signingPublicKey)
         guard let signedDevice = bundle.userConfiguration.signedDevices.first,
               let deviceConfig = try signedDevice.verified(using: signingPublicKey) else {
-            throw PQSSession.SessionErrors.configurationError
+            throw PQSError.configurationError
         }
         
         // Get one-time keys if available
@@ -279,7 +327,7 @@ actor SessionIdentityTests {
         let verifiedMLKEMKey = mlKEMKey != nil ? try mlKEMKey!.verified(using: signingPublicKey) : nil
         
         guard let verifiedMLKEMKey = verifiedMLKEMKey else {
-            throw PQSSession.SessionErrors.configurationError
+            throw PQSError.configurationError
         }
         
         return try await session.createEncryptableSessionIdentityModel(
@@ -300,7 +348,7 @@ actor SessionIdentityTests {
         let signingPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: bundle.userConfiguration.signingPublicKey)
         guard let signedDevice = bundle.userConfiguration.signedDevices.first,
               let deviceConfig = try signedDevice.verified(using: signingPublicKey) else {
-            throw PQSSession.SessionErrors.configurationError
+            throw PQSError.configurationError
         }
         
         // Get one-time keys if available
@@ -312,7 +360,7 @@ actor SessionIdentityTests {
         let verifiedMLKEMKey = mlKEMKey != nil ? try mlKEMKey!.verified(using: signingPublicKey) : nil
         
         guard let verifiedMLKEMKey = verifiedMLKEMKey else {
-            throw PQSSession.SessionErrors.configurationError
+            throw PQSError.configurationError
         }
         
         // Create the identity manually without storing it
@@ -329,7 +377,6 @@ actor SessionIdentityTests {
                 signingPublicKey: deviceConfig.signingPublicKey,
                 mlKEMPublicKey: verifiedMLKEMKey,
                 oneTimePublicKey: verifiedOneTimeKey,
-                state: nil,
                 deviceName: deviceName,
                 isMasterDevice: deviceConfig.isMasterDevice
             ),
@@ -420,7 +467,7 @@ actor SessionIdentityTests {
             do {
                 _ = try await session.refreshIdentities(secretName: "alice", forceRefresh: true)
                 Issue.record("Expected refreshIdentities to throw invalidSignature for tampered configuration")
-            } catch let error as PQSSession.SessionErrors {
+            } catch let error as PQSError {
                 #expect(error == .invalidSignature)
             }
 
@@ -461,7 +508,7 @@ actor SessionIdentityTests {
             #expect(foreignBundle.userConfiguration.signingPublicKey != trustedConfiguration.signingPublicKey)
             transport.configurations["alice"] = foreignBundle.userConfiguration
 
-            await #expect(throws: PQSSession.SessionErrors.peerSigningKeyOutOfSync) {
+            await #expect(throws: PQSError.peerSigningKeyOutOfSync) {
                 _ = try await session.refreshIdentities(secretName: "alice", forceRefresh: true)
             }
 
@@ -785,7 +832,7 @@ actor SessionIdentityTests {
             #expect(replacement.id != originalIdentity.id)
             #expect(replacementProps.longTermPublicKey == rotatedDevice.longTermPublicKey)
             #expect(replacementProps.signingPublicKey == rotatedDevice.signingPublicKey)
-            #expect(replacementProps.state == nil)
+            #expect(!replacementProps.hasRatchetState)
             // Demote-in-place contract: the original row id is retained as an inactive
             // snapshot (outbound ledgers may still reference it) rather than deleted;
             // only the replacement row remains active for this device.

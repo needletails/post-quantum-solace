@@ -103,8 +103,8 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
     ///
     /// - Parameter deviceId: The unique identifier of the device for which to retrieve keys.
     /// - Throws: An error if verification fails.
-    /// - Returns: An array of verified `CurvePublicKey` instances.
-    public func getVerifiedCurveKeys(deviceId: UUID) throws -> [CurvePublicKey] {
+    /// - Returns: An array of verified `X25519PublicKey` instances.
+    public func getVerifiedX25519Keys(deviceId: UUID) throws -> [X25519PublicKey] {
         guard let device = try getVerifiedDevices().first(where: { $0.deviceId == deviceId }) else {
             return []
         }
@@ -127,8 +127,12 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         return try filteredKeys.compactMap { try $0.verified(using: publicKey) }
     }
 
-    /// Returns the current device-owned key bundle, falling back to legacy fields stored
-    /// in the account-signed device entry for configurations created before bundle support.
+    /// Returns the current device-owned key bundle.
+    ///
+    /// Unlock migration mints a signed bundle for the local device. Peer
+    /// configurations that predate bundle support still carry long-term keys on
+    /// the account-signed device entry; synthesize a bundle from those fields
+    /// because this process cannot re-sign a foreign device key.
     public func currentDeviceKeyBundle(for device: UserDeviceConfiguration) throws -> DeviceKeyBundle {
         let deviceSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
         if let signedBundle = signedDeviceKeyBundles.last(where: { $0.id == device.deviceId }) {
@@ -193,7 +197,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         /// - Throws: An error if verification fails.
         public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> UserDeviceConfiguration? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BinaryDecoder().decode(UserDeviceConfiguration.self, from: data)
+            return try? BinaryDecoder().decode(UserDeviceConfiguration.self, from: data)
         }
     }
 
@@ -245,7 +249,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
 
         public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> DeviceKeyBundle? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BinaryDecoder().decode(DeviceKeyBundle.self, from: data)
+            return try? BinaryDecoder().decode(DeviceKeyBundle.self, from: data)
         }
     }
 
@@ -273,12 +277,12 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         /// Initializes a new `SignedOneTimePublicKey` instance.
         ///
         /// - Parameters:
-        ///   - key: The `CurvePublicKey` to be signed.
+        ///   - key: The `X25519PublicKey` to be signed.
         ///   - deviceId: The unique identifier for the device associated with the key.
         ///   - signingKey: The private signing key used for signing.
         /// - Throws: An error if the signing process fails.
         public init(
-            key: CurvePublicKey,
+            key: X25519PublicKey,
             deviceId: UUID,
             signingKey: Curve25519.Signing.PrivateKey
         ) throws {
@@ -289,14 +293,21 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             signature = try signingKey.signature(for: encoded)
         }
 
+        init(id: UUID, deviceId: UUID, data: Data, signature: Data) {
+            self.id = id
+            self.deviceId = deviceId
+            self.data = data
+            self.signature = signature
+        }
+
         /// Verifies the signature of the public one-time key data.
         ///
         /// - Parameter publicKey: The public signing key used for verification.
-        /// - Returns: An optional `CurvePublicKey` if verification is successful.
+        /// - Returns: An optional `X25519PublicKey` if verification is successful.
         /// - Throws: An error if verification fails.
-        public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> CurvePublicKey? {
+        public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> X25519PublicKey? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BinaryDecoder().decode(CurvePublicKey.self, from: data)
+            return X25519KeyDecoding.publicKey(from: data)
         }
     }
 
@@ -347,7 +358,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         /// - Throws: An error if verification fails.
         public func verified(using publicKey: Curve25519.Signing.PublicKey) throws -> MLKEMPublicKey? {
             guard publicKey.isValidSignature(signature, for: data) else { return nil }
-            return try BinaryDecoder().decode(MLKEMPublicKey.self, from: data)
+            return try? BinaryDecoder().decode(MLKEMPublicKey.self, from: data)
         }
     }
 
@@ -364,9 +375,9 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
 
 /// An enum representing the different types of cryptographic keys supported by the system.
 /// This enum is used to distinguish between key types when working with various cryptographic operations.
-public enum KeysType: Sendable {
+public enum KeyKind: Sendable {
     /// Curve25519 elliptic curve keys for classical cryptography.
-    case curve
+    case x25519
     /// Post-quantum KEM keys for quantum-resistant cryptography.
     case mlKEM
 }

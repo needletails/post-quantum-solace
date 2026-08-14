@@ -202,22 +202,28 @@ public struct UserSession: Identifiable, Codable, Sendable, Hashable {
 /// A struct representing one-time keys used for ephemeral key exchange in the Double Ratchet protocol.
 /// These keys are used once and then discarded to provide forward secrecy.
 public struct OneTimeKeys: Codable, Sendable {
-    /// The Curve25519 public key for classical cryptography operations.
-    public let curve: CurvePublicKey?
+    /// The X25519 public key for classical cryptography operations.
+    public let x25519: X25519PublicKey?
 
     /// The MLKEM public key for post-quantum cryptography operations.
     public let mlKEM: MLKEMPublicKey?
 
+    /// Pinned to the 3.x wire keys; renaming them would break interop.
+    private enum CodingKeys: String, CodingKey {
+        case x25519 = "curve"
+        case mlKEM
+    }
+
     /// Initializes a new `OneTimeKeys` instance.
     ///
     /// - Parameters:
-    ///   - curve: The Curve25519 public key for classical cryptography. Optional.
+    ///   - x25519: The X25519 public key for classical cryptography. Optional.
     ///   - mlKEM: The MLKEM public key for post-quantum cryptography. Optional.
     public init(
-        curve: CurvePublicKey? = nil,
+        x25519: X25519PublicKey? = nil,
         mlKEM: MLKEMPublicKey? = nil
     ) {
-        self.curve = curve
+        self.x25519 = x25519
         self.mlKEM = mlKEM
     }
 }
@@ -225,27 +231,34 @@ public struct OneTimeKeys: Codable, Sendable {
 /// A struct representing long-term keys used for persistent identity and authentication.
 /// These keys remain valid for extended periods and are used for device identification.
 public struct LongTermKeys: Codable, Sendable {
-    /// The Curve25519 public key for classical cryptography operations.
-    public let curve: CurvePublicKey?
+    /// The X25519 public key for classical cryptography operations.
+    public let x25519: X25519PublicKey?
 
     /// The Curve25519 public key used for digital signatures and authentication.
-    public let signing: CurvePublicKey?
+    public let signing: X25519PublicKey?
 
     /// The MLKEM public key for post-quantum cryptography operations.
     public let mlKEM: MLKEMPublicKey?
 
+    /// Pinned to the 3.x wire keys; renaming them would break interop.
+    private enum CodingKeys: String, CodingKey {
+        case x25519 = "curve"
+        case signing
+        case mlKEM
+    }
+
     /// Initializes a new `LongTermKeys` instance.
     ///
     /// - Parameters:
-    ///   - curve: The Curve25519 public key for classical cryptography. Optional.
+    ///   - x25519: The X25519 public key for classical cryptography. Optional.
     ///   - signing: The Curve25519 public key used for digital signatures. Optional.
     ///   - mlKEM: The MLKEM public key for post-quantum cryptography. Optional.
     public init(
-        curve: CurvePublicKey? = nil,
-        signing: CurvePublicKey? = nil,
+        x25519: X25519PublicKey? = nil,
+        signing: X25519PublicKey? = nil,
         mlKEM: MLKEMPublicKey? = nil
     ) {
-        self.curve = curve
+        self.x25519 = x25519
         self.signing = signing
         self.mlKEM = mlKEM
     }

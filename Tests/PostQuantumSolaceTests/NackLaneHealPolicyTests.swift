@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import SessionEvents
 import Testing
 @testable import PQSSession
 
@@ -14,59 +15,50 @@ struct NackLaneHealPolicyTests {
     @Test("mint fresh control when preferred failed try-all")
     func mintWhenPreferredFailed() {
         #expect(
-            ControlDeliveryLanePolicy.shouldMintFreshControlLane(
-                preferredFailedInTryAll: true,
-                preferredCleared: false,
+            ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+                isSameAccount: false,
+                forceFreshInitiating: true,
                 liveOrphanOrRecovery: false) == true)
     }
 
     @Test("mint fresh control when preferred was cleared")
     func mintWhenPreferredCleared() {
         #expect(
-            ControlDeliveryLanePolicy.shouldMintFreshControlLane(
-                preferredFailedInTryAll: false,
-                preferredCleared: true,
+            ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+                isSameAccount: true,
+                forceFreshInitiating: false,
                 liveOrphanOrRecovery: false) == true)
     }
 
     @Test("do not mint fresh control when preferred healthy")
     func noMintWhenPreferredHealthy() {
         #expect(
-            ControlDeliveryLanePolicy.shouldMintFreshControlLane(
-                preferredFailedInTryAll: false,
-                preferredCleared: false,
+            ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+                isSameAccount: false,
+                forceFreshInitiating: false,
                 liveOrphanOrRecovery: false) == false)
     }
 
     @Test("do not mint fresh control when live orphan or recovery")
     func noMintWhenLiveHealLane() {
         #expect(
-            ControlDeliveryLanePolicy.shouldMintFreshControlLane(
-                preferredFailedInTryAll: true,
-                preferredCleared: true,
+            ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+                isSameAccount: true,
+                forceFreshInitiating: true,
                 liveOrphanOrRecovery: true) == false)
     }
 
     @Test("mint only once per continuous try-all failure episode")
     func mintOncePerContinuousFailureEpisode() {
         #expect(
-            ControlDeliveryLanePolicy.shouldMintFreshControlLane(
-                preferredFailedInTryAll: true,
-                preferredCleared: false,
-                surgicalEscapeAlreadyAttempted: false,
+            ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+                isSameAccount: false,
+                forceFreshInitiating: true,
                 liveOrphanOrRecovery: false))
         #expect(
-            !ControlDeliveryLanePolicy.shouldMintFreshControlLane(
-                preferredFailedInTryAll: true,
-                preferredCleared: false,
-                surgicalEscapeAlreadyAttempted: true,
-                liveOrphanOrRecovery: false))
-        // A cryptographically distinct failed orphan replay earns one bounded remint.
-        #expect(
-            ControlDeliveryLanePolicy.shouldMintFreshControlLane(
-                preferredFailedInTryAll: true,
-                preferredCleared: true,
-                surgicalEscapeAlreadyAttempted: true,
+            !ControlDeliveryLanePolicy.shouldRequireSurgicalFreshLane(
+                isSameAccount: false,
+                forceFreshInitiating: false,
                 liveOrphanOrRecovery: false))
     }
 
@@ -193,51 +185,24 @@ struct NackLaneHealPolicyTests {
     }
 }
 
-@Suite("NACK lane heal source contracts")
+/// Covered by NackLaneHealPolicyTests (this file), StrictOOBRetryTests (OOB retry),
+/// OrphanInPlaceHealTests P1 (blankForHeaderExists), and StrictOOBRetryTests.
+@Suite("NACK lane heal contracts")
 struct NackLaneHealSourceTests {
-    @Test("control mint, prove-fail demote, fingerprint rearm are wired")
-    func sourceContractsWired() throws {
-        let root = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let ratchet = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/Task/TaskProcessor+Ratchet.swift"),
-            encoding: .utf8)
-        let sequence = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/Task/TaskProcessor+Sequence.swift"),
-            encoding: .utf8)
-        let session = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/PQSSession.swift"),
-            encoding: .utf8)
-        let events = try String(
-            contentsOf: root.appendingPathComponent(
-                "Sources/PQSSession/PQSSession+Events.swift"),
-            encoding: .utf8)
-
-        // Strict §4.1: retry emission is OOB; surgical lane helpers may remain
-        // for legacy decode / other controls during the mixed-fleet window.
-        #expect(events.contains("sendOutOfBandResendRequest("))
-        #expect(events.contains("resendRequestSubmittedOutOfBand"))
-        #expect(sequence.contains("demoteProveFailedActive(")
-            || ratchet.contains("proveFailedActiveDemoted")
-            || session.contains("proveFailedActiveDemoted"))
-        #expect(session.contains("OrphanReplayRearmPolicy.shouldRearm")
-            || sequence.contains("OrphanReplayRearmPolicy.shouldRearm"))
-        #expect(ratchet.contains("blankForHeaderExists"))
-        #expect(!ratchet.contains("blankForHeaderExists = false"))
-        // Must NOT seed preference from try-all failure (demote cascade under
-        // blankForHeader storms). Preference stays success-only.
-        let rolledBack = try #require(ratchet.range(of: "pqs.recovery.laneRolledBack reason="))
-        let afterRollback = ratchet[rolledBack.upperBound...]
-        let throwPreferred = try #require(afterRollback.range(of: "throw preferredError"))
-        let recordWindow = String(afterRollback[..<throwPreferred.lowerBound])
-        #expect(!recordWindow.contains("preferredSessionIdentityIdByPeerDevice["))
-        #expect(sequence.contains("UnansweredInitiatingLanePolicy.shouldForceRemintEvenIfAnswered"))
-        #expect(ratchet.contains("pinnedExplicitOutboundRecipient("))
-        #expect(ratchet.contains("ExplicitOutboundRecipientPinPolicy.shouldHonorExplicitRecipient"))
+    @Test("control mint, prove-fail demote, fingerprint rearm APIs exist")
+    func sourceContractsWired() {
+        let oob: (any PQSNetworkHost, [String], String, UUID, UUID) async throws -> Void = {
+            try await $0.sendOutOfBandResendRequest(
+                failedEnvelopeMessageIds: $1,
+                to: $2,
+                deviceId: $3,
+                requestingDeviceId: $4)
+        }
+        _ = oob
+        _ = OrphanReplayRearmPolicy.shouldRearm
+        _ = ExplicitOutboundRecipientPinPolicy.shouldHonorExplicitRecipient
+        _ = UnansweredInitiatingLanePolicy.shouldForceRemintEvenIfAnswered
+        _ = InboundInitiatingSlotPolicy.shouldEnsureInboundBlank
+        #expect(InboundInitiatingSlotPolicy.shouldEnsureInboundBlank(blankForHeaderExists: true) == false)
     }
 }

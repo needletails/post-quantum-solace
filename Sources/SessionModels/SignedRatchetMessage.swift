@@ -72,7 +72,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
     ///     used to create the digital signature. This key should correspond to the sender's identity.
     /// - Throws:
     ///   - `BinaryEncoderError` if the message cannot be encoded to Binary format
-    ///   - `CryptoError` if the signing operation fails due to invalid key or cryptographic issues
+    ///   - `PQSError` if the signing operation fails due to invalid key or cryptographic issues
     ///   - `Curve25519Error` if the private key is invalid or corrupted
     public init(
         message: RatchetMessage,
@@ -127,7 +127,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
         ///   - signingPrivateKey: The Curve25519 private key used to create the signature.
         /// - Throws:
         ///   - `BinaryEncoderError` if the message cannot be encoded to Binary format
-        ///   - `CryptoError` if the signing operation fails
+        ///   - `PQSError` if the signing operation fails
         init(
             message: RatchetMessage,
             signingPrivateKey: Curve25519.Signing.PrivateKey
@@ -146,7 +146,7 @@ public struct SignedRatchetMessage: Codable & Sendable {
         ///   private key used to create the signature. This should be the sender's public key.
         /// - Returns: `true` if the signature is valid and the message data hasn't been
         ///   tampered with, `false` otherwise.
-        /// - Throws: `CryptoError` if the verification process fails due to cryptographic issues
+        /// - Throws: `PQSError` if the verification process fails due to cryptographic issues
         public func verifySignature(using publicKey: Curve25519.Signing.PublicKey) throws -> Bool {
             publicKey.isValidSignature(signature, for: data)
         }
