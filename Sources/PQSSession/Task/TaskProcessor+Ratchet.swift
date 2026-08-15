@@ -134,32 +134,30 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
         return key
     }
     
-    /// Updates the one-time key for the current session.
+    /// Handles a strict-enforcement consumption request for a one-time key.
     ///
-    /// This method performs key rotation by generating a new Curve25519 one-time key pair
-    /// and removing the old key. The operation is performed asynchronously on a dedicated
-    /// executor to prevent blocking the main cryptographic operations.
+    /// Called by DoubleRatchetKit when an inbound PQXDH bootstrap frame decrypts
+    /// under `enforceOTKConsistency`. The published key is spent — prune its
+    /// signed public entry and publish a freshly minted replacement so the
+    /// server pool stays topped up. The local *private* half is deliberately
+    /// retained (deferred consumption): recovery legitimately replays the
+    /// initiator's first encrypted frame, and the decrypt preflight re-hydrates
+    /// the ratchet state from the pool via `fetchOneTimePrivateKey(_:)`. The
+    /// private key is deleted only when the reverse handshake confirms — see
+    /// `noteAcceptedInboundForDeferredOneTimeKeyConsumption` in
+    /// `TaskProcessor+RatchetInbound.swift`.
     ///
-    /// ## Key Rotation Process
-    /// 1. Generates new Curve25519 key pair
-    /// 2. Signs the new public key with the device's signing key
-    /// 3. Updates session context with new keys
-    /// 4. Removes the old key from storage
-    /// 5. Notifies transport layer of key updates
-    /// 6. Persists encrypted session context
-    ///
-    /// ## Security Considerations
-    /// - Key rotation prevents forward secrecy attacks
-    /// - New keys are signed to prevent impersonation
-    /// - Old keys are securely removed from storage
-    /// - Operation is performed on dedicated executor to prevent timing attacks
+    /// ## Idempotency
+    /// Bootstrap replays repeat this call for the same id. Only the first call
+    /// still finds the id in the signed public list; later calls return without
+    /// minting again.
     ///
     /// ## Performance Considerations
     /// - Key generation is performed asynchronously to avoid blocking
     /// - Network operations are detached to prevent delays
     /// - Failed operations are logged but don't block the session
     ///
-    /// - Parameter id: The UUID of the one-time key to remove and replace.
+    /// - Parameter id: The UUID of the spent one-time key.
     func updateOneTimeKey(remove id: UUID) async {
         // If we do not detach then the ratchet encrypt takes too long due to the network
         updateKeyTasks.append(Task(executorPreference: keyTransportExecutor) { [weak self] in
@@ -172,23 +170,31 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
                     throw PQSError.sessionNotInitialized
                 }
                 
+                guard var signedKeys = await session
+                    .sessionContext?
+                    .activeUserConfiguration
+                    .signedOneTimePublicKeys
+                else { return }
+                
+                // Replay idempotency: only the first consumption request for this
+                // id still finds its signed public entry.
+                guard signedKeys.contains(where: { $0.id == id }) else {
+                    await cancelAndRemoveUpdateKeyTasks()
+                    return
+                }
+                
                 let newID = UUID()
                 let keypair = crypto.generateCurve25519PrivateKey()
                 let privateKeyRep = try X25519PrivateKey(id: newID, keypair.rawRepresentation)
                 let publicKey = try X25519PublicKey(id: newID, keypair.publicKey.rawRepresentation)
                 
                 var deviceKeys = sessionContext.sessionUser.deviceKeys
-                deviceKeys.oneTimePrivateKeys.removeAll { $0.id == id }
+                // Deferred consumption: retain the spent private key until the
+                // reverse handshake confirms; only append the replacement here.
                 deviceKeys.oneTimePrivateKeys.append(privateKeyRep)
                 
                 sessionContext.sessionUser.deviceKeys = deviceKeys
                 sessionContext.updateSessionUser(sessionContext.sessionUser)
-                
-                guard var signedKeys = await session
-                    .sessionContext?
-                    .activeUserConfiguration
-                    .signedOneTimePublicKeys
-                else { return }
                 
                 let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
                 let newSignedKey = try UserConfiguration.SignedOneTimePublicKey(key: publicKey, deviceId: sessionContext.sessionUser.deviceId, signingKey: signingKey)
@@ -288,25 +294,24 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
     ) async throws {
         self.session = session
         await ratchetManager.setDelegate(self)
-        // Strict OTK enforcement stays OFF in 4.0: PQS recovery replays the first
-        // encrypted outbound frame (transport failure / lane repair), which requires
-        // the initial one-time key to remain resolvable until the reverse handshake
-        // confirms. Enforcement consumes the OTK on first decrypt and fails fast on
-        // replays, stalling rotation/repair flows.
+        // Strict OTK enforcement is ON as of 4.1.0, paired with PQS-side deferred
+        // consumption (Documentation.docc/DeferredOTKConsumption.md):
         //
-        // Deferred consumption is designed (not yet implemented) in
-        // Documentation.docc/DeferredOTKConsumption.md: consume on the
-        // reverse-handshake-confirmed event (first inbound header-chain frame),
-        // via the existing SessionIdentityDelegate.updateOneTimeKey(remove:) hook.
-        // Enabling it later is additive — this flag is runtime and the delegate
-        // surface already exists — so it is scheduled for a 4.1 minor, not this break.
-        //
-        // Until then the private OTK is retained longer than the Double Ratchet
-        // specification's ideal, which slightly extends the window in which a later
-        // device compromise could decrypt a recorded initial handshake frame. Wire
-        // confidentiality is unaffected and server-side single-use of published
-        // OTKs still holds.
-        await ratchetManager.setEnforceOTKConsistency(false)
+        // - DRK consumes on every authenticated decrypt whose header cites an
+        //   oneTimeKeyId: it fires updateOneTimeKey(remove:) and clears the state
+        //   copy of the OTK.
+        // - PQS's delegate treats that as a consumption *request*: it replaces the
+        //   published public key but retains the private half in the device-key
+        //   pool. The state copy is restored right after commit
+        //   (restoreDeferredOneTimeKeyIntoRatchetState) because DRK 4.0.0 lanes
+        //   embed and re-use the OTK in every epoch re-key — letting it go nil
+        //   desyncs the peer's chains.
+        // - The private half is deleted when a committed inbound frame proves the
+        //   lane can no longer cite it: the lane re-keyed onto a different OTK id,
+        //   or (future DRK) frames stop citing entirely. Tracked in
+        //   DeviceKeys.pendingOneTimeKeyConsumptions. After deletion, a bootstrap
+        //   replay fails fast in the decrypt preflight.
+        await ratchetManager.setEnforceOTKConsistency(true)
         switch task {
         case let .writeMessage(outboundTask):
             try await handleWriteMessage(
@@ -331,7 +336,8 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
     func loadKeys(
         props: SessionIdentity.UnwrappedProps,
         sessionContext: SessionContext,
-        session: PQSSession
+        session: PQSSession,
+        sessionIdentityId: UUID
     ) async throws -> LoadedKeysResult {
         /// What are our requirements? We need to ensure that the proper keys are loaded for local and remote
         /// What are our scenarios?
@@ -424,6 +430,24 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
             remoteMLKEMPublicKey = props.mlKEMPublicKey
         }
         
+        // Strict encrypt throws if a sending handshake still wants a remote OTK
+        // but the state copy of our local OTK is gone (cleared on inbound
+        // consume, or a reminted lane that kept peer OTK props). Re-supply
+        // from the deferred-consumption pool only while the sending handshake
+        // is unfinished — doing so after the handshake would look like a
+        // sending-key change and trigger a DH ratchet.
+        if localOneTimePrivateKey == nil {
+            let needsSendingHandshake: Bool
+            if let status = try? await ratchetManager.sessionStatus(sessionId: sessionIdentityId) {
+                needsSendingHandshake = !status.sendingHandshakeFinished
+            } else {
+                needsSendingHandshake = !props.hasRatchetState
+            }
+            if needsSendingHandshake {
+                localOneTimePrivateKey = effectiveSessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last
+            }
+        }
+
         if shouldEmitKeyPayloadLogs {
             logger.log(level: .debug, message: """
                 loadKeys: recipient=\(props.secretName) \n

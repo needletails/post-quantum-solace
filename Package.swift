@@ -29,7 +29,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/needletails/binary-codable.git", from: "1.0.5"),
-        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "4.0.0"),
+        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "4.1.0"),
         .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.5"),
         .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.5")
     ],

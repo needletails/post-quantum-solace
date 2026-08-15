@@ -1,9 +1,8 @@
 # Deferred One-Time-Key Consumption
 
-Design for enabling strict one-time-key (OTK) enforcement without breaking
-recovery replays. Status: **designed, not yet implemented** — strict
-enforcement stays off in 4.0.0. Implementation is additive (no public API
-break) and targets a 4.1 minor of DoubleRatchetKit and Post-Quantum Solace.
+Strict one-time-key (OTK) enforcement without breaking recovery replays.
+Status: **implemented in Post-Quantum Solace 4.1.0**, entirely on the PQS
+side — DoubleRatchetKit 4.0.0 is used as-is, no DRK changes were required.
 
 ## Problem
 
@@ -11,99 +10,141 @@ DoubleRatchetKit supports strict OTK enforcement
 (`setEnforceOTKConsistency(true)`): on the first authenticated decrypt of an
 inbound PQXDH bootstrap frame, it consumes the local one-time prekey — it
 calls `SessionIdentityDelegate.updateOneTimeKey(remove:)` and clears
-`localOneTimePrivateKey` from the ratchet state — and fails fast if the same
-bootstrap frame arrives again.
+`localOneTimePrivateKey` from the ratchet state.
 
-Post-Quantum Solace cannot enable that today because recovery legitimately
-replays the initiator's first encrypted frame:
+Post-Quantum Solace could not enable that in 4.0.0 because recovery
+legitimately replays the initiator's first encrypted frame:
 
 - transport failure / lane repair resends the original bootstrap frame;
 - archived-identity fallback re-runs session establishment against an older
-  snapshot.
+  snapshot or a freshly ensured blank lane.
 
-Consumption-on-first-decrypt makes those replays fail fast and strands
-rotation/repair flows. So 4.0.0 ships with enforcement off, and the private
-OTK is retained until normal batch rotation.
+If the private OTK were *deleted* at first decrypt, those replays would fail
+fast and strand rotation/repair flows.
 
-### Current security posture
+## Why no DoubleRatchetKit changes were needed
 
-The retained private OTK slightly extends the window in which a *later
-device compromise* could decrypt a *recorded bootstrap frame* for that
-session. Wire confidentiality is unaffected, and server-side single-use of
-published OTKs still holds. The exposure is bounded to the initial handshake
-frame, not the conversation.
+Four properties of DRK 4.0.0 make the deferral implementable purely in the
+Post-Quantum Solace delegate layer:
+
+1. **Consumption fires only after authenticated decrypt.** All strict-mode
+   consumption sites run after the bootstrap frame passes AEAD
+   authentication, and DRK clears the `RatchetState` copy of the OTK itself.
+2. **The decrypt preflight re-hydrates from the host pool.** When a
+   bootstrap frame cites an `oneTimeKeyId` and the state copy is gone, DRK
+   asks the delegate via `fetchOneTimePrivateKey(_:)` and only throws
+   `missingOneTimeKey` under strict mode when the host pool also lacks the
+   key. Whether a replay decrypts is therefore decided by *when PQS deletes
+   the pool key* — which is exactly the lever this design controls.
+3. **`updateOneTimeKey(remove:)` is a notification, not a command.** The
+   delegate owns the pool; deferring the destructive part is a delegate
+   implementation detail, invisible to DRK.
+4. **The lane still needs the state copy after every consume.** In
+   DRK 4.0.0 the OTK is not a one-shot bootstrap key: its public half is
+   embedded in every outgoing header while present in state, and it
+   participates in every PQXDH epoch re-key. Strict mode clears the state
+   copy on every consuming decrypt, so after each commit PQS writes the pool
+   key back via `respondToSession` (a local-key change, not a sending DH
+   ratchet). This restore is deliberately unconditional: if the state copy
+   stayed nil, the next outbound header would embed no OTK and the peer
+   would perform a receive-driven epoch re-key we never mirrored — permanent
+   chain divergence. Once the pool key is deleted (lane superseded) the
+   restore becomes a no-op.
 
 ## Design
 
-### The confirming event (no timers)
+### The confirming events (no timers)
 
-The initiator keeps emitting the PQXDH bootstrap header — which carries
-`oneTimeKeyId` — until its `sendingHandshakeFinished` flag flips, and that
-flag flips only after the initiator has processed the responder's first
-authenticated reply. Therefore, on the responder:
+Because a DRK 4.0.0 lane embeds and re-uses its OTK in every epoch re-key,
+a live lane cites the same `oneTimeKeyId` for its whole lifetime — "the
+initiator stops citing after the reverse handshake" does **not** happen
+with this DRK release. The events that *do* prove a key can never be
+legitimately cited again are:
 
-> The first inbound frame decrypted via the header-chain path (no
-> `oneTimeKeyId`; post-bootstrap turn) is cryptographic proof that the
-> initiator has advanced past the handshake and can never legitimately
-> resend the bootstrap frame.
+> 1. **Lane re-key (supersede).** A committed inbound frame on the same
+>    lane citing a *different* `oneTimeKeyId`: the peer re-fetched our
+>    bundle and epoch re-keyed the lane, so the superseded key is
+>    unreachable for it from that point on.
+> 2. **No-id frame.** A committed inbound frame with no `oneTimeKeyId`:
+>    the lane operates without an OTK. This is also the forward-compatible
+>    trigger for a future DRK that stops citing once the reverse handshake
+>    completes.
 
-Call this event **reverse handshake confirmed**. It is observable purely
-from protocol state — no elapsed-time heuristics are involved.
+Both events are observable purely from protocol state — no elapsed-time
+heuristics are involved — and PQS observes them directly because it decodes
+every inbound header before handing the frame to DRK. Pending entries whose
+lane never re-keys are bounded by normal batch key rotation.
 
-### State machine
+### State machine (all PQS-owned)
 
-| State | Owner | Set when | Cleared when |
-|---|---|---|---|
-| `pendingConsumedOneTimeKeyId` (new, optional, persisted in `RatchetState`) | DoubleRatchetKit | Bootstrap decrypt succeeds with an OTK, instead of consuming immediately | Reverse handshake confirmed |
-| Local private OTK in device keys | Post-Quantum Solace (delegate) | Key generation / publication | `updateOneTimeKey(remove:)` fires on confirmation |
+| State | Set when | Cleared when |
+|---|---|---|
+| Signed public OTK entry in `activeUserConfiguration` | Key publication | First `updateOneTimeKey(remove:)` for the id — pruned and a freshly minted replacement is published (doubles as the mint-once idempotency marker) |
+| `DeviceKeys.pendingOneTimeKeyConsumptions` (optional, persisted in the session context) | A committed inbound frame citing one-time-key ids — recorded against the winning lane in `finalizeAcceptedInbound` | A confirming event on that lane (re-key supersede or no-id frame) |
+| Private OTK halves in `DeviceKeys` pools | Key generation | Confirming event — deleted together with the pending entry, unless still pending for a sibling lane |
 
-On **reverse handshake confirmed**, DoubleRatchetKit:
+Implementation points:
 
-1. persists the ratchet state with the pending marker cleared,
-2. clears `localOneTimePrivateKey` from state,
-3. calls `SessionIdentityDelegate.updateOneTimeKey(remove: id)` — the hook
-   that already exists; no new delegate requirements.
+- `TaskProcessor.updateOneTimeKey(remove:)` (`TaskProcessor+Ratchet.swift`)
+  handles the consumption *request*: prune the spent signed public key,
+  mint + publish the replacement, keep the private half. Replay-idempotent.
+  `loadKeys` also re-supplies a pool key when a reminted lane starts a
+  sending handshake with a cleared state copy.
+- `noteAcceptedInboundForDeferredOneTimeKeyConsumption`
+  (`TaskProcessor+RatchetInbound.swift`) records and confirms pending
+  consumptions. It runs inside `finalizeAcceptedInbound`, i.e. only for
+  frames whose accepted-ledger write succeeded — a rolled-back decrypt can
+  neither record nor confirm.
+- The MLKEM one-time key cited by the hybrid PQXDH bootstrap follows the
+  same lifecycle and is deleted on the same confirming event. The final
+  (last-resort) MLKEM key is never consumed. MLKEM pool replenishment stays
+  with the existing batch-rotation flow.
 
-The same lifecycle applies to the MLKEM one-time key consumed by the hybrid
-PQXDH derivation.
+### Replay behavior
 
-### Replay behavior once implemented
-
-- Bootstrap replay **before** confirmation: decrypts via the retained OTK —
-  identical to today's behavior; recovery flows unaffected.
-- Bootstrap replay **after** confirmation: fails fast under strict
-  enforcement — now *correct*, because the initiator provably advanced; a
-  bootstrap replay at that point is an attacker or a bug.
+- Bootstrap replay **before** confirmation: the decrypt preflight
+  re-hydrates the state OTK from the retained pool key — recovery flows
+  (lane repair, archived-identity fallback, ensured blank lanes) are
+  unaffected.
+- Bootstrap replay **after** confirmation: the pool key is gone, so the
+  preflight fails fast under strict enforcement — *correct*, because the
+  initiator provably advanced; a bootstrap replay at that point is an
+  attacker or a bug.
 
 ### Crash and idempotency safety
 
-The pending marker is persisted with the ratchet state before the delegate
-deletion runs, so a crash between decrypt and deletion replays the deletion
-idempotently on the next confirmation. Deletion is keyed by OTK id and is
-already idempotent on the Post-Quantum Solace side.
+- The pending record is persisted in the encrypted session context in the
+  same write that mutates the pools, so a crash cannot separate them.
+- An unrecorded pending entry is re-recorded by the next committed frame
+  citing the id; an unconfirmed one is re-confirmed by the next committed
+  frame after the lane's confirming event. Both directions self-heal
+  without timers.
+- Deletion is keyed by key id (`removeAll { $0.id == id }`) and idempotent.
+- Pending entries whose lane never confirms (abandoned handshake) are
+  bounded by normal batch key rotation, which replaces the pools wholesale;
+  a stale entry then confirms as a no-op.
 
-### Why this is not API-breaking
+### Persistence compatibility
 
-- `enforceOTKConsistency` is a runtime toggle (`setEnforceOTKConsistency`),
-  flipped internally by the message pipeline — enabling it later changes no
-  signatures.
-- `SessionIdentityDelegate.updateOneTimeKey(remove:)` already exists.
-- The new `RatchetState` field is optional; legacy blobs decode unchanged
-  (the codebase already validates this pattern with pre-existing
-  legacy-decode tests and golden persisted-data fixtures).
+`DeviceKeys.pendingOneTimeKeyConsumptions` is optional with an additive
+coding key and resets to `nil` when the last entry clears, so:
 
-## Implementation-phase verification checklist
+- session contexts persisted before 4.1.0 decode unchanged;
+- encodes are byte-identical to 4.0.0 whenever nothing is pending (golden
+  fixtures unaffected).
 
-1. Prove from code and dogfood logs that archived-identity fallback decrypts
-   bootstrap replays via retained snapshot state without re-requiring the
-   private OTK. If a snapshot re-derivation path *does* require it, gate the
-   delegate deletion on the last referencing snapshot being pruned
-   (Post-Quantum Solace owns snapshot lifecycle).
-2. Replay tests: bootstrap replay before and after confirmation; crash
-   between marker persistence and deletion; multi-device fan-out where
-   sibling lanes are still pre-confirmation while one lane confirms.
-3. Golden fixtures: existing 3.x/4.0 blobs decode byte-identically; the new
-   field only appears in encodes when a consumption is actually pending.
+## Verification results (was: implementation-phase checklist)
+
+1. **Archived/blank-lane replays** — verified in code: the decrypt preflight
+   hydrates from the pool, and `initializeRecipient` additionally falls back
+   to the OTK retained inside archived ratchet state
+   (`props.ratchetOneTimePrivateKey`). No snapshot path re-requires a
+   deleted pool key before confirmation.
+2. **Replay tests** — `DeferredOTKConsumptionTests` covers pending-record on
+   bootstrap, retention before confirmation, deletion + clearing on
+   confirmation, and mint-once idempotency of the consumption request.
+3. **Golden fixtures** — unchanged; the new field only appears in encodes
+   while a consumption is actually pending.
 
 ## See also
 
