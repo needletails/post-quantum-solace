@@ -9285,7 +9285,12 @@ actor EndToEndTests {
                 var reconciliationTriggered = false
                 private var msgCount = 0
 
-                func capture(_ msg: ReceivedMessage) { captured = msg }
+                // Idempotent: ack-overdue resends and orphan-resend replays of
+                // suppressed traffic re-enter the capture gate; only the first
+                // suppressed envelope is the one this test replays.
+                func capture(_ msg: ReceivedMessage) {
+                    if captured == nil { captured = msg }
+                }
                 func getCaptured() -> ReceivedMessage? { captured }
                 func isCaptured(_ msg: ReceivedMessage) -> Bool { captured?.messageId == msg.messageId }
                 func markDecrypted() { messageDecrypted = true }
@@ -9406,6 +9411,21 @@ actor EndToEndTests {
 
             for _ in 0..<60 {
                 if await probe.messageDecrypted { break }
+                // The archive walk may run as a deferred `.background` pass
+                // (active-first inbound policy): when ack-overdue recovery
+                // traffic has re-keyed the active lane before the replay, the
+                // inline `receiveMessage` call throws while the deferred pass
+                // decrypts from the archived snapshot and persists the message
+                // internally. Both are archive recoveries without
+                // reconciliation, so accept the persisted record as success.
+                let persistedFromArchive = await recipientStore.createdMessages.contains {
+                    $0.sharedId == oldMessage.messageId
+                        || $0.sharedId == oldMessage.logicalMessageId
+                }
+                if persistedFromArchive {
+                    await probe.markDecrypted()
+                    break
+                }
                 try await Task.sleep(for: .milliseconds(100))
             }
 

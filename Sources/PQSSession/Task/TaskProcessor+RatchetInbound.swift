@@ -380,6 +380,18 @@ extension MessagePipeline {
                 decryptedData = data
             }
 
+            // Strict mode clears the state copy of the OTK after authenticated
+            // decrypt, but DRK 4.0.0 lanes embed and re-use that key in every
+            // epoch re-key, so it must be written back or the peer's chains
+            // desync. Re-run recipient init while the private half is still in
+            // the pool: `respondToSession` sees a local-key change and writes
+            // the OTK back without a sending DH ratchet. Once the key is
+            // deleted (lane superseded) this is a no-op, so replays fail fast.
+            await restoreDeferredOneTimeKeyIntoRatchetState(
+                sessionIdentity: decryptionSessionIdentity,
+                session: session,
+                ratchetMessage: verificationResult.ratchetMessage)
+
 #if DEBUG
             if let transform = await session._testDecryptedPayloadTransform {
                 decryptedData = transform(decryptedData)
@@ -424,7 +436,9 @@ extension MessagePipeline {
                             decryptionSessionIdentity = try await finalizeAcceptedInbound(
                                 decryptionSessionIdentity,
                                 inboundTask: inboundTask,
-                                session: session)
+                                session: session,
+                                headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
                             return
                         }
 
@@ -445,7 +459,9 @@ extension MessagePipeline {
                             decryptionSessionIdentity = try await finalizeAcceptedInbound(
                                 decryptionSessionIdentity,
                                 inboundTask: inboundTask,
-                                session: session)
+                                session: session,
+                                headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
                             return
                         case .skipStale:
                             logger.log(
@@ -455,7 +471,9 @@ extension MessagePipeline {
                             decryptionSessionIdentity = try await finalizeAcceptedInbound(
                                 decryptionSessionIdentity,
                                 inboundTask: inboundTask,
-                                session: session)
+                                session: session,
+                                headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
                             return
                         case .process:
                             processedReestablishment = envelope
@@ -520,7 +538,9 @@ extension MessagePipeline {
                                     decryptionSessionIdentity = try await finalizeAcceptedInbound(
                                         decryptionSessionIdentity,
                                         inboundTask: inboundTask,
-                                        session: session)
+                                        session: session,
+                                        headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
+                                        headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
                                     return
                                 }
                                 // Keep the proven lane after a correlated peerRefresh
@@ -582,7 +602,9 @@ extension MessagePipeline {
                             decryptionSessionIdentity = try await finalizeAcceptedInbound(
                                 decryptionSessionIdentity,
                                 inboundTask: inboundTask,
-                                session: session)
+                                session: session,
+                                headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
                             return
                         }
                         try await session.installLinkedDeviceReprovisioningBundle(bundle)
@@ -645,6 +667,8 @@ extension MessagePipeline {
                     decryptionSessionIdentity,
                     inboundTask: inboundTask,
                     session: session,
+                    headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
+                    headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
                     acknowledgeTransport: false)
                 didAcceptInbound = true
             } else if await shouldAcceptWithoutChatRow(decodedMessage, session: session) {
@@ -655,6 +679,8 @@ extension MessagePipeline {
                     decryptionSessionIdentity,
                     inboundTask: inboundTask,
                     session: session,
+                    headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
+                    headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
                     acknowledgeTransport: false)
                 didAcceptInbound = true
             }
@@ -797,6 +823,8 @@ extension MessagePipeline {
         _ decryptionSessionIdentity: SessionIdentity,
         inboundTask: InboundTaskMessage,
         session: PQSSession,
+        headerOneTimeKeyId: UUID?,
+        headerMLKEMOneTimeKeyId: UUID?,
         acknowledgeTransport: Bool = true
     ) async throws -> SessionIdentity {
         let activated = try await session.activateSessionIdentityAfterInboundDecrypt(
@@ -809,6 +837,13 @@ extension MessagePipeline {
             senderDeviceId: inboundTask.senderDeviceId,
             envelopeMessageId: inboundTask.sharedMessageId,
             logicalSharedId: inboundTask.resolvedLogicalSharedId)
+        // Deferred OTK consumption is driven only by committed frames, so a
+        // rolled-back decrypt can neither record nor confirm a consumption.
+        await noteAcceptedInboundForDeferredOneTimeKeyConsumption(
+            laneId: activated.id,
+            headerOneTimeKeyId: headerOneTimeKeyId,
+            headerMLKEMOneTimeKeyId: headerMLKEMOneTimeKeyId,
+            session: session)
         preferredSessionIdentityIdByPeerDevice[
             peerDeviceIdentityPreferenceKey(
                 secretName: inboundTask.senderSecretName,
@@ -824,6 +859,129 @@ extension MessagePipeline {
             level: .info,
             message: "pqs.recovery.laneSelectedAfterInboundDecrypt sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) sessionId=\(activated.id)")
         return activated
+    }
+
+    /// Writes the deferred OTK back into ratchet state after strict-mode decrypt
+    /// cleared it. No-op when the header cites no OTK or the private half has
+    /// already been deleted (lane superseded).
+    ///
+    /// This restore is deliberately **unconditional** for cited frames. In
+    /// DRK 4.0.0 the state OTK is not a one-shot bootstrap key: its public half
+    /// is embedded in every outgoing header while present, and it participates
+    /// in every PQXDH epoch re-key. If we let the state copy stay nil after a
+    /// consuming decrypt, our next outbound header embeds no OTK, the peer's
+    /// `hasReceivingKeyChanges` sees an identity-key change, and it performs a
+    /// receive-driven epoch re-key that we never mirrored — permanent chain
+    /// divergence (`maxSkippedHeadersExceeded` storms). Verified empirically:
+    /// gating this restore on `sendingHandshakeFinished` produced exactly that
+    /// divergence.
+    private func restoreDeferredOneTimeKeyIntoRatchetState(
+        sessionIdentity: SessionIdentity,
+        session: PQSSession,
+        ratchetMessage: RatchetMessage
+    ) async {
+        guard let otkId = ratchetMessage.header.oneTimeKeyId else { return }
+        guard let sessionContext = await session.sessionContext else { return }
+        guard sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.contains(where: { $0.id == otkId }) else {
+            return
+        }
+        do {
+            try await initializeRecipient(
+                sessionIdentity: sessionIdentity,
+                session: session,
+                ratchetMessage: ratchetMessage)
+        } catch {
+            logger.log(
+                level: .error,
+                message: "pqs.otk.restoreIntoRatchetStateFailed lane=\(sessionIdentity.id.uuidString) otkId=\(otkId.uuidString) error=\(error)")
+        }
+    }
+
+    private func noteAcceptedInboundForDeferredOneTimeKeyConsumption(
+        laneId: UUID,
+        headerOneTimeKeyId: UUID?,
+        headerMLKEMOneTimeKeyId: UUID?,
+        session: PQSSession
+    ) async {
+        do {
+            guard var sessionContext = await session.sessionContext else { return }
+            var deviceKeys = sessionContext.sessionUser.deviceKeys
+            var mutated = false
+            var confirmed: [PendingOneTimeKeyConsumption] = []
+            // Only the X25519 `oneTimeKeyId` discriminates lanes here. In
+            // DRK 4.0.0 a live lane cites its bootstrap OTK id for its whole
+            // lifetime (the state OTK participates in every epoch re-key), so
+            // the deletion-confirming events are:
+            //   1. A committed frame on the same lane citing a *different* id —
+            //      the peer re-fetched our bundle and epoch re-keyed the lane,
+            //      so the superseded key can never be legitimately cited again.
+            //   2. A committed frame with no id — a lane established without an
+            //      OTK, and the forward-compatible trigger for a future DRK
+            //      that stops citing after the reverse handshake completes.
+            // `mlKEMOneTimeKeyId` mirrors non-optional lane state and is cited
+            // on every frame forever, so it never drives confirmation alone.
+            if let headerOneTimeKeyId {
+                let laneEntries = deviceKeys.removePendingOneTimeKeyConsumptions(for: laneId)
+                for entry in laneEntries {
+                    if entry.oneTimeKeyId == headerOneTimeKeyId {
+                        deviceKeys.recordPendingOneTimeKeyConsumption(entry)
+                    } else {
+                        confirmed.append(entry)
+                        mutated = true
+                    }
+                }
+                // Record only keys we can actually delete later. A bootstrap
+                // decrypted purely via archived-state fallback (pool already
+                // rotated) has nothing to defer.
+                let alreadyPending = (deviceKeys.pendingOneTimeKeyConsumptions ?? []).contains {
+                    $0.sessionIdentityId == laneId && $0.oneTimeKeyId == headerOneTimeKeyId
+                }
+                if !alreadyPending,
+                   deviceKeys.oneTimePrivateKeys.contains(where: { $0.id == headerOneTimeKeyId }) {
+                    // The cited MLKEM id is consumable only while it is a pool key —
+                    // the final (last-resort) MLKEM key is never consumed.
+                    let pendingMLKEMId = headerMLKEMOneTimeKeyId.flatMap { id in
+                        deviceKeys.mlKEMOneTimePrivateKeys.contains(where: { $0.id == id }) ? id : nil
+                    }
+                    deviceKeys.recordPendingOneTimeKeyConsumption(PendingOneTimeKeyConsumption(
+                        sessionIdentityId: laneId,
+                        oneTimeKeyId: headerOneTimeKeyId,
+                        mlKEMOneTimeKeyId: pendingMLKEMId))
+                    mutated = true
+                    audit(.recovery, "pqs.otk.consumptionPending lane=\(laneId.uuidString) otkId=\(headerOneTimeKeyId.uuidString) mlkemId=\(pendingMLKEMId?.uuidString ?? "nil")")
+                }
+            } else {
+                confirmed = deviceKeys.removePendingOneTimeKeyConsumptions(for: laneId)
+                mutated = !confirmed.isEmpty
+            }
+
+            for entry in confirmed {
+                if let otkId = entry.oneTimeKeyId,
+                   !deviceKeys.isOneTimeKeyStillPending(otkId) {
+                    deviceKeys.oneTimePrivateKeys.removeAll { $0.id == otkId }
+                }
+                if let kemId = entry.mlKEMOneTimeKeyId,
+                   !deviceKeys.isMLKEMOneTimeKeyStillPending(kemId) {
+                    deviceKeys.mlKEMOneTimePrivateKeys.removeAll { $0.id == kemId }
+                }
+                let trigger = headerOneTimeKeyId == nil ? "reverseHandshake" : "laneRekey"
+                audit(.recovery, "pqs.otk.consumedAfterConfirmation trigger=\(trigger) lane=\(laneId.uuidString) otkId=\(entry.oneTimeKeyId?.uuidString ?? "nil") mlkemId=\(entry.mlKEMOneTimeKeyId?.uuidString ?? "nil")")
+            }
+
+            guard mutated else { return }
+            sessionContext.sessionUser.deviceKeys = deviceKeys
+            sessionContext.updateSessionUser(sessionContext.sessionUser)
+            await session.setSessionContext(sessionContext)
+            let encodedData = try BinaryEncoder().encode(sessionContext)
+            guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: session.getAppSymmetricKey()) else {
+                throw PQSError.sessionEncryptionError
+            }
+            try await session.cache?.updateLocalSessionContext(encryptedConfig)
+        } catch {
+            logger.log(
+                level: .error,
+                message: "pqs.otk.deferredConsumptionBookkeepingFailed lane=\(laneId.uuidString) error=\(error)")
+        }
     }
 
     private func acknowledgeAcceptedInbound(

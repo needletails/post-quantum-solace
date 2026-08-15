@@ -56,6 +56,7 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
         case finalMLKEMPrivateKey = "f" // Final Post-Quantum private key
         case rotateKeysDate = "g" // Date to rotate the keys
         case deviceAuthMLDSA = "h" // ML-DSA-65 device JWT signing state
+        case pendingOneTimeKeyConsumptions = "i" // Deferred OTK consumptions awaiting reverse-handshake confirmation
     }
 
     /// Unique identifier for the device.
@@ -120,6 +121,22 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     /// `updateDeviceAuthMLDSA(_:)`.
     public private(set) var deviceAuthMLDSA: DeviceAuthMLDSAState?
 
+    /// Deferred one-time-key consumptions awaiting reverse-handshake confirmation.
+    ///
+    /// Strict OTK enforcement (4.1.0) marks a bootstrap's one-time keys as spent
+    /// at first authenticated decrypt, but the private halves must stay resolvable
+    /// until the initiator provably advances past the handshake — recovery replays
+    /// the initiator's first encrypted frame. Each entry names the receive lane
+    /// whose bootstrap consumed the keys; the first *committed* inbound frame on
+    /// that lane without a one-time-key id deletes the private halves and clears
+    /// the entry.
+    ///
+    /// Optional so session contexts persisted before 4.1.0 decode unchanged, and
+    /// `nil` while nothing is pending so encodes stay byte-identical to 4.0.0.
+    /// Mutate only through `recordPendingOneTimeKeyConsumption(_:)` and
+    /// `removePendingOneTimeKeyConsumptions(for:)`.
+    public private(set) var pendingOneTimeKeyConsumptions: [PendingOneTimeKeyConsumption]?
+
     /// Initializes a new instance of `DeviceKeys` with all required cryptographic material.
     ///
     /// This initializer creates a complete set of device keys for secure communication.
@@ -179,6 +196,71 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     /// the key material (e.g. when the server reports the key was superseded).
     public mutating func updateDeviceAuthMLDSA(_ state: DeviceAuthMLDSAState?) {
         deviceAuthMLDSA = state
+    }
+
+    /// Records a deferred one-time-key consumption for a receive lane.
+    /// Idempotent: re-recording an identical entry (bootstrap replay) is a no-op.
+    public mutating func recordPendingOneTimeKeyConsumption(_ entry: PendingOneTimeKeyConsumption) {
+        var entries = pendingOneTimeKeyConsumptions ?? []
+        guard !entries.contains(entry) else { return }
+        entries.append(entry)
+        pendingOneTimeKeyConsumptions = entries
+    }
+
+    /// Removes and returns every pending consumption recorded for a receive lane.
+    /// Resets the field to `nil` when the last entry is removed so encodes stay
+    /// byte-identical to pre-4.1.0 blobs while nothing is pending.
+    public mutating func removePendingOneTimeKeyConsumptions(for sessionIdentityId: UUID) -> [PendingOneTimeKeyConsumption] {
+        guard var entries = pendingOneTimeKeyConsumptions else { return [] }
+        let matched = entries.filter { $0.sessionIdentityId == sessionIdentityId }
+        guard !matched.isEmpty else { return [] }
+        entries.removeAll { $0.sessionIdentityId == sessionIdentityId }
+        pendingOneTimeKeyConsumptions = entries.isEmpty ? nil : entries
+        return matched
+    }
+
+    /// True while any remaining pending entry still names this X25519 one-time key.
+    /// A sibling lane that bootstrapped with the same published key must keep the
+    /// private half until that lane also confirms.
+    public func isOneTimeKeyStillPending(_ id: UUID) -> Bool {
+        (pendingOneTimeKeyConsumptions ?? []).contains { $0.oneTimeKeyId == id }
+    }
+
+    /// True while any remaining pending entry still names this MLKEM one-time key.
+    public func isMLKEMOneTimeKeyStillPending(_ id: UUID) -> Bool {
+        (pendingOneTimeKeyConsumptions ?? []).contains { $0.mlKEMOneTimeKeyId == id }
+    }
+}
+
+/// A deferred one-time-key consumption: the keys an inbound PQXDH bootstrap
+/// decrypt marked as spent, retained until the reverse handshake confirms.
+///
+/// The confirming event is protocol state, not elapsed time: the initiator keeps
+/// citing the one-time-key id until it has processed the responder's first
+/// authenticated reply, so the first committed inbound frame on the lane without
+/// a one-time-key id proves the bootstrap can never legitimately replay again.
+public struct PendingOneTimeKeyConsumption: Codable, Sendable, Equatable {
+    enum CodingKeys: String, CodingKey {
+        case sessionIdentityId = "a"
+        case oneTimeKeyId = "b"
+        case mlKEMOneTimeKeyId = "c"
+    }
+
+    /// The receive lane (session identity) whose bootstrap consumed the keys.
+    public let sessionIdentityId: UUID
+
+    /// X25519 one-time private key pending deletion, if the bootstrap cited one.
+    public let oneTimeKeyId: UUID?
+
+    /// MLKEM one-time private key pending deletion, if the bootstrap cited a
+    /// pool key. Always `nil` when the final (last-resort) MLKEM key was used —
+    /// that key is never consumed.
+    public let mlKEMOneTimeKeyId: UUID?
+
+    public init(sessionIdentityId: UUID, oneTimeKeyId: UUID?, mlKEMOneTimeKeyId: UUID?) {
+        self.sessionIdentityId = sessionIdentityId
+        self.oneTimeKeyId = oneTimeKeyId
+        self.mlKEMOneTimeKeyId = mlKEMOneTimeKeyId
     }
 }
 

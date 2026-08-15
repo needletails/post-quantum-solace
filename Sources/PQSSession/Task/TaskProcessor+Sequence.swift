@@ -80,7 +80,13 @@ extension MessagePipeline {
         // Persisting to cache alone is not enough because the active processing loop consumes
         // from `jobConsumer`. If we don't enqueue here, the job may not run until a future
         // cache reload happens (which can look like the task processor "stalled").
-        try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
+        //
+        // This direct feed must join the same serialization as bulk cache
+        // reloads: the row was persisted above, so a refill that fetches it
+        // between `createJob` and this feed would enqueue it a second time —
+        // `process` never re-checks cache existence, so a duplicate enqueue
+        // sends the same frame twice.
+        try await feedJobDeduplicated(job, symmetricKey: symmetricKey)
 
         // A prior writer failure owns the wake-up boundary. Keep newly persisted
         // work queued until registration explicitly resumes the processor.
@@ -337,6 +343,35 @@ extension MessagePipeline {
         for job in try await cache.fetchJobs() where !skippedJobIds.contains(job.id) {
             try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
         }
+    }
+
+    /// Single-job counterpart of `loadFromCache`: acquires the same bulk-reload
+    /// lock and skips the feed when a concurrent refill already enqueued the job
+    /// (or it is executing). Without this, `enqueue`'s direct feed races the
+    /// processing loop's cache refill and the same job runs twice.
+    private func feedJobDeduplicated(
+        _ job: JobModel,
+        symmetricKey: SymmetricKey
+    ) async throws {
+        while isBulkReloadingJobs {
+            await withCheckedContinuation { continuation in
+                bulkReloadWaiters.append(continuation)
+            }
+        }
+        isBulkReloadingJobs = true
+        defer {
+            isBulkReloadingJobs = false
+            let waiters = bulkReloadWaiters
+            bulkReloadWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+        let alreadyEnqueued = await jobConsumer.deque.contains { $0.item.id == job.id }
+        guard !alreadyEnqueued, !inFlightJobIds.contains(job.id) else {
+            return
+        }
+        try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
     }
     
     // MARK: - Job execution
