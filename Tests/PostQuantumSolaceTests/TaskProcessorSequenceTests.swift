@@ -1566,6 +1566,19 @@ actor TaskProcessorSequenceTests {
             MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
         )
 
+        // Hold the first published-batch upload so peerRefresh cannot fail and
+        // end the episode before the identical frame is redelivered. Waiting
+        // for that upload to finish races `endReestablishmentEpisode`
+        // (userNotFound in this harness), which would make a second
+        // replacement look like a coalescing failure.
+        let uploadPause = OTKUploadPause()
+        transport.beforeUpdateOneTimeKeys = {
+            await uploadPause.beforeFirstUpload()
+        }
+        defer {
+            transport.beforeUpdateOneTimeKeys = nil
+        }
+
         let peerDeviceId = UUID()
         let inbound = try makeTestInboundTaskMessage(
             senderSecretName: "bob_missing_otk",
@@ -1591,25 +1604,29 @@ actor TaskProcessorSequenceTests {
                 failureClass: "ratchet.missingOneTimeKey")),
             "Pending missingOneTimeKey replay should not be dropped before decryption")
 
-        // The batch replacement now runs off the job loop; wait for the first
-        // upload to land before capturing the baseline.
-        let sawFirstUpload = try await waitUntil {
-            await self.transport.updateOneTimeKeysCallCount >= 1
+        let uploadPaused = try await waitUntil {
+            await uploadPause.isPaused()
         }
-        #expect(sawFirstUpload, "First missingOneTimeKey recovery should upload a replacement batch")
+        #expect(uploadPaused, "First missingOneTimeKey recovery should reach OTK upload")
 
-        // Redelivery of the identical frame must not trigger another OTK batch replacement.
-        let otkCallsAfterFirst = await transport.updateOneTimeKeysCallCount
+        // Redelivery of the identical frame must not start another replacement
+        // while the episode is still open. The pause is before the call is
+        // recorded, so the baseline is the in-flight first upload.
+        let otkCallsWhileHeld = await transport.updateOneTimeKeysCallCount
         try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(inbound)),
             session: session
         )
-        try await Task.sleep(until: .now + .milliseconds(500))
-        let otkCallsAfterSecond = await transport.updateOneTimeKeysCallCount
+        let redeliveryDrained = try await waitUntil {
+            guard let cache = await self.session.cache else { return false }
+            return (try? await cache.fetchJobs())?.isEmpty == true
+        }
+        #expect(redeliveryDrained, "Redelivered frame should leave the job queue")
         #expect(
-            otkCallsAfterSecond == otkCallsAfterFirst,
+            await transport.updateOneTimeKeysCallCount == otkCallsWhileHeld,
             "Redelivered missingOneTimeKey frame must not replace the OTK batch again")
 
+        await uploadPause.release()
         await session.shutdown()
     }
 
@@ -1732,11 +1749,26 @@ actor TaskProcessorSequenceTests {
         try await firstFeed
         try await secondFeed
 
-        #expect(
-            await session.hasPendingResendAfterReestablishment(
+        // Once the pause is released the recovery episode can complete and
+        // flushPendingResends drains pending entries into submitted resend
+        // requests. On slow runners that drain wins the race with this
+        // assertion, so accept either state: still pending, or already
+        // drained into a submitted request (which implies it was recorded
+        // inside the episode).
+        let secondRecorded = try await waitUntil { [session] in
+            if await session.hasPendingResendAfterReestablishment(
                 sender: "bob_missing_otk_inflight",
                 deviceId: peerDeviceId,
-                failedMessageId: "missing_otk_inflight_2"),
+                failedMessageId: "missing_otk_inflight_2") {
+                return true
+            }
+            return await session.resendRequestSubmissionCount(
+                sender: "bob_missing_otk_inflight",
+                deviceId: peerDeviceId,
+                failedMessageId: "missing_otk_inflight_2") > 0
+        }
+        #expect(
+            secondRecorded,
             "Second missingOneTimeKey should be recorded inside the in-flight recovery episode")
 
         let sawSingleX25519Upload = try await waitUntil {
