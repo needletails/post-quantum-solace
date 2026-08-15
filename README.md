@@ -2,9 +2,9 @@
 
 # Post-Quantum Solace
 
-[![Swift](https://img.shields.io/badge/Swift-6.1+-orange.svg)](https://swift.org)
+[![Swift](https://img.shields.io/badge/Swift-3+-orange.svg)](https://swift.org)
 [![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20macOS%2015%2B%20%7C%20Linux%20%7C%20Android-blue.svg)](https://developer.apple.com)
-[![Version](https://img.shields.io/badge/Version-4.0.0-blue.svg)](https://github.com/needletails/post-quantum-solace)
+[![Version](https://img.shields.io/badge/Version-4.1.0-blue.svg)](https://github.com/needletails/post-quantum-solace)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-green.svg)](LICENSE)
 
 A secure, post-quantum cryptographic messaging SDK with end-to-end encryption, built for the quantum-resistant future.
@@ -41,7 +41,7 @@ Requires **DoubleRatchetKit 4.0.0**.
 - **macOS**: 15.0+
 - **Linux**: Ubuntu 24.04+ or equivalent
 - **Android**: API Level 24+ (Android 7.0+)
-- **Swift**: 6.1+
+- **Swift**: 6.3+
 - **Xcode**: 15.0+ (for iOS/macOS development)
 
 ## 🚀 Installation
@@ -243,12 +243,12 @@ Post-Quantum Solace is designed to work seamlessly across multiple platforms:
 - Compatible with Android API Level 24+ (Android 7.0+)
 - Supports both ARM64 and x86_64 architectures
 - Integration with Android NDK and Gradle build system
-- Requires [Swift Android SDK 6.1+](https://github.com/finagolfin/swift-android-sdk/releases)
+- Requires [Swift Android SDK 6.3+](https://github.com/finagolfin/swift-android-sdk/releases)
 
 ### Platform-Specific Considerations
 
 **Android Development:**
-- Install [Swift Android SDK 6.1+](https://github.com/finagolfin/swift-android-sdk/releases)
+- Install [Swift Android SDK 6.3+](https://github.com/finagolfin/swift-android-sdk/releases)
 - Use Swift Package Manager with Android NDK integration
 - Ensure proper JNI bindings for Android-specific functionality
 - Consider memory management for mobile environments
