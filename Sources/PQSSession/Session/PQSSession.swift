@@ -1043,6 +1043,42 @@ public actor PQSSession: SessionCacheSynchronizer {
         await setDatabaseDelegate(conformer: store)
     }
 
+    /// Ensures the host-facing delegates are wired on a live session without
+    /// disturbing `sessionContext` or ratchet state.
+    ///
+    /// ``init(configuration:ratchetConfiguration:)`` wires hosts at construction,
+    /// but a session can legitimately hold an unlocked `sessionContext` while its
+    /// hosts are absent: a bare ``PQSSession`` that unlocked after
+    /// ``attachPersistenceHost(_:)``, or a session revived by
+    /// ``unlock(appPassword:)`` after ``shutdown()`` cleared its delegates.
+    /// Hosts call this from their session-start event so a context-bearing actor
+    /// can never enter service throwing `transportNotInitialized` /
+    /// `receiverDelegateNotSet`.
+    ///
+    /// Transport, observer, and host delegate are always (re)bound. The
+    /// persistence host is installed only when no `SessionCache` exists yet, so a
+    /// live session keeps its warm cache. Idempotent.
+    public func configureHosts(
+        transport: any PQSNetworkHost,
+        store: any PQSPersistenceHost,
+        observer: any MessageStoreObserver,
+        delegate: (any PQSHostDelegate)? = nil
+    ) async {
+        if _sessionContext != nil, transportDelegate == nil || receiverDelegate == nil {
+            logger.log(
+                level: .info,
+                message: "Wiring missing host delegates on live session (transport: \(transportDelegate == nil ? "absent" : "present"), receiver: \(receiverDelegate == nil ? "absent" : "present"))")
+        }
+        await setTransportDelegate(conformer: transport)
+        if cache == nil {
+            await setDatabaseDelegate(conformer: store)
+        }
+        setReceiverDelegate(conformer: observer)
+        if let delegate {
+            await setPQSSessionDelegate(conformer: delegate)
+        }
+    }
+
     /// Sets (or clears) the application-facing event receiver.
     ///
     /// The receiver hears about lifecycle changes — created/updated/deleted

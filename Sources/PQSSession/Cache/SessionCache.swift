@@ -109,12 +109,18 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// Fetches the local device configuration, either from cache or the store.
     /// - Returns: The cached or fetched configuration data.
     /// - Throws: An error if the configuration cannot be found.
+    ///
+    /// Reads must not run the synchronizer: it decrypts the blob and installs
+    /// `sessionContext` on the session as a side effect. `verifyAppPassword`'s
+    /// cold-cache fetch was silently unlocking a not-yet-wired session that
+    /// way (context present, delegates absent). Context installation belongs
+    /// to explicit events only: `unlock`, linking, and persisted writes.
     func fetchLocalSessionContext() async throws -> Data {
         if let localDeviceConfiguration {
             return localDeviceConfiguration
         } else {
             let data = try await store.fetchLocalSessionContext()
-            try await setLocalDeviceConfiguration(data)
+            localDeviceConfiguration = data
             return data
         }
     }
