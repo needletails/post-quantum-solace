@@ -120,11 +120,15 @@ actor ChannelCommunicationTests {
         let (cache, symmetricKey) = try await setupSession()
 
         let metadata = try BinaryEncoder().encode(
-            ChannelInfo(
-                name: "general",
-                administrator: "alice",
-                members: ["alice", "bob"],
-                operators: ["alice"]))
+            ChannelStoredMetadata(
+                core: ChannelInfo(
+                    name: "general",
+                    administrator: "alice",
+                    members: ["alice", "bob"],
+                    operators: ["alice"]),
+                overlay: ChannelLocalOverlay(
+                    userMarkedPinned: true,
+                    displayTitle: "General team")))
 
         try await session.messagePipeline.createChannelCommunication(
             sender: "alice",
@@ -157,8 +161,10 @@ actor ChannelCommunicationTests {
         #expect(props?.members.contains("carol") == true)
         #expect(props?.members.count == 3)
 
-        let decoded = try BinaryDecoder().decode(ChannelInfo.self, from: props!.metadata)
-        #expect(decoded.members.contains("carol"))
+        let decoded = try BinaryDecoder().decode(ChannelStoredMetadata.self, from: props!.metadata)
+        #expect(decoded.core.members.contains("carol"))
+        #expect(decoded.overlay?.userMarkedPinned == true)
+        #expect(decoded.overlay?.displayTitle == "General team")
 
         await session.shutdown()
     }

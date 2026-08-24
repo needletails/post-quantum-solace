@@ -10611,6 +10611,11 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
         get async { await oobResendTracker.callCount }
     }
 
+    /// Per-call view (secretName, deviceId, id count) for frame-cap assertions.
+    var outOfBandResendRequestCalls: [(secretName: String, deviceId: String, keyCount: Int)] {
+        get async { await oobResendTracker.calls }
+    }
+
     func sendOutOfBandResendRequest(
         failedEnvelopeMessageIds: [String],
         to secretName: String,

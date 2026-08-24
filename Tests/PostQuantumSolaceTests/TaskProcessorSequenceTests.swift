@@ -2152,6 +2152,62 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    @Test("Oversized resend drains chunk to the OOB frame cap and spend attempts")
+    func testResendDrainChunksToProtocolFrameCap() async throws {
+        let identityStore = MockIdentityStore(
+            mockUserData: .init(session: session),
+            session: session,
+            isSender: true)
+        try await createSenderSession(store: identityStore)
+
+        let sender = "bob_chunked_drain"
+        let deviceId = UUID()
+        // Mirrors the field failure: 144 deferred ids on one lane, above the
+        // `OutOfBandResendControl.maxMessageIds` frame cap. Unchunked, the
+        // submission throws `tooManyMessageIds` before transport, no attempt is
+        // ever counted, and the identical batch re-defers and replays on every
+        // drain event until the pending TTL.
+        let total = OutOfBandResendControl.maxMessageIds * 2 + 16
+        for index in 0..<total {
+            await session.deferPeerResendUntilReestablished(
+                sender: sender,
+                deviceId: deviceId,
+                failedMessageId: "chunk-id-\(index)",
+                failureClass: "crypto.bodyDecryptionFailed",
+                notifyDelegate: false)
+        }
+
+        await session.flushPendingResends(
+            sender: sender,
+            deviceId: deviceId,
+            reason: "test.chunkedDrain")
+
+        let laneCalls = await transport.outOfBandResendRequestCalls
+            .filter { $0.secretName == sender }
+        #expect(
+            laneCalls.count == 3,
+            "\(total) ids must submit as 3 frames, got \(laneCalls.count)")
+        #expect(
+            laneCalls.allSatisfy { $0.keyCount <= OutOfBandResendControl.maxMessageIds },
+            "every frame must respect maxMessageIds; counts=\(laneCalls.map(\.keyCount))")
+        #expect(
+            laneCalls.reduce(0) { $0 + $1.keyCount } == total,
+            "every deferred id must be submitted exactly once")
+
+        // Transport-confirmed submission must spend one attempt for ids in every
+        // chunk, not just the first frame, so the §4.1 cap can terminate.
+        #expect(await session.resendRequestSubmissionCount(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: "chunk-id-0") == 1)
+        #expect(await session.resendRequestSubmissionCount(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: "chunk-id-\(total - 1)") == 1)
+
+        await session.shutdown()
+    }
+
     @Test("Hot-path resend submission cap terminalizes sharedId without peerRefresh")
     func testHotPathResendSubmissionCapTerminalizesWithoutASR() async {
         let sender = "bob_hot_path_cap"

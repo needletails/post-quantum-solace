@@ -1302,50 +1302,69 @@ extension MessagePipeline {
 
             guard !ready.isEmpty else { continue }
 
-            do {
-                let sharedIds = ready.map(\.failedSharedMessageId)
-                logger.log(
-                    level: .info,
-                    message: "pqs.recovery.resendDrainStarted reason=\(reason) count=\(sharedIds.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) ids=\(sharedIds.joined(separator: ","))")
-                for pending in ready {
-                    await session.deferPeerResendUntilReestablished(
-                        sender: pending.senderName,
-                        deviceId: pending.senderDeviceId,
-                        failedMessageId: pending.failedSharedMessageId,
-                        failureClass: pending.failureClass,
-                        notifyDelegate: false)
+            // §4.1 framing cap: one unencrypted resend-control frame carries at most
+            // `OutOfBandResendControl.maxMessageIds` ids. An oversized batch throws
+            // `tooManyMessageIds` before anything is transported, so no attempt is
+            // ever counted, the cap never terminates, and the identical batch
+            // re-defers and replays on every drain event until the pending TTL
+            // (the episodeExpired livelock). Chunk the lane so each frame is valid
+            // and every submitted id spends an attempt.
+            let maxPerRequest = OutOfBandResendControl.maxMessageIds
+            let chunks = stride(from: 0, to: ready.count, by: maxPerRequest).map {
+                Array(ready[$0 ..< min($0 + maxPerRequest, ready.count)])
+            }
+            chunkLoop: for (chunkIndex, chunk) in chunks.enumerated() {
+                do {
+                    let sharedIds = chunk.map(\.failedSharedMessageId)
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.resendDrainStarted reason=\(reason) count=\(sharedIds.count) chunk=\(chunkIndex + 1)/\(chunks.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) ids=\(sharedIds.joined(separator: ","))")
+                    for pending in chunk {
+                        await session.deferPeerResendUntilReestablished(
+                            sender: pending.senderName,
+                            deviceId: pending.senderDeviceId,
+                            failedMessageId: pending.failedSharedMessageId,
+                            failureClass: pending.failureClass,
+                            notifyDelegate: false)
+                    }
+                    try await session.requestMessageResend(
+                        sharedMessageIds: sharedIds,
+                        senderName: key.senderName,
+                        senderDeviceId: key.senderDeviceId)
+                    for pending in chunk {
+                        await session.markPeerResendRequestSent(
+                            sender: pending.senderName,
+                            deviceId: pending.senderDeviceId,
+                            failedMessageId: pending.failedSharedMessageId)
+                        await session.markInboundFailure(
+                            sender: pending.senderName,
+                            deviceId: pending.senderDeviceId,
+                            messageId: pending.failedSharedMessageId,
+                            failureClass: pending.failureClass)
+                    }
+                    logger.log(
+                        level: .info,
+                        message: "pqs.recovery.resendDrainSubmitted reason=\(reason) count=\(sharedIds.count) chunk=\(chunkIndex + 1)/\(chunks.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) ids=\(sharedIds.joined(separator: ","))")
+                    audit(.recovery, "pqs.recovery.resendDrainSubmitted reason=\(reason) count=\(sharedIds.count) chunk=\(chunkIndex + 1)/\(chunks.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId.uuidString) ids=\(sharedIds.joined(separator: ","))")
+                } catch {
+                    // Re-defer this chunk plus every not-yet-submitted chunk so a
+                    // transport failure keeps them durable for the next concrete
+                    // drain event. Already-submitted chunks keep their transported
+                    // attempt counts.
+                    let unsubmitted = chunks[chunkIndex...].flatMap { $0 }
+                    for pending in unsubmitted {
+                        await session.deferPeerResendUntilReestablished(
+                            sender: pending.senderName,
+                            deviceId: pending.senderDeviceId,
+                            failedMessageId: pending.failedSharedMessageId,
+                            failureClass: pending.failureClass)
+                    }
+                    logger.log(
+                        level: .warning,
+                        message: "pqs.recovery.resendDrainFailed reason=\(reason) count=\(unsubmitted.count) chunk=\(chunkIndex + 1)/\(chunks.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) error=\(error)")
+                    audit(.recovery, "pqs.recovery.resendDrainFailed reason=\(reason) count=\(unsubmitted.count) chunk=\(chunkIndex + 1)/\(chunks.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId.uuidString) error=\(error)")
+                    break chunkLoop
                 }
-                try await session.requestMessageResend(
-                    sharedMessageIds: sharedIds,
-                    senderName: key.senderName,
-                    senderDeviceId: key.senderDeviceId)
-                for pending in ready {
-                    await session.markPeerResendRequestSent(
-                        sender: pending.senderName,
-                        deviceId: pending.senderDeviceId,
-                        failedMessageId: pending.failedSharedMessageId)
-                    await session.markInboundFailure(
-                        sender: pending.senderName,
-                        deviceId: pending.senderDeviceId,
-                        messageId: pending.failedSharedMessageId,
-                        failureClass: pending.failureClass)
-                }
-                logger.log(
-                    level: .info,
-                    message: "pqs.recovery.resendDrainSubmitted reason=\(reason) count=\(sharedIds.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) ids=\(sharedIds.joined(separator: ","))")
-                audit(.recovery, "pqs.recovery.resendDrainSubmitted reason=\(reason) count=\(sharedIds.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId.uuidString) ids=\(sharedIds.joined(separator: ","))")
-            } catch {
-                for pending in ready {
-                    await session.deferPeerResendUntilReestablished(
-                        sender: pending.senderName,
-                        deviceId: pending.senderDeviceId,
-                        failedMessageId: pending.failedSharedMessageId,
-                        failureClass: pending.failureClass)
-                }
-                logger.log(
-                    level: .warning,
-                    message: "pqs.recovery.resendDrainFailed reason=\(reason) count=\(ready.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) error=\(error)")
-                audit(.recovery, "pqs.recovery.resendDrainFailed reason=\(reason) count=\(ready.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId.uuidString) error=\(error)")
             }
         }
     }

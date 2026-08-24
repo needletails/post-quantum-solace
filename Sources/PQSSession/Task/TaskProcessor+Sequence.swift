@@ -296,6 +296,20 @@ extension MessagePipeline {
                             await jobConsumer.gracefulShutdown()
                             return .drained
                         }
+                    } catch SessionCache.CacheErrors.jobNotFound {
+                        // A job vanishing mid-flight means a concurrent path already
+                        // completed or deleted it. That is a queue-plumbing race, not
+                        // a ratchet outcome: it must never demote a lane, emit a
+                        // recovery signal, or halt the drain (one halted loop is what
+                        // amplified a single race into a storm during offline
+                        // backlog replay). Skip to the next job.
+                        logger.log(
+                            level: .warning,
+                            message: "Job vanished mid-flight (already handled by a concurrent path); continuing queue drain")
+                        if await jobConsumer.deque.isEmpty {
+                            await jobConsumer.gracefulShutdown()
+                            return .drained
+                        }
                     } catch {
                         await jobConsumer.gracefulShutdown()
                         throw error
@@ -1002,13 +1016,44 @@ extension MessagePipeline {
                 let senderSecretName = inbound.senderSecretName
                 let senderDeviceId = inbound.senderDeviceId
                 let sharedMessageId = inbound.sharedMessageId
-                audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
-                await session.scheduleTransportProtocolWork {
-                    await delegate?.inboundRecoveryDeferred(
-                        senderSecretName: senderSecretName,
-                        senderDeviceId: senderDeviceId,
-                        failedSharedMessageId: sharedMessageId,
-                        failureClass: "inbound.unhandledError")
+                if case JobProcessorErrors.missingIdentity = error {
+                    // Identity resolution failed even after a forced directory
+                    // refresh. This is not a decrypt outcome, so the recovery ring
+                    // never claimed a durable resend for this sharedId — notifying
+                    // the host alone would purge the spool copy with zero §4.1
+                    // retry attempts (silent content loss). Register the bounded
+                    // OOB resend first; the defer itself fires
+                    // `inboundRecoveryDeferred`, keeping the host's claim-and-purge
+                    // contract true. A transient miss heals on sender resend; a
+                    // genuinely unlinked device terminates at the submission cap
+                    // via `pendingResendExhausted`.
+                    audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error) failureClass=inbound.missingIdentity")
+                    await session.deferPeerResendUntilReestablished(
+                        sender: senderSecretName,
+                        deviceId: senderDeviceId,
+                        failedMessageId: sharedMessageId,
+                        failureClass: "inbound.missingIdentity")
+                    // Identity misses never open a reestablishment episode, so no
+                    // episode-end event would ever drain this lane. Flush on this
+                    // concrete failure event instead; cooldown and the attempt cap
+                    // still gate the actual submission.
+                    if await !session.hasOpenReestablishmentEpisode(
+                        sender: senderSecretName,
+                        deviceId: senderDeviceId) {
+                        await session.flushPendingResends(
+                            sender: senderSecretName,
+                            deviceId: senderDeviceId,
+                            reason: "missingIdentity")
+                    }
+                } else {
+                    audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
+                    await session.scheduleTransportProtocolWork {
+                        await delegate?.inboundRecoveryDeferred(
+                            senderSecretName: senderSecretName,
+                            senderDeviceId: senderDeviceId,
+                            failedSharedMessageId: sharedMessageId,
+                            failureClass: "inbound.unhandledError")
+                    }
                 }
             }
             try await cache.deleteJob(job)
@@ -1084,7 +1129,16 @@ extension MessagePipeline {
         var updatedProps = props
         updatedProps.attempts += 1
         _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
-        try await cache.updateJob(job)
+        do {
+            try await cache.updateJob(job)
+        } catch SessionCache.CacheErrors.jobNotFound {
+            // A concurrent path (unhandled-error delete, consumer completion)
+            // already removed this job; nothing is left to re-queue.
+            logger.log(
+                level: .info,
+                message: "Skipped inbound re-queue; job already removed by a concurrent path")
+            return .deleted
+        }
         
         // If we are running the consumer proceed
         if await !jobConsumer.deque.isEmpty {
@@ -1452,7 +1506,16 @@ extension MessagePipeline {
         updatedProps.delayedUntil = nil
         isPausedUntilTransportReady = true
         _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
-        try await cache.updateJob(job)
+        do {
+            try await cache.updateJob(job)
+        } catch SessionCache.CacheErrors.jobNotFound {
+            // A concurrent path already removed this job; there is no durable
+            // row left to carry the retry bookkeeping.
+            logger.log(
+                level: .info,
+                message: "Skipped outbound transport retry bookkeeping; job already removed by a concurrent path")
+            return .deleted
+        }
         let logMessage: String
         if let recoveryLog = recoveryTransportSendFailureLog(
             props: props,

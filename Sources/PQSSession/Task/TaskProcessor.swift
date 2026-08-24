@@ -972,17 +972,25 @@ actor MessagePipeline {
             throw PQSError.missingMetadata
         }
 
+        let existingStored = ChannelStoredMetadata.migrating(from: props.metadata)
+        let existingInfo = existingStored?.core
         let wireInfo = ChannelInfo(
             name: channelName,
             administrator: administrator,
             members: members,
-            operators: operators)
-        let metadata = try BinaryEncoder().encode(wireInfo)
+            operators: operators,
+            enabledBotNames: existingInfo?.enabledBotNames,
+            botMemberWelcome: existingInfo?.botMemberWelcome,
+            botOperatorWelcome: existingInfo?.botOperatorWelcome,
+            botIdleHint: existingInfo?.botIdleHint)
+        let wireMetadata = try BinaryEncoder().encode(wireInfo)
+        let localMetadata = try BinaryEncoder().encode(
+            ChannelStoredMetadata(core: wireInfo, overlay: existingStored?.overlay))
 
         props.administrator = administrator
         props.members = members
         props.operators = operators
-        props.metadata = metadata
+        props.metadata = localMetadata
 
         _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
         try await cache.updateCommunication(communicationModel)
@@ -993,7 +1001,7 @@ actor MessagePipeline {
             let params = try await session.requireSessionParametersWithoutTransportDelegate()
             try await session.sendCommunicationSynchronization(
                 recipient: .channel(channelName),
-                metadata: metadata,
+                metadata: wireMetadata,
                 sessionContext: params.sessionContext,
                 sessionDelegate: params.sessionDelegate,
                 cache: params.cache,
