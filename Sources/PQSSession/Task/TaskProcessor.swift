@@ -233,10 +233,11 @@ actor MessagePipeline {
     /// Keeps recovery behavior while reducing startup storms that can race with live traffic.
     let peerRefreshRequestCooldown: TimeInterval = 15
 
-    /// Recovery-critical control messages may need one retry even when a recent outbound
-    /// reconciliation already set the peer cooldown. Keyed by outbound shared id.
-    var outboundControlRepairBypassAtBySharedId: [String: Date] = [:]
-    let outboundControlRepairBypassTTL: TimeInterval = 60 * 10
+    /// Recovery-critical control messages and a locally proven outbound OTK invariant
+    /// failure may need one retry even when a recent outbound reconciliation already
+    /// set the peer cooldown. Keyed by outbound shared id so the bypass is bounded.
+    var outboundRepairBypassAtBySharedId: [String: Date] = [:]
+    let outboundRepairBypassTTL: TimeInterval = 60 * 10
 
     struct PendingOutboundTransport: Sendable {
         let message: SignedRatchetMessage

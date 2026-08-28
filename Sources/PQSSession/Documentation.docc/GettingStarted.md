@@ -11,8 +11,8 @@ and recovering from a verified account-identity change.
 ## Prerequisites
 
 - iOS 18.0+ / macOS 15.0+ (also Linux and Android via the supported package platforms)
-- Swift 6.1+
-- Xcode 15+
+- Swift 6.3+
+- Xcode with a Swift 6.3 toolchain
 - DoubleRatchetKit 4.0.0+
 
 ## Installation
@@ -208,6 +208,12 @@ For a hard reset after a suspected compromise (master-only):
 ```swift
 try await session.rotateKeysOnPotentialCompromise()
 ```
+
+Call ``PQSSession/rotateKeysOnPotentialCompromise()`` only when the account
+keys may have been exposed (unlocked lost device, malware, copied local
+keys). Do not call it for routine hygiene, a peer safety-number change, or
+device unlink. Nudge already rotates session material automatically;
+``PQSSession/rotateCurrentDeviceKeys()`` is the linked-device scoped action.
 
 > Important: ``PQSSession/rotateKeysOnPotentialCompromise()`` rotates the
 > account-level signing key. Calling it on a child device throws

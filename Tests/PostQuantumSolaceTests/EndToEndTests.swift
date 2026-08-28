@@ -43,6 +43,23 @@ actor SessionEventProbe {
     }
 }
 
+actor OutboundUnrecoverableProbe {
+    struct Event: Equatable {
+        let sharedMessageId: String
+        let reason: String
+    }
+
+    private var events: [Event] = []
+
+    func mark(sharedMessageId: String, reason: String) {
+        events.append(.init(sharedMessageId: sharedMessageId, reason: reason))
+    }
+
+    func recorded() -> [Event] {
+        events
+    }
+}
+
 actor LinkedDeviceCompromiseProbe {
     private var reportedDeviceIds: [UUID] = []
 
@@ -9793,6 +9810,7 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
     let session: PQSSession
     let compromiseProbe: LinkedDeviceCompromiseProbe?
     let peerIdentityTrustProbe: PeerIdentityTrustProbe?
+    let outboundUnrecoverableProbe: OutboundUnrecoverableProbe?
     /// Test-only: forces `retrieveUserInfo` so Missing Offer Identity paths are deterministic.
     var forcedRetrieveUserInfo: (secretName: String, deviceId: String)?
     
@@ -9800,11 +9818,13 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
         session: PQSSession,
         compromiseProbe: LinkedDeviceCompromiseProbe? = nil,
         peerIdentityTrustProbe: PeerIdentityTrustProbe? = nil,
+        outboundUnrecoverableProbe: OutboundUnrecoverableProbe? = nil,
         forcedRetrieveUserInfo: (secretName: String, deviceId: String)? = nil
     ) {
         self.session = session
         self.compromiseProbe = compromiseProbe
         self.peerIdentityTrustProbe = peerIdentityTrustProbe
+        self.outboundUnrecoverableProbe = outboundUnrecoverableProbe
         self.forcedRetrieveUserInfo = forcedRetrieveUserInfo
     }
     
@@ -9932,7 +9952,11 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
         senderDeviceId _: UUID,
         sharedMessageId _: String
     ) async {}
-    func outboundMessageUnrecoverable(sharedMessageId _: String, reason _: String) async {}
+    func outboundMessageUnrecoverable(sharedMessageId: String, reason: String) async {
+        await outboundUnrecoverableProbe?.mark(
+            sharedMessageId: sharedMessageId,
+            reason: reason)
+    }
     func reestablishmentEpisodeDidEnd(senderSecretName _: String, senderDeviceId _: UUID) async {}
     func shouldSuppressInboundRecoveryFromSender(_: String) async -> Bool { false }
     func preferredOnlinePeerDeviceId(for _: String) async -> UUID? { nil }

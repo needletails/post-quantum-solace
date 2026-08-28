@@ -115,4 +115,25 @@ struct FriendshipMetadataMergeTests {
             stored: stored)
         #expect(resolved.ourState == FriendshipMetadata.State.blocked)
     }
+
+    @Test("inbound merge copies a delivery token unless the stored user blocked")
+    func inboundMergeCopiesDeliveryTokenUnlessBlocked() {
+        var stored = FriendshipMetadata(myState: .accepted, theirState: .accepted, ourState: .accepted)
+        stored.sealedDeliveryToken = Data(repeating: 0x11, count: 32)
+        var inbound = FriendshipMetadata(myState: .accepted, theirState: .accepted, ourState: .accepted)
+        inbound.sealedDeliveryToken = Data(repeating: 0x22, count: 32)
+
+        let merged = FriendshipMetadataConflictPolicy.inboundFriendship.resolve(
+            passed: inbound,
+            stored: stored)
+        #expect(merged.sealedDeliveryToken == Data(repeating: 0x22, count: 32))
+
+        var blocked = FriendshipMetadata(myState: .blocked, theirState: .blockedByOther, ourState: .blocked)
+        blocked.sealedDeliveryToken = Data(repeating: 0x11, count: 32)
+        let blockedMerge = FriendshipMetadataConflictPolicy.inboundFriendship.resolve(
+            passed: inbound,
+            stored: blocked)
+        #expect(blockedMerge.sealedDeliveryToken == Data(repeating: 0x11, count: 32))
+        #expect(blockedMerge.myState == .blocked)
+    }
 }

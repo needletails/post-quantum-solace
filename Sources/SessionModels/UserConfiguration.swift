@@ -208,24 +208,54 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         public let longTermPublicKey: Data
         public let finalMLKEMPublicKey: MLKEMPublicKey
         public let updatedAt: Date?
+        /// Additive capability bitmask. Missing on 4.2.0 bundles (identified path).
+        public let capabilities: DeviceCapabilities
+
+        public var supportsSealedSender: Bool {
+            capabilities.contains(.sealedSender)
+        }
 
         enum CodingKeys: String, CodingKey, Codable, Sendable {
             case deviceId = "a"
             case longTermPublicKey = "b"
             case finalMLKEMPublicKey = "c"
             case updatedAt = "d"
+            case capabilities = "e"
         }
 
         public init(
             deviceId: UUID,
             longTermPublicKey: Data,
             finalMLKEMPublicKey: MLKEMPublicKey,
-            updatedAt: Date? = Date()
+            updatedAt: Date? = Date(),
+            capabilities: DeviceCapabilities = []
         ) {
             self.deviceId = deviceId
             self.longTermPublicKey = longTermPublicKey
             self.finalMLKEMPublicKey = finalMLKEMPublicKey
             self.updatedAt = updatedAt
+            self.capabilities = capabilities
+        }
+
+        public init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            deviceId = try container.decode(UUID.self, forKey: .deviceId)
+            longTermPublicKey = try container.decode(Data.self, forKey: .longTermPublicKey)
+            finalMLKEMPublicKey = try container.decode(MLKEMPublicKey.self, forKey: .finalMLKEMPublicKey)
+            updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt)
+            let raw = try container.decodeIfPresent(UInt32.self, forKey: .capabilities) ?? 0
+            capabilities = DeviceCapabilities(rawValue: raw)
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(deviceId, forKey: .deviceId)
+            try container.encode(longTermPublicKey, forKey: .longTermPublicKey)
+            try container.encode(finalMLKEMPublicKey, forKey: .finalMLKEMPublicKey)
+            try container.encodeIfPresent(updatedAt, forKey: .updatedAt)
+            if capabilities.rawValue != 0 {
+                try container.encode(capabilities.rawValue, forKey: .capabilities)
+            }
         }
     }
 

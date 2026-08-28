@@ -123,7 +123,8 @@ extension PQSSession {
                 bundle: .init(
                     deviceId: localDevice.deviceId,
                     longTermPublicKey: localDevice.longTermPublicKey,
-                    finalMLKEMPublicKey: localDevice.finalMLKEMPublicKey
+                    finalMLKEMPublicKey: localDevice.finalMLKEMPublicKey,
+                    capabilities: .sealedSender
                 ),
                 signingKey: signingPrivateKey
             )

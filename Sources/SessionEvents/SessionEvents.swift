@@ -119,14 +119,20 @@ public enum FriendshipMetadataConflictPolicy: Sendable {
     case inboundFriendship
 
     func resolve(passed: FriendshipMetadata, stored: FriendshipMetadata) -> FriendshipMetadata {
+        let resolved: FriendshipMetadata
         switch self {
         case .preferSettled:
-            return preferSettledFriendshipMetadata(passed: passed, stored: stored)
+            resolved = preferSettledFriendshipMetadata(passed: passed, stored: stored)
         case .incoming:
-            return passed
+            resolved = passed
         case .inboundFriendship:
-            return preferInboundFriendshipMetadata(passed: passed, stored: stored)
+            resolved = preferInboundFriendshipMetadata(passed: passed, stored: stored)
         }
+        var merged = resolved
+        if stored.myState != .blocked {
+            merged.sealedDeliveryToken = passed.sealedDeliveryToken ?? stored.sealedDeliveryToken
+        }
+        return merged
     }
 }
 

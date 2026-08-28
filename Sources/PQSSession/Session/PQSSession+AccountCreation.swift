@@ -176,11 +176,12 @@ extension PQSSession {
         }
 
         let signedDeviceKeyBundle = try UserConfiguration.SignedDeviceKeyBundle(
-            bundle: .init(
-                deviceId: deviceId,
-                longTermPublicKey: longTerm.x25519.publicKey.rawRepresentation,
-                finalMLKEMPublicKey: mlKEMPublicKey
-            ),
+                bundle: .init(
+                    deviceId: deviceId,
+                    longTermPublicKey: longTerm.x25519.publicKey.rawRepresentation,
+                    finalMLKEMPublicKey: mlKEMPublicKey,
+                    capabilities: .sealedSender
+                ),
             signingKey: longTerm.signing
         )
 

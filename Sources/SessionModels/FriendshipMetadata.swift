@@ -96,6 +96,10 @@ public struct FriendshipMetadata: Sendable, Codable {
     /// The other user's state before the active block was applied.
     public var blockedPreviousTheirState: State?
 
+    /// Recipient delivery token for sealed sender. Shared only over E2EE
+    /// contact metadata after accept. Never uploaded in the clear.
+    public var sealedDeliveryToken: Data?
+
     /// Initializes a new instance of `FriendshipMetadata`.
     ///
     /// Creates a new friendship metadata instance with the specified states. All states
@@ -110,13 +114,44 @@ public struct FriendshipMetadata: Sendable, Codable {
         theirState: State = .pending,
         ourState: State = .pending,
         blockedPreviousMyState: State? = nil,
-        blockedPreviousTheirState: State? = nil
+        blockedPreviousTheirState: State? = nil,
+        sealedDeliveryToken: Data? = nil
     ) {
         self.myState = myState
         self.theirState = theirState
         self.ourState = ourState
         self.blockedPreviousMyState = blockedPreviousMyState
         self.blockedPreviousTheirState = blockedPreviousTheirState
+        self.sealedDeliveryToken = sealedDeliveryToken
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case myState
+        case theirState
+        case ourState
+        case blockedPreviousMyState
+        case blockedPreviousTheirState
+        case sealedDeliveryToken
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        myState = try container.decode(State.self, forKey: .myState)
+        theirState = try container.decode(State.self, forKey: .theirState)
+        ourState = try container.decode(State.self, forKey: .ourState)
+        blockedPreviousMyState = try container.decodeIfPresent(State.self, forKey: .blockedPreviousMyState)
+        blockedPreviousTheirState = try container.decodeIfPresent(State.self, forKey: .blockedPreviousTheirState)
+        sealedDeliveryToken = try container.decodeIfPresent(Data.self, forKey: .sealedDeliveryToken)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(myState, forKey: .myState)
+        try container.encode(theirState, forKey: .theirState)
+        try container.encode(ourState, forKey: .ourState)
+        try container.encodeIfPresent(blockedPreviousMyState, forKey: .blockedPreviousMyState)
+        try container.encodeIfPresent(blockedPreviousTheirState, forKey: .blockedPreviousTheirState)
+        try container.encodeIfPresent(sealedDeliveryToken, forKey: .sealedDeliveryToken)
     }
 
     /// Sets the state to indicate that a friend request has been sent.
@@ -230,6 +265,9 @@ public struct FriendshipMetadata: Sendable, Codable {
         }
         myState = isBlocking ? .blocked : .blockedByOther
         theirState = isBlocking ? .blockedByOther : .blocked
+        // A blocked relationship never retains a credential for sealed access.
+        // Unblock does not restore it; re-acceptance must share the current token.
+        sealedDeliveryToken = nil
         updateOurState()
     }
 

@@ -52,7 +52,8 @@ extension PQSSession {
             deviceId: device.deviceId,
             longTermPublicKey: device.longTermPublicKey,
             finalMLKEMPublicKey: device.finalMLKEMPublicKey,
-            updatedAt: nil)
+            updatedAt: nil,
+            capabilities: .sealedSender)
         let signed = try UserConfiguration.SignedDeviceKeyBundle(bundle: bundle, signingKey: signingKey)
         context.activeUserConfiguration.signedDeviceKeyBundles.append(signed)
         return context

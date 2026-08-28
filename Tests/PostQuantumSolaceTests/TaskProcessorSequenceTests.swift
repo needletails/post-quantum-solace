@@ -645,6 +645,148 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    @Test("Outbound missing OTK replaces poisoned lane and retries once")
+    func testOutboundMissingOneTimeKeyReplacesLaneAndRetries() async throws {
+        let identityStore = MockIdentityStore(
+            mockUserData: .init(session: session),
+            session: session,
+            isSender: true)
+        try await createSenderSession(store: identityStore)
+
+        let peerName = "bob_outbound_missing_otk"
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
+
+        let original = try await session.resetSessionIdentityForFreshSession(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            sendOneTimeIdentities: false,
+            reason: "testSeed")
+        let sharedId = "outbound-missing-otk-repair"
+        await session.markOrphanResendInitiatingSession(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            sessionId: original.id)
+        await session.messagePipeline.rememberResendReplayQueued(
+            sharedId: sharedId,
+            requesterName: peerName,
+            requesterDeviceId: peerDeviceId,
+            servicedFromPersistedStore: false)
+
+        let delegate = MockTaskDelegateWithOneShotOutboundError(
+            error: RatchetError.missingOneTimeKey)
+        await session.messagePipeline.setTaskDelegate(delegate)
+
+        let message = CryptoMessage(
+            text: "repair me",
+            metadata: .init(),
+            recipient: .nickname(peerName),
+            sentDate: Date(),
+            destructionTime: nil)
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .writeMessage(.init(
+                message: message,
+                recipientIdentity: original,
+                localId: localId,
+                sharedId: sharedId,
+                isPersistedOutbound: false,
+                coalescingKey: "call-state|\(peerDeviceId.uuidString)"))),
+            session: session)
+
+        let attempts = await delegate.attempts()
+        #expect(attempts.count == 2)
+        #expect(attempts[0].recipientIdentity.id == original.id)
+        #expect(attempts[1].recipientIdentity.id != original.id)
+        #expect(attempts[1].sharedId == sharedId)
+        #expect(attempts[1].localId == localId)
+        #expect(attempts[1].isPersistedOutbound == false)
+        #expect(attempts[1].coalescingKey == "call-state|\(peerDeviceId.uuidString)")
+
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        let replacementProps = try #require(
+            await attempts[1].recipientIdentity.props(symmetricKey: symmetricKey))
+        #expect(
+            replacementProps.oneTimePublicKey == nil,
+            "Outbound OTK repair must retry on a no-OTK recovery lane")
+        #expect(
+            await session.orphanResendInitiatingSessionId(
+                secretName: peerName,
+                deviceId: peerDeviceId) == attempts[1].recipientIdentity.id,
+            "A pending orphan replay must transfer ownership to the replacement lane")
+
+        await session.shutdown()
+    }
+
+    @Test("Repeated outbound missing OTK is bounded and marks persisted content failed")
+    func testOutboundMissingOneTimeKeyRepairExhaustionMarksPersistedFailed() async throws {
+        let identityStore = MockIdentityStore(
+            mockUserData: .init(session: session),
+            session: session,
+            isSender: true)
+        try await createSenderSession(store: identityStore)
+
+        let probe = OutboundUnrecoverableProbe()
+        await session.setPQSSessionDelegate(conformer: SessionDelegate(
+            session: session,
+            outboundUnrecoverableProbe: probe))
+
+        let peerName = "bob_outbound_missing_otk_exhausted"
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
+
+        let original = try await session.resetSessionIdentityForFreshSession(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            sendOneTimeIdentities: false,
+            reason: "testSeed")
+        let sharedId = "outbound-missing-otk-exhausted"
+
+        let delegate = MockTaskDelegateWithAlwaysOutboundError(
+            error: RatchetError.missingOneTimeKey)
+        await session.messagePipeline.setTaskDelegate(delegate)
+
+        let message = CryptoMessage(
+            text: "cannot encrypt",
+            metadata: .init(),
+            recipient: .nickname(peerName),
+            sentDate: Date(),
+            destructionTime: nil)
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .writeMessage(.init(
+                message: message,
+                recipientIdentity: original,
+                localId: localId,
+                sharedId: sharedId,
+                isPersistedOutbound: true))),
+            session: session)
+
+        let attempts = await delegate.attempts()
+        #expect(
+            attempts.count == 2,
+            "First missingOneTimeKey remints once; the retry is bounded and must not loop")
+        #expect(attempts[0].sharedId == sharedId)
+        #expect(attempts[1].sharedId == sharedId)
+        #expect(attempts[1].recipientIdentity.id != original.id)
+
+        let events = await probe.recorded()
+        #expect(events.count == 1, "Persisted outbound must be marked failed after bounded repair")
+        #expect(events.first?.sharedMessageId == sharedId)
+        #expect(events.first?.reason == "missingOneTimeKey.repairExhausted")
+
+        let jobs = try await session.cache?.fetchJobs() ?? []
+        #expect(jobs.isEmpty, "Exhausted outbound repair must delete the failed job")
+
+        await session.shutdown()
+    }
+
     @Test("Error Handling - Same Account Invalid Signature Reports Linked Device Compromise")
     func testSameAccountInvalidSignatureReportsLinkedDeviceCompromise() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
@@ -3362,6 +3504,58 @@ final class MockTaskDelegateWithOneShotError: TaskSequenceDelegate, @unchecked S
 
     func getErrorCount() async -> Int {
         await errorTracker.getErrorCount()
+    }
+}
+
+private actor OneShotOutboundErrorProbe {
+    private var recordedAttempts: [OutboundTaskMessage] = []
+
+    func record(_ message: OutboundTaskMessage) -> Bool {
+        recordedAttempts.append(message)
+        return recordedAttempts.count == 1
+    }
+
+    func attempts() -> [OutboundTaskMessage] {
+        recordedAttempts
+    }
+}
+
+final class MockTaskDelegateWithOneShotOutboundError: TaskSequenceDelegate, @unchecked Sendable {
+    private let error: Error
+    private let probe = OneShotOutboundErrorProbe()
+
+    init(error: Error) {
+        self.error = error
+    }
+
+    func performRatchet(task: SessionModels.TaskType, session: PQSSession) async throws {
+        guard case .writeMessage(let message) = task else { return }
+        if await probe.record(message) {
+            throw error
+        }
+    }
+
+    func attempts() async -> [OutboundTaskMessage] {
+        await probe.attempts()
+    }
+}
+
+final class MockTaskDelegateWithAlwaysOutboundError: TaskSequenceDelegate, @unchecked Sendable {
+    private let error: Error
+    private let probe = OneShotOutboundErrorProbe()
+
+    init(error: Error) {
+        self.error = error
+    }
+
+    func performRatchet(task: SessionModels.TaskType, session: PQSSession) async throws {
+        guard case .writeMessage(let message) = task else { return }
+        _ = await probe.record(message)
+        throw error
+    }
+
+    func attempts() async -> [OutboundTaskMessage] {
+        await probe.attempts()
     }
 }
 
