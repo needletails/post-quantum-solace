@@ -180,6 +180,16 @@ extension MessagePipeline {
         outboundTask: OutboundTaskMessage,
         session: PQSSession
     ) async throws {
+        // Record before yielding to transport for the same immediate-resend
+        // invariant as newly encrypted outbound messages. A prepared envelope is
+        // already durable, and a transport error cannot prove the peer did not
+        // receive it.
+        await session.recordOutboundDeviceSend(
+            sharedId: outboundTask.sharedId,
+            recipientSecretName: pendingTransport.metadata.secretName,
+            recipientDeviceId: pendingTransport.metadata.deviceId,
+            sessionIdentityId: pendingTransport.sessionIdentityId,
+            envelopeMessageId: pendingTransport.metadata.envelopeMessageId)
         try await session.transportDelegate?.sendMessage(
             pendingTransport.message,
             metadata: pendingTransport.metadata)
@@ -187,12 +197,6 @@ extension MessagePipeline {
             pendingTransport.metadata.transportEvent,
             sharedId: outboundTask.sharedId)
         await noteResendReplayTransported(sharedId: outboundTask.sharedId)
-        await session.recordOutboundDeviceSend(
-            sharedId: outboundTask.sharedId,
-            recipientSecretName: pendingTransport.metadata.secretName,
-            recipientDeviceId: pendingTransport.metadata.deviceId,
-            sessionIdentityId: pendingTransport.sessionIdentityId,
-            envelopeMessageId: pendingTransport.metadata.envelopeMessageId)
         pendingOutboundTransportBySharedId.removeValue(forKey: outboundTask.sharedId)
         await completeResponderPeerRefreshIfNeeded(
             pendingTransport.metadata.transportEvent,

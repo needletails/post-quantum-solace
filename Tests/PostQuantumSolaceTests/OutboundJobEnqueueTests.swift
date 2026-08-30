@@ -391,6 +391,7 @@ extension EndToEndTests {
         #expect(storeJobs.count >= 1)
         #expect(await aliceTransport.sendMessageCallCount == sendsBefore)
     }
+
 }
 
 extension MockIdentityStore {

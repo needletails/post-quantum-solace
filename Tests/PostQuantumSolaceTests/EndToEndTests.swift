@@ -10539,6 +10539,11 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     /// Useful for forging signatures or mutating payloads deterministically.
     var transformOutgoing: (@Sendable (ReceivedMessage) async throws -> ReceivedMessage)?
 
+    /// Optional re-entrant hook while `sendMessage` is still awaiting transport.
+    /// Models an online recipient returning a resend request before the original
+    /// transport call unwinds on the sender.
+    var duringSendMessage: (@Sendable (ReceivedMessage) async throws -> Void)?
+
     /// Optional hook to pause or observe OTK uploads in recovery tests.
     var beforeUpdateOneTimeKeys: (@Sendable () async -> Void)?
 
@@ -10742,6 +10747,7 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
         if let shouldDeliver, await shouldDeliver(finalReceived) == false {
             return
         }
+        try await duringSendMessage?(finalReceived)
         continuation?.yield(finalReceived)
     }
     

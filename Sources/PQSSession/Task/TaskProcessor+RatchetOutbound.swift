@@ -1115,13 +1115,14 @@ extension MessagePipeline {
             audit(.send, "pqs.send.transportMissing sharedId=\(outboundTask.sharedId)", level: .error)
             throw PQSError.transportNotInitialized
         }
-        
-        try await transportDelegate.sendMessage(signedMessage, metadata: transportMetadata)
-        
-        audit(.send, "pqs.send.deviceTransportOk sharedId=\(outboundTask.sharedId) envelopeMessageId=\(envelopeMessageId) recipientSecret=\(props.secretName) recipientDeviceId=\(props.deviceId.uuidString) sessionIdentityId=\(sessionIdentity.id.uuidString) recipient=\(outboundTask.message.recipient.auditRecipientTag) persisted=\(outboundTask.isPersistedOutbound)",
-            level: .info)
-        
+
         // MessageRecord-lite: envelope id + logical sharedId + encrypting SessionID.
+        // Publish this mapping before yielding to transport. A live recipient can
+        // receive the ciphertext and return requestMessageResend while
+        // `sendMessage` is still suspended; recording afterward made that request
+        // look like an unknown shared id and permanently unavailable. Keeping the
+        // mapping across a transport error is intentional because handoff failure
+        // is ambiguous: the peer may already have received the envelope.
         let priorAttempt = await session.outboundDeviceSendRecord(
             sharedId: outboundTask.sharedId,
             recipientDeviceId: props.deviceId)?.resendAttempt ?? -1
@@ -1139,6 +1140,12 @@ extension MessagePipeline {
             envelopeMessageId: envelopeMessageId,
             resendAttempt: isOrphanReplayForAttempt ? max(0, priorAttempt) + 1 : 0)
         let isOrphanReplay = isOrphanReplayForAttempt
+
+        try await transportDelegate.sendMessage(signedMessage, metadata: transportMetadata)
+        
+        audit(.send, "pqs.send.deviceTransportOk sharedId=\(outboundTask.sharedId) envelopeMessageId=\(envelopeMessageId) recipientSecret=\(props.secretName) recipientDeviceId=\(props.deviceId.uuidString) sessionIdentityId=\(sessionIdentity.id.uuidString) recipient=\(outboundTask.message.recipient.auditRecipientTag) persisted=\(outboundTask.isPersistedOutbound)",
+            level: .info)
+        
         if isOrphanReplay {
             audit(.recovery, "pqs.recovery.messageRecordSessionId=\(sessionIdentity.id.uuidString) sharedId=\(outboundTask.sharedId) recipientDeviceId=\(props.deviceId.uuidString)")
             rememberOrphanResendTransport(
