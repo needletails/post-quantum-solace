@@ -138,6 +138,17 @@ struct GoldenPersistedDataTests {
             pinned: "Ak5CVE4jAAAAU2Vzc2lvbk1vZGVscy5DaGFubmVsU3RvcmVkTWV0YWRhdGECAAAABAAAAGNvcmVvAAAAAQQAAAAEAAAAbmFtZQsAAAABBgAAAGRlc2lnbg0AAABhZG1pbmlzdHJhdG9yCgAAAAEFAAAAYWxpY2UHAAAAbWVtYmVycw8AAAABAQAAAAEFAAAAYWxpY2UJAAAAb3BlcmF0b3JzBQAAAAEAAAAABwAAAG92ZXJsYXkBAAAAAA==")
     }
 
+    @Test("pre-bot ChannelStoredMetadata fixture remains decodable")
+    func preBotChannelStoredMetadataDecodes() throws {
+        let pinned = "Ak5CVE4jAAAAU2Vzc2lvbk1vZGVscy5DaGFubmVsU3RvcmVkTWV0YWRhdGECAAAABAAAAGNvcmVvAAAAAQQAAAAEAAAAbmFtZQsAAAABBgAAAGRlc2lnbg0AAABhZG1pbmlzdHJhdG9yCgAAAAEFAAAAYWxpY2UHAAAAbWVtYmVycw8AAAABAQAAAAEFAAAAYWxpY2UJAAAAb3BlcmF0b3JzBQAAAAEAAAAABwAAAG92ZXJsYXkBAAAAAA=="
+        let bytes = try #require(Data(base64Encoded: pinned))
+        let decoded = try BinaryDecoder().decode(ChannelStoredMetadata.self, from: bytes)
+        #expect(decoded.core.name == "design")
+        #expect(decoded.core.enabledBotNames == nil)
+        #expect(decoded.core.botMemberWelcome == nil)
+        #expect(try BinaryEncoder().encode(decoded) == bytes)
+    }
+
     @Test("OutboundDeviceSendRecord v1 encoding is stable")
     func outboundDeviceSendRecordGolden() throws {
         try assertGolden(

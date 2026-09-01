@@ -38,8 +38,9 @@ import SessionModels
 ///
 /// ## Architecture
 ///
-/// `PQSSession` follows a singleton pattern and uses Swift's actor model for thread-safe
-/// concurrent access. It delegates specific responsibilities to protocol-conforming objects:
+/// `PQSSession` is instance-based: construct one actor with ``SessionConfiguration``.
+/// It uses Swift's actor model for thread-safe concurrent access and delegates
+/// specific responsibilities to protocol-conforming objects:
 ///
 /// - `PQSNetworkHost` - Network communication and key distribution
 /// - `PQSPersistenceHost` - Persistent storage and caching
@@ -81,7 +82,7 @@ import SessionModels
 /// ## Thread Safety
 ///
 /// This actor is designed for concurrent access and all public methods are thread-safe.
-/// The singleton pattern ensures consistent state across your application.
+/// Construct one instance per account host and keep it for the process lifetime.
 ///
 /// ## Error Handling
 ///
@@ -220,6 +221,67 @@ public actor PQSSession: SessionCacheSynchronizer {
     ///
     public func confirmServerAcceptedEnvelope(_ envelopeMessageId: String) async {
         await messagePipeline.confirmServerAcceptedEnvelope(envelopeMessageId, session: self)
+    }
+
+    /// Drops a sealed accept-claim without marking the chat delivered so the
+    /// caller can rebuild an identified envelope with a new id.
+    public func consumeUnackedEnvelopeForIdentifiedFallback(
+        _ envelopeMessageId: String
+    ) async -> (message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata)? {
+        guard let entry = await messagePipeline.takeUnackedOutboundEnvelope(envelopeMessageId) else {
+            return nil
+        }
+        let newMetadata = SignedRatchetMessageMetadata(
+            secretName: entry.pending.metadata.secretName,
+            deviceId: entry.pending.metadata.deviceId,
+            recipient: entry.pending.metadata.recipient,
+            transportMetadata: entry.pending.metadata.transportMetadata,
+            sharedMessageId: entry.pending.metadata.sharedMessageId,
+            envelopeMessageId: EnvelopeMessageIdentityPolicy.mintEnvelopeMessageId().rawValue,
+            transportEvent: entry.pending.metadata.transportEvent,
+            requiresServerAck: entry.pending.metadata.requiresServerAck
+        )
+        let pending = MessagePipeline.PendingOutboundTransport(
+            message: entry.pending.message,
+            metadata: newMetadata,
+            sessionIdentityId: entry.pending.sessionIdentityId,
+            needsRemoteDeletion: entry.pending.needsRemoteDeletion,
+            x25519OneTimeKeyId: entry.pending.x25519OneTimeKeyId,
+            mlKEMOneTimeKeyId: entry.pending.mlKEMOneTimeKeyId,
+            createdAt: Date()
+        )
+        await messagePipeline.registerUnackedServerAccept(
+            pending: pending,
+            localId: entry.localId,
+            sharedId: entry.sharedId,
+            isPersistedOutbound: entry.isPersistedOutbound,
+            session: self
+        )
+        return (entry.pending.message, newMetadata)
+    }
+
+    public func sendIdentifiedFallback(
+        _ message: SignedRatchetMessage,
+        metadata: SignedRatchetMessageMetadata
+    ) async throws {
+        try await transportDelegate?.sendMessage(message, metadata: metadata)
+    }
+
+    /// Privilege or protocol sealed rejection: stop waiting and fail the bubble.
+    public func failUnackedServerAcceptEnvelope(
+        _ envelopeMessageId: String,
+        reason: String
+    ) async {
+        guard let entry = await messagePipeline.takeUnackedOutboundEnvelope(envelopeMessageId) else {
+            return
+        }
+        if entry.isPersistedOutbound {
+            await messagePipeline.markPersistedOutboundFailed(
+                session: self,
+                localMessageId: entry.localId,
+                reason: reason
+            )
+        }
     }
 
     /// Whether this envelope is still waiting for server `privateMessageAccepted`.

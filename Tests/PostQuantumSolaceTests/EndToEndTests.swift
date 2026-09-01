@@ -43,6 +43,23 @@ actor SessionEventProbe {
     }
 }
 
+actor OutboundUnrecoverableProbe {
+    struct Event: Equatable {
+        let sharedMessageId: String
+        let reason: String
+    }
+
+    private var events: [Event] = []
+
+    func mark(sharedMessageId: String, reason: String) {
+        events.append(.init(sharedMessageId: sharedMessageId, reason: reason))
+    }
+
+    func recorded() -> [Event] {
+        events
+    }
+}
+
 actor LinkedDeviceCompromiseProbe {
     private var reportedDeviceIds: [UUID] = []
 
@@ -9793,6 +9810,7 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
     let session: PQSSession
     let compromiseProbe: LinkedDeviceCompromiseProbe?
     let peerIdentityTrustProbe: PeerIdentityTrustProbe?
+    let outboundUnrecoverableProbe: OutboundUnrecoverableProbe?
     /// Test-only: forces `retrieveUserInfo` so Missing Offer Identity paths are deterministic.
     var forcedRetrieveUserInfo: (secretName: String, deviceId: String)?
     
@@ -9800,11 +9818,13 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
         session: PQSSession,
         compromiseProbe: LinkedDeviceCompromiseProbe? = nil,
         peerIdentityTrustProbe: PeerIdentityTrustProbe? = nil,
+        outboundUnrecoverableProbe: OutboundUnrecoverableProbe? = nil,
         forcedRetrieveUserInfo: (secretName: String, deviceId: String)? = nil
     ) {
         self.session = session
         self.compromiseProbe = compromiseProbe
         self.peerIdentityTrustProbe = peerIdentityTrustProbe
+        self.outboundUnrecoverableProbe = outboundUnrecoverableProbe
         self.forcedRetrieveUserInfo = forcedRetrieveUserInfo
     }
     
@@ -9932,7 +9952,11 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
         senderDeviceId _: UUID,
         sharedMessageId _: String
     ) async {}
-    func outboundMessageUnrecoverable(sharedMessageId _: String, reason _: String) async {}
+    func outboundMessageUnrecoverable(sharedMessageId: String, reason: String) async {
+        await outboundUnrecoverableProbe?.mark(
+            sharedMessageId: sharedMessageId,
+            reason: reason)
+    }
     func reestablishmentEpisodeDidEnd(senderSecretName _: String, senderDeviceId _: UUID) async {}
     func shouldSuppressInboundRecoveryFromSender(_: String) async -> Bool { false }
     func preferredOnlinePeerDeviceId(for _: String) async -> UUID? { nil }
@@ -10515,6 +10539,11 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     /// Useful for forging signatures or mutating payloads deterministically.
     var transformOutgoing: (@Sendable (ReceivedMessage) async throws -> ReceivedMessage)?
 
+    /// Optional re-entrant hook while `sendMessage` is still awaiting transport.
+    /// Models an online recipient returning a resend request before the original
+    /// transport call unwinds on the sender.
+    var duringSendMessage: (@Sendable (ReceivedMessage) async throws -> Void)?
+
     /// Optional hook to pause or observe OTK uploads in recovery tests.
     var beforeUpdateOneTimeKeys: (@Sendable () async -> Void)?
 
@@ -10609,6 +10638,11 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
 
     var outOfBandResendRequestCount: Int {
         get async { await oobResendTracker.callCount }
+    }
+
+    /// Per-call view (secretName, deviceId, id count) for frame-cap assertions.
+    var outOfBandResendRequestCalls: [(secretName: String, deviceId: String, keyCount: Int)] {
+        get async { await oobResendTracker.calls }
     }
 
     func sendOutOfBandResendRequest(
@@ -10713,6 +10747,7 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
         if let shouldDeliver, await shouldDeliver(finalReceived) == false {
             return
         }
+        try await duringSendMessage?(finalReceived)
         continuation?.yield(finalReceived)
     }
     

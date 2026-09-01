@@ -296,6 +296,20 @@ extension MessagePipeline {
                             await jobConsumer.gracefulShutdown()
                             return .drained
                         }
+                    } catch SessionCache.CacheErrors.jobNotFound {
+                        // A job vanishing mid-flight means a concurrent path already
+                        // completed or deleted it. That is a queue-plumbing race, not
+                        // a ratchet outcome: it must never demote a lane, emit a
+                        // recovery signal, or halt the drain (one halted loop is what
+                        // amplified a single race into a storm during offline
+                        // backlog replay). Skip to the next job.
+                        logger.log(
+                            level: .warning,
+                            message: "Job vanished mid-flight (already handled by a concurrent path); continuing queue drain")
+                        if await jobConsumer.deque.isEmpty {
+                            await jobConsumer.gracefulShutdown()
+                            return .drained
+                        }
                     } catch {
                         await jobConsumer.gracefulShutdown()
                         throw error
@@ -843,9 +857,13 @@ extension MessagePipeline {
                 try await cache.deleteJob(job)
                 return .deleted
             case .writeMessage(let message):
-                logger.log(level: .error, message: "missingOneTimeKey for writeMessage to recipient: \(message.message.recipient)")
-                await noteResendReplayDropped(sharedId: message.sharedId, reason: "missingOneTimeKey")
-                try await cache.deleteJob(job)
+                return try await handleFreshOutboundRepair(
+                    message: message,
+                    error: ratchetError,
+                    job: job,
+                    cache: cache,
+                    session: session,
+                    symmetricKey: symmetricKey)
             }
         } catch let cryptoError as CryptoKitError {
             switch props.task.task {
@@ -1002,13 +1020,44 @@ extension MessagePipeline {
                 let senderSecretName = inbound.senderSecretName
                 let senderDeviceId = inbound.senderDeviceId
                 let sharedMessageId = inbound.sharedMessageId
-                audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
-                await session.scheduleTransportProtocolWork {
-                    await delegate?.inboundRecoveryDeferred(
-                        senderSecretName: senderSecretName,
-                        senderDeviceId: senderDeviceId,
-                        failedSharedMessageId: sharedMessageId,
-                        failureClass: "inbound.unhandledError")
+                if case JobProcessorErrors.missingIdentity = error {
+                    // Identity resolution failed even after a forced directory
+                    // refresh. This is not a decrypt outcome, so the recovery ring
+                    // never claimed a durable resend for this sharedId — notifying
+                    // the host alone would purge the spool copy with zero §4.1
+                    // retry attempts (silent content loss). Register the bounded
+                    // OOB resend first; the defer itself fires
+                    // `inboundRecoveryDeferred`, keeping the host's claim-and-purge
+                    // contract true. A transient miss heals on sender resend; a
+                    // genuinely unlinked device terminates at the submission cap
+                    // via `pendingResendExhausted`.
+                    audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error) failureClass=inbound.missingIdentity")
+                    await session.deferPeerResendUntilReestablished(
+                        sender: senderSecretName,
+                        deviceId: senderDeviceId,
+                        failedMessageId: sharedMessageId,
+                        failureClass: "inbound.missingIdentity")
+                    // Identity misses never open a reestablishment episode, so no
+                    // episode-end event would ever drain this lane. Flush on this
+                    // concrete failure event instead; cooldown and the attempt cap
+                    // still gate the actual submission.
+                    if await !session.hasOpenReestablishmentEpisode(
+                        sender: senderSecretName,
+                        deviceId: senderDeviceId) {
+                        await session.flushPendingResends(
+                            sender: senderSecretName,
+                            deviceId: senderDeviceId,
+                            reason: "missingIdentity")
+                    }
+                } else {
+                    audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
+                    await session.scheduleTransportProtocolWork {
+                        await delegate?.inboundRecoveryDeferred(
+                            senderSecretName: senderSecretName,
+                            senderDeviceId: senderDeviceId,
+                            failedSharedMessageId: sharedMessageId,
+                            failureClass: "inbound.unhandledError")
+                    }
                 }
             }
             try await cache.deleteJob(job)
@@ -1084,7 +1133,16 @@ extension MessagePipeline {
         var updatedProps = props
         updatedProps.attempts += 1
         _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
-        try await cache.updateJob(job)
+        do {
+            try await cache.updateJob(job)
+        } catch SessionCache.CacheErrors.jobNotFound {
+            // A concurrent path (unhandled-error delete, consumer completion)
+            // already removed this job; nothing is left to re-queue.
+            logger.log(
+                level: .info,
+                message: "Skipped inbound re-queue; job already removed by a concurrent path")
+            return .deleted
+        }
         
         // If we are running the consumer proceed
         if await !jobConsumer.deque.isEmpty {
@@ -1452,7 +1510,16 @@ extension MessagePipeline {
         updatedProps.delayedUntil = nil
         isPausedUntilTransportReady = true
         _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
-        try await cache.updateJob(job)
+        do {
+            try await cache.updateJob(job)
+        } catch SessionCache.CacheErrors.jobNotFound {
+            // A concurrent path already removed this job; there is no durable
+            // row left to carry the retry bookkeeping.
+            logger.log(
+                level: .info,
+                message: "Skipped outbound transport retry bookkeeping; job already removed by a concurrent path")
+            return .deleted
+        }
         let logMessage: String
         if let recoveryLog = recoveryTransportSendFailureLog(
             props: props,
@@ -1539,6 +1606,8 @@ extension MessagePipeline {
             return "ratchet.sendingKeyIsNil"
         case .stateUninitialized:
             return "ratchet.stateUninitialized"
+        case .missingOneTimeKey:
+            return "ratchet.missingOneTimeKey"
         default:
             return "ratchet.freshSessionRepair"
         }
@@ -1800,14 +1869,20 @@ extension MessagePipeline {
 
     private func handleFreshOutboundRepair(
         message: OutboundTaskMessage,
-        error: RatchetError,
+        error ratchetError: RatchetError,
         job: JobModel,
         cache: SessionCache,
         session: PQSSession,
         symmetricKey: SymmetricKey
     ) async throws -> JobProcessingOutcome {
+        let requiresFreshNoOTKLane = ratchetError == .missingOneTimeKey
         guard let props = await message.recipientIdentity.props(symmetricKey: symmetricKey) else {
-            logger.log(level: .error, message: "Fresh outbound repair failed: missing recipient props for \(error)")
+            logger.log(level: .error, message: "Fresh outbound repair failed: missing recipient props for \(ratchetError)")
+            await reportTerminalOutboundRepairIfNeeded(
+                message: message,
+                error: ratchetError,
+                reason: "missingRecipientProps",
+                session: session)
             await noteResendReplayDropped(sharedId: message.sharedId, reason: "outboundRepairMissingProps")
             try await cache.deleteJob(job)
             return .deleted
@@ -1821,10 +1896,10 @@ extension MessagePipeline {
 
         logger.log(
             level: .warning,
-            message: "\(freshSessionFailureClass(error)) while sending to \(props.secretName) deviceId=\(props.deviceId); resetting SessionIdentity and retrying once")
+            message: "\(freshSessionFailureClass(ratchetError)) while sending to \(props.secretName) deviceId=\(props.deviceId); resetting SessionIdentity and retrying once")
 
         let isPendingResendReplay = pendingResendReplayBySharedId[message.sharedId] != nil
-        if isPendingResendReplay {
+        if isPendingResendReplay && !requiresFreshNoOTKLane {
             // Orphan-resend replays must not be deleted by the outbound repair
             // cooldown — that drops the orphan-resend recovery wave with no wire frame.
             await session.clearOutboundReconciliationCooldown(
@@ -1835,7 +1910,9 @@ extension MessagePipeline {
             sender: props.secretName,
             deviceId: props.deviceId,
             flow: .outbound)
-        let canBypassCooldown = isRecoveryCriticalControl && consumeOutboundControlRepairBypass(sharedId: message.sharedId)
+        let canBypassCooldown =
+            (isRecoveryCriticalControl || requiresFreshNoOTKLane)
+            && consumeOutboundRepairBypass(sharedId: message.sharedId)
 
         guard canAttempt || canBypassCooldown else {
             if isRecoveryCriticalControl {
@@ -1844,13 +1921,18 @@ extension MessagePipeline {
                     deviceId: props.deviceId)
                 logger.log(
                     level: .warning,
-                    message: "pqs.recovery.criticalControlRepairExhausted failureClass=\(freshSessionFailureClass(error)) recipient=\(props.secretName) deviceId=\(props.deviceId) sharedId=\(message.sharedId) action=closeEpisode")
+                    message: "pqs.recovery.criticalControlRepairExhausted failureClass=\(freshSessionFailureClass(ratchetError)) recipient=\(props.secretName) deviceId=\(props.deviceId) sharedId=\(message.sharedId) action=closeEpisode")
             }
             logger.log(level: .warning, message: "Suppressing repeated fresh outbound repair for \(props.secretName) (\(props.deviceId))")
             // Failed repair must not leave a state-less preferred zombie (dogfood poison).
             _ = try? await session.demoteZombieStateLessActives(
                 secretName: props.secretName,
                 deviceId: props.deviceId)
+            await reportTerminalOutboundRepairIfNeeded(
+                message: message,
+                error: ratchetError,
+                reason: "repairExhausted",
+                session: session)
             await noteResendReplayDropped(sharedId: message.sharedId, reason: "outboundRepairSuppressed")
             try await cache.deleteJob(job)
             return .deleted
@@ -1859,14 +1941,15 @@ extension MessagePipeline {
         if !canAttempt, canBypassCooldown {
             logger.log(
                 level: .info,
-                message: "Allowing one cooldown-bypassed outbound repair for recovery control sharedId=\(message.sharedId) to \(props.secretName) (\(props.deviceId))")
+                message: "Allowing one cooldown-bypassed outbound repair sharedId=\(message.sharedId) failureClass=\(freshSessionFailureClass(ratchetError)) recipient=\(props.secretName) deviceId=\(props.deviceId)")
         }
 
         do {
             // Prefer the orphan-resend initiating session when replaying; a second
             // `outboundRepair` reset would mint yet another SessionID mid-wave.
             let replacement: SessionIdentity
-            if let protectedId = await session.orphanResendInitiatingSessionId(
+            if !requiresFreshNoOTKLane,
+               let protectedId = await session.orphanResendInitiatingSessionId(
                 secretName: props.secretName,
                 deviceId: props.deviceId
             ),
@@ -1887,7 +1970,13 @@ extension MessagePipeline {
                     secretName: props.secretName,
                     deviceId: props.deviceId,
                     sendOneTimeIdentities: false,
-                    reason: "outboundRepair")
+                    reason: requiresFreshNoOTKLane
+                        ? "outboundMissingOneTimeKey"
+                        : "outboundRepair",
+                    reuseStateLessRepairLane: !requiresFreshNoOTKLane)
+                clearPreferredSessionIdentity(
+                    secretName: props.secretName,
+                    deviceId: props.deviceId)
                 if isPendingResendReplay {
                     await session.markOrphanResendInitiatingSession(
                         secretName: props.secretName,
@@ -1906,27 +1995,45 @@ extension MessagePipeline {
                     recipientIdentity: replacement,
                     localId: message.localId,
                     sharedId: message.sharedId,
-                    isPersistedOutbound: message.isPersistedOutbound
+                    isPersistedOutbound: message.isPersistedOutbound,
+                    coalescingKey: message.coalescingKey
                 )),
                 priority: .urgent)
 
             try await cache.deleteJob(job)
             try await enqueue(retry, session: session)
             return .deleted
-        } catch {
+        } catch let repairError {
             if isRecoveryCriticalControl {
                 await session.endReestablishmentEpisode(
                     sender: props.secretName,
                     deviceId: props.deviceId)
             }
-            logger.log(level: .error, message: "Fresh outbound repair failed for \(props.secretName) (\(props.deviceId)): \(error)")
+            logger.log(level: .error, message: "Fresh outbound repair failed for \(props.secretName) (\(props.deviceId)): \(repairError)")
             _ = try? await session.demoteZombieStateLessActives(
                 secretName: props.secretName,
                 deviceId: props.deviceId)
+            await reportTerminalOutboundRepairIfNeeded(
+                message: message,
+                error: ratchetError,
+                reason: "repairFailed",
+                session: session)
             await noteResendReplayDropped(sharedId: message.sharedId, reason: "outboundRepairFailed")
             try await cache.deleteJob(job)
             return .deleted
         }
+    }
+
+    private func reportTerminalOutboundRepairIfNeeded(
+        message: OutboundTaskMessage,
+        error: RatchetError,
+        reason: String,
+        session: PQSSession
+    ) async {
+        guard error == .missingOneTimeKey, message.isPersistedOutbound else { return }
+        await session.sessionDelegate?.outboundMessageUnrecoverable(
+            sharedMessageId: message.sharedId,
+            reason: "missingOneTimeKey.\(reason)")
     }
 
     private func isRecoveryCriticalControlMessage(_ message: CryptoMessage) -> Bool {
@@ -1950,17 +2057,17 @@ extension MessagePipeline {
         }
     }
 
-    private func consumeOutboundControlRepairBypass(sharedId: String, now: Date = Date()) -> Bool {
-        let cutoff = now.addingTimeInterval(-outboundControlRepairBypassTTL)
-        outboundControlRepairBypassAtBySharedId = outboundControlRepairBypassAtBySharedId.filter { _, createdAt in
+    private func consumeOutboundRepairBypass(sharedId: String, now: Date = Date()) -> Bool {
+        let cutoff = now.addingTimeInterval(-outboundRepairBypassTTL)
+        outboundRepairBypassAtBySharedId = outboundRepairBypassAtBySharedId.filter { _, createdAt in
             createdAt > cutoff
         }
 
-        guard outboundControlRepairBypassAtBySharedId[sharedId] == nil else {
+        guard outboundRepairBypassAtBySharedId[sharedId] == nil else {
             return false
         }
 
-        outboundControlRepairBypassAtBySharedId[sharedId] = now
+        outboundRepairBypassAtBySharedId[sharedId] = now
         return true
     }
     

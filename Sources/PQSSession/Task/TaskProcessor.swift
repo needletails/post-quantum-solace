@@ -233,10 +233,11 @@ actor MessagePipeline {
     /// Keeps recovery behavior while reducing startup storms that can race with live traffic.
     let peerRefreshRequestCooldown: TimeInterval = 15
 
-    /// Recovery-critical control messages may need one retry even when a recent outbound
-    /// reconciliation already set the peer cooldown. Keyed by outbound shared id.
-    var outboundControlRepairBypassAtBySharedId: [String: Date] = [:]
-    let outboundControlRepairBypassTTL: TimeInterval = 60 * 10
+    /// Recovery-critical control messages and a locally proven outbound OTK invariant
+    /// failure may need one retry even when a recent outbound reconciliation already
+    /// set the peer cooldown. Keyed by outbound shared id so the bypass is bounded.
+    var outboundRepairBypassAtBySharedId: [String: Date] = [:]
+    let outboundRepairBypassTTL: TimeInterval = 60 * 10
 
     struct PendingOutboundTransport: Sendable {
         let message: SignedRatchetMessage
@@ -972,17 +973,25 @@ actor MessagePipeline {
             throw PQSError.missingMetadata
         }
 
+        let existingStored = ChannelStoredMetadata.migrating(from: props.metadata)
+        let existingInfo = existingStored?.core
         let wireInfo = ChannelInfo(
             name: channelName,
             administrator: administrator,
             members: members,
-            operators: operators)
-        let metadata = try BinaryEncoder().encode(wireInfo)
+            operators: operators,
+            enabledBotNames: existingInfo?.enabledBotNames,
+            botMemberWelcome: existingInfo?.botMemberWelcome,
+            botOperatorWelcome: existingInfo?.botOperatorWelcome,
+            botIdleHint: existingInfo?.botIdleHint)
+        let wireMetadata = try BinaryEncoder().encode(wireInfo)
+        let localMetadata = try BinaryEncoder().encode(
+            ChannelStoredMetadata(core: wireInfo, overlay: existingStored?.overlay))
 
         props.administrator = administrator
         props.members = members
         props.operators = operators
-        props.metadata = metadata
+        props.metadata = localMetadata
 
         _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
         try await cache.updateCommunication(communicationModel)
@@ -993,7 +1002,7 @@ actor MessagePipeline {
             let params = try await session.requireSessionParametersWithoutTransportDelegate()
             try await session.sendCommunicationSynchronization(
                 recipient: .channel(channelName),
-                metadata: metadata,
+                metadata: wireMetadata,
                 sessionContext: params.sessionContext,
                 sessionDelegate: params.sessionDelegate,
                 cache: params.cache,

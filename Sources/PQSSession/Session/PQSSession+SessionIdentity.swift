@@ -1749,7 +1749,8 @@ public extension PQSSession {
         deviceId: UUID,
         sendOneTimeIdentities: Bool = true,
         reason: String = "unspecified",
-        demotePriorActives: Bool = true
+        demotePriorActives: Bool = true,
+        reuseStateLessRepairLane: Bool = true
     ) async throws -> SessionIdentity {
         guard let cache else {
             throw PQSError.databaseNotInitialized
@@ -1810,7 +1811,8 @@ public extension PQSSession {
         // Reuse it instead of tearing the row down again under concurrent recovery.
         // Consume-lane callers (`sendOneTimeIdentities == true`) must fall through to
         // the atomic OTK consume below so bootstrap semantics stay exact.
-        if !sendOneTimeIdentities,
+        if reuseStateLessRepairLane,
+           !sendOneTimeIdentities,
            let reusable = activeMatches.last(where: { !$0.props.hasRatchetState }),
            activeMatches.allSatisfy({ !$0.props.hasRatchetState }) {
             let keysMatchDevice =

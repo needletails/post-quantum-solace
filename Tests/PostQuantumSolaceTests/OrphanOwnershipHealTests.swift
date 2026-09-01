@@ -102,6 +102,76 @@ struct OrphanOwnershipHealPolicyTests {
     }
 }
 
+/// Lane heal for waves the owner cannot service at all (every id
+/// terminally unavailable — ephemeral frames with no plaintext). The NACK
+/// proved the outbound lane is diverged; with zero queued replays nothing
+/// re-proves it, so new traffic would keep dying on the dead ratchet
+/// (dogfood: parent→child personal lane failing for 6+ hours after
+/// ownerMissingPlaintext-only waves).
+@Suite("Unservicable resend lane heal policy")
+struct UnservicableResendLaneHealPolicyTests {
+    @Test("all-unavailable wave with no live mark remints the lane")
+    func allUnavailableWaveRemints() {
+        let decision = UnservicableResendLaneHealPolicy.decision(
+            queuedReplayCount: 0,
+            coalescedReplayCount: 0,
+            unavailableCount: 3,
+            stateLessInitiatingMarkIsLive: false)
+        #expect(decision == .remintLane)
+    }
+
+    @Test("live state-less mark suppresses a second remint on NACK retries")
+    func liveStateLessMarkSuppressesRemint() {
+        // The prior heal has not carried traffic yet; the requester's bounded
+        // retries for old ids do not indict the fresh lane.
+        let decision = UnservicableResendLaneHealPolicy.decision(
+            queuedReplayCount: 0,
+            coalescedReplayCount: 0,
+            unavailableCount: 1,
+            stateLessInitiatingMarkIsLive: true)
+        #expect(decision == .reuseExistingStateLessMark)
+    }
+
+    @Test("wave that queued a replay needs no extra heal")
+    func queuedReplayWaveNeedsNoHeal() {
+        // The msg0 replay itself remints/re-proves the lane.
+        let decision = UnservicableResendLaneHealPolicy.decision(
+            queuedReplayCount: 1,
+            coalescedReplayCount: 0,
+            unavailableCount: 2,
+            stateLessInitiatingMarkIsLive: false)
+        #expect(decision == .noHealNeeded)
+    }
+
+    @Test("coalesced replay in flight suppresses the remint")
+    func coalescedReplayInFlightSuppressesRemint() {
+        // A mixed wave: some ids terminally unavailable, but at least one id
+        // was serviced within the cooldown window — that msg0 is in flight
+        // and re-proves the lane. Reminting now would discard the very lane
+        // the in-flight replay is proving. Once the cooldown expires, the
+        // next NACK either queues a fresh replay (heals) or goes fully
+        // terminal (reaches remintLane).
+        let decision = UnservicableResendLaneHealPolicy.decision(
+            queuedReplayCount: 0,
+            coalescedReplayCount: 1,
+            unavailableCount: 2,
+            stateLessInitiatingMarkIsLive: false)
+        #expect(decision == .noHealNeeded)
+    }
+
+    @Test("wave with nothing terminal needs no heal")
+    func nothingTerminalNeedsNoHeal() {
+        // Fully coalesced/deferred waves answered nothing unavailable; a
+        // sibling owner or an in-flight replay may still land.
+        let decision = UnservicableResendLaneHealPolicy.decision(
+            queuedReplayCount: 0,
+            coalescedReplayCount: 0,
+            unavailableCount: 0,
+            stateLessInitiatingMarkIsLive: false)
+        #expect(decision == .noHealNeeded)
+    }
+}
+
 /// Pre-merge linked-device log checklist (dogfood echo primary ↔ child):
 /// 1. Non-owner: `orphanResendDeferredNotContentOwner` (if NACK observed)
 /// 2. Owner only: `orphanResend` / `orphanResendRetransport` + MessageRecord=recovery

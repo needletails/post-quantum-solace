@@ -116,7 +116,8 @@ extension PQSSession {
                 bundle: .init(
                     deviceId: currentDevice.deviceId,
                     longTermPublicKey: newLongTermPrivateKey.publicKey.rawRepresentation,
-                    finalMLKEMPublicKey: newFinalMLKEMPublicKey
+                    finalMLKEMPublicKey: newFinalMLKEMPublicKey,
+                    capabilities: .sealedSender
                 ),
                 signingKey: deviceSigningPrivateKey
             )
@@ -329,7 +330,8 @@ extension PQSSession {
                 bundle: .init(
                     deviceId: sessionContext.sessionUser.deviceId,
                     longTermPublicKey: longTerm.x25519.publicKey.rawRepresentation,
-                    finalMLKEMPublicKey: mlKEMPublicKey
+                    finalMLKEMPublicKey: mlKEMPublicKey,
+                    capabilities: .sealedSender
                 ),
                 signingKey: longTerm.signing
             )
@@ -861,7 +863,8 @@ private extension PQSSession {
             bundle: .init(
                 deviceId: device.deviceId,
                 longTermPublicKey: currentBundle.longTermPublicKey,
-                finalMLKEMPublicKey: mlKEMPublicKey
+                finalMLKEMPublicKey: mlKEMPublicKey,
+                capabilities: .sealedSender
             ),
             signingKey: signingPrivateKey
         )

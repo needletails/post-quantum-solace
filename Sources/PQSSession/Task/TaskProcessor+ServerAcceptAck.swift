@@ -27,6 +27,11 @@ extension MessagePipeline {
         startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
     }
 
+    func takeUnackedOutboundEnvelope(_ envelopeMessageId: String) -> UnackedOutboundEnvelope? {
+        unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)?.cancel()
+        return unackedServerAcceptByEnvelopeId.removeValue(forKey: envelopeMessageId)
+    }
+
     func confirmServerAcceptedEnvelope(_ envelopeMessageId: String, session: PQSSession) async {
         guard let entry = unackedServerAcceptByEnvelopeId.removeValue(forKey: envelopeMessageId) else {
             return
