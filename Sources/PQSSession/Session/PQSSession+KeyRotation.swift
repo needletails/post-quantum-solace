@@ -125,7 +125,11 @@ extension PQSSession {
             sessionContext.activeUserConfiguration.signedDeviceKeyBundles.removeAll { $0.id == currentDevice.deviceId }
             sessionContext.activeUserConfiguration.signedDeviceKeyBundles.append(signedDeviceKeyBundle)
             sessionContext.sessionUser.deviceKeys.longTermPrivateKey = newLongTermPrivateKey.rawRepresentation
-            sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey = newFinalMLKEMPrivateKey
+            // Routine device rotation: keep the outgoing final key one generation so
+            // sealed envelopes and bootstraps already encapsulated to it still open.
+            sessionContext.sessionUser.deviceKeys.replaceFinalMLKEMPrivateKey(
+                newFinalMLKEMPrivateKey,
+                retainingPrevious: true)
 
             guard let transportDelegate else {
                 throw PQSError.transportNotInitialized
@@ -324,7 +328,11 @@ extension PQSSession {
             sessionContext.sessionUser.deviceKeys.rotateAccountSigningKey(longTerm.signing.rawRepresentation)
             sessionContext.activeUserConfiguration.signingPublicKey = longTerm.signing.publicKey.rawRepresentation
             sessionContext.sessionUser.deviceKeys.longTermPrivateKey = longTerm.x25519.rawRepresentation
-            sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey = mlKEMPrivateKey
+            // Compromise rotation: the retired final key is suspect. Discard every prior
+            // generation so nothing encapsulated to it can be opened here.
+            sessionContext.sessionUser.deviceKeys.replaceFinalMLKEMPrivateKey(
+                mlKEMPrivateKey,
+                retainingPrevious: false)
             sessionContext.activeUserConfiguration.signedDevices = allReSigned
             let signedDeviceKeyBundle = try UserConfiguration.SignedDeviceKeyBundle(
                 bundle: .init(
@@ -831,7 +839,11 @@ private extension PQSSession {
         let mlKEMPrivateKey = try MLKEMPrivateKey(id: mlKEMId, mlKEM.encode())
         let mlKEMPublicKey = try MLKEMPublicKey(id: mlKEMId, mlKEM.publicKey.rawRepresentation)
 
-        sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey = mlKEMPrivateKey
+        // Scheduled rotation runs from the outbound hot path; peers may already hold
+        // envelopes sealed to the outgoing key. Retain it one generation.
+        sessionContext.sessionUser.deviceKeys.replaceFinalMLKEMPrivateKey(
+            mlKEMPrivateKey,
+            retainingPrevious: true)
 
         let signingKeyData = sessionContext.activeUserConfiguration.signingPublicKey
         let signingKey = try Curve25519.Signing.PublicKey(rawRepresentation: signingKeyData)

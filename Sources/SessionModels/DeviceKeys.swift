@@ -57,6 +57,7 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
         case rotateKeysDate = "g" // Date to rotate the keys
         case deviceAuthMLDSA = "h" // ML-DSA-65 device JWT signing state
         case pendingOneTimeKeyConsumptions = "i" // Deferred OTK consumptions awaiting reverse-handshake confirmation
+        case previousFinalMLKEMPrivateKey = "j" // Final key retired by the most recent routine rotation
     }
 
     /// Unique identifier for the device.
@@ -105,6 +106,22 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     /// been consumed. It should be replaced with new one-time keys as soon as
     /// possible to maintain optimal security.
     public var finalMLKEMPrivateKey: MLKEMPrivateKey
+
+    /// The final MLKEM private key retired by the most recent *routine* rotation.
+    ///
+    /// Peers encapsulate to the published final key: sealed-sender outer boxes always,
+    /// and PQXDH bootstraps whenever the one-time pool is empty. Routine rotation
+    /// (`rotateMLKEMKeysIfNeeded` weekly, `rotateCurrentDeviceKeys`) replaces that key
+    /// while envelopes sealed to it can still be in flight — spooled while this device
+    /// was offline, or produced by a sender still inside its configuration lookup
+    /// window. Exactly one prior generation is retained so those envelopes open; it is
+    /// released by the next rotation. Compromise rotation clears it: the retired key is
+    /// suspect and nothing sealed to it may be trusted.
+    ///
+    /// Optional so session contexts persisted before this field decode unchanged and
+    /// encodes stay byte-identical while `nil`. Mutate only through
+    /// `replaceFinalMLKEMPrivateKey(_:retainingPrevious:)`.
+    public private(set) var previousFinalMLKEMPrivateKey: MLKEMPrivateKey?
 
     /// Date to rotate the keys, if applicable.
     ///
@@ -190,6 +207,29 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
     /// guard on `currentDevice.isMasterDevice` (the rotation function does so today).
     public mutating func rotateAccountSigningKey(_ data: Data) {
         signingPrivateKey = data
+    }
+
+    /// Installs a new final MLKEM private key.
+    ///
+    /// - Parameters:
+    ///   - newKey: The freshly generated final key whose public half is being published.
+    ///   - retainingPrevious: `true` for routine rotation, which keeps the outgoing key
+    ///     as `previousFinalMLKEMPrivateKey` so in-flight envelopes sealed to it still
+    ///     open. `false` for compromise rotation, which discards all prior generations.
+    public mutating func replaceFinalMLKEMPrivateKey(
+        _ newKey: MLKEMPrivateKey,
+        retainingPrevious: Bool
+    ) {
+        previousFinalMLKEMPrivateKey = retainingPrevious ? finalMLKEMPrivateKey : nil
+        finalMLKEMPrivateKey = newKey
+    }
+
+    /// Resolves a final MLKEM private key by the id a peer cited, checking the current
+    /// generation first and then the single retained prior generation.
+    public func finalMLKEMPrivateKey(matching id: UUID) -> MLKEMPrivateKey? {
+        if finalMLKEMPrivateKey.id == id { return finalMLKEMPrivateKey }
+        if let previous = previousFinalMLKEMPrivateKey, previous.id == id { return previous }
+        return nil
     }
 
     /// Replaces the ML-DSA-65 device JWT signing state. Pass `nil` to discard

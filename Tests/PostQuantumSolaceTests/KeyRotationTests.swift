@@ -793,4 +793,98 @@ actor KeyRotationTests {
 
         await session.shutdown()
     }
+
+    @Test("routine rotation retains exactly one prior final ML-KEM key and persists it")
+    func testRoutineRotation_retainsOnePriorFinalMLKEMKey() async throws {
+        _ = try await setupRotatableSession()
+
+        guard let generation0 = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        #expect(generation0.previousFinalMLKEMPrivateKey == nil)
+
+        try await session.rotateCurrentDeviceKeys()
+        guard let generation1 = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Rotated session context should not be nil")
+            return
+        }
+        // The retired key is retained byte-for-byte: a box sealed to generation 0's
+        // public key opens with it.
+        #expect(generation1.finalMLKEMPrivateKey.id != generation0.finalMLKEMPrivateKey.id)
+        #expect(generation1.previousFinalMLKEMPrivateKey == generation0.finalMLKEMPrivateKey)
+        #expect(generation1.finalMLKEMPrivateKey(matching: generation0.finalMLKEMPrivateKey.id) == generation0.finalMLKEMPrivateKey)
+        #expect(generation1.finalMLKEMPrivateKey(matching: generation1.finalMLKEMPrivateKey.id) == generation1.finalMLKEMPrivateKey)
+
+        // Persisted, not just in-memory: reload the encrypted context from the cache.
+        guard let sessionCache = await session.cache else {
+            Issue.record("Session cache should be initialized")
+            return
+        }
+        let persistedData = try await sessionCache.fetchLocalSessionContext()
+        guard let persistedPlain = try await crypto.decrypt(data: persistedData, symmetricKey: session.getAppSymmetricKey()) else {
+            throw PQSError.sessionDecryptionError
+        }
+        let persisted = try BinaryDecoder().decode(SessionContext.self, from: persistedPlain)
+        #expect(persisted.sessionUser.deviceKeys.previousFinalMLKEMPrivateKey == generation0.finalMLKEMPrivateKey)
+
+        // A second rotation slides the window: generation 0 is released, only
+        // generation 1 is retained.
+        try await session.rotateCurrentDeviceKeys()
+        guard let generation2 = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Second rotated session context should not be nil")
+            return
+        }
+        #expect(generation2.previousFinalMLKEMPrivateKey == generation1.finalMLKEMPrivateKey)
+        #expect(generation2.finalMLKEMPrivateKey(matching: generation0.finalMLKEMPrivateKey.id) == nil)
+
+        await session.shutdown()
+    }
+
+    @Test("compromise rotation discards the retained prior final ML-KEM key")
+    func testCompromiseRotation_clearsPriorFinalMLKEMKey() async throws {
+        _ = try await setupRotatableSession()
+
+        try await session.rotateCurrentDeviceKeys()
+        guard let afterRoutine = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Rotated session context should not be nil")
+            return
+        }
+        #expect(afterRoutine.previousFinalMLKEMPrivateKey != nil)
+
+        try await session.rotateKeysOnPotentialCompromise()
+        guard let afterCompromise = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Compromise-rotated session context should not be nil")
+            return
+        }
+        #expect(afterCompromise.finalMLKEMPrivateKey.id != afterRoutine.finalMLKEMPrivateKey.id)
+        #expect(afterCompromise.previousFinalMLKEMPrivateKey == nil)
+        #expect(afterCompromise.finalMLKEMPrivateKey(matching: afterRoutine.finalMLKEMPrivateKey.id) == nil)
+
+        await session.shutdown()
+    }
+
+    @Test("DeviceKeys without a prior final ML-KEM key decodes and re-encodes byte-identically")
+    func testDeviceKeys_priorFinalKeyIsOptionalOnTheWire() async throws {
+        _ = try await setupRotatableSession()
+        guard let keys = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        #expect(keys.previousFinalMLKEMPrivateKey == nil)
+
+        let encoded = try BinaryEncoder().encode(keys)
+        let decoded = try BinaryDecoder().decode(DeviceKeys.self, from: encoded)
+        #expect(decoded == keys)
+        #expect(try BinaryEncoder().encode(decoded) == encoded)
+
+        var rotated = keys
+        let replacement = try MLKEMPrivateKey(id: UUID(), crypto.generateMLKem1024PrivateKey().encode())
+        rotated.replaceFinalMLKEMPrivateKey(replacement, retainingPrevious: true)
+        let rotatedRoundTrip = try BinaryDecoder().decode(DeviceKeys.self, from: BinaryEncoder().encode(rotated))
+        #expect(rotatedRoundTrip.previousFinalMLKEMPrivateKey == keys.finalMLKEMPrivateKey)
+        #expect(rotatedRoundTrip.finalMLKEMPrivateKey == replacement)
+
+        await session.shutdown()
+    }
 }
