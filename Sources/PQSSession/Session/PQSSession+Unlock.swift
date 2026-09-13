@@ -118,7 +118,18 @@ extension PQSSession {
         var signedDeviceKeyBundles = configuration.signedDeviceKeyBundles.filter { signedBundle in
             devices.contains(where: { $0.deviceId == signedBundle.id })
         }
-        if let localDevice {
+        // Only mint the local bundle when none exists yet (first account creation).
+        // The membership row's `finalMLKEMPublicKey` / `longTermPublicKey` are frozen
+        // at signing time; per-device rotation updates the device-signed bundle only.
+        // Re-minting from the row after a rotation republishes retired keys that this
+        // device can no longer open (sealed-sender `authenticationFailed`).
+        let hasLocalBundle = localDevice.map { device in
+            signedDeviceKeyBundles.contains { signed in
+                signed.id == device.deviceId
+                    && (try? signed.verified(using: signingPrivateKey.publicKey)) != nil
+            }
+        } ?? false
+        if let localDevice, !hasLocalBundle {
             let localBundle = try UserConfiguration.SignedDeviceKeyBundle(
                 bundle: .init(
                     deviceId: localDevice.deviceId,

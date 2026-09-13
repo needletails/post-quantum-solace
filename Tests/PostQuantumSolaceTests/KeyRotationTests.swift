@@ -733,4 +733,64 @@ actor KeyRotationTests {
 
         await session.shutdown()
     }
+
+    @Test("adoptVerifiedUserConfiguration keeps the local device-signed bundle over a stale snapshot and republishes it")
+    func testAdoptVerifiedUserConfiguration_preservesRotatedLocalBundleAndRepublishes() async throws {
+        await store.resetLastPublishedRotatedKeys()
+        let (transport, _) = try await setupRotatableSession()
+
+        guard let preRotationContext = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        // Snapshot the server/peer-visible configuration *before* rotation. This is what a
+        // lookup cache, a read-after-publish race, or a sibling's full republish hands back.
+        let staleSnapshot = preRotationContext.activeUserConfiguration
+        let staleBundle = staleSnapshot.signedDeviceKeyBundles.first {
+            $0.id == preRotationContext.sessionUser.deviceId
+        }
+        #expect(staleBundle != nil)
+
+        try await session.rotateCurrentDeviceKeys()
+        let publishesAfterRotation = await transport.publishRotatedKeysCallCount
+
+        guard let rotatedContext = await session.sessionContext else {
+            Issue.record("Rotated session context should not be nil")
+            return
+        }
+        let rotatedPrivateId = rotatedContext.sessionUser.deviceKeys.finalMLKEMPrivateKey.id
+        #expect(rotatedPrivateId != preRotationContext.sessionUser.deviceKeys.finalMLKEMPrivateKey.id)
+
+        // Adopt the stale snapshot exactly as `refreshUserConfiguration` does on registration.
+        try await session.adoptVerifiedUserConfiguration(staleSnapshot)
+
+        guard let adoptedContext = await session.sessionContext else {
+            Issue.record("Adopted session context should not be nil")
+            return
+        }
+        let deviceSigningKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: adoptedContext.sessionUser.deviceKeys.signingPrivateKey
+        ).publicKey
+        let adoptedSelfBundles = adoptedContext.activeUserConfiguration.signedDeviceKeyBundles.filter {
+            $0.id == adoptedContext.sessionUser.deviceId
+        }
+        #expect(adoptedSelfBundles.count == 1)
+        let adoptedSelfBundle = try adoptedSelfBundles.first?.verified(using: deviceSigningKey)
+        // The advertised final ML-KEM key must be the one this device can actually open.
+        #expect(adoptedSelfBundle?.finalMLKEMPublicKey.id == rotatedPrivateId)
+        #expect(adoptedContext.sessionUser.deviceKeys.finalMLKEMPrivateKey.id == rotatedPrivateId)
+
+        // Drift on the snapshot is the event that converges the server record.
+        #expect(await transport.publishRotatedKeysCallCount == publishesAfterRotation + 1)
+        let republished = await store.lastPublishedRotatedKeys?.deviceKeyBundle
+        #expect(republished?.id == adoptedContext.sessionUser.deviceId)
+        let republishedBundle = try republished?.verified(using: deviceSigningKey)
+        #expect(republishedBundle?.finalMLKEMPublicKey.id == rotatedPrivateId)
+
+        // A snapshot that already matches must not publish again.
+        try await session.adoptVerifiedUserConfiguration(adoptedContext.activeUserConfiguration)
+        #expect(await transport.publishRotatedKeysCallCount == publishesAfterRotation + 1)
+
+        await session.shutdown()
+    }
 }
