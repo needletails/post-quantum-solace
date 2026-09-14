@@ -112,13 +112,11 @@ extension PQSSession {
             let newFinalMLKEMPrivateKey = try MLKEMPrivateKey(id: mlKEMId, newMLKEM.encode())
             let newFinalMLKEMPublicKey = try MLKEMPublicKey(id: mlKEMId, newMLKEM.publicKey.rawRepresentation)
 
-            let signedDeviceKeyBundle = try UserConfiguration.SignedDeviceKeyBundle(
-                bundle: .init(
-                    deviceId: currentDevice.deviceId,
-                    longTermPublicKey: newLongTermPrivateKey.publicKey.rawRepresentation,
-                    finalMLKEMPublicKey: newFinalMLKEMPublicKey,
-                    capabilities: .sealedSender
-                ),
+            let signedDeviceKeyBundle = try signedDeviceKeyBundlePreservingSealedSenderKey(
+                deviceId: currentDevice.deviceId,
+                longTermPublicKey: newLongTermPrivateKey.publicKey.rawRepresentation,
+                finalMLKEMPublicKey: newFinalMLKEMPublicKey,
+                deviceKeys: sessionContext.sessionUser.deviceKeys,
                 signingKey: deviceSigningPrivateKey
             )
 
@@ -333,14 +331,15 @@ extension PQSSession {
             sessionContext.sessionUser.deviceKeys.replaceFinalMLKEMPrivateKey(
                 mlKEMPrivateKey,
                 retainingPrevious: false)
+            try replaceSealedSenderKey(
+                in: &sessionContext.sessionUser.deviceKeys,
+                retainingPrevious: false)
             sessionContext.activeUserConfiguration.signedDevices = allReSigned
-            let signedDeviceKeyBundle = try UserConfiguration.SignedDeviceKeyBundle(
-                bundle: .init(
-                    deviceId: sessionContext.sessionUser.deviceId,
-                    longTermPublicKey: longTerm.x25519.publicKey.rawRepresentation,
-                    finalMLKEMPublicKey: mlKEMPublicKey,
-                    capabilities: .sealedSender
-                ),
+            let signedDeviceKeyBundle = try signedDeviceKeyBundlePreservingSealedSenderKey(
+                deviceId: sessionContext.sessionUser.deviceId,
+                longTermPublicKey: longTerm.x25519.publicKey.rawRepresentation,
+                finalMLKEMPublicKey: mlKEMPublicKey,
+                deviceKeys: sessionContext.sessionUser.deviceKeys,
                 signingKey: longTerm.signing
             )
             sessionContext.activeUserConfiguration.signedDeviceKeyBundles.removeAll {
@@ -871,13 +870,11 @@ private extension PQSSession {
             throw PQSError.deviceIdentityCorrupted
         }
         let currentBundle = try sessionContext.activeUserConfiguration.currentDeviceKeyBundle(for: device)
-        let signedDeviceKeyBundle = try UserConfiguration.SignedDeviceKeyBundle(
-            bundle: .init(
-                deviceId: device.deviceId,
-                longTermPublicKey: currentBundle.longTermPublicKey,
-                finalMLKEMPublicKey: mlKEMPublicKey,
-                capabilities: .sealedSender
-            ),
+        let signedDeviceKeyBundle = try signedDeviceKeyBundlePreservingSealedSenderKey(
+            deviceId: device.deviceId,
+            longTermPublicKey: currentBundle.longTermPublicKey,
+            finalMLKEMPublicKey: mlKEMPublicKey,
+            deviceKeys: sessionContext.sessionUser.deviceKeys,
             signingKey: signingPrivateKey
         )
         sessionContext.activeUserConfiguration.signedDeviceKeyBundles.removeAll { $0.id == device.deviceId }
@@ -901,5 +898,91 @@ private extension PQSSession {
             ))
 
         try await updateRotatedKeySessionContext(sessionContext: sessionContext)
+    }
+
+    /// Settings action: rotate only the dedicated sealed-sender key, retaining
+    /// one prior generation. Does not touch the weekly final ML-KEM key.
+    public func rotateSealedSenderMLKEMKey() async throws {
+        if keyLoadingState == .rotating {
+            logger.log(level: .debug, message: "Key rotation already in progress, skipping dedicated sealed-sender rotation")
+            return
+        }
+        setKeyLoadingState(.rotating)
+        do {
+            var sessionContext = try await getSessionContext()
+            let accountSigningPublicKey = try Curve25519.Signing.PublicKey(
+                rawRepresentation: sessionContext.activeUserConfiguration.signingPublicKey
+            )
+            let deviceSigningPrivateKey = try Curve25519.Signing.PrivateKey(
+                rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey
+            )
+            guard let deviceIndex = sessionContext.activeUserConfiguration.signedDevices.firstIndex(where: { signed in
+                guard let verified = try? signed.verified(using: accountSigningPublicKey) else { return false }
+                return verified.deviceId == sessionContext.sessionUser.deviceId
+            }),
+                  let currentDevice = try sessionContext.activeUserConfiguration.signedDevices[deviceIndex]
+                .verified(using: accountSigningPublicKey)
+            else {
+                throw PQSError.invalidDeviceIdentity
+            }
+            try replaceSealedSenderKey(
+                in: &sessionContext.sessionUser.deviceKeys,
+                retainingPrevious: true)
+            let currentBundle = try sessionContext.activeUserConfiguration.currentDeviceKeyBundle(for: currentDevice)
+            let signedDeviceKeyBundle = try signedDeviceKeyBundlePreservingSealedSenderKey(
+                deviceId: currentDevice.deviceId,
+                longTermPublicKey: currentBundle.longTermPublicKey,
+                finalMLKEMPublicKey: currentBundle.finalMLKEMPublicKey,
+                deviceKeys: sessionContext.sessionUser.deviceKeys,
+                signingKey: deviceSigningPrivateKey
+            )
+            sessionContext.activeUserConfiguration.signedDeviceKeyBundles.removeAll { $0.id == currentDevice.deviceId }
+            sessionContext.activeUserConfiguration.signedDeviceKeyBundles.append(signedDeviceKeyBundle)
+            guard let transportDelegate else {
+                throw PQSError.transportNotInitialized
+            }
+            try await transportDelegate.publishRotatedKeys(
+                for: sessionContext.sessionUser.secretName,
+                deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                rotated: .init(
+                    pskData: sessionContext.activeUserConfiguration.signingPublicKey,
+                    signedDevice: sessionContext.activeUserConfiguration.signedDevices[deviceIndex],
+                    deviceKeyBundle: signedDeviceKeyBundle))
+            try await updateRotatedKeySessionContext(sessionContext: sessionContext)
+            setKeyLoadingState(.complete)
+        } catch {
+            setKeyLoadingState(.complete)
+            throw error
+        }
+    }
+
+    internal func signedDeviceKeyBundlePreservingSealedSenderKey(
+        deviceId: UUID,
+        longTermPublicKey: Data,
+        finalMLKEMPublicKey: MLKEMPublicKey,
+        deviceKeys: DeviceKeys,
+        signingKey: Curve25519.Signing.PrivateKey
+    ) throws -> UserConfiguration.SignedDeviceKeyBundle {
+        try UserConfiguration.SignedDeviceKeyBundle(
+            bundle: .init(
+                deviceId: deviceId,
+                longTermPublicKey: longTermPublicKey,
+                finalMLKEMPublicKey: finalMLKEMPublicKey,
+                updatedAt: Date(),
+                capabilities: deviceKeys.sealedSenderDeviceCapabilities,
+                sealedSenderMLKEMPublicKey: try deviceKeys.sealedSenderMLKEMPublicKey()
+            ),
+            signingKey: signingKey
+        )
+    }
+
+    internal func replaceSealedSenderKey(
+        in deviceKeys: inout DeviceKeys,
+        retainingPrevious: Bool
+    ) throws {
+        let generated = try crypto.generateMLKem1024PrivateKey()
+        let keyId = UUID()
+        let privateKey = try MLKEMPrivateKey(id: keyId, generated.encode())
+        deviceKeys.replaceSealedSenderMLKEMPrivateKey(privateKey, retainingPrevious: retainingPrevious)
     }
 }

@@ -135,6 +135,7 @@ extension PQSSession {
                     deviceId: localDevice.deviceId,
                     longTermPublicKey: localDevice.longTermPublicKey,
                     finalMLKEMPublicKey: localDevice.finalMLKEMPublicKey,
+                    updatedAt: Date(),
                     capabilities: .sealedSender
                 ),
                 signingKey: signingPrivateKey

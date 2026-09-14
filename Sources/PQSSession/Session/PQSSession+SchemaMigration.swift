@@ -7,6 +7,7 @@
 
 import BinaryCodable
 import Crypto
+import DoubleRatchetKit
 import Foundation
 import SessionModels
 
@@ -18,12 +19,21 @@ extension PQSSession {
         appSymmetricKey: SymmetricKey
     ) async throws -> SessionContext {
         var context = sessionContext
-        if context.schemaVersion >= PQSSessionConstants.sessionSchemaVersion {
-            return context
+        var didSchemaMigrate = false
+        if context.schemaVersion < PQSSessionConstants.sessionSchemaVersion {
+            context = try await migrateSchema1To2(context)
+            context.schemaVersion = PQSSessionConstants.sessionSchemaVersion
+            didSchemaMigrate = true
         }
-        context = try await migrateSchema1To2(context)
-        context.schemaVersion = PQSSessionConstants.sessionSchemaVersion
-        try await persistSessionContext(context, appSymmetricKey: appSymmetricKey)
+        let mintedSealedSender: Bool
+        (context, mintedSealedSender) = try mintSealedSenderKeyIfNeeded(context)
+        if didSchemaMigrate || mintedSealedSender {
+            try await persistSessionContext(context, appSymmetricKey: appSymmetricKey)
+        }
+        if mintedSealedSender {
+            await setSessionContext(context)
+            try? await publishLocalDeviceKeyBundle()
+        }
         return context
     }
 
@@ -35,7 +45,7 @@ extension PQSSession {
         return context
     }
 
-    private func mintLocalDeviceKeyBundleIfNeeded(_ context: SessionContext) throws -> SessionContext {
+    func mintLocalDeviceKeyBundleIfNeeded(_ context: SessionContext) throws -> SessionContext {
         var context = context
         let deviceId = context.sessionUser.deviceId
         let hasBundle = context.activeUserConfiguration.signedDeviceKeyBundles.contains { $0.id == deviceId }
@@ -48,15 +58,60 @@ extension PQSSession {
         }
         let signingKey = try Curve25519.Signing.PrivateKey(
             rawRepresentation: context.sessionUser.deviceKeys.signingPrivateKey)
+        let deviceKeys = context.sessionUser.deviceKeys
+        let longTermPublicKey = try Curve25519.KeyAgreement.PrivateKey(
+            rawRepresentation: deviceKeys.longTermPrivateKey
+        ).publicKey.rawRepresentation
+        let finalRaw = try deviceKeys.finalMLKEMPrivateKey.rawRepresentation.decodeMLKem1024()
+        let finalPublicKey = try MLKEMPublicKey(
+            id: deviceKeys.finalMLKEMPrivateKey.id,
+            finalRaw.publicKey.rawRepresentation)
         let bundle = UserConfiguration.DeviceKeyBundle(
             deviceId: device.deviceId,
-            longTermPublicKey: device.longTermPublicKey,
-            finalMLKEMPublicKey: device.finalMLKEMPublicKey,
-            updatedAt: nil,
-            capabilities: .sealedSender)
+            longTermPublicKey: longTermPublicKey,
+            finalMLKEMPublicKey: finalPublicKey,
+            updatedAt: Date(),
+            capabilities: deviceKeys.sealedSenderDeviceCapabilities,
+            sealedSenderMLKEMPublicKey: try deviceKeys.sealedSenderMLKEMPublicKey())
         let signed = try UserConfiguration.SignedDeviceKeyBundle(bundle: bundle, signingKey: signingKey)
         context.activeUserConfiguration.signedDeviceKeyBundles.append(signed)
         return context
+    }
+
+    /// Mints a dedicated sealed-sender key for existing devices that predate it.
+    /// Idempotent: returns false when the key is already present.
+    func mintSealedSenderKeyIfNeeded(_ context: SessionContext) throws -> (SessionContext, Bool) {
+        var context = context
+        guard context.sessionUser.deviceKeys.sealedSenderMLKEMPrivateKey == nil else {
+            return (context, false)
+        }
+        let generated = try crypto.generateMLKem1024PrivateKey()
+        let sealedPrivateKey = try MLKEMPrivateKey(id: UUID(), generated.encode())
+        context.sessionUser.deviceKeys.replaceSealedSenderMLKEMPrivateKey(
+            sealedPrivateKey,
+            retainingPrevious: false)
+        let deviceId = context.sessionUser.deviceId
+        guard let device = try context.activeUserConfiguration.getVerifiedDevices().first(where: {
+            $0.deviceId == deviceId
+        }) else {
+            return (context, true)
+        }
+        let signingKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: context.sessionUser.deviceKeys.signingPrivateKey)
+        let current = try context.activeUserConfiguration.currentDeviceKeyBundle(for: device)
+        let signed = try UserConfiguration.SignedDeviceKeyBundle(
+            bundle: .init(
+                deviceId: deviceId,
+                longTermPublicKey: current.longTermPublicKey,
+                finalMLKEMPublicKey: current.finalMLKEMPublicKey,
+                updatedAt: Date(),
+                capabilities: context.sessionUser.deviceKeys.sealedSenderDeviceCapabilities,
+                sealedSenderMLKEMPublicKey: try context.sessionUser.deviceKeys.sealedSenderMLKEMPublicKey()
+            ),
+            signingKey: signingKey)
+        context.activeUserConfiguration.signedDeviceKeyBundles.removeAll { $0.id == deviceId }
+        context.activeUserConfiguration.signedDeviceKeyBundles.append(signed)
+        return (context, true)
     }
 
     private func dropRetiredEncryptedRetryJobs() async throws {

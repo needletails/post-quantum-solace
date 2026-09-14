@@ -46,6 +46,186 @@ struct SealedOuterBoxTests {
         #expect(sealed.version == SealedOuterBox.currentVersion)
         #expect(sealed.kemCiphertext.count == 1_568)
         #expect(sealed.aeadCiphertext.count >= 28)
+        #expect(sealed.recipientKeyId == fixture.recipientPublicKey.id)
+    }
+
+    @Test("nil recipientKeyId is omitted from JSON and BinaryCodable keyed payloads")
+    func recipientKeyIdNilIsSkippedOnTheWire() throws {
+        struct Legacy: Codable, Equatable {
+            enum CodingKeys: String, CodingKey {
+                case version = "a"
+                case kemCiphertext = "b"
+                case aeadCiphertext = "c"
+            }
+            var version: UInt8
+            var kemCiphertext: Data
+            var aeadCiphertext: Data
+        }
+        let current = SealedOuterCiphertext(
+            version: 1,
+            kemCiphertext: Data([1, 2, 3]),
+            aeadCiphertext: Data([4, 5, 6]),
+            recipientKeyId: nil
+        )
+        let legacy = Legacy(
+            version: 1,
+            kemCiphertext: Data([1, 2, 3]),
+            aeadCiphertext: Data([4, 5, 6])
+        )
+        let object = try #require(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(current)) as? [String: Any]
+        )
+        #expect(Set(object.keys) == Set(["a", "b", "c"]))
+        #expect(try JSONEncoder().encode(current) == JSONEncoder().encode(legacy))
+        let decoded = try BinaryDecoder().decode(
+            SealedOuterCiphertext.self,
+            from: BinaryEncoder().encode(current)
+        )
+        #expect(decoded.recipientKeyId == nil)
+        #expect(try BinaryEncoder().encode(decoded) == BinaryEncoder().encode(current))
+    }
+
+    @Test("legacy bytes without d still open after a hinted seal/open pair")
+    func legacyCiphertextWithoutHintStillOpens() throws {
+        let fixture = try Fixture()
+        let sealed = try fixture.seal()
+        let legacy = SealedOuterCiphertext(
+            version: sealed.version,
+            kemCiphertext: sealed.kemCiphertext,
+            aeadCiphertext: sealed.aeadCiphertext,
+            recipientKeyId: nil
+        )
+        _ = try fixture.open(legacy)
+        #expect(SealedOpenFailureReason.classify(
+            hintedKeyId: UUID(),
+            heldKeyIds: [fixture.recipientPrivateKey.id],
+            boxError: nil
+        ) == .recipientKeyUnknown)
+        #expect(SealedOpenFailureReason.classify(
+            hintedKeyId: fixture.recipientPrivateKey.id,
+            heldKeyIds: [fixture.recipientPrivateKey.id],
+            boxError: .authenticationFailed
+        ) == .authenticationFailed)
+        #expect(SealedOpenFailureReason.classify(
+            hintedKeyId: fixture.recipientPrivateKey.id,
+            heldKeyIds: [fixture.recipientPrivateKey.id],
+            boxError: .unsupportedVersion
+        ) == .malformed)
+    }
+
+    @Test("seal to key A then open with A's retained prior key")
+    func openSucceedsWithPreviousGenerationKey() throws {
+        let fixture = try Fixture()
+        let sealed = try fixture.seal()
+        var keys = DeviceKeys(
+            deviceId: UUID(),
+            signingPrivateKey: Data(repeating: 1, count: 32),
+            longTermPrivateKey: Data(repeating: 2, count: 32),
+            oneTimePrivateKeys: [],
+            mlKEMOneTimePrivateKeys: [],
+            finalMLKEMPrivateKey: fixture.recipientPrivateKey
+        )
+        let next = try MLKEMPrivateKey(id: UUID(), MLKEM1024.PrivateKey().encode())
+        keys.replaceFinalMLKEMPrivateKey(next, retainingPrevious: true)
+        #expect(keys.finalMLKEMPrivateKey(matching: fixture.recipientPrivateKey.id) == fixture.recipientPrivateKey)
+        _ = try fixture.open(sealed, recipientFinalMLKEMPrivateKey: keys.previousFinalMLKEMPrivateKey)
+        _ = try SealedInboundOpen.open(
+            sealed,
+            deviceKeys: keys,
+            recipientSecretName: fixture.context.recipientSecretName,
+            recipientDeviceId: fixture.context.recipientDeviceId,
+            envelopeId: fixture.context.envelopeId,
+            packetId: fixture.context.packetId
+        )
+    }
+
+    @Test("hinted inbound open resolves by id and unknown ids stay terminal")
+    func hintedInboundOpenResolvesByKeyId() throws {
+        let fixture = try Fixture()
+        let sealed = try fixture.seal()
+        var keys = DeviceKeys(
+            deviceId: fixture.context.recipientDeviceId,
+            signingPrivateKey: Data(repeating: 1, count: 32),
+            longTermPrivateKey: Data(repeating: 2, count: 32),
+            oneTimePrivateKeys: [],
+            mlKEMOneTimePrivateKeys: [],
+            finalMLKEMPrivateKey: fixture.recipientPrivateKey
+        )
+        #expect(sealed.recipientKeyId == fixture.recipientPublicKey.id)
+        _ = try SealedInboundOpen.open(
+            sealed,
+            deviceKeys: keys,
+            recipientSecretName: fixture.context.recipientSecretName,
+            recipientDeviceId: fixture.context.recipientDeviceId,
+            envelopeId: fixture.context.envelopeId,
+            packetId: fixture.context.packetId
+        )
+
+        let unknownId = UUID()
+        let hintedUnknown = SealedOuterCiphertext(
+            version: sealed.version,
+            kemCiphertext: sealed.kemCiphertext,
+            aeadCiphertext: sealed.aeadCiphertext,
+            recipientKeyId: unknownId
+        )
+        do {
+            _ = try SealedInboundOpen.open(
+                hintedUnknown,
+                deviceKeys: keys,
+                recipientSecretName: fixture.context.recipientSecretName,
+                recipientDeviceId: fixture.context.recipientDeviceId,
+                envelopeId: fixture.context.envelopeId,
+                packetId: fixture.context.packetId
+            )
+            Issue.record("Unknown recipientKeyId must not open")
+        } catch SealedInboundOpenError.recipientKeyUnknown(let keyId) {
+            #expect(keyId == unknownId)
+        }
+
+        let nextFinal = try MLKEMPrivateKey(id: UUID(), MLKEM1024.PrivateKey().encode())
+        keys.replaceFinalMLKEMPrivateKey(nextFinal, retainingPrevious: true)
+        let legacy = SealedOuterCiphertext(
+            version: sealed.version,
+            kemCiphertext: sealed.kemCiphertext,
+            aeadCiphertext: sealed.aeadCiphertext,
+            recipientKeyId: nil
+        )
+        _ = try SealedInboundOpen.open(
+            legacy,
+            deviceKeys: keys,
+            recipientSecretName: fixture.context.recipientSecretName,
+            recipientDeviceId: fixture.context.recipientDeviceId,
+            envelopeId: fixture.context.envelopeId,
+            packetId: fixture.context.packetId
+        )
+    }
+
+    @Test("dedicated sealed-sender rotation keeps one generation openable")
+    func dedicatedKeyRotationOpensPreviousGeneration() throws {
+        let fixture = try Fixture()
+        var keys = DeviceKeys(
+            deviceId: fixture.context.recipientDeviceId,
+            signingPrivateKey: Data(repeating: 1, count: 32),
+            longTermPrivateKey: Data(repeating: 2, count: 32),
+            oneTimePrivateKeys: [],
+            mlKEMOneTimePrivateKeys: [],
+            finalMLKEMPrivateKey: try MLKEMPrivateKey(id: UUID(), MLKEM1024.PrivateKey().encode())
+        )
+        keys.replaceSealedSenderMLKEMPrivateKey(fixture.recipientPrivateKey, retainingPrevious: false)
+        let sealed = try fixture.seal()
+        #expect(sealed.recipientKeyId == fixture.recipientPrivateKey.id)
+
+        let nextDedicated = try MLKEMPrivateKey(id: UUID(), MLKEM1024.PrivateKey().encode())
+        keys.replaceSealedSenderMLKEMPrivateKey(nextDedicated, retainingPrevious: true)
+        #expect(keys.sealedRecipientPrivateKey(matching: fixture.recipientPrivateKey.id) == fixture.recipientPrivateKey)
+        _ = try SealedInboundOpen.open(
+            sealed,
+            deviceKeys: keys,
+            recipientSecretName: fixture.context.recipientSecretName,
+            recipientDeviceId: fixture.context.recipientDeviceId,
+            envelopeId: fixture.context.envelopeId,
+            packetId: fixture.context.packetId
+        )
     }
 
     @Test("wrong final key fails closed")

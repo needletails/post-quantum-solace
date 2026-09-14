@@ -112,7 +112,8 @@ public enum SealedOuterBox {
             return SealedOuterCiphertext(
                 version: currentVersion,
                 kemCiphertext: kemCiphertext,
-                aeadCiphertext: combined
+                aeadCiphertext: combined,
+                recipientKeyId: recipientFinalMLKEMPublicKey.id
             )
         } catch let error as SealedOuterBoxError {
             throw error

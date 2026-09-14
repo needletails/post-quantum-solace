@@ -204,6 +204,18 @@ extension PQSSession {
             await receiverDelegate?.updatedCommunication(communicationModel, members: [credentials.secretName])
             logger.log(level: .debug, message: "Created Communication Model")
 
+            // Child's first device-signed bundle is local until this publish.
+            // Master full publishes carry membership only.
+            if !bundle.deviceConfiguration.isMasterDevice {
+                do {
+                    try await publishLocalDeviceKeyBundle()
+                } catch {
+                    logger.log(
+                        level: .warning,
+                        message: "Child first-bundle publish deferred deviceId=\(bundle.deviceKeys.deviceId.uuidString) error=\(error)")
+                }
+            }
+
             // Start the session and return the PQSSession
             return try await unlock(appPassword: credentials.password)
         } else {
@@ -295,6 +307,28 @@ extension PQSSession {
             // every peer seal to a key we can no longer open.
             mergedConfiguration.signedDeviceKeyBundles.removeAll { $0.id == deviceId }
             mergedConfiguration.signedDeviceKeyBundles.append(localBundle)
+        }
+
+        let incomingDevices = (try? incomingConfiguration.getVerifiedDevices()) ?? []
+        for sibling in incomingDevices where sibling.deviceId != deviceId {
+            guard let siblingSigningKey = try? Curve25519.Signing.PublicKey(
+                rawRepresentation: sibling.signingPublicKey
+            ) else { continue }
+            let localSigned = currentContext.activeUserConfiguration.signedDeviceKeyBundles.first {
+                $0.id == sibling.deviceId
+            }
+            let incomingSigned = incomingConfiguration.signedDeviceKeyBundles.first {
+                $0.id == sibling.deviceId
+            }
+            let localUpdated = localSigned.flatMap { try? $0.verified(using: siblingSigningKey) }?.updatedAt
+            let incomingUpdated = incomingSigned.flatMap { try? $0.verified(using: siblingSigningKey) }?.updatedAt
+            let keepIncoming = DeviceKeyBundleMerge.shouldPreferIncoming(
+                existingUpdatedAt: localUpdated,
+                incomingUpdatedAt: incomingUpdated)
+            let kept = keepIncoming ? incomingSigned : localSigned
+            guard let kept else { continue }
+            mergedConfiguration.signedDeviceKeyBundles.removeAll { $0.id == sibling.deviceId }
+            mergedConfiguration.signedDeviceKeyBundles.append(kept)
         }
 
         return mergedConfiguration
@@ -390,6 +424,60 @@ extension PQSSession {
                 level: .warning,
                 message: "pqs.recovery.selfDeviceKeyBundleDrift republish failed deviceId=\(deviceId.uuidString) error=\(error)")
         }
+    }
+
+    /// Live-lookup heal for a sealed-open hint naming a key this device does not hold.
+    ///
+    /// The unknown key id is the event. One check per id per session; then
+    /// `republishLocalDeviceKeyBundleIfRemoteDrifted` if the server record drifted.
+    public func verifyPublishedDeviceKeyBundle(unknownRecipientKeyId: UUID) async {
+        guard verifiedUnknownSealedRecipientKeyIds.insert(unknownRecipientKeyId).inserted else {
+            return
+        }
+        guard let currentContext = await sessionContext,
+              let transportDelegate
+        else { return }
+        do {
+            let remote = try await transportDelegate.findConfiguration(
+                for: currentContext.sessionUser.secretName)
+            await republishLocalDeviceKeyBundleIfRemoteDrifted(
+                incoming: remote,
+                currentContext: currentContext)
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "pqs.recovery.verifyPublishedDeviceKeyBundle failed keyId=\(unknownRecipientKeyId.uuidString) error=\(error)")
+        }
+    }
+
+    /// Publishes this device's authoritative signed key bundle. Called when a
+    /// child finishes `linkDevice` so the first bundle reaches the server
+    /// without waiting for weekly rotation.
+    public func publishLocalDeviceKeyBundle() async throws {
+        guard let currentContext = await sessionContext else { return }
+        let deviceId = currentContext.sessionUser.deviceId
+        guard let signedDevice = currentContext.activeUserConfiguration.signedDevices.first(where: {
+            $0.id == deviceId
+        }),
+              let accountSigningKey = try? Curve25519.Signing.PublicKey(
+                rawRepresentation: currentContext.activeUserConfiguration.signingPublicKey),
+              let device = try? signedDevice.verified(using: accountSigningKey),
+              let deviceSigningKey = try? Curve25519.Signing.PublicKey(
+                rawRepresentation: device.signingPublicKey),
+              let localSigned = localAuthoritativeDeviceKeyBundle(
+                in: currentContext,
+                deviceSigningKey: deviceSigningKey)
+        else { return }
+        guard let transportDelegate else {
+            throw PQSError.transportNotInitialized
+        }
+        try await transportDelegate.publishRotatedKeys(
+            for: currentContext.sessionUser.secretName,
+            deviceId: deviceId.uuidString,
+            rotated: .init(
+                pskData: currentContext.activeUserConfiguration.signingPublicKey,
+                signedDevice: signedDevice,
+                deviceKeyBundle: localSigned))
     }
 
     /// Adopts a `UserConfiguration` that has already been verified against its own
