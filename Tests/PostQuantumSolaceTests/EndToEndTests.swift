@@ -1349,11 +1349,17 @@ actor EndToEndTests {
             return outboundReady && inboundReady
         })
 
+        let baselineCount = await bobStore.getAllMessages().count
         try await _senderMaxSkipSession.send(
             recipient: .nickname("bob"),
             text: "baseline-before-gap"
         )
-        #expect(await waitUntil { await self._recipientMaxSkipSession.messagePipeline.isRunning })
+        // `messagePipeline.isRunning` is only true while the job loop is inside
+        // a pass. On Linux the baseline often drains before this check, so wait
+        // for the persisted inbound instead of that transient flag.
+        #expect(
+            await waitUntil { await bobStore.getAllMessages().count > baselineCount },
+            "Expected recipient to persist the baseline message before the gap burst")
 
         await gate.arm()
         for i in 0..<13 {
@@ -8994,6 +9000,20 @@ actor EndToEndTests {
             "Old message encrypted with previous keys should be decrypted from the archived snapshot"
         )
 
+        // Stop further inbound so follow-up control/recovery frames cannot
+        // re-archive the promoted lane before we observe it. Then wait until
+        // the processor finishes jobs already queued by that decrypt.
+        bobTask?.cancel()
+        bobTask = nil
+        let idleDeadline = Date().addingTimeInterval(8)
+        while Date() < idleDeadline {
+            if await !self._recipientSession.messagePipeline.isRunning {
+                try await Task.sleep(for: .milliseconds(50))
+                if await !self._recipientSession.messagePipeline.isRunning { break }
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+
         // Assert only against the failed active rows. Archive fallback promotes
         // the proven archived row (deleting these actives); any surviving failed
         // row must retain its exact pre-attempt encrypted state.
@@ -9014,14 +9034,20 @@ actor EndToEndTests {
         // send/receive lane for alice — not stay archived with preferred pointing
         // at an inactive row outbound cannot select.
         var promotedActiveWithState = false
-        for identity in try await bobCache.fetchSessionIdentities() {
-            guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
-            guard props.secretName == sMockUserData.ssn else { continue }
-            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
-            else { continue }
-            if props.hasRatchetState {
-                promotedActiveWithState = true
+        let promoteDeadline = Date().addingTimeInterval(8)
+        while Date() < promoteDeadline {
+            promotedActiveWithState = false
+            for identity in try await bobCache.fetchSessionIdentities() {
+                guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
+                guard props.secretName == sMockUserData.ssn else { continue }
+                guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+                else { continue }
+                if props.hasRatchetState {
+                    promotedActiveWithState = true
+                }
             }
+            if promotedActiveWithState { break }
+            try await Task.sleep(for: .milliseconds(50))
         }
         #expect(
             promotedActiveWithState,

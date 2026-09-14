@@ -76,7 +76,10 @@ struct SealedOuterBoxTests {
             JSONSerialization.jsonObject(with: JSONEncoder().encode(current)) as? [String: Any]
         )
         #expect(Set(object.keys) == Set(["a", "b", "c"]))
-        #expect(try JSONEncoder().encode(current) == JSONEncoder().encode(legacy))
+        // Compare decoded values, not raw JSONEncoder bytes. Linux Foundation
+        // emits keyed fields in dictionary order, so byte-identity fails even
+        // when the wire keys and values match.
+        #expect(try JSONDecoder().decode(Legacy.self, from: JSONEncoder().encode(current)) == legacy)
         let decoded = try BinaryDecoder().decode(
             SealedOuterCiphertext.self,
             from: BinaryEncoder().encode(current)
