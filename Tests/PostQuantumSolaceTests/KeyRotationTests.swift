@@ -733,4 +733,580 @@ actor KeyRotationTests {
 
         await session.shutdown()
     }
+
+    @Test("adoptVerifiedUserConfiguration keeps the local device-signed bundle over a stale snapshot and republishes it")
+    func testAdoptVerifiedUserConfiguration_preservesRotatedLocalBundleAndRepublishes() async throws {
+        await store.resetLastPublishedRotatedKeys()
+        let (transport, _) = try await setupRotatableSession()
+
+        guard let preRotationContext = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        // Snapshot the server/peer-visible configuration *before* rotation. This is what a
+        // lookup cache, a read-after-publish race, or a sibling's full republish hands back.
+        let staleSnapshot = preRotationContext.activeUserConfiguration
+        let staleBundle = staleSnapshot.signedDeviceKeyBundles.first {
+            $0.id == preRotationContext.sessionUser.deviceId
+        }
+        #expect(staleBundle != nil)
+
+        try await session.rotateCurrentDeviceKeys()
+        let publishesAfterRotation = await transport.publishRotatedKeysCallCount
+
+        guard let rotatedContext = await session.sessionContext else {
+            Issue.record("Rotated session context should not be nil")
+            return
+        }
+        let rotatedPrivateId = rotatedContext.sessionUser.deviceKeys.finalMLKEMPrivateKey.id
+        #expect(rotatedPrivateId != preRotationContext.sessionUser.deviceKeys.finalMLKEMPrivateKey.id)
+
+        // Adopt the stale snapshot exactly as `refreshUserConfiguration` does on registration.
+        try await session.adoptVerifiedUserConfiguration(staleSnapshot)
+
+        guard let adoptedContext = await session.sessionContext else {
+            Issue.record("Adopted session context should not be nil")
+            return
+        }
+        let deviceSigningKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: adoptedContext.sessionUser.deviceKeys.signingPrivateKey
+        ).publicKey
+        let adoptedSelfBundles = adoptedContext.activeUserConfiguration.signedDeviceKeyBundles.filter {
+            $0.id == adoptedContext.sessionUser.deviceId
+        }
+        #expect(adoptedSelfBundles.count == 1)
+        let adoptedSelfBundle = try adoptedSelfBundles.first?.verified(using: deviceSigningKey)
+        // The advertised final ML-KEM key must be the one this device can actually open.
+        #expect(adoptedSelfBundle?.finalMLKEMPublicKey.id == rotatedPrivateId)
+        #expect(adoptedContext.sessionUser.deviceKeys.finalMLKEMPrivateKey.id == rotatedPrivateId)
+
+        // Drift on the snapshot is the event that converges the server record.
+        #expect(await transport.publishRotatedKeysCallCount == publishesAfterRotation + 1)
+        let republished = await store.lastPublishedRotatedKeys?.deviceKeyBundle
+        #expect(republished?.id == adoptedContext.sessionUser.deviceId)
+        let republishedBundle = try republished?.verified(using: deviceSigningKey)
+        #expect(republishedBundle?.finalMLKEMPublicKey.id == rotatedPrivateId)
+
+        // A snapshot that already matches must not publish again.
+        try await session.adoptVerifiedUserConfiguration(adoptedContext.activeUserConfiguration)
+        #expect(await transport.publishRotatedKeysCallCount == publishesAfterRotation + 1)
+
+        await session.shutdown()
+    }
+
+    @Test("routine rotation retains exactly one prior final ML-KEM key and persists it")
+    func testRoutineRotation_retainsOnePriorFinalMLKEMKey() async throws {
+        _ = try await setupRotatableSession()
+
+        guard let generation0 = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        #expect(generation0.previousFinalMLKEMPrivateKey == nil)
+
+        try await session.rotateCurrentDeviceKeys()
+        guard let generation1 = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Rotated session context should not be nil")
+            return
+        }
+        // The retired key is retained byte-for-byte: a box sealed to generation 0's
+        // public key opens with it.
+        #expect(generation1.finalMLKEMPrivateKey.id != generation0.finalMLKEMPrivateKey.id)
+        #expect(generation1.previousFinalMLKEMPrivateKey == generation0.finalMLKEMPrivateKey)
+        #expect(generation1.finalMLKEMPrivateKey(matching: generation0.finalMLKEMPrivateKey.id) == generation0.finalMLKEMPrivateKey)
+        #expect(generation1.finalMLKEMPrivateKey(matching: generation1.finalMLKEMPrivateKey.id) == generation1.finalMLKEMPrivateKey)
+
+        // Persisted, not just in-memory: reload the encrypted context from the cache.
+        guard let sessionCache = await session.cache else {
+            Issue.record("Session cache should be initialized")
+            return
+        }
+        let persistedData = try await sessionCache.fetchLocalSessionContext()
+        guard let persistedPlain = try await crypto.decrypt(data: persistedData, symmetricKey: session.getAppSymmetricKey()) else {
+            throw PQSError.sessionDecryptionError
+        }
+        let persisted = try BinaryDecoder().decode(SessionContext.self, from: persistedPlain)
+        #expect(persisted.sessionUser.deviceKeys.previousFinalMLKEMPrivateKey == generation0.finalMLKEMPrivateKey)
+
+        // A second rotation slides the window: generation 0 is released, only
+        // generation 1 is retained.
+        try await session.rotateCurrentDeviceKeys()
+        guard let generation2 = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Second rotated session context should not be nil")
+            return
+        }
+        #expect(generation2.previousFinalMLKEMPrivateKey == generation1.finalMLKEMPrivateKey)
+        #expect(generation2.finalMLKEMPrivateKey(matching: generation0.finalMLKEMPrivateKey.id) == nil)
+
+        await session.shutdown()
+    }
+
+    @Test("compromise rotation discards the retained prior final ML-KEM key")
+    func testCompromiseRotation_clearsPriorFinalMLKEMKey() async throws {
+        _ = try await setupRotatableSession()
+
+        try await session.rotateCurrentDeviceKeys()
+        guard let afterRoutine = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Rotated session context should not be nil")
+            return
+        }
+        #expect(afterRoutine.previousFinalMLKEMPrivateKey != nil)
+
+        try await session.rotateKeysOnPotentialCompromise()
+        guard let afterCompromise = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Compromise-rotated session context should not be nil")
+            return
+        }
+        #expect(afterCompromise.finalMLKEMPrivateKey.id != afterRoutine.finalMLKEMPrivateKey.id)
+        #expect(afterCompromise.previousFinalMLKEMPrivateKey == nil)
+        #expect(afterCompromise.finalMLKEMPrivateKey(matching: afterRoutine.finalMLKEMPrivateKey.id) == nil)
+
+        await session.shutdown()
+    }
+
+    @Test("DeviceKeys without a prior final ML-KEM key decodes and re-encodes byte-identically")
+    func testDeviceKeys_priorFinalKeyIsOptionalOnTheWire() async throws {
+        _ = try await setupRotatableSession()
+        guard let keys = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        #expect(keys.previousFinalMLKEMPrivateKey == nil)
+
+        let encoded = try BinaryEncoder().encode(keys)
+        let decoded = try BinaryDecoder().decode(DeviceKeys.self, from: encoded)
+        #expect(decoded == keys)
+        #expect(try BinaryEncoder().encode(decoded) == encoded)
+
+        var rotated = keys
+        let replacement = try MLKEMPrivateKey(id: UUID(), crypto.generateMLKem1024PrivateKey().encode())
+        rotated.replaceFinalMLKEMPrivateKey(replacement, retainingPrevious: true)
+        let rotatedRoundTrip = try BinaryDecoder().decode(DeviceKeys.self, from: BinaryEncoder().encode(rotated))
+        #expect(rotatedRoundTrip.previousFinalMLKEMPrivateKey == keys.finalMLKEMPrivateKey)
+        #expect(rotatedRoundTrip.finalMLKEMPrivateKey == replacement)
+
+        await session.shutdown()
+    }
+
+    @Test("routine rotation leaves the dedicated sealed-sender key unchanged")
+    func testRoutineRotation_doesNotRotateDedicatedSealedSenderKey() async throws {
+        _ = try await setupRotatableSession()
+        guard let before = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        #expect(before.sealedSenderMLKEMPrivateKey != nil)
+        let dedicatedId = before.sealedSenderMLKEMPrivateKey?.id
+
+        try await session.rotateCurrentDeviceKeys()
+        guard let after = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Rotated session context should not be nil")
+            return
+        }
+        #expect(after.sealedSenderMLKEMPrivateKey?.id == dedicatedId)
+        #expect(after.previousSealedSenderMLKEMPrivateKey == nil)
+        #expect(after.finalMLKEMPrivateKey.id != before.finalMLKEMPrivateKey.id)
+
+        await session.shutdown()
+    }
+
+    @Test("compromise rotation replaces the dedicated sealed-sender key and clears retention")
+    func testCompromiseRotation_replacesDedicatedSealedSenderKey() async throws {
+        _ = try await setupRotatableSession()
+        try await session.rotateSealedSenderMLKEMKey()
+        guard let afterSettings = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Settings-rotated keys should exist")
+            return
+        }
+        #expect(afterSettings.previousSealedSenderMLKEMPrivateKey != nil)
+        let previousDedicated = afterSettings.sealedSenderMLKEMPrivateKey?.id
+
+        try await session.rotateKeysOnPotentialCompromise()
+        guard let afterCompromise = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Compromise-rotated keys should exist")
+            return
+        }
+        #expect(afterCompromise.sealedSenderMLKEMPrivateKey?.id != previousDedicated)
+        #expect(afterCompromise.previousSealedSenderMLKEMPrivateKey == nil)
+
+        await session.shutdown()
+    }
+
+    @Test("publishLocalDeviceKeyBundle publishes exactly once")
+    func testPublishLocalDeviceKeyBundle_publishesOnce() async throws {
+        await store.resetLastPublishedRotatedKeys()
+        let (transport, _) = try await setupRotatableSession()
+        let before = await transport.publishRotatedKeysCallCount
+        try await session.publishLocalDeviceKeyBundle()
+        #expect(await transport.publishRotatedKeysCallCount == before + 1)
+        try await session.publishLocalDeviceKeyBundle()
+        #expect(await transport.publishRotatedKeysCallCount == before + 2)
+
+        await session.shutdown()
+    }
+
+    @Test("schema mint derives bundle public keys from held private keys")
+    func testMintLocalDeviceKeyBundle_derivesFromPrivateKeys() async throws {
+        _ = try await setupRotatableSession()
+        guard var context = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        context.activeUserConfiguration.signedDeviceKeyBundles.removeAll()
+        let minted = try await session.mintLocalDeviceKeyBundleIfNeeded(context)
+        let deviceId = minted.sessionUser.deviceId
+        let signingKey = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: minted.sessionUser.deviceKeys.signingPrivateKey
+        ).publicKey
+        let bundle = try minted.activeUserConfiguration.signedDeviceKeyBundles
+            .first { $0.id == deviceId }?
+            .verified(using: signingKey)
+        let expectedLongTerm = try Curve25519.KeyAgreement.PrivateKey(
+            rawRepresentation: minted.sessionUser.deviceKeys.longTermPrivateKey
+        ).publicKey.rawRepresentation
+        #expect(bundle?.longTermPublicKey == expectedLongTerm)
+        #expect(bundle?.finalMLKEMPublicKey.id == minted.sessionUser.deviceKeys.finalMLKEMPrivateKey.id)
+        #expect(bundle?.updatedAt != nil)
+
+        await session.shutdown()
+    }
+
+    @Test("DeviceKeyBundleMerge prefers newer updatedAt and treats nil as oldest")
+    func testDeviceKeyBundleMerge_updatedAtRule() {
+        let now = Date()
+        let earlier = now.addingTimeInterval(-60)
+        #expect(DeviceKeyBundleMerge.shouldPreferIncoming(existingUpdatedAt: nil, incomingUpdatedAt: now))
+        #expect(!DeviceKeyBundleMerge.shouldPreferIncoming(existingUpdatedAt: now, incomingUpdatedAt: nil))
+        #expect(DeviceKeyBundleMerge.shouldPreferIncoming(existingUpdatedAt: earlier, incomingUpdatedAt: now))
+        #expect(!DeviceKeyBundleMerge.shouldPreferIncoming(existingUpdatedAt: now, incomingUpdatedAt: earlier))
+        #expect(DeviceKeyBundleMerge.shouldPreferIncoming(existingUpdatedAt: now, incomingUpdatedAt: now))
+        #expect(DeviceKeyBundleMerge.shouldPreferIncoming(existingUpdatedAt: nil, incomingUpdatedAt: nil))
+    }
+
+    @Test("DeviceKeyBundle without a dedicated public key re-encodes byte-identically")
+    func testDeviceKeyBundle_dedicatedFieldSkippedWhenNil() throws {
+        let kem = try crypto.generateMLKem1024PrivateKey()
+        let publicKey = try MLKEMPublicKey(id: UUID(), kem.publicKey.rawRepresentation)
+        let bundle = UserConfiguration.DeviceKeyBundle(
+            deviceId: UUID(),
+            longTermPublicKey: Data(repeating: 3, count: 32),
+            finalMLKEMPublicKey: publicKey,
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            capabilities: .sealedSender
+        )
+        #expect(bundle.sealedSenderMLKEMPublicKey == nil)
+        let encoded = try BinaryEncoder().encode(bundle)
+        let decoded = try BinaryDecoder().decode(UserConfiguration.DeviceKeyBundle.self, from: encoded)
+        #expect(try BinaryEncoder().encode(decoded) == encoded)
+        #expect(decoded.sealedSenderMLKEMPublicKey == nil)
+        #expect(DeviceCapabilities.dedicatedSealedKey.rawValue == 1 << 1)
+    }
+
+    @Test("adoption keeps the sibling bundle with the greater updatedAt")
+    func testAdoption_keepsNewerSiblingBundle() async throws {
+        _ = try await setupRotatableSession()
+        guard var context = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        let accountSigning = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: context.sessionUser.deviceKeys.signingPrivateKey)
+        let siblingSigning = Curve25519.Signing.PrivateKey()
+        let siblingId = UUID()
+        let kem = try crypto.generateMLKem1024PrivateKey()
+        let olderPublic = try MLKEMPublicKey(id: UUID(), kem.publicKey.rawRepresentation)
+        let newerPublic = try MLKEMPublicKey(id: UUID(), kem.publicKey.rawRepresentation)
+        let siblingDevice = UserDeviceConfiguration(
+            deviceId: siblingId,
+            signingPublicKey: siblingSigning.publicKey.rawRepresentation,
+            longTermPublicKey: Data(repeating: 7, count: 32),
+            finalMLKEMPublicKey: olderPublic,
+            deviceName: "sibling",
+            hmacData: Data(repeating: 8, count: 32),
+            isMasterDevice: false)
+        let signedSibling = try UserConfiguration.SignedDeviceConfiguration(
+            device: siblingDevice,
+            signingKey: accountSigning)
+        let olderBundle = try UserConfiguration.SignedDeviceKeyBundle(
+            bundle: .init(
+                deviceId: siblingId,
+                longTermPublicKey: siblingDevice.longTermPublicKey,
+                finalMLKEMPublicKey: olderPublic,
+                updatedAt: Date(timeIntervalSince1970: 100)),
+            signingKey: siblingSigning)
+        let newerBundle = try UserConfiguration.SignedDeviceKeyBundle(
+            bundle: .init(
+                deviceId: siblingId,
+                longTermPublicKey: siblingDevice.longTermPublicKey,
+                finalMLKEMPublicKey: newerPublic,
+                updatedAt: Date(timeIntervalSince1970: 200)),
+            signingKey: siblingSigning)
+
+        context.activeUserConfiguration.signedDevices.append(signedSibling)
+        context.activeUserConfiguration.signedDeviceKeyBundles.append(newerBundle)
+        var incoming = context.activeUserConfiguration
+        incoming.signedDeviceKeyBundles.removeAll { $0.id == siblingId }
+        incoming.signedDeviceKeyBundles.append(olderBundle)
+
+        let merged = await session.userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+            incoming,
+            currentContext: context)
+        let kept = try merged.signedDeviceKeyBundles
+            .first { $0.id == siblingId }?
+            .verified(using: siblingSigning.publicKey)
+        #expect(kept?.finalMLKEMPublicKey.id == newerPublic.id)
+
+        await session.shutdown()
+    }
+
+    @Test("verifyPublishedDeviceKeyBundle looks up once per unknown key id")
+    func testVerifyPublishedDeviceKeyBundle_oncePerKeyId() async throws {
+        let (transport, _) = try await setupRotatableSession()
+        await transport.resetCallTracking()
+        let unknown = UUID()
+        await session.verifyPublishedDeviceKeyBundle(unknownRecipientKeyId: unknown)
+        await session.verifyPublishedDeviceKeyBundle(unknownRecipientKeyId: unknown)
+        #expect(await transport.findConfigurationCallCount == 1)
+        await session.verifyPublishedDeviceKeyBundle(unknownRecipientKeyId: UUID())
+        #expect(await transport.findConfigurationCallCount == 2)
+
+        await session.shutdown()
+    }
+
+    @Test("child linkDevice publishes its first bundle exactly once")
+    func testChildLinkDevice_publishesFirstBundleOnce() async throws {
+        _ = try await setupRotatableSession()
+        guard let masterContext = await session.sessionContext else {
+            Issue.record("Master session context should be initialized")
+            return
+        }
+
+        var childSession = PQSSession()
+        let childUserData = MockUserData(session: childSession)
+        let childCache = MockIdentityStore(
+            mockUserData: childUserData,
+            session: childSession,
+            isSender: true)
+        let childTransport = _MockTransportDelegate(session: childSession, store: store)
+        let linkDelegate = MockDeviceLinkingDelegate(secretName: masterContext.sessionUser.secretName)
+        await childCache.setLocalSalt("childLinkSalt")
+        await childSession.setDatabaseDelegate(conformer: childCache)
+        await childSession.setTransportDelegate(conformer: childTransport)
+        await childSession.setPQSSessionDelegate(conformer: SessionDelegate(session: childSession))
+        await childSession.setReceiverDelegate(conformer: ReceiverDelegate(session: childSession))
+        await childSession.setConnectivity(true)
+        childSession.linkDelegate = linkDelegate
+
+        let bundle = try await childSession.createDeviceCryptographicBundle(isMaster: false)
+        guard let childDevice = try bundle.userConfiguration.getVerifiedDevices().first(where: {
+            $0.deviceId == bundle.deviceKeys.deviceId
+        }) else {
+            Issue.record("Child bundle should include its device")
+            return
+        }
+        let masterSigning = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: masterContext.sessionUser.deviceKeys.signingPrivateKey)
+        var configuration = masterContext.activeUserConfiguration
+        configuration.signedDevices.removeAll { $0.id == childDevice.deviceId }
+        configuration.signedDevices.append(try UserConfiguration.SignedDeviceConfiguration(
+            device: childDevice,
+            signingKey: masterSigning))
+        for signedBundle in bundle.userConfiguration.signedDeviceKeyBundles {
+            configuration.signedDeviceKeyBundles.removeAll { $0.id == signedBundle.id }
+            configuration.signedDeviceKeyBundles.append(signedBundle)
+        }
+        for key in bundle.userConfiguration.signedOneTimePublicKeys {
+            configuration.signedOneTimePublicKeys.removeAll { $0.id == key.id }
+            configuration.signedOneTimePublicKeys.append(key)
+        }
+        for key in bundle.userConfiguration.signedMLKEMOneTimePublicKeys {
+            configuration.signedMLKEMOneTimePublicKeys.removeAll { $0.id == key.id }
+            configuration.signedMLKEMOneTimePublicKeys.append(key)
+        }
+        linkDelegate.userConfiguration = configuration
+        await store.upsertUserConfiguration(
+            secretName: masterContext.sessionUser.secretName,
+            deviceId: bundle.deviceKeys.deviceId,
+            config: configuration)
+
+        await store.resetLastPublishedRotatedKeys()
+        let before = await childTransport.publishRotatedKeysCallCount
+        childSession = try await childSession.linkDevice(bundle: bundle, password: "123")
+        #expect(await childTransport.publishRotatedKeysCallCount == before + 1)
+        #expect(await store.lastPublishedRotatedKeys?.deviceKeyBundle?.id == bundle.deviceKeys.deviceId)
+        let childSigning = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: bundle.deviceKeys.signingPrivateKey
+        ).publicKey
+        let publishedBundle = try await store.lastPublishedRotatedKeys?.deviceKeyBundle?
+            .verified(using: childSigning)
+        #expect(publishedBundle?.deviceId == bundle.deviceKeys.deviceId)
+        #expect(publishedBundle?.sealedSenderMLKEMPublicKey != nil)
+
+        await childSession.shutdown()
+        await session.shutdown()
+    }
+
+    @Test("child linkDevice source publishes the first bundle before unlock")
+    func testChildLinkDevice_sourcePublishesBeforeUnlock() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let source = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/PQSSession/Session/PQSSession+DeviceLinking.swift"),
+            encoding: .utf8)
+        #expect(source.contains("if !bundle.deviceConfiguration.isMasterDevice"))
+        let publish = try #require(source.range(of: "try await publishLocalDeviceKeyBundle()"))
+        let unlock = try #require(source.range(of: "return try await unlock(appPassword: credentials.password)"))
+        #expect(publish.lowerBound < unlock.lowerBound)
+    }
+
+    @Test("schema mint of a dedicated sealed-sender key publishes once")
+    func testMintSealedSenderKey_publishesOnce() async throws {
+        let (transport, _) = try await setupRotatableSession()
+        guard var context = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        let keys = context.sessionUser.deviceKeys
+        context.sessionUser.deviceKeys = DeviceKeys(
+            deviceId: keys.deviceId,
+            signingPrivateKey: keys.signingPrivateKey,
+            longTermPrivateKey: keys.longTermPrivateKey,
+            oneTimePrivateKeys: keys.oneTimePrivateKeys,
+            mlKEMOneTimePrivateKeys: keys.mlKEMOneTimePrivateKeys,
+            finalMLKEMPrivateKey: keys.finalMLKEMPrivateKey,
+            rotateKeysDate: keys.rotateKeysDate)
+        let minted: Bool
+        (context, minted) = try await session.mintSealedSenderKeyIfNeeded(context)
+        #expect(minted)
+        await session.setSessionContext(context)
+        let before = await transport.publishRotatedKeysCallCount
+        try await session.publishLocalDeviceKeyBundle()
+        #expect(await transport.publishRotatedKeysCallCount == before + 1)
+        #expect(context.sessionUser.deviceKeys.sealedSenderMLKEMPrivateKey != nil)
+
+        await session.shutdown()
+    }
+
+    @Test("envelope sealed to the final key opens after routine rotation")
+    func testSpooledSealedEnvelopeOpensAfterRoutineRotation() async throws {
+        _ = try await setupRotatableSession()
+        guard let before = await session.sessionContext?.sessionUser.deviceKeys,
+              let context = await session.sessionContext
+        else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        let raw = try before.finalMLKEMPrivateKey.rawRepresentation.decodeMLKem1024()
+        let finalPublic = try MLKEMPublicKey(
+            id: before.finalMLKEMPrivateKey.id,
+            raw.publicKey.rawRepresentation)
+        let envelopeId = "env-seal-rotate"
+        let packetId = "pkt-seal-rotate"
+        let sealed = try makeSealedBox(
+            to: finalPublic,
+            recipientSecretName: context.sessionUser.secretName,
+            recipientDeviceId: before.deviceId,
+            envelopeId: envelopeId,
+            packetId: packetId)
+
+        try await session.rotateCurrentDeviceKeys()
+        guard let after = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Rotated keys should exist")
+            return
+        }
+        #expect(after.finalMLKEMPrivateKey.id != before.finalMLKEMPrivateKey.id)
+        #expect(after.previousFinalMLKEMPrivateKey?.id == before.finalMLKEMPrivateKey.id)
+        _ = try SealedInboundOpen.open(
+            sealed,
+            deviceKeys: after,
+            recipientSecretName: context.sessionUser.secretName,
+            recipientDeviceId: after.deviceId,
+            envelopeId: envelopeId,
+            packetId: packetId)
+
+        await session.shutdown()
+    }
+
+    @Test("envelope sealed to the dedicated key still opens after final-key rotation")
+    func testDedicatedSealedEnvelopeSurvivesFinalKeyRotation() async throws {
+        _ = try await setupRotatableSession()
+        guard let before = await session.sessionContext?.sessionUser.deviceKeys,
+              let context = await session.sessionContext,
+              let dedicatedPublic = try before.sealedSenderMLKEMPublicKey()
+        else {
+            Issue.record("Dedicated sealed-sender key should exist")
+            return
+        }
+        let envelopeId = "env-dedicated"
+        let packetId = "pkt-dedicated"
+        let sealed = try makeSealedBox(
+            to: dedicatedPublic,
+            recipientSecretName: context.sessionUser.secretName,
+            recipientDeviceId: before.deviceId,
+            envelopeId: envelopeId,
+            packetId: packetId)
+        #expect(sealed.recipientKeyId == dedicatedPublic.id)
+
+        try await session.rotateCurrentDeviceKeys()
+        guard let after = await session.sessionContext?.sessionUser.deviceKeys else {
+            Issue.record("Rotated keys should exist")
+            return
+        }
+        #expect(after.sealedSenderMLKEMPrivateKey?.id == before.sealedSenderMLKEMPrivateKey?.id)
+        _ = try SealedInboundOpen.open(
+            sealed,
+            deviceKeys: after,
+            recipientSecretName: context.sessionUser.secretName,
+            recipientDeviceId: after.deviceId,
+            envelopeId: envelopeId,
+            packetId: packetId)
+
+        await session.shutdown()
+    }
+
+    private func makeSealedBox(
+        to publicKey: MLKEMPublicKey,
+        recipientSecretName: String,
+        recipientDeviceId: UUID,
+        envelopeId: String,
+        packetId: String
+    ) throws -> SealedOuterCiphertext {
+        let certificate = try SenderCertificate.issue(
+            secretName: "peer",
+            deviceId: UUID(),
+            issuedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            signingKey: try MLDSA65.PrivateKey()
+        )
+        let innerKEM = try MLKEM1024.PrivateKey()
+        let signedMessage = try SignedRatchetMessage(
+            message: RatchetMessage(
+                header: EncryptedHeader(
+                    remoteLongTermPublicKey: Data(repeating: 0xA7, count: 32),
+                    remoteOneTimePublicKey: nil,
+                    remoteMLKEMPublicKey: try MLKEMPublicKey(
+                        innerKEM.publicKey.rawRepresentation
+                    ),
+                    headerCiphertext: Data(repeating: 0xB8, count: 48),
+                    messageCiphertext: Data(repeating: 0xC9, count: 48),
+                    oneTimeKeyId: nil,
+                    mlKEMOneTimeKeyId: UUID(),
+                    encrypted: Data(repeating: 0xDA, count: 48)
+                ),
+                ciphertext: Data("spooled sealed".utf8)
+            ),
+            signingPrivateKey: Curve25519.Signing.PrivateKey().rawRepresentation
+        )
+        return try SealedOuterBox.seal(
+            certificate: certificate,
+            signedMessage: signedMessage,
+            recipientFinalMLKEMPublicKey: publicKey,
+            recipientSecretName: recipientSecretName,
+            recipientDeviceId: recipientDeviceId,
+            envelopeId: envelopeId,
+            packetId: packetId
+        )
+    }
 }

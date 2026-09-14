@@ -210,6 +210,8 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
         public let updatedAt: Date?
         /// Additive capability bitmask. Missing on 4.2.0 bundles (identified path).
         public let capabilities: DeviceCapabilities
+        /// Dedicated sealed-sender public key. Skipped when nil.
+        public let sealedSenderMLKEMPublicKey: MLKEMPublicKey?
 
         public var supportsSealedSender: Bool {
             capabilities.contains(.sealedSender)
@@ -221,6 +223,7 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             case finalMLKEMPublicKey = "c"
             case updatedAt = "d"
             case capabilities = "e"
+            case sealedSenderMLKEMPublicKey = "f"
         }
 
         public init(
@@ -228,13 +231,15 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             longTermPublicKey: Data,
             finalMLKEMPublicKey: MLKEMPublicKey,
             updatedAt: Date? = Date(),
-            capabilities: DeviceCapabilities = []
+            capabilities: DeviceCapabilities = [],
+            sealedSenderMLKEMPublicKey: MLKEMPublicKey? = nil
         ) {
             self.deviceId = deviceId
             self.longTermPublicKey = longTermPublicKey
             self.finalMLKEMPublicKey = finalMLKEMPublicKey
             self.updatedAt = updatedAt
             self.capabilities = capabilities
+            self.sealedSenderMLKEMPublicKey = sealedSenderMLKEMPublicKey
         }
 
         public init(from decoder: Decoder) throws {
@@ -245,6 +250,9 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt)
             let raw = try container.decodeIfPresent(UInt32.self, forKey: .capabilities) ?? 0
             capabilities = DeviceCapabilities(rawValue: raw)
+            sealedSenderMLKEMPublicKey = try container.decodeIfPresent(
+                MLKEMPublicKey.self,
+                forKey: .sealedSenderMLKEMPublicKey)
         }
 
         public func encode(to encoder: Encoder) throws {
@@ -255,6 +263,9 @@ public struct UserConfiguration: Codable, Sendable, Equatable {
             try container.encodeIfPresent(updatedAt, forKey: .updatedAt)
             if capabilities.rawValue != 0 {
                 try container.encode(capabilities.rawValue, forKey: .capabilities)
+            }
+            if let sealedSenderMLKEMPublicKey {
+                try container.encode(sealedSenderMLKEMPublicKey, forKey: .sealedSenderMLKEMPublicKey)
             }
         }
     }

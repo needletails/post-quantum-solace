@@ -1165,8 +1165,10 @@ extension MessagePipeline {
         if let mlKEMOneTimeKeyId = ratchetMessage.header.mlKEMOneTimeKeyId {
             if let privateMLKEMOneTimeKey = localMLKEMPrivateKeys.first(where: { $0.id == mlKEMOneTimeKeyId }) {
                 localMLKEMPrivateKey = privateMLKEMOneTimeKey
-            } else if sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey.id == mlKEMOneTimeKeyId {
-                localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
+            } else if let finalKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey(matching: mlKEMOneTimeKeyId) {
+                // Current final key, or the single generation retired by the last routine
+                // rotation (a bootstrap encapsulated to the bundle the sender held then).
+                localMLKEMPrivateKey = finalKey
             } else if let storedKEM = props.ratchetMLKEMPrivateKey, storedKEM.id == mlKEMOneTimeKeyId {
                 localMLKEMPrivateKey = storedKEM
             } else {

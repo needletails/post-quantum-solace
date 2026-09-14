@@ -789,6 +789,10 @@ public actor PQSSession: SessionCacheSynchronizer {
         keyLoadingState = newState
     }
 
+    /// Sealed-open `recipientKeyUnknown` ids already healed this session.
+    /// One live lookup + possible republish per id; not per envelope.
+    var verifiedUnknownSealedRecipientKeyIds: Set<UUID> = []
+
     var pendingLinkedDeviceRepair = false
     func setPendingLinkedDeviceRepair(_ isPending: Bool) {
         pendingLinkedDeviceRepair = isPending

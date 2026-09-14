@@ -1967,6 +1967,10 @@ public extension PQSSession {
                     for: secretName,
                     configuration: configuration,
                     symmetricKey: symmetricKey)
+                await persistPinnedPeerConfigurationIfChanged(
+                    secretName: secretName,
+                    configuration: configuration,
+                    symmetricKey: symmetricKey)
             }
 
             var verifiedDevices = try verifiedDevicesWithUsableKeyMaterial(
@@ -2252,6 +2256,47 @@ public extension PQSSession {
             logger.log(
                 level: .debug,
                 message: "Verified pinned peer account signing key for \(secretName)")
+        }
+    }
+
+    /// Converges the persisted `Contact.configuration` snapshot with a live,
+    /// signature-checked, pin-verified configuration.
+    ///
+    /// The snapshot is written once at contact creation and otherwise only replaced by
+    /// the destructive account-identity acknowledgement. Consumers that key off the
+    /// peer's *device-signed* bundle (sealed-sender final ML-KEM key, capabilities)
+    /// would otherwise keep using material the peer retired on rotation. The account
+    /// signing key must already match (`enforcePeerAccountSigningKeyPin`), so this is
+    /// never a trust change — only device membership / bundle drift.
+    private func persistPinnedPeerConfigurationIfChanged(
+        secretName: String,
+        configuration: UserConfiguration,
+        symmetricKey: SymmetricKey
+    ) async {
+        guard let cache else { return }
+        do {
+            let encodedRemote = try BinaryEncoder().encode(configuration)
+            for contact in try await cache.fetchContacts() {
+                guard var props = await contact.props(symmetricKey: symmetricKey),
+                      props.secretName == secretName
+                else { continue }
+                guard props.configuration.signingPublicKey == configuration.signingPublicKey else {
+                    continue
+                }
+                if (try? BinaryEncoder().encode(props.configuration)) == encodedRemote {
+                    continue
+                }
+                props.configuration = configuration
+                _ = try await contact.updateProps(symmetricKey: symmetricKey, props: props)
+                try await cache.updateContact(contact)
+                logger.log(
+                    level: .info,
+                    message: "Converged persisted contact configuration for \(secretName) after identity refresh")
+            }
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "Failed to converge persisted contact configuration for \(secretName): \(error)")
         }
     }
 

@@ -4,7 +4,7 @@
 
 [![Swift](https://img.shields.io/badge/Swift-6.3+-orange.svg)](https://swift.org)
 [![Platform](https://img.shields.io/badge/Platform-iOS%2018%2B%20%7C%20macOS%2015%2B%20%7C%20Linux%20%7C%20Android-blue.svg)](https://developer.apple.com)
-[![Version](https://img.shields.io/badge/Version-4.3.0-blue.svg)](https://github.com/needletails/post-quantum-solace)
+[![Version](https://img.shields.io/badge/Version-4.4.0-blue.svg)](https://github.com/needletails/post-quantum-solace)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-green.svg)](LICENSE)
 
 A secure, post-quantum cryptographic messaging SDK with end-to-end encryption, built for the quantum-resistant future.

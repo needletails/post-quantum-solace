@@ -130,7 +130,7 @@ extension PQSSession {
         let hmacData = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
 
         // Create device keys object
-        let deviceKeys = DeviceKeys(
+        var deviceKeys = DeviceKeys(
             deviceId: deviceId,
             signingPrivateKey: longTerm.signing.rawRepresentation,
             longTermPrivateKey: longTerm.x25519.rawRepresentation,
@@ -139,6 +139,11 @@ extension PQSSession {
             finalMLKEMPrivateKey: mlKEMPrivateKey,
             rotateKeysDate: Calendar.current.date(byAdding: .weekOfYear, value: 1, to: Date())
         )
+        let sealedSenderGenerated = try crypto.generateMLKem1024PrivateKey()
+        let sealedSenderId = UUID()
+        deviceKeys.replaceSealedSenderMLKEMPrivateKey(
+            try MLKEMPrivateKey(id: sealedSenderId, sealedSenderGenerated.encode()),
+            retainingPrevious: false)
 
         // Create a user device configuration
         let device = UserDeviceConfiguration(
@@ -180,7 +185,9 @@ extension PQSSession {
                     deviceId: deviceId,
                     longTermPublicKey: longTerm.x25519.publicKey.rawRepresentation,
                     finalMLKEMPublicKey: mlKEMPublicKey,
-                    capabilities: .sealedSender
+                    updatedAt: Date(),
+                    capabilities: deviceKeys.sealedSenderDeviceCapabilities,
+                    sealedSenderMLKEMPublicKey: try deviceKeys.sealedSenderMLKEMPublicKey()
                 ),
             signingKey: longTerm.signing
         )

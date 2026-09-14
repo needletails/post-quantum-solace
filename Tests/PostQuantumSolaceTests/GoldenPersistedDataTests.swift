@@ -343,6 +343,41 @@ struct GoldenPersistedDataTests {
             pinned: "Ak5CVE4cAAAAU2Vzc2lvbk1vZGVscy5UcmFuc3BvcnRFdmVudAEAAAABAAAAZgQAAAAAAAAA")
     }
 
+    @Test("DeviceKeys with nil dedicated sealed-sender keys re-encode byte-identically")
+    func deviceKeysDedicatedFieldsNilReencodeIdentically() throws {
+        let kem = try MLKEM1024.PrivateKey()
+        let keys = DeviceKeys(
+            deviceId: Self.id1,
+            signingPrivateKey: Data(repeating: 0x21, count: 32),
+            longTermPrivateKey: Data(repeating: 0x22, count: 32),
+            oneTimePrivateKeys: [],
+            mlKEMOneTimePrivateKeys: [],
+            finalMLKEMPrivateKey: try MLKEMPrivateKey(id: Self.id2, kem.encode()),
+            rotateKeysDate: Self.epoch
+        )
+        #expect(keys.sealedSenderMLKEMPrivateKey == nil)
+        #expect(keys.previousSealedSenderMLKEMPrivateKey == nil)
+        let encoded = try BinaryEncoder().encode(keys)
+        let decoded = try BinaryDecoder().decode(DeviceKeys.self, from: encoded)
+        #expect(try BinaryEncoder().encode(decoded) == encoded)
+    }
+
+    @Test("DeviceKeyBundle with nil dedicated public key re-encodes byte-identically")
+    func deviceKeyBundleDedicatedFieldNilReencodeIdentically() throws {
+        let kem = try MLKEM1024.PrivateKey()
+        let bundle = UserConfiguration.DeviceKeyBundle(
+            deviceId: Self.id1,
+            longTermPublicKey: Data(repeating: 0x31, count: 32),
+            finalMLKEMPublicKey: try MLKEMPublicKey(id: Self.id2, kem.publicKey.rawRepresentation),
+            updatedAt: Self.epoch,
+            capabilities: []
+        )
+        #expect(bundle.sealedSenderMLKEMPublicKey == nil)
+        let encoded = try BinaryEncoder().encode(bundle)
+        let decoded = try BinaryDecoder().decode(UserConfiguration.DeviceKeyBundle.self, from: encoded)
+        #expect(try BinaryEncoder().encode(decoded) == encoded)
+    }
+
     @Test("TransportEvent.messageResendUnavailable v1 bytes are rejected")
     func transportMessageResendUnavailableGolden() throws {
         // Phase 2: encrypted-retry cases are gone. Keep the pinned bytes and

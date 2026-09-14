@@ -168,14 +168,16 @@ struct SealedSenderModelTests {
             )
             let bundleConstructions = source.components(separatedBy: "bundle: .init(").count - 1
             let advertised = source.components(separatedBy: "capabilities: .sealedSender").count - 1
+            let viaHelper = source.components(separatedBy: "sealedSenderDeviceCapabilities").count - 1
             if bundleConstructions > 0 {
                 #expect(
-                    advertised >= bundleConstructions,
+                    advertised + viaHelper >= bundleConstructions,
                     "\(path) publishes a DeviceKeyBundle without .sealedSender"
                 )
             } else {
                 #expect(
-                    source.contains("capabilities: .sealedSender"),
+                    source.contains("capabilities: .sealedSender")
+                        || source.contains("sealedSenderDeviceCapabilities"),
                     "\(path) publishes a DeviceKeyBundle without .sealedSender"
                 )
             }

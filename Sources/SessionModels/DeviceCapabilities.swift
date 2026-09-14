@@ -21,4 +21,8 @@ public struct DeviceCapabilities: OptionSet, Sendable, Hashable, Codable {
 
     /// Device can send and receive sealed-sender DMs.
     public static let sealedSender = DeviceCapabilities(rawValue: 1 << 0)
+
+    /// Device advertises a dedicated sealed-sender ML-KEM key that does not
+    /// rotate with the weekly final-key schedule.
+    public static let dedicatedSealedKey = DeviceCapabilities(rawValue: 1 << 1)
 }
