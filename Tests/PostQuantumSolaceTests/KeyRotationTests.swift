@@ -1350,6 +1350,7 @@ actor KeyRotationTests {
         let spent = Array(context.activeUserConfiguration.signedOneTimePublicKeys.prefix(2))
         try #require(spent.count == 2)
         await transport.resetCallTracking()
+        transport.rejectCancelledOneTimeKeyUploads = true
 
         let gate = UploadGate()
         transport.beforeUpdateOneTimeKeys = {

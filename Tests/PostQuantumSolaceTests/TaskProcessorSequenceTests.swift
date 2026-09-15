@@ -1905,6 +1905,11 @@ actor TaskProcessorSequenceTests {
         defer {
             transport.beforeUpdateOneTimeKeys = nil
         }
+        // The suite shares one mock transport. Prior tests (and createSenderSession)
+        // may already have incremented the counter; this assertion is about *this*
+        // recovery's single curve upload. macOS CI runs other suites in parallel
+        // and the 3s wait for an absolute `== 1` timed out there.
+        await transport.resetCallTracking()
 
         let peerDeviceId = UUID()
         let first = try makeTestInboundTaskMessage(
@@ -1962,10 +1967,13 @@ actor TaskProcessorSequenceTests {
             secondRecorded,
             "Second missingOneTimeKey should be recorded inside the in-flight recovery episode")
 
-        let sawSingleX25519Upload = try await waitUntil {
+        let sawSingleX25519Upload = try await waitUntil(timeout: 10) {
             await self.transport.updateOneTimeKeysCallCount == 1
         }
         #expect(sawSingleX25519Upload, "Only the first in-flight recovery should upload a replacement curve OTK batch")
+        #expect(
+            await transport.updateOneTimeKeysCallCount == 1,
+            "A second in-flight recovery must not start another curve OTK upload")
 
         await session.shutdown()
     }
