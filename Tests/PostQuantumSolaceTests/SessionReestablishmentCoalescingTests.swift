@@ -280,8 +280,8 @@ struct SessionReestablishmentCoalescingTests {
         let deadPeer = UUID()
         let healablePeer = UUID()
 
-        // missingOneTimeKey-style open: frames of the dead epoch can never
-        // decrypt, so transport must not hold-and-replay them.
+        // missingOneTimeKey / lane-saturated orphan-resend: frames of the dead
+        // epoch can never decrypt, so transport must not hold-and-replay them.
         #expect(await session.tryBeginReestablishmentEpisode(
             sender: "alice",
             deviceId: deadPeer,
@@ -293,8 +293,8 @@ struct SessionReestablishmentCoalescingTests {
             sender: "alice",
             deviceId: deadPeer)))
 
-        // Default open (e.g. awaiting sender orphan-resend): held frames may
-        // decrypt after the lane heals, so transport should hold.
+        // Default open (e.g. invalidSignature peerRefresh leader): held frames
+        // may decrypt after local state heals, so transport should hold.
         #expect(await session.tryBeginReestablishmentEpisode(
             sender: "alice",
             deviceId: healablePeer))

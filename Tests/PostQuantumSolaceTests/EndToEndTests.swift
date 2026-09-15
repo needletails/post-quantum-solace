@@ -10816,6 +10816,9 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
         if let beforeUpdateOneTimeKeys {
             await beforeUpdateOneTimeKeys()
         }
+        // A real URLSession PUT fails with CancellationError once its task is cancelled;
+        // a cancelled upload must not be counted as delivered.
+        try Task.checkCancellation()
         // Track calls for testing (thread-safe)
         await callTracker.record(secretName: secretName, deviceId: deviceId, keyCount: keys.count)
         try await otkErrorInjector.checkAndThrow()

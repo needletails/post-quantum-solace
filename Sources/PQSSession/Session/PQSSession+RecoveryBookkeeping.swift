@@ -758,11 +758,13 @@ extension PQSSession {
     }
 
     /// `true` when an open episode for this peer device should make transport
-    /// hold offline ciphertext replay (held frames may decrypt once the lane
-    /// heals, e.g. after a sender orphan-resend). Episodes opened for
-    /// dead-session classes (`missingOneTimeKey`) return `false`: their spooled
-    /// frames can never decrypt, so holding them only builds an immortal
-    /// redelivery queue — they must flow to the bounded attempt-and-purge path.
+    /// hold offline ciphertext replay (held frames may decrypt once *local*
+    /// state heals, e.g. after a peerRefresh that restores the same epoch).
+    /// Episodes opened for dead-session classes (`missingOneTimeKey`,
+    /// lane-saturated orphan-resend) return `false`: their spooled frames can
+    /// never decrypt locally, so holding them only parks later-epoch mail and
+    /// builds an immortal redelivery queue — they must flow to the bounded
+    /// attempt-and-purge path.
     public func shouldHoldOfflineCiphertextDuringRecovery(
         sender: String,
         deviceId: UUID,
@@ -780,8 +782,9 @@ extension PQSSession {
     ///
     /// `heldOfflineFramesCanHeal: false` marks the episode as covering a dead
     /// session epoch (see `deadSessionCiphertextEpisodes`). The mark also
-    /// applies when the episode is already open: a `missingOneTimeKey` failure
-    /// proves the epoch is dead no matter which class opened the episode first.
+    /// applies when the episode is already open: a `missingOneTimeKey` or
+    /// lane-saturated orphan-resend failure proves the epoch is dead no matter
+    /// which class opened the episode first.
     @discardableResult
     func tryBeginReestablishmentEpisode(
         sender: String,

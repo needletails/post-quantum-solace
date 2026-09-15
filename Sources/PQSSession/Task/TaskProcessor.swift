@@ -13,7 +13,6 @@
 //  This file is part of the Post-Quantum Solace SDK, which provides
 //  post-quantum cryptographic session management capabilities.
 
-import DequeModule
 import DoubleRatchetKit
 import Foundation
 import NeedleTailAsyncSequence
@@ -89,13 +88,11 @@ actor MessagePipeline {
         shouldExecuteAsTask: false
     )
 
-    /// Queue of tasks for updating cryptographic keys.
-    /// These tasks run on the key transport executor to avoid blocking message processing.
-    var updateKeyTasks: Deque<Task<Void, Never>> = []
-
-    /// Queue of tasks for deleting cryptographic keys.
-    /// These tasks run on the key transport executor for proper cleanup.
-    var deleteKeyTasks: Deque<Task<Void, Never>> = []
+    /// In-flight one-time-key replacement uploads, keyed so each task retires only
+    /// itself on completion. Consumptions burst (several ratchet handshakes in one
+    /// second), and the tasks finish out of order; a FIFO pop here cancelled an
+    /// older sibling's PUT mid-flight and lost its replacement key.
+    var updateKeyTasks: [UUID: Task<Void, Never>] = [:]
 
     /// The serial executor exposed to allow `Sendable` access to async work.
     /// External code can use this to schedule work on the cryptographic executor

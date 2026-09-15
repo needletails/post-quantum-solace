@@ -104,9 +104,11 @@ extension MessagePipeline {
     ///   `coalescingKey`;
     /// - the candidate is `.writeMessage`, non-persisted, carries the same
     ///   key, and targets the same recipient identity lane;
-    /// - the candidate is not currently in flight (an executing send is mid
-    ///   transport; superseding it would race an unknown outcome — the worst
-    ///   case is one redundant send, never a lost one).
+    /// - the candidate is not currently in flight **and** is still sitting in
+    ///   the live deque (an executing send, or a job already yielded but not
+    ///   yet marked in-flight, is mid-process; superseding it would race
+    ///   `jobNotFound` and drop the replacement — the worst case is one
+    ///   redundant send, never a lost one).
     ///
     /// Matches are removed from the durable cache first, then from the live
     /// consumer deque so a running drain cannot still transport them.
@@ -121,8 +123,21 @@ extension MessagePipeline {
         else { return }
 
         var supersededIds = Set<UUID>()
+        // Snapshot the live deque once. A job can be dequeued by the consumer
+        // before `inFlightJobIds` is inserted; superseding that row deletes
+        // the cache entry `commitPreparedOutbound` still needs. Device logs
+        // then show `jobNotFound` + "Unhandled error... Deleting job" and the
+        // replacement never transports (read receipts vanishing after an
+        // immediate delivered→read pair).
+        let enqueuedIds = Set(await jobConsumer.deque.map { $0.item.id })
         for job in try await cache.fetchJobs() {
             guard !inFlightJobIds.contains(job.id) else { continue }
+            // Processor running and the job is no longer queued: it is either
+            // executing or in the dequeue→inFlight gap. Skip so the worst
+            // case is one redundant send, never a dropped replacement.
+            if isRunning && !enqueuedIds.contains(job.id) {
+                continue
+            }
             guard let props = await job.props(symmetricKey: symmetricKey),
                   case .writeMessage(let pending) = props.task.task,
                   !pending.isPersistedOutbound,
@@ -398,6 +413,16 @@ extension MessagePipeline {
         
         guard let props = await job.props(symmetricKey: symmetricKey) else {
             try await cache.deleteJob(job)
+            return .deleted
+        }
+
+        // Coalesce may have deleted this row after the consumer yielded it.
+        // Do not enter encrypt / the unhandled `jobNotFound` delete path.
+        let cachedJobIds = Set((try await cache.fetchJobs()).map(\.id))
+        if !cachedJobIds.contains(job.id) {
+            logger.log(
+                level: .info,
+                message: "Job already removed before process (superseded or completed); skipping")
             return .deleted
         }
         
@@ -977,6 +1002,15 @@ extension MessagePipeline {
                 level: .info,
                 message: "Job processing paused after cancellation; retained durable job for explicit resume")
             return .paused
+        } catch SessionCache.CacheErrors.jobNotFound {
+            // The cache row vanished after dequeue (keyed supersede, concurrent
+            // completion). This is queue plumbing, not a content failure: do
+            // not log unhandled, do not delete a replacement job, do not emit
+            // recovery. The replacement — if any — is already persisted.
+            logger.log(
+                level: .info,
+                message: "Job vanished during process (already handled by a concurrent path); skipping")
+            return .deleted
         } catch {
             
             // If we are throwing an error for some other reason... On write we delay the message sending for retry before considering it a loss and deleting
@@ -1199,6 +1233,10 @@ extension MessagePipeline {
     ///    sender; when a *new* ciphertext for that sharedId still fails after a
     ///    transport-confirmed NACK, re-arm a bounded NACK (orphan replay did not prove).
     /// 4. Distinct ids keep requesting resend until the sender heals or reports unavailable.
+    /// 5. After lane saturation, the coalesce episode is marked
+    ///    `heldOfflineFramesCanHeal: false` so later oldest-first offline frames
+    ///    still attempt decrypt. Orphan-resend cannot make the old ciphertext
+    ///    decryptable; holding the tail parks later-epoch chat.
     private func handleUndecryptableInboundResend(
         message: InboundTaskMessage,
         failureClass: String,
@@ -1377,6 +1415,11 @@ extension MessagePipeline {
         // peer-device, open the existing reestablishment episode so further distinct
         // sharedIds coalesce via deferPeerResendUntilReestablished. Sender orphanResend
         // still owns heal — this does not emit peerRefresh / receive ASR.
+        //
+        // Dead-session mark: orphan-resend produces *new* ciphertext. Holding the
+        // rest of an oldest-first offline backlog behind this episode parks later
+        // frames (including live-epoch chat) that were never decrypt-attempted.
+        // Same contract as missingOneTimeKey — flow through decrypt, fail, purge.
         if !rearmedAfterFailedReplay,
            laneSaturated,
            await session.hasTransportedPeerResendRequest(
@@ -1385,7 +1428,8 @@ extension MessagePipeline {
         {
             _ = await session.tryBeginReestablishmentEpisode(
                 sender: message.senderSecretName,
-                deviceId: message.senderDeviceId)
+                deviceId: message.senderDeviceId,
+                heldOfflineFramesCanHeal: false)
             audit(.recovery, "pqs.recovery.undecryptableLaneSaturated sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) sharedId=\(message.sharedMessageId) awaitingSenderOrphanResend=true")
             auditInboundDecryptFailure(
                 message: message,

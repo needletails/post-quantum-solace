@@ -24,6 +24,14 @@ import SessionModels
 import Testing
 import Crypto
 
+private extension MessagePipeline {
+    /// Production binds `session` inside the first ratchet job; tests that drive
+    /// `updateOneTimeKey(remove:)` directly have no such job.
+    func bindSessionForTesting(_ session: PQSSession) {
+        self.session = session
+    }
+}
+
 @Suite(.serialized)
 actor KeyRotationTests {
 
@@ -1069,6 +1077,330 @@ actor KeyRotationTests {
         #expect(await transport.findConfigurationCallCount == 1)
         await session.verifyPublishedDeviceKeyBundle(unknownRecipientKeyId: UUID())
         #expect(await transport.findConfigurationCallCount == 2)
+
+        await session.shutdown()
+    }
+
+    /// Signs a bundle for the local device that keeps its long-term and final keys but
+    /// advertises `dedicated` as the sealed-sender key — the shape a server row takes when
+    /// the device once published a dedicated key it no longer holds.
+    private func makeSelfBundle(
+        from context: SessionContext,
+        dedicated: MLKEMPublicKey?
+    ) throws -> UserConfiguration.SignedDeviceKeyBundle {
+        let deviceId = context.sessionUser.deviceId
+        let deviceSigning = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: context.sessionUser.deviceKeys.signingPrivateKey)
+        let current = try #require(
+            try context.activeUserConfiguration.signedDeviceKeyBundles
+                .first { $0.id == deviceId }?
+                .verified(using: deviceSigning.publicKey))
+        var capabilities: DeviceCapabilities = .sealedSender
+        if dedicated != nil {
+            capabilities.insert(.dedicatedSealedKey)
+        }
+        return try UserConfiguration.SignedDeviceKeyBundle(
+            bundle: .init(
+                deviceId: deviceId,
+                longTermPublicKey: current.longTermPublicKey,
+                finalMLKEMPublicKey: current.finalMLKEMPublicKey,
+                updatedAt: Date(),
+                capabilities: capabilities,
+                sealedSenderMLKEMPublicKey: dedicated),
+            signingKey: deviceSigning)
+    }
+
+    private func makeForeignDedicatedKey() throws -> MLKEMPublicKey {
+        let kem = try crypto.generateMLKem1024PrivateKey()
+        return try MLKEMPublicKey(id: UUID(), kem.publicKey.rawRepresentation)
+    }
+
+    @Test("server bundle advertising a dedicated key this device does not hold triggers a republish")
+    func testDedicatedKeyDrift_republishesHeldKeys() async throws {
+        await store.resetLastPublishedRotatedKeys()
+        let (transport, _) = try await setupRotatableSession()
+        guard let context = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        let deviceKeys = context.sessionUser.deviceKeys
+        let heldDedicatedId = try #require(deviceKeys.sealedSenderMLKEMPrivateKey?.id)
+        let deviceSigning = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: deviceKeys.signingPrivateKey).publicKey
+
+        // Same long-term and final keys as ours, so the pre-fix comparison sees no drift.
+        let foreign = try makeForeignDedicatedKey()
+        var remote = try await store.findConfiguration(for: context.sessionUser.secretName)
+        remote.signedDeviceKeyBundles.removeAll { $0.id == context.sessionUser.deviceId }
+        remote.signedDeviceKeyBundles.append(try makeSelfBundle(from: context, dedicated: foreign))
+
+        let before = await transport.publishRotatedKeysCallCount
+        let converged = await session.republishLocalDeviceKeyBundleIfRemoteDrifted(
+            incoming: remote,
+            currentContext: context,
+            triggerUnknownRecipientKeyId: foreign.id)
+        #expect(converged)
+        #expect(await transport.publishRotatedKeysCallCount == before + 1)
+        let published = try await store.lastPublishedRotatedKeys?.deviceKeyBundle?
+            .verified(using: deviceSigning)
+        #expect(published?.sealedSenderMLKEMPublicKey?.id == heldDedicatedId)
+        #expect(published?.finalMLKEMPublicKey.id == deviceKeys.finalMLKEMPrivateKey.id)
+        #expect(published?.capabilities.contains(.dedicatedSealedKey) == true)
+
+        await session.shutdown()
+    }
+
+    @Test("server bundle missing our minted dedicated key triggers a republish")
+    func testUnadvertisedDedicatedKey_republishesHeldKeys() async throws {
+        let (transport, _) = try await setupRotatableSession()
+        guard let context = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        // The offline-unlock mint path: local holds a dedicated key the server never saw.
+        var remote = try await store.findConfiguration(for: context.sessionUser.secretName)
+        remote.signedDeviceKeyBundles.removeAll { $0.id == context.sessionUser.deviceId }
+        remote.signedDeviceKeyBundles.append(try makeSelfBundle(from: context, dedicated: nil))
+
+        let before = await transport.publishRotatedKeysCallCount
+        let converged = await session.republishLocalDeviceKeyBundleIfRemoteDrifted(
+            incoming: remote,
+            currentContext: context)
+        #expect(converged)
+        #expect(await transport.publishRotatedKeysCallCount == before + 1)
+
+        await session.shutdown()
+    }
+
+    @Test("server bundle matching the held keys does not republish and reports converged")
+    func testMatchingServerBundle_doesNotRepublish() async throws {
+        let (transport, _) = try await setupRotatableSession()
+        guard let context = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        let remote = try await store.findConfiguration(for: context.sessionUser.secretName)
+        let before = await transport.publishRotatedKeysCallCount
+        let converged = await session.republishLocalDeviceKeyBundleIfRemoteDrifted(
+            incoming: remote,
+            currentContext: context,
+            triggerUnknownRecipientKeyId: UUID())
+        #expect(converged)
+        #expect(await transport.publishRotatedKeysCallCount == before)
+
+        await session.shutdown()
+    }
+
+    @Test("local authority rebuilds the bundle when the stored copy advertises a dedicated key we do not hold")
+    func testLocalAuthoritativeBundle_rebuildsFromHeldPrivateKeys() async throws {
+        _ = try await setupRotatableSession()
+        guard var context = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        let deviceKeys = context.sessionUser.deviceKeys
+        let deviceId = context.sessionUser.deviceId
+        let heldDedicatedId = try #require(deviceKeys.sealedSenderMLKEMPrivateKey?.id)
+        let deviceSigning = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: deviceKeys.signingPrivateKey).publicKey
+
+        // Consistent stored copy is returned as-is.
+        let stored = try #require(context.activeUserConfiguration.signedDeviceKeyBundles.first { $0.id == deviceId })
+        let unchanged = await session.localAuthoritativeDeviceKeyBundle(in: context, deviceSigningKey: deviceSigning)
+        #expect(unchanged?.data == stored.data)
+
+        // A stored copy carrying someone else's dedicated key (e.g. adopted from a stale
+        // server snapshot) is replaced by one signed from the keys actually held.
+        let foreign = try makeForeignDedicatedKey()
+        let stale = try makeSelfBundle(from: context, dedicated: foreign)
+        context.activeUserConfiguration.signedDeviceKeyBundles.removeAll { $0.id == deviceId }
+        context.activeUserConfiguration.signedDeviceKeyBundles.append(stale)
+
+        let rebuilt = try #require(
+            await session.localAuthoritativeDeviceKeyBundle(in: context, deviceSigningKey: deviceSigning))
+        let bundle = try #require(try rebuilt.verified(using: deviceSigning))
+        #expect(bundle.sealedSenderMLKEMPublicKey?.id == heldDedicatedId)
+        #expect(bundle.finalMLKEMPublicKey.id == deviceKeys.finalMLKEMPrivateKey.id)
+        #expect(bundle.capabilities.contains(.dedicatedSealedKey))
+
+        // Adoption of that stale snapshot therefore carries the held keys, not the foreign one.
+        var incoming = context.activeUserConfiguration
+        incoming.signedDeviceKeyBundles.removeAll { $0.id == deviceId }
+        incoming.signedDeviceKeyBundles.append(stale)
+        let merged = await session.userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+            incoming,
+            currentContext: context)
+        let adopted = try merged.signedDeviceKeyBundles
+            .first { $0.id == deviceId }?
+            .verified(using: deviceSigning)
+        #expect(adopted?.sealedSenderMLKEMPublicKey?.id == heldDedicatedId)
+
+        await session.shutdown()
+    }
+
+    @Test("a failed heal lookup releases the key id so the next unknown-key event retries")
+    func testVerifyPublishedDeviceKeyBundle_retriesAfterLookupFailure() async throws {
+        let (transport, _) = try await setupRotatableSession()
+        await transport.resetCallTracking()
+        let unknown = UUID()
+
+        transport.findConfigurationError = PQSError.userNotFound
+        await session.verifyPublishedDeviceKeyBundle(unknownRecipientKeyId: unknown)
+        #expect(await transport.findConfigurationCallCount == 1)
+
+        transport.findConfigurationError = nil
+        await session.verifyPublishedDeviceKeyBundle(unknownRecipientKeyId: unknown)
+        #expect(await transport.findConfigurationCallCount == 2)
+
+        // Converged now; the same id is suppressed for the rest of the session.
+        await session.verifyPublishedDeviceKeyBundle(unknownRecipientKeyId: unknown)
+        #expect(await transport.findConfigurationCallCount == 2)
+
+        await session.shutdown()
+    }
+
+    @Test("a rejected republish releases the key id and the next unknown-key event converges the server")
+    func testVerifyPublishedDeviceKeyBundle_retriesAfterPublishFailure() async throws {
+        await store.resetLastPublishedRotatedKeys()
+        let (transport, _) = try await setupRotatableSession()
+        guard let context = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        let secretName = context.sessionUser.secretName
+        let deviceId = context.sessionUser.deviceId
+        let heldDedicatedId = try #require(context.sessionUser.deviceKeys.sealedSenderMLKEMPrivateKey?.id)
+        let deviceSigning = try Curve25519.Signing.PrivateKey(
+            rawRepresentation: context.sessionUser.deviceKeys.signingPrivateKey).publicKey
+
+        // Server row drifted to a dedicated key we never held.
+        let foreign = try makeForeignDedicatedKey()
+        var drifted = try await store.findConfiguration(for: secretName)
+        drifted.signedDeviceKeyBundles.removeAll { $0.id == deviceId }
+        drifted.signedDeviceKeyBundles.append(try makeSelfBundle(from: context, dedicated: foreign))
+        await store.upsertUserConfiguration(secretName: secretName, deviceId: deviceId, config: drifted)
+        await transport.resetCallTracking()
+
+        transport.publishRotatedKeysError = PQSError.transportNotInitialized
+        await session.verifyPublishedDeviceKeyBundle(unknownRecipientKeyId: foreign.id)
+        #expect(await transport.findConfigurationCallCount == 1)
+        #expect(await store.lastPublishedRotatedKeys == nil)
+
+        transport.publishRotatedKeysError = nil
+        await session.verifyPublishedDeviceKeyBundle(unknownRecipientKeyId: foreign.id)
+        #expect(await transport.findConfigurationCallCount == 2)
+        let published = try await store.lastPublishedRotatedKeys?.deviceKeyBundle?
+            .verified(using: deviceSigning)
+        #expect(published?.sealedSenderMLKEMPublicKey?.id == heldDedicatedId)
+
+        // The server row now advertises the held key.
+        let serverBundle = try await store.findConfiguration(for: secretName).signedDeviceKeyBundles
+            .first { $0.id == deviceId }?
+            .verified(using: deviceSigning)
+        #expect(serverBundle?.sealedSenderMLKEMPublicKey?.id == heldDedicatedId)
+
+        await session.shutdown()
+    }
+
+    /// Parks the first upload until the test opens the gate, and exposes
+    /// `entered == 2` as the event that both tasks have reached the transport.
+    private actor UploadGate {
+        private var parked: CheckedContinuation<Void, Never>?
+        private var secondEntered: CheckedContinuation<Void, Never>?
+        private var isOpen = false
+        private(set) var entries = 0
+
+        func enter() -> Int {
+            entries += 1
+            if entries >= 2, let secondEntered {
+                self.secondEntered = nil
+                secondEntered.resume()
+            }
+            return entries
+        }
+
+        func waitUntilBothEntered() async {
+            if entries >= 2 { return }
+            await withCheckedContinuation { secondEntered = $0 }
+        }
+
+        func park() async {
+            guard !isOpen else { return }
+            await withCheckedContinuation { parked = $0 }
+        }
+
+        func open() {
+            isOpen = true
+            parked?.resume()
+            parked = nil
+        }
+    }
+
+    /// Dogfood 2026-09-15 (Device3 09:45:29): two ratchet handshakes consumed one-time
+    /// keys in the same second; the replacement upload that finished first popped the
+    /// FIFO and cancelled its still-in-flight sibling's PUT. The sibling's replacement
+    /// key was never published. A completing upload may retire only itself.
+    @Test("a fast one-time-key replacement does not cancel a slower sibling upload")
+    func testConcurrentOneTimeKeyReplacements_doNotCancelEachOther() async throws {
+        let (transport, _) = try await setupRotatableSession()
+        guard let context = await session.sessionContext else {
+            Issue.record("Session context should be initialized")
+            return
+        }
+        let spent = Array(context.activeUserConfiguration.signedOneTimePublicKeys.prefix(2))
+        try #require(spent.count == 2)
+        await transport.resetCallTracking()
+
+        let gate = UploadGate()
+        transport.beforeUpdateOneTimeKeys = {
+            // The first consumption's PUT is slow; the second completes immediately.
+            if await gate.enter() == 1 { await gate.park() }
+        }
+
+        let pipeline = await session.messagePipeline
+        // In production the ratchet job that consumed the key has already bound the
+        // pipeline to its session; there is no handshake in this test, so bind it here.
+        await pipeline.bindSessionForTesting(session)
+        await pipeline.updateOneTimeKey(remove: spent[0].id)
+        await pipeline.updateOneTimeKey(remove: spent[1].id)
+        try #require(await pipeline.updateKeyTasks.count == 2)
+
+        // Both tasks have reached the transport; one is parked, the other can
+        // finish and retire. Wait for that retirement — callCount ticks before
+        // the task drops itself from the dictionary.
+        await gate.waitUntilBothEntered()
+        var spins = 0
+        while await pipeline.updateKeyTasks.count != 1 && spins < 2_000 {
+            await Task.yield()
+            spins += 1
+        }
+
+        #expect(await pipeline.updateKeyTasks.count == 1,
+                "The slow upload must remain tracked after its sibling completes")
+        #expect(await transport.updateOneTimeKeysCallCount == 1)
+
+        let remaining = Array(await pipeline.updateKeyTasks.values)
+        await gate.open()
+        for handle in remaining {
+            await handle.value
+        }
+        #expect(await pipeline.updateKeyTasks.isEmpty)
+        #expect(await transport.updateOneTimeKeysCallCount == 2,
+                "Both replacement keys must reach the server")
+        // Both deltas must survive in the live context: neither task may write back a
+        // pre-upload snapshot that resurrects the other's spent key or drops the other's
+        // freshly minted private key.
+        let finalContext = try #require(await session.sessionContext)
+        let published = Set(finalContext.activeUserConfiguration.signedOneTimePublicKeys.map(\.id))
+        #expect(!published.contains(spent[0].id))
+        #expect(!published.contains(spent[1].id))
+        let uploaded = Set(await transport.updateOneTimeKeysCalls.map(\.keyCount))
+        #expect(uploaded == [1])
+        let heldPrivateIds = Set(finalContext.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        let publishedNew = published.subtracting(context.activeUserConfiguration.signedOneTimePublicKeys.map(\.id))
+        #expect(publishedNew.count == 2, "Two replacement public keys must be advertised")
+        #expect(publishedNew.isSubset(of: heldPrivateIds),
+                "Every advertised replacement must have its private key held locally")
 
         await session.shutdown()
     }

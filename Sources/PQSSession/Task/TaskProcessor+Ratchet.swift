@@ -160,26 +160,21 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
     /// - Parameter id: The UUID of the spent one-time key.
     func updateOneTimeKey(remove id: UUID) async {
         // If we do not detach then the ratchet encrypt takes too long due to the network
-        updateKeyTasks.append(Task(executorPreference: keyTransportExecutor) { [weak self] in
+        let taskId = UUID()
+        updateKeyTasks[taskId] = Task(executorPreference: keyTransportExecutor) { [weak self] in
             guard let self else { return }
             do {
                 guard let session = await session else {
                     throw PQSError.sessionNotInitialized
                 }
-                guard var sessionContext = await session.sessionContext else {
+                guard let sessionContext = await session.sessionContext else {
                     throw PQSError.sessionNotInitialized
                 }
                 
-                guard var signedKeys = await session
-                    .sessionContext?
-                    .activeUserConfiguration
-                    .signedOneTimePublicKeys
-                else { return }
-                
                 // Replay idempotency: only the first consumption request for this
                 // id still finds its signed public entry.
-                guard signedKeys.contains(where: { $0.id == id }) else {
-                    await cancelAndRemoveUpdateKeyTasks()
+                guard sessionContext.activeUserConfiguration.signedOneTimePublicKeys.contains(where: { $0.id == id }) else {
+                    await retireUpdateKeyTask(taskId)
                     return
                 }
                 
@@ -188,73 +183,68 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
                 let privateKeyRep = try X25519PrivateKey(id: newID, keypair.rawRepresentation)
                 let publicKey = try X25519PublicKey(id: newID, keypair.publicKey.rawRepresentation)
                 
-                var deviceKeys = sessionContext.sessionUser.deviceKeys
-                // Deferred consumption: retain the spent private key until the
-                // reverse handshake confirms; only append the replacement here.
-                deviceKeys.oneTimePrivateKeys.append(privateKeyRep)
-                
-                sessionContext.sessionUser.deviceKeys = deviceKeys
-                sessionContext.updateSessionUser(sessionContext.sessionUser)
-                
-                let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
-                let newSignedKey = try UserConfiguration.SignedOneTimePublicKey(key: publicKey, deviceId: sessionContext.sessionUser.deviceId, signingKey: signingKey)
-                
-                signedKeys.removeAll { $0.id == id }
-                signedKeys.append(newSignedKey)
+                let sessionUser = sessionContext.sessionUser
+                let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: sessionUser.deviceKeys.signingPrivateKey)
+                let newSignedKey = try UserConfiguration.SignedOneTimePublicKey(key: publicKey, deviceId: sessionUser.deviceId, signingKey: signingKey)
                 
                 try await session.transportDelegate?.updateOneTimeKeys(
-                    for: sessionContext.sessionUser.secretName,
-                    deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                    for: sessionUser.secretName,
+                    deviceId: sessionUser.deviceId.uuidString,
                     keys: [newSignedKey]
                 )
                 
-                // Update the user configuration only after the server accepted the replacement key.
-                sessionContext.activeUserConfiguration.signedOneTimePublicKeys = signedKeys
-                await session.setSessionContext(sessionContext)
+                // The server accepted the replacement. Apply this task's delta to the
+                // *current* context, not the snapshot taken before the round-trip: a
+                // sibling replacement may have committed in the meantime, and writing the
+                // snapshot back would resurrect its spent public key and drop its new
+                // private key (the peer could then pick an OTK we cannot decrypt).
+                guard let updated = await session.mutateSessionContext({ context in
+                    var deviceKeys = context.sessionUser.deviceKeys
+                    // Deferred consumption: retain the spent private key until the
+                    // reverse handshake confirms; only append the replacement here.
+                    deviceKeys.oneTimePrivateKeys.append(privateKeyRep)
+                    var user = context.sessionUser
+                    user.deviceKeys = deviceKeys
+                    context.updateSessionUser(user)
+                    context.activeUserConfiguration.signedOneTimePublicKeys.removeAll { $0.id == id }
+                    context.activeUserConfiguration.signedOneTimePublicKeys.append(newSignedKey)
+                }) else {
+                    throw PQSError.sessionNotInitialized
+                }
                 
-                // Encrypt and persist
-                let encodedData = try BinaryEncoder().encode(sessionContext)
+                // Persist whatever is current now, not only this task's returned
+                // snapshot: a sibling may have committed between mutate and here.
+                let toPersist = await session.sessionContext ?? updated
+                let encodedData = try BinaryEncoder().encode(toPersist)
                 guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: session.getAppSymmetricKey()) else {
                     throw PQSError.sessionEncryptionError
                 }
                 
                 try await session.cache?.updateLocalSessionContext(encryptedConfig)
-                await cancelAndRemoveUpdateKeyTasks()
+                await retireUpdateKeyTask(taskId)
+            } catch is CancellationError {
+                // Only session shutdown cancels these tasks now; nothing to report.
+                await retireUpdateKeyTask(taskId)
             } catch {
-                await cancelAndRemoveUpdateKeyTasks()
+                await retireUpdateKeyTask(taskId)
                 await logger.log(level: .error, message: "Failed to update one time key: \(error)")
             }
-        })
+        }
     }
-    
-    private func cancelAndRemoveUpdateKeyTasks() async {
-        guard !updateKeyTasks.isEmpty else { return }
-        let item = updateKeyTasks.removeFirst()
-        item.cancel()
-    }
-    
-    private func cancelAndRemoveDeleteKeyTasks() async {
-        guard !deleteKeyTasks.isEmpty else { return }
-        let item = deleteKeyTasks.removeFirst()
-        item.cancel()
+
+    /// Drops this task's own bookkeeping entry. Never cancels a sibling.
+    private func retireUpdateKeyTask(_ taskId: UUID) async {
+        updateKeyTasks.removeValue(forKey: taskId)
     }
 
     /// Cancels all in-flight key transport offload tasks (session shutdown).
     func cancelBackgroundKeyTasks() async {
-        let updates = updateKeyTasks
-        let deletes = deleteKeyTasks
+        let updates = Array(updateKeyTasks.values)
         updateKeyTasks.removeAll()
-        deleteKeyTasks.removeAll()
         for task in updates {
             task.cancel()
         }
-        for task in deletes {
-            task.cancel()
-        }
         for task in updates {
-            await task.value
-        }
-        for task in deletes {
             await task.value
         }
     }

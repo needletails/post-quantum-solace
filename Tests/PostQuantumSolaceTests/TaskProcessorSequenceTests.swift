@@ -1127,6 +1127,55 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    @Test("Lane-saturated maxSkipped episode does not hold later offline frames")
+    func testSaturatedMaxSkippedEpisodeDoesNotHoldLaterOfflineFrames() async throws {
+        // Dogfood: oldest-first offline replay failed the first few consent
+        // frames with maxSkipped, then held the remaining ~75 including all
+        // text. Orphan-resend cannot decrypt those parked copies.
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.messagePipeline.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
+        )
+
+        let peerName = "bob_lane_hold"
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
+        await session.markPeerResendRequestTransported(
+            sender: peerName,
+            deviceId: peerDeviceId,
+            failedMessageIds: ["lane_hold_0"])
+
+        for index in 0..<PQSSessionConstants.undecryptableLaneEscalateThreshold {
+            let inbound = try makeTestInboundTaskMessage(
+                senderSecretName: peerName,
+                senderDeviceId: peerDeviceId,
+                sharedMessageId: "lane_hold_\(index)")
+            try await session.messagePipeline.enqueue(
+                EncryptableTask(task: .streamMessage(inbound)),
+                session: session
+            )
+            try await Task.sleep(until: .now + .seconds(1))
+        }
+
+        #expect(
+            await session.hasOpenReestablishmentEpisode(
+                sender: peerName,
+                deviceId: peerDeviceId),
+            "Saturation with a transported NACK must open a coalesce episode")
+        #expect(
+            !(await session.shouldHoldOfflineCiphertextDuringRecovery(
+                sender: peerName,
+                deviceId: peerDeviceId)),
+            "Saturated orphan-resend must not hold later oldest-first offline frames")
+
+        await session.shutdown()
+    }
+
     @Test("sessionDecryptionError resends and awaits sender orphanResend")
     func testSessionDecryptionErrorResendsAndAwaitsSenderOrphanResend() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)

@@ -1145,15 +1145,24 @@ package extension ContactService {
             // Already in target state; skip update and avoid sending duplicate receipt.
             return
         }
+        if allowExternalUpdate {
+            // The host call is a durable handoff, not proof of peer delivery.
+            // Queue it before committing the local transition so a handoff
+            // failure leaves this operation retryable.
+            let metadata = DeliveryStateMetadata(
+                state: deliveryState,
+                sharedId: message.sharedId
+            )
+            let encodedDeliveryState = try BinaryEncoder().encode(metadata)
+            try await sessionDelegate.deliveryStateChanged(
+                recipient: messageRecipient,
+                metadata: encodedDeliveryState
+            )
+        }
         props.deliveryState = deliveryState
         let updatedMessage = try await message.updateMessage(with: props, symmetricKey: symmetricKey)
         try await cache.updateMessage(updatedMessage, symmetricKey: symmetricKey)
         await receiver.updatedMessage(updatedMessage)
-        if allowExternalUpdate {
-            let metadata = DeliveryStateMetadata(state: props.deliveryState, sharedId: updatedMessage.sharedId)
-            let encodedDeliveryState = try BinaryEncoder().encode(metadata)
-            try await sessionDelegate.deliveryStateChanged(recipient: messageRecipient, metadata: encodedDeliveryState)
-        }
     }
     
     /// Sends a contact created acknowledgment to the specified recipient.

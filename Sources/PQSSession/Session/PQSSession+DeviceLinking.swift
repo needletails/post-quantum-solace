@@ -21,6 +21,49 @@ import NeedleTailLogger
 import SessionEvents
 import SessionModels
 
+/// What this device is entitled to advertise about itself, derived from the private
+/// keys it holds. Used to decide whether a stored or fetched bundle for the local
+/// device is trustworthy and whether the server record needs a republish.
+enum DeviceKeyBundleAuthority {
+    /// Builds the bundle a peer must see for envelopes to open here: long-term public
+    /// key, final ML-KEM public key under the held final key id, and the dedicated
+    /// sealed-sender public key with its capability bit when that key is minted.
+    static func bundle(
+        derivedFrom deviceKeys: DeviceKeys,
+        deviceId: UUID
+    ) throws -> UserConfiguration.DeviceKeyBundle {
+        let longTermPublicKey = try Curve25519.KeyAgreement.PrivateKey(
+            rawRepresentation: deviceKeys.longTermPrivateKey
+        ).publicKey.rawRepresentation
+        let finalRaw = try deviceKeys.finalMLKEMPrivateKey.rawRepresentation.decodeMLKem1024()
+        let finalPublicKey = try MLKEMPublicKey(
+            id: deviceKeys.finalMLKEMPrivateKey.id,
+            finalRaw.publicKey.rawRepresentation)
+        return UserConfiguration.DeviceKeyBundle(
+            deviceId: deviceId,
+            longTermPublicKey: longTermPublicKey,
+            finalMLKEMPublicKey: finalPublicKey,
+            updatedAt: Date(),
+            capabilities: deviceKeys.sealedSenderDeviceCapabilities,
+            sealedSenderMLKEMPublicKey: try deviceKeys.sealedSenderMLKEMPublicKey())
+    }
+
+    /// Two bundles advertise the same keys when a peer resolving either one would
+    /// encapsulate to identical material: same long-term key, same final ML-KEM key,
+    /// same capability bits, and the same dedicated sealed-sender key (or none).
+    /// `updatedAt` is deliberately excluded; it is a merge tiebreaker, not key material.
+    static func advertisesSameKeys(
+        _ lhs: UserConfiguration.DeviceKeyBundle,
+        _ rhs: UserConfiguration.DeviceKeyBundle
+    ) -> Bool {
+        lhs.deviceId == rhs.deviceId
+            && lhs.longTermPublicKey == rhs.longTermPublicKey
+            && lhs.finalMLKEMPublicKey == rhs.finalMLKEMPublicKey
+            && lhs.capabilities == rhs.capabilities
+            && lhs.sealedSenderMLKEMPublicKey == rhs.sealedSenderMLKEMPublicKey
+    }
+}
+
 /// Device linking and user-configuration adoption: `linkDevice`,
 /// verified-configuration acknowledgement, and device/key updates.
 extension PQSSession {
@@ -334,52 +377,73 @@ extension PQSSession {
         return mergedConfiguration
     }
 
-    /// The local device's own signed key bundle, only when it is provably backed by the
-    /// private keys this device currently holds.
+    /// The local device's own signed key bundle, backed by the private keys this
+    /// device currently holds.
     ///
-    /// Verifies the bundle under the device signing key and requires both the final
-    /// ML-KEM key id and the long-term public key to match `sessionUser.deviceKeys`.
-    /// Returns `nil` when no such bundle exists (pre-bundle contexts) or when the local
-    /// copy itself is inconsistent, in which case the incoming bundle is left untouched.
+    /// The private halves are the authority for what this device advertises: the
+    /// long-term key, the final ML-KEM key, and — when minted — the dedicated
+    /// sealed-sender key with its capability bit. Peers encapsulate to the dedicated
+    /// key whenever the published bundle advertises one, so a stored bundle that
+    /// disagrees with `sessionUser.deviceKeys` on *any* of these fields would make
+    /// every sealed envelope unopenable here. The stored signed bundle is returned when
+    /// it advertises exactly the held keys; otherwise a fresh bundle is signed from
+    /// them. Returns `nil` only when the local signing key cannot produce a bundle the
+    /// account attests for this device (fail closed).
     func localAuthoritativeDeviceKeyBundle(
         in context: SessionContext,
         deviceSigningKey: Curve25519.Signing.PublicKey
     ) -> UserConfiguration.SignedDeviceKeyBundle? {
         let deviceId = context.sessionUser.deviceId
         let deviceKeys = context.sessionUser.deviceKeys
-        guard let signed = context.activeUserConfiguration.signedDeviceKeyBundles.first(where: {
+        guard let authoritative = try? DeviceKeyBundleAuthority.bundle(
+            derivedFrom: deviceKeys,
+            deviceId: deviceId)
+        else {
+            return nil
+        }
+
+        if let signed = context.activeUserConfiguration.signedDeviceKeyBundles.first(where: {
             $0.id == deviceId
         }),
-              let bundle = try? signed.verified(using: deviceSigningKey),
-              bundle.deviceId == deviceId
+           let stored = try? signed.verified(using: deviceSigningKey),
+           DeviceKeyBundleAuthority.advertisesSameKeys(stored, authoritative) {
+            return signed
+        }
+
+        guard let signingKey = try? Curve25519.Signing.PrivateKey(
+            rawRepresentation: deviceKeys.signingPrivateKey),
+              let rebuilt = try? UserConfiguration.SignedDeviceKeyBundle(
+                bundle: authoritative,
+                signingKey: signingKey),
+              (try? rebuilt.verified(using: deviceSigningKey)) != nil
         else {
             return nil
         }
-        guard bundle.finalMLKEMPublicKey.id == deviceKeys.finalMLKEMPrivateKey.id else {
-            return nil
-        }
-        guard let longTermPrivateKey = try? Curve25519.KeyAgreement.PrivateKey(
-            rawRepresentation: deviceKeys.longTermPrivateKey),
-              bundle.longTermPublicKey == longTermPrivateKey.publicKey.rawRepresentation
-        else {
-            return nil
-        }
-        return signed
+        return rebuilt
     }
 
     /// Republishes the local device-signed key bundle when a fetched configuration
-    /// advertises retired key material for this device.
+    /// advertises key material for this device that differs from what it holds.
     ///
     /// The drift itself is the event: the server (and therefore every peer doing a
-    /// live lookup) is encapsulating sealed-sender boxes to a final ML-KEM key whose
-    /// private half no longer exists here. `publishRotatedKeys` is per-device and wins
-    /// the server-side bundle merge, so one publish converges the record. Skipped while
-    /// a rotation is in flight because that rotation publishes its own bundle.
+    /// live lookup) is encapsulating sealed-sender boxes to a key whose private half
+    /// does not exist here — a retired final ML-KEM key, or a dedicated sealed-sender
+    /// key this device never held or has since replaced. `publishRotatedKeys` is
+    /// per-device and wins the server-side bundle merge, so one publish converges the
+    /// record. Skipped while a rotation is in flight because that rotation publishes
+    /// its own bundle.
+    ///
+    /// - Returns: `true` when the server record is known to match the held keys after
+    ///   this call (already matched, or the republish was accepted). `false` when the
+    ///   check could not complete or the publish failed, so callers do not treat the
+    ///   drift as handled.
+    @discardableResult
     func republishLocalDeviceKeyBundleIfRemoteDrifted(
         incoming configuration: UserConfiguration,
-        currentContext: SessionContext
-    ) async {
-        guard keyLoadingState != .rotating else { return }
+        currentContext: SessionContext,
+        triggerUnknownRecipientKeyId: UUID? = nil
+    ) async -> Bool {
+        guard keyLoadingState != .rotating else { return false }
         let deviceId = currentContext.sessionUser.deviceId
         guard let signedDevice = currentContext.activeUserConfiguration.signedDevices.first(where: {
             $0.id == deviceId
@@ -394,23 +458,32 @@ extension PQSSession {
                 deviceSigningKey: deviceSigningKey),
               let localBundle = try? localSigned.verified(using: deviceSigningKey)
         else {
-            return
+            return false
         }
 
         let remoteBundle = configuration.signedDeviceKeyBundles
             .first(where: { $0.id == deviceId })
             .flatMap { try? $0.verified(using: deviceSigningKey) }
         let remoteMatches = remoteBundle.map {
-            $0.finalMLKEMPublicKey == localBundle.finalMLKEMPublicKey
-                && $0.longTermPublicKey == localBundle.longTermPublicKey
+            DeviceKeyBundleAuthority.advertisesSameKeys($0, localBundle)
         } ?? false
-        guard !remoteMatches else { return }
+        let keyIds = "remoteFinalMLKEMId=\(remoteBundle?.finalMLKEMPublicKey.id.uuidString ?? "none") remoteDedicatedMLKEMId=\(remoteBundle?.sealedSenderMLKEMPublicKey?.id.uuidString ?? "none") localFinalMLKEMId=\(localBundle.finalMLKEMPublicKey.id.uuidString) localDedicatedMLKEMId=\(localBundle.sealedSenderMLKEMPublicKey?.id.uuidString ?? "none")"
+        guard !remoteMatches else {
+            if let triggerUnknownRecipientKeyId {
+                // A peer sealed to a key we do not hold even though the server record
+                // matches ours: that sender used a stale lookup, not a drifted record.
+                logger.log(
+                    level: .info,
+                    message: "pqs.recovery.selfDeviceKeyBundleDrift deviceId=\(deviceId.uuidString) triggerKeyId=\(triggerUnknownRecipientKeyId.uuidString) \(keyIds) action=none")
+            }
+            return true
+        }
 
         logger.log(
             level: .warning,
-            message: "pqs.recovery.selfDeviceKeyBundleDrift deviceId=\(deviceId.uuidString) remoteFinalMLKEMId=\(remoteBundle?.finalMLKEMPublicKey.id.uuidString ?? "none") localFinalMLKEMId=\(localBundle.finalMLKEMPublicKey.id.uuidString) action=republish")
+            message: "pqs.recovery.selfDeviceKeyBundleDrift deviceId=\(deviceId.uuidString) triggerKeyId=\(triggerUnknownRecipientKeyId?.uuidString ?? "none") \(keyIds) action=republish")
 
-        guard let transportDelegate else { return }
+        guard let transportDelegate else { return false }
         do {
             try await transportDelegate.publishRotatedKeys(
                 for: currentContext.sessionUser.secretName,
@@ -419,31 +492,45 @@ extension PQSSession {
                     pskData: currentContext.activeUserConfiguration.signingPublicKey,
                     signedDevice: signedDevice,
                     deviceKeyBundle: localSigned))
+            return true
         } catch {
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.selfDeviceKeyBundleDrift republish failed deviceId=\(deviceId.uuidString) error=\(error)")
+            return false
         }
     }
 
     /// Live-lookup heal for a sealed-open hint naming a key this device does not hold.
     ///
-    /// The unknown key id is the event. One check per id per session; then
-    /// `republishLocalDeviceKeyBundleIfRemoteDrifted` if the server record drifted.
+    /// The unknown key id is the event. The id is claimed before the lookup so
+    /// concurrent opens citing the same key share one check; it stays claimed only
+    /// when the check completed and the server record is known to match. A failed
+    /// lookup or rejected republish releases the id so the next envelope sealed to it
+    /// can retry — otherwise one transient failure would leave the record drifted for
+    /// the rest of the session.
     public func verifyPublishedDeviceKeyBundle(unknownRecipientKeyId: UUID) async {
         guard verifiedUnknownSealedRecipientKeyIds.insert(unknownRecipientKeyId).inserted else {
             return
         }
         guard let currentContext = await sessionContext,
               let transportDelegate
-        else { return }
+        else {
+            verifiedUnknownSealedRecipientKeyIds.remove(unknownRecipientKeyId)
+            return
+        }
         do {
             let remote = try await transportDelegate.findConfiguration(
                 for: currentContext.sessionUser.secretName)
-            await republishLocalDeviceKeyBundleIfRemoteDrifted(
+            let converged = await republishLocalDeviceKeyBundleIfRemoteDrifted(
                 incoming: remote,
-                currentContext: currentContext)
+                currentContext: currentContext,
+                triggerUnknownRecipientKeyId: unknownRecipientKeyId)
+            if !converged {
+                verifiedUnknownSealedRecipientKeyIds.remove(unknownRecipientKeyId)
+            }
         } catch {
+            verifiedUnknownSealedRecipientKeyIds.remove(unknownRecipientKeyId)
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.verifyPublishedDeviceKeyBundle failed keyId=\(unknownRecipientKeyId.uuidString) error=\(error)")

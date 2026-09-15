@@ -823,6 +823,20 @@ public actor PQSSession: SessionCacheSynchronizer {
         _sessionContext = context
     }
 
+    /// Applies `mutate` to the live context without a suspension point between the
+    /// read and the write, so concurrent workers that each changed a different part
+    /// of the context (e.g. two one-time-key replacements) cannot overwrite each
+    /// other with a snapshot taken before their network round-trip.
+    ///
+    /// - Returns: The context after mutation, or `nil` when no session is active.
+    @discardableResult
+    func mutateSessionContext(_ mutate: (inout SessionContext) throws -> Void) rethrows -> SessionContext? {
+        guard var context = _sessionContext else { return nil }
+        try mutate(&context)
+        _sessionContext = context
+        return context
+    }
+
     /// Asynchronously retrieves the application password
     ///
     /// The application password is used to derive encryption keys for session data.
