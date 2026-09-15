@@ -126,7 +126,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          printf 'y\n' | skip android sdk install --version 6.3
+          # Host OSS toolchain on macos-26 is 6.3.3; 6.3-RELEASE modules
+          # cannot be imported by that compiler.
+          printf 'y\n' | skip android sdk install --version 6.3.3 --swift-version 6.3.3
 
       - name: Cache Swift packages
         uses: actions/cache@v4
@@ -148,4 +150,4 @@ jobs:
 
       - name: Skip Android build (macOS)
         if: ${{ runner.os == 'macOS' }}
-        run: skip android build
+        run: skip android build --swift-version 6.3.3
