@@ -1890,6 +1890,163 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    /// Dogfood 2026-09-17 (sunflower ← nudge `3D60FE0A`): seven `missingOneTimeKey`
+    /// frames landed in one burst. Only the episode leader was terminalized
+    /// (`contentUnrecoverable reason=missingOneTimeKeyDeadEpoch`); the six
+    /// coalesced frames were merely deferred. The host's durable placeholder row
+    /// for one of them (`0B969E92`) outlived the process and was re-armed on every
+    /// relaunch (`pendingResendRearmed failureClass=hostRearm` → OOB NACK) for
+    /// content the sender can never re-encrypt from a dead epoch. A dead-epoch
+    /// frame is terminal at the failure event regardless of which frame opened
+    /// the episode, so the coalesce path must terminalize exactly like the leader.
+    @Test("missingOneTimeKey coalesced frames are terminalized like the episode leader")
+    func testMissingOneTimeKeyCoalescedFrameIsTerminalizedLikeLeader() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        let probe = EpisodeEndProbe()
+        await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
+        await session.messagePipeline.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+
+        // Hold the published-batch upload so the episode stays open while the
+        // second frame coalesces (see the burst test above for the race).
+        let uploadPause = OTKUploadPause()
+        transport.beforeUpdateOneTimeKeys = {
+            await uploadPause.beforeFirstUpload()
+        }
+        defer {
+            transport.beforeUpdateOneTimeKeys = nil
+        }
+
+        let sender = "bob_missing_otk_terminal"
+        let peerDeviceId = UUID()
+        let leaderId = "missing_otk_terminal_leader"
+        let coalescedId = "missing_otk_terminal_coalesced"
+        let leader = try makeTestInboundTaskMessage(
+            senderSecretName: sender,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: leaderId)
+        let coalesced = try makeTestInboundTaskMessage(
+            senderSecretName: sender,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: coalescedId)
+
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .streamMessage(leader)),
+            session: session
+        )
+        let hasPendingRepair = try await waitForPendingRepair(sender: sender, deviceId: peerDeviceId)
+        #expect(hasPendingRepair, "First missingOneTimeKey should start a recovery episode")
+        let uploadPaused = try await waitUntil {
+            await uploadPause.isPaused()
+        }
+        #expect(uploadPaused, "First missingOneTimeKey recovery should reach OTK upload")
+        // Existing contract: the leader is terminal at the failure event.
+        #expect(
+            await session.isInboundContentUnrecoverable(
+                sender: sender,
+                deviceId: peerDeviceId,
+                sharedId: leaderId),
+            "Episode leader must be terminal (missingOneTimeKeyDeadEpoch)")
+
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .streamMessage(coalesced)),
+            session: session
+        )
+        let coalescedRecorded = try await waitUntil { [session] in
+            await session.hasPendingResendAfterReestablishment(
+                sender: sender,
+                deviceId: peerDeviceId,
+                failedMessageId: coalescedId)
+        }
+        #expect(coalescedRecorded, "Coalesced frame is still deferred for the post-peerRefresh resend round")
+
+        // RED: the coalesced dead-epoch frame must be terminal at defer time, not
+        // left for an episode TTL / OOB round trip that may never run before exit.
+        #expect(
+            await session.isInboundContentUnrecoverable(
+                sender: sender,
+                deviceId: peerDeviceId,
+                sharedId: coalescedId),
+            "Coalesced missingOneTimeKey frame must be terminalized like the leader")
+
+        // The host must be told once per newly terminal id so it drops the
+        // placeholder + durable ledger row instead of re-arming it on relaunch.
+        let hostNotified = try await waitUntil {
+            await probe.unrecoverableContent().contains {
+                $0.0 == sender && $0.1 == peerDeviceId && $0.2 == coalescedId
+            }
+        }
+        #expect(hostNotified, "Host must receive inboundContentUnrecoverable for the coalesced frame")
+        let coalescedNotifications = await probe.unrecoverableContent().filter { $0.2 == coalescedId }.count
+        #expect(coalescedNotifications == 1, "Terminal notification is once per sharedId")
+
+        await uploadPause.release()
+        await session.shutdown()
+    }
+
+    /// `tryBeginReestablishmentEpisode(heldOfflineFramesCanHeal: false)` documents
+    /// that the dead-epoch mark "also applies when the episode is already open",
+    /// but the `missingOneTimeKey` coalesce branch never called it. A healable
+    /// episode (invalidSignature leader) followed by a `missingOneTimeKey` from
+    /// the same peer device therefore kept `shouldHoldOfflineCiphertextDuringRecovery`
+    /// true, so transport parked dead offline frames until the episode ended.
+    @Test("missingOneTimeKey coalesced into a healable episode upgrades it to dead-epoch")
+    func testMissingOneTimeKeyCoalescedIntoHealableEpisodeUpgradesDeadMark() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.messagePipeline.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+        await transport.resetCallTracking()
+
+        let sender = "bob_missing_otk_healable"
+        let peerDeviceId = UUID()
+        let sharedId = "missing_otk_healable_1"
+
+        // A healable leader (e.g. invalidSignature peerRefresh) opened the episode:
+        // transport is holding offline ciphertext for this peer device.
+        #expect(await session.tryBeginReestablishmentEpisode(sender: sender, deviceId: peerDeviceId))
+        #expect(
+            await session.shouldHoldOfflineCiphertextDuringRecovery(sender: sender, deviceId: peerDeviceId),
+            "Healable episode must start by holding offline ciphertext")
+
+        let inbound = try makeTestInboundTaskMessage(
+            senderSecretName: sender,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: sharedId)
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session
+        )
+        let coalesced = try await waitUntil { [session] in
+            await session.hasPendingResendAfterReestablishment(
+                sender: sender,
+                deviceId: peerDeviceId,
+                failedMessageId: sharedId)
+        }
+        #expect(coalesced, "missingOneTimeKey inside an open episode must coalesce into it")
+        #expect(
+            await session.hasOpenReestablishmentEpisode(sender: sender, deviceId: peerDeviceId),
+            "Coalescing must not close or re-lead the open episode")
+        #expect(
+            await transport.updateOneTimeKeysCallCount == 0,
+            "Coalesced frame must not replace the OTK batch")
+
+        // RED: the dead-epoch proof must upgrade the open episode in place so
+        // transport stops holding frames that can never decrypt locally.
+        #expect(
+            !(await session.shouldHoldOfflineCiphertextDuringRecovery(sender: sender, deviceId: peerDeviceId)),
+            "missingOneTimeKey proves the epoch dead; the open healable episode must stop holding offline ciphertext")
+        #expect(
+            await session.isInboundContentUnrecoverable(sender: sender, deviceId: peerDeviceId, sharedId: sharedId),
+            "Coalesced dead-epoch frame is terminal")
+
+        await session.endReestablishmentEpisode(sender: sender, deviceId: peerDeviceId)
+        await session.shutdown()
+    }
+
     @Test("missingOneTimeKey marks recovery pending before OTK replacement completes")
     func testMissingOneTimeKeyMarksRecoveryPendingBeforeOTKReplacementCompletes() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)

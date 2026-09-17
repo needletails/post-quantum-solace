@@ -719,10 +719,21 @@ extension MessagePipeline {
 
                 // Pending replay IDs outlive the single-flight episode. Only a live
                 // episode may suppress a new event-driven repair attempt.
-                let hasOpenOTKEpisode = await session.hasOpenReestablishmentEpisode(
+                //
+                // missingOneTimeKey proves the sender's session epoch is dead: the
+                // referenced one-time key is consumed, so every spooled frame of
+                // that epoch is permanently undecryptable. Transport must not
+                // hold-and-replay offline frames behind this episode — they can
+                // only heal via sender re-encryption, never by re-decrypting.
+                // The dead mark is applied on this single call whether we become
+                // the leader or coalesce: an episode opened by a healable class
+                // (invalidSignature) must stop holding offline ciphertext the
+                // moment a dead-epoch frame lands in it.
+                let isEpisodeLeader = await session.tryBeginReestablishmentEpisode(
                     sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId)
-                if hasOpenOTKEpisode {
+                    deviceId: message.senderDeviceId,
+                    heldOfflineFramesCanHeal: false)
+                if !isEpisodeLeader {
                     auditInboundDecryptFailure(
                         message: message,
                         failureClass: failureClass,
@@ -736,6 +747,12 @@ extension MessagePipeline {
                         level: .info,
                         message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=pendingPeerRefresh")
                     await session.markInboundFailure(message, failureClass: failureClass)
+                    // Coalesced frames are as dead as the leader: the key they
+                    // reference is consumed regardless of which frame opened the
+                    // episode. Terminalize now, not at episode TTL — a placeholder
+                    // left non-terminal outlives the process and is re-armed on
+                    // every relaunch (dogfood 2026-09-17 `0B969E92`).
+                    await terminalizeDeadEpochInbound(message, session: session)
                     try await cache.deleteJob(job)
                     return .deleted
                 }
@@ -748,17 +765,8 @@ extension MessagePipeline {
                     level: .warning,
                     message: "pqs.recovery.started failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=replaceOTKBatchThenPeerRefresh")
 
-                // If we make it to this point we will try and reestablish session and refresh OTK(s)
-
-                // missingOneTimeKey proves the sender's session epoch is dead: the
-                // referenced one-time key is consumed, so every spooled frame of
-                // that epoch is permanently undecryptable. Transport must not
-                // hold-and-replay offline frames behind this episode — they can
-                // only heal via sender re-encryption, never by re-decrypting.
-                _ = await session.tryBeginReestablishmentEpisode(
-                    sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId,
-                    heldOfflineFramesCanHeal: false)
+                // If we make it to this point we are the episode leader (opened as
+                // dead-epoch above): reestablish the session and refresh OTK(s).
                 await session.deferPeerResendUntilReestablished(
                     sender: message.senderSecretName,
                     deviceId: message.senderDeviceId,
@@ -774,17 +782,7 @@ extension MessagePipeline {
                 await session.markInboundFailure(message, failureClass: failureClass)
                 // Dead-epoch frames never heal by re-decrypt. Terminalize this sharedId
                 // so spool redelivery is swallowed without another OTK/peerRefresh storm.
-                let newlyTerminal = await session.markInboundContentUnrecoverable(
-                    sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId,
-                    sharedId: message.sharedMessageId)
-                if newlyTerminal {
-                    audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=missingOneTimeKeyDeadEpoch")
-                    await session.sessionDelegate?.inboundContentUnrecoverable(
-                        senderSecretName: message.senderSecretName,
-                        senderDeviceId: message.senderDeviceId,
-                        sharedMessageId: message.sharedMessageId)
-                }
+                await terminalizeDeadEpochInbound(message, session: session)
 
                 // The published-batch replacement (key generation + two uploads with
                 // retry backoff) and the subsequent peerRefresh emit must not block the
@@ -1222,6 +1220,30 @@ extension MessagePipeline {
             session: session,
             symmetricKey: symmetricKey,
             failureClass: failureClass)
+    }
+
+    /// `missingOneTimeKey` proves the sender's session epoch is dead: the
+    /// referenced one-time key is consumed, so this frame can never decrypt
+    /// locally and only heals via sender re-encryption on the healed lane.
+    /// Terminalize the sharedId at the failure event — episode leader and
+    /// coalesced frames alike — so spool redelivery is swallowed and the host
+    /// drops its placeholder + durable ledger row instead of re-arming it on
+    /// every relaunch. `markInboundContentUnrecoverable` is once-per-tuple, so
+    /// redelivered copies do not re-notify the host.
+    private func terminalizeDeadEpochInbound(
+        _ message: InboundTaskMessage,
+        session: PQSSession
+    ) async {
+        let newlyTerminal = await session.markInboundContentUnrecoverable(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            sharedId: message.sharedMessageId)
+        guard newlyTerminal else { return }
+        audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=missingOneTimeKeyDeadEpoch")
+        await session.sessionDelegate?.inboundContentUnrecoverable(
+            senderSecretName: message.senderSecretName,
+            senderDeviceId: message.senderDeviceId,
+            sharedMessageId: message.sharedMessageId)
     }
 
     /// Undecryptable inbound policy (orphan-resend):
