@@ -1086,6 +1086,7 @@ extension MessagePipeline {
                     job: persistenceJob)
             } catch {
                 atomicOutboundPreparationIdentityIds.remove(sessionIdentity.id)
+                audit(.send, "pqs.send.preparedCommitFailed sharedId=\(outboundTask.sharedId) sessionIdentityId=\(sessionIdentity.id.uuidString) recipientDeviceId=\(props.deviceId.uuidString) persisted=\(outboundTask.isPersistedOutbound) error=\(error)")
                 jobProps.preparedOutbound = nil
                 _ = try? await persistenceJob.updateProps(
                     symmetricKey: databaseSymmetricKey,

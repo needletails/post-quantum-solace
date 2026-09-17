@@ -241,6 +241,74 @@ actor SessionIdentityTests {
         await session.shutdown()
     }
 
+    /// Dogfood 2026-09-17 23:35 `sessionIdentityNotFound. Deleting job...`: an
+    /// ephemeral delivered receipt reached `commitPreparedOutbound` while the
+    /// identity row was not in the in-memory list, yet the very next job on the
+    /// same lane resolved it (from the store). Commit must treat the store as the
+    /// source of truth like `updateSessionIdentity` does, not the warm list.
+    @Test("commitPreparedOutbound reloads from the store when the memory list misses the identity")
+    func testCommitPreparedOutboundReloadsIdentityFromStore() async throws {
+        let store = MockSessionIdentityStore()
+        let cache = SessionCache(store: store)
+        let symmetricKey = SymmetricKey(size: .bits256)
+        let identity = SessionIdentity(id: UUID(), data: Data([0x01]))
+        // Row exists on disk but the cache has never loaded identities.
+        store.identities.append(identity)
+        let job = try makeOutboundJob(recipient: identity, symmetricKey: symmetricKey)
+        try await cache.createJob(job)
+
+        let updated = SessionIdentity(id: identity.id, data: Data([0x02]))
+        try await cache.commitPreparedOutbound(sessionIdentity: updated, job: job)
+
+        let cached = try await cache.fetchSessionIdentities()
+        #expect(cached.first(where: { $0.id == identity.id })?.data == Data([0x02]))
+        #expect(store.identities.first(where: { $0.id == identity.id })?.data == Data([0x02]))
+        await session.shutdown()
+    }
+
+    @Test("commitPreparedOutbound still throws when the identity is absent from the store")
+    func testCommitPreparedOutboundThrowsWhenIdentityMissingEverywhere() async throws {
+        let store = MockSessionIdentityStore()
+        let cache = SessionCache(store: store)
+        let symmetricKey = SymmetricKey(size: .bits256)
+        let other = SessionIdentity(id: UUID(), data: Data([0x01]))
+        try await cache.createSessionIdentity(other)
+        let missing = SessionIdentity(id: UUID(), data: Data([0x02]))
+        let job = try makeOutboundJob(recipient: missing, symmetricKey: symmetricKey)
+        try await cache.createJob(job)
+
+        await #expect(throws: SessionCache.CacheErrors.sessionIdentityNotFound) {
+            try await cache.commitPreparedOutbound(sessionIdentity: missing, job: job)
+        }
+        #expect(store.identities.count == 1)
+        await session.shutdown()
+    }
+
+    private func makeOutboundJob(
+        recipient: SessionIdentity,
+        symmetricKey: SymmetricKey
+    ) throws -> JobModel {
+        try JobModel(
+            id: UUID(),
+            props: .init(
+                sequenceId: 1,
+                task: .init(task: .writeMessage(.init(
+                    message: CryptoMessage(
+                        text: "receipt",
+                        metadata: .init(),
+                        recipient: .nickname("bob"),
+                        sentDate: Date(),
+                        destructionTime: nil),
+                    recipientIdentity: recipient,
+                    localId: UUID(),
+                    sharedId: UUID().uuidString,
+                    isPersistedOutbound: false))),
+                isBackgroundTask: true,
+                scheduledAt: Date(),
+                attempts: 0),
+            symmetricKey: symmetricKey)
+    }
+
     @Test("SessionCache keeps previous identity when update persistence fails")
     func testSessionCachePreservesIdentityWhenUpdateFails() async throws {
         let store = MockSessionIdentityStore()

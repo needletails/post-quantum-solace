@@ -531,7 +531,19 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         sessionIdentity: SessionIdentity,
         job: JobModel
     ) async throws {
-        guard let identityIndex = sessionIdentities.firstIndex(where: { $0.id == sessionIdentity.id }) else {
+        // The warm list is a cache, not the source of truth. Every other identity
+        // mutation falls back to the store on a miss; commit did not, so a row that
+        // was evicted/never loaded in memory but present on disk turned an
+        // ephemeral receipt into "Unhandled error ... sessionIdentityNotFound.
+        // Deleting job" while the next job on the same lane resolved it fine
+        // (dogfood 2026-09-17 23:35, lanes 3E0E4F00 / EA6A76D3).
+        var identityIndex = sessionIdentities.firstIndex(where: { $0.id == sessionIdentity.id })
+        if identityIndex == nil {
+            let identities = try await store.fetchSessionIdentities()
+            sessionIdentities = identities
+            identityIndex = sessionIdentities.firstIndex(where: { $0.id == sessionIdentity.id })
+        }
+        guard let identityIndex else {
             throw CacheErrors.sessionIdentityNotFound
         }
         guard let jobIndex = jobs.firstIndex(where: { $0.id == job.id }) else {
