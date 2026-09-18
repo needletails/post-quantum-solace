@@ -57,7 +57,7 @@ struct DeferredOTKConsumptionTests {
 
     @Test("legacy DeviceKeys blobs decode without pending consumptions")
     func legacyDeviceKeysDecodeWithoutPendingField() throws {
-        var keys = try makeDeviceKeys()
+        let keys = try makeDeviceKeys()
         #expect(keys.pendingOneTimeKeyConsumptions == nil)
         let encoded = try BinaryEncoder().encode(keys)
         let decoded = try BinaryDecoder().decode(DeviceKeys.self, from: encoded)

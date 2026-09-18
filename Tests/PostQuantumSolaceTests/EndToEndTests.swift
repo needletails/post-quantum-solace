@@ -48,13 +48,13 @@ actor OutboundUnrecoverableProbe {
         let sharedMessageId: String
         let reason: String
     }
-
+    
     private var events: [Event] = []
-
+    
     func mark(sharedMessageId: String, reason: String) {
         events.append(.init(sharedMessageId: sharedMessageId, reason: reason))
     }
-
+    
     func recorded() -> [Event] {
         events
     }
@@ -62,15 +62,15 @@ actor OutboundUnrecoverableProbe {
 
 actor LinkedDeviceCompromiseProbe {
     private var reportedDeviceIds: [UUID] = []
-
+    
     func mark(deviceId: UUID) {
         reportedDeviceIds.append(deviceId)
     }
-
+    
     func count() -> Int {
         reportedDeviceIds.count
     }
-
+    
     func contains(_ deviceId: UUID) -> Bool {
         reportedDeviceIds.contains(deviceId)
     }
@@ -82,20 +82,20 @@ actor PeerIdentityTrustProbe {
         let deviceId: UUID
         let failedSharedMessageId: String?
     }
-
+    
     private var events: [Event] = []
-
+    
     func mark(secretName: String, deviceId: UUID, failedSharedMessageId: String?) {
         events.append(.init(
             secretName: secretName,
             deviceId: deviceId,
             failedSharedMessageId: failedSharedMessageId))
     }
-
+    
     func count() -> Int {
         events.count
     }
-
+    
     func contains(secretName: String, deviceId: UUID, failedSharedMessageId: String?) -> Bool {
         events.contains(.init(
             secretName: secretName,
@@ -269,8 +269,8 @@ actor EndToEndTests {
             store: store,
             receiver: senderChildReceiver1,
             transport: useProvidedTransport
-                ? transport
-                : _MockTransportDelegate(session: _senderChildSession1, store: self.store))
+            ? transport
+            : _MockTransportDelegate(session: _senderChildSession1, store: self.store))
         _senderChildSession1 = try await _senderChildSession1.linkDevice(
             bundle: bundle, password: "123")
         try await senderChildReceiver1.setKey(_senderChildSession1.getDatabaseSymmetricKey())
@@ -303,8 +303,8 @@ actor EndToEndTests {
             store: store,
             receiver: senderChildReceiver2,
             transport: useProvidedTransport
-                ? transport
-                : _MockTransportDelegate(session: _senderChildSession2, store: self.store))
+            ? transport
+            : _MockTransportDelegate(session: _senderChildSession2, store: self.store))
         _senderChildSession2 = try await _senderChildSession2.linkDevice(
             bundle: bundle, password: "123")
         try await senderChildReceiver2.setKey(_senderChildSession2.getDatabaseSymmetricKey())
@@ -377,8 +377,8 @@ actor EndToEndTests {
             store: store,
             receiver: recipientChildReceiver1,
             transport: useProvidedTransport
-                ? transport
-                : _MockTransportDelegate(session: _recipientChildSession1, store: self.store))
+            ? transport
+            : _MockTransportDelegate(session: _recipientChildSession1, store: self.store))
         _recipientChildSession1 = try await _recipientChildSession1.linkDevice(
             bundle: bundle, password: "123")
         try await recipientChildReceiver1.setKey(_recipientChildSession1.getDatabaseSymmetricKey())
@@ -412,7 +412,7 @@ actor EndToEndTests {
         _ = try await _recipientChildSession2.refreshIdentities(
             secretName: rMockUserData.rsn, forceRefresh: true)
     }
-
+    
     private func linkedConfiguration(
         masterSession: PQSSession,
         childBundle: PQSSession.CryptographicBundle
@@ -427,13 +427,13 @@ actor EndToEndTests {
         }
         let masterSigningKey = try Curve25519.Signing.PrivateKey(
             rawRepresentation: masterContext.sessionUser.deviceKeys.signingPrivateKey)
-
+        
         var configuration = masterContext.activeUserConfiguration
         configuration.signedDevices.removeAll { $0.id == childDevice.deviceId }
         configuration.signedDevices.append(try UserConfiguration.SignedDeviceConfiguration(
             device: childDevice,
             signingKey: masterSigningKey))
-
+        
         for key in childBundle.userConfiguration.signedOneTimePublicKeys {
             configuration.signedOneTimePublicKeys.removeAll { $0.id == key.id }
             configuration.signedOneTimePublicKeys.append(key)
@@ -500,7 +500,7 @@ actor EndToEndTests {
         } catch is CryptoKitError {
             return false
         } catch let sessionError as PQSError
-            where sessionError == .sessionDecryptionError {
+                    where sessionError == .sessionDecryptionError {
             return false
         }
     }
@@ -553,8 +553,8 @@ actor EndToEndTests {
         try await joeReceiver.setKey(joeSession.getDatabaseSymmetricKey())
         
         // Pre-create channel communication on both caches so inbound channel can resolve it
-       let channelName = "general"
-       let info = ChannelInfo(
+        let channelName = "general"
+        let info = ChannelInfo(
             name: channelName,
             administrator: "alice",
             members: ["alice", "bob", "joe"],
@@ -610,7 +610,7 @@ actor EndToEndTests {
     func testManualKeyRotationThenImmediateSend() async throws {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -619,7 +619,7 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         func cleanup() async {
             aliceTransport.continuation?.finish()
             bobTransport.continuation?.finish()
@@ -633,31 +633,31 @@ actor EndToEndTests {
             }
             await shutdownSessions()
         }
-
+        
         do {
             let senderStore = createSenderStore()
             let recipientStore = createRecipientStore()
-        
-
+            
+            
             let sd = SessionDelegate(session: _senderSession)
             let rsd = SessionDelegate(session: _recipientSession)
-        
+            
             try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
             try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-        
+            
             try await createFriendship(
                 aliceSession: _senderSession,
                 sd: sd,
                 bobSession: _recipientSession,
                 rsd: rsd)
-        
+            
             // Alice receive loop
             aliceTask = Task {
                 await #expect(throws: Never.self, "Alice should process Bob's replies after rotation") {
                     var count = 0
                     for await received in aliceStream {
                         count += 1
-
+                        
                         if count == 3 {
                             _ = try await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
                             aliceTransport.continuation?.finish()
@@ -666,7 +666,7 @@ actor EndToEndTests {
                     }
                 }
             }
-        
+            
             // Bob receive loop
             bobTask = Task {
                 await #expect(throws: Never.self, "Bob should process Alice's post-rotation send and reply") {
@@ -691,10 +691,10 @@ actor EndToEndTests {
                     }
                 }
             }
-        
+            
             // Warm-up to establish identity/ratchet
             try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
-
+            
             // Let the receive loops finish the rotation flow before deterministic teardown.
             try await Task.sleep(until: .now + .seconds(5))
             await cleanup()
@@ -799,7 +799,7 @@ actor EndToEndTests {
             try await group.waitForAll()
         }
         try await Task.sleep(until: .now + .seconds(1))
-
+        
         // Wait briefly for the control frame. In practice, delivery/processing order can be
         // non-deterministic in these in-memory transports, so don't hard-fail on timing here.
         var attempts = 0
@@ -845,7 +845,7 @@ actor EndToEndTests {
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
-
+        
         // Receive loops must run before friendship bootstrap so OTK notify and the
         // friendship packet are processed as they arrive (Linux CI is slower here).
         aliceTask = Task {
@@ -900,13 +900,13 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         try await createFriendship(
             aliceSession: _senderMaxSkipSession,
             sd: sd,
             bobSession: _recipientMaxSkipSession,
             rsd: rsd)
-
+        
         let aliceDeviceId = try #require(await _senderMaxSkipSession.sessionContext?.sessionUser.deviceId)
         let friendshipReadyDeadline = Date().addingTimeInterval(15)
         while Date() < friendshipReadyDeadline {
@@ -932,11 +932,11 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .seconds(2))
         try await _recipientMaxSkipSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .seconds(2))
-
+        
         try await _senderMaxSkipSession.send(
             recipient: .nickname("bob"),
             text: messageToSend)
-
+        
         // Poll for Bob's decrypt; allow up to 4s for async delivery when run in batch
         var waited: TimeInterval = 0
         while !bobDecrypted && waited < 4 {
@@ -1022,9 +1022,9 @@ actor EndToEndTests {
         let persisted = await senderStore.getAllMessages()
         #expect(persisted.contains(where: { $0.sharedId == replaySharedId }), "Sender persistence should retain replay shared id")
     }
-
+    
     // Encrypted-retry TransportEvent delivery was deleted in Phase 2; OOB coverage is StrictOOBRetryTests.
-
+    
     @Test("MaxSkipped defers resend for the failed shared id without key rotation")
     func testMaxSkippedResendRequestAndReplaySharedIdEndToEnd() async throws {
         actor FlowProbe {
@@ -1032,7 +1032,7 @@ actor EndToEndTests {
             var failedLogicalSharedId: String?
             var didHitMaxSkipped = false
             var sawPeerRefresh = false
-
+            
             func markFailed(envelopeMessageId: String, logicalSharedId: String?) {
                 failedEnvelopeMessageId = envelopeMessageId
                 failedLogicalSharedId = logicalSharedId
@@ -1040,12 +1040,12 @@ actor EndToEndTests {
             }
             func markPeerRefresh() { sawPeerRefresh = true }
         }
-
+        
         actor DropGate {
             let dropCount: Int
             var armed = false
             var dropped = 0
-
+            
             init(dropCount: Int) { self.dropCount = dropCount }
             func arm() { armed = true }
             func shouldDropNext() -> Bool {
@@ -1056,17 +1056,17 @@ actor EndToEndTests {
                 }
                 return false
             }
-
+            
             func isFailingDeliveryCandidate() -> Bool {
                 armed && dropped >= dropCount
             }
         }
-
+        
         let probe = FlowProbe()
         let gate = DropGate(dropCount: 12) // > maxSkippedMessageKeys(10) for these sessions
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -1078,7 +1078,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         defer {
             Task {
                 aliceTask?.cancel()
@@ -1086,10 +1086,10 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
-
+        
         // Drop a burst of Alice->Bob non-control messages once armed to trigger max-skipped on the first delivered gap message.
         aliceTransport.shouldDeliver = { received in
             guard received.sender == "alice", received.recipient == "bob" else { return true }
@@ -1097,17 +1097,17 @@ actor EndToEndTests {
             let shouldDrop = await gate.shouldDropNext()
             return !shouldDrop
         }
-
+        
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
             bobTransport.continuation = continuation
         }
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
-
+        
         let bobStore = createRecipientStore()
         try await createSenderMaxSkipSession(
             store: createSenderStore(),
@@ -1119,7 +1119,7 @@ actor EndToEndTests {
             transport: bobTransport,
             sessionDelegate: rsd
         )
-
+        
         // Receive loops must run before friendship so OTK / friendship frames establish ratchets.
         aliceTask = Task {
             for await received in aliceStream {
@@ -1133,7 +1133,7 @@ actor EndToEndTests {
                 )
             }
         }
-
+        
         bobTask = Task {
             for await received in bobStream {
                 if received.transportEvent == nil,
@@ -1149,14 +1149,14 @@ actor EndToEndTests {
                 )
             }
         }
-
+        
         try await createFriendship(
             aliceSession: _senderMaxSkipSession,
             sd: sd,
             bobSession: _recipientMaxSkipSession,
             rsd: rsd
         )
-
+        
         let aliceDeviceId = try #require(await _senderMaxSkipSession.sessionContext?.sessionUser.deviceId)
         #expect(await waitUntil {
             let outboundReady = (try? await self._senderMaxSkipSession.hasInitializedOutboundRatchetForPeer("bob")) == true
@@ -1165,16 +1165,16 @@ actor EndToEndTests {
                 deviceId: aliceDeviceId)
             return outboundReady && inboundReady
         }, "Friendship ratchet must be ready before gap-drop burst")
-
+        
         // Prime the conversation with one delivered message before arming gap-drop behavior.
         try await _senderMaxSkipSession.send(
             recipient: .nickname("bob"),
             text: "baseline-before-gap"
         )
         try? await Task.sleep(until: .now + .milliseconds(250))
-
+        
         await gate.arm()
-
+        
         // Burst: first 12 dropped, next delivered should trigger max-skipped.
         for i in 0..<13 {
             try await _senderMaxSkipSession.send(
@@ -1182,15 +1182,15 @@ actor EndToEndTests {
                 text: "gap-\(i)"
             )
         }
-
+        
         let sawMaxSkipped = await waitUntil {
             await probe.didHitMaxSkipped
         }
         #expect(sawMaxSkipped, "Expected recipient to identify the first failing shared id after the dropped gap")
-
+        
         let failedEnvelope = try #require(await probe.failedEnvelopeMessageId)
         let failedLogical = try #require(await probe.failedLogicalSharedId)
-
+        
         // Orphan-resend contract: the receiver drops the frame and requests a bounded
         // resend; the *sender* heals the lane and replays the same sharedId. Transient
         // deferral/episode state may resolve before polling observes it, so accept
@@ -1230,12 +1230,12 @@ actor EndToEndTests {
                 failedLogicalSharedId = logicalSharedId
             }
         }
-
+        
         actor DropGate {
             let dropCount: Int
             var armed = false
             var dropped = 0
-
+            
             init(dropCount: Int) { self.dropCount = dropCount }
             func arm() { armed = true }
             func shouldDropNext() -> Bool {
@@ -1246,17 +1246,17 @@ actor EndToEndTests {
                 }
                 return false
             }
-
+            
             func isFailingDeliveryCandidate() -> Bool {
                 armed && dropped >= dropCount
             }
         }
-
+        
         let probe = Probe()
         let gate = DropGate(dropCount: 12)
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -1268,7 +1268,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         defer {
             Task {
                 aliceTask?.cancel()
@@ -1276,7 +1276,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
         aliceTransport.shouldDeliver = { received in
@@ -1285,17 +1285,17 @@ actor EndToEndTests {
             let shouldDrop = await gate.shouldDropNext()
             return !shouldDrop
         }
-
+        
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
             bobTransport.continuation = continuation
         }
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
-
+        
         let bobStore = createRecipientStore()
         try await createSenderMaxSkipSession(
             store: createSenderStore(),
@@ -1307,7 +1307,7 @@ actor EndToEndTests {
             transport: bobTransport,
             sessionDelegate: rsd
         )
-
+        
         aliceTask = Task {
             for await received in aliceStream {
                 _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -1316,7 +1316,7 @@ actor EndToEndTests {
                 )
             }
         }
-
+        
         bobTask = Task {
             for await received in bobStream {
                 if received.transportEvent == nil,
@@ -1332,14 +1332,14 @@ actor EndToEndTests {
                 )
             }
         }
-
+        
         try await createFriendship(
             aliceSession: _senderMaxSkipSession,
             sd: sd,
             bobSession: _recipientMaxSkipSession,
             rsd: rsd
         )
-
+        
         let aliceDeviceId = try #require(await _senderMaxSkipSession.sessionContext?.sessionUser.deviceId)
         #expect(await waitUntil {
             let outboundReady = (try? await self._senderMaxSkipSession.hasInitializedOutboundRatchetForPeer("bob")) == true
@@ -1348,7 +1348,7 @@ actor EndToEndTests {
                 deviceId: aliceDeviceId)
             return outboundReady && inboundReady
         })
-
+        
         let baselineCount = await bobStore.getAllMessages().count
         try await _senderMaxSkipSession.send(
             recipient: .nickname("bob"),
@@ -1360,7 +1360,7 @@ actor EndToEndTests {
         #expect(
             await waitUntil { await bobStore.getAllMessages().count > baselineCount },
             "Expected recipient to persist the baseline message before the gap burst")
-
+        
         await gate.arm()
         for i in 0..<13 {
             try await _senderMaxSkipSession.send(
@@ -1368,7 +1368,7 @@ actor EndToEndTests {
                 text: "running-gap-\(i)"
             )
         }
-
+        
         #expect(
             await waitUntil { await probe.failedEnvelopeMessageId != nil },
             "Expected running processor to observe a failed envelope id")
@@ -1390,7 +1390,7 @@ actor EndToEndTests {
             await bobTransport.publishRotatedKeysCallCount == 0,
             "Inbound failure policy must not rotate keys")
     }
-
+    
     @Test("replay with same shared id is still admitted after inbound failure policy marks original")
     func testReplayWithSameSharedIdIsStillAdmittedAfterInboundFailurePolicyMarksOriginal() async throws {
         struct CapturedInbound: Sendable {
@@ -1399,10 +1399,10 @@ actor EndToEndTests {
             let deviceId: UUID
             let messageId: String
         }
-
+        
         actor Probe {
             var outbound: [CapturedInbound] = []
-
+            
             func markOutbound(_ received: ReceivedMessage) {
                 outbound.append(.init(
                     message: received.message,
@@ -1411,13 +1411,13 @@ actor EndToEndTests {
                     messageId: received.messageId
                 ))
             }
-
+            
             func frames() -> [CapturedInbound] { outbound }
         }
-
+        
         let probe = Probe()
         var replayCaptureTask: Task<Void, Never>?
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 6,
             _ condition: @escaping @Sendable () async -> Bool
@@ -1429,14 +1429,14 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         defer {
             Task {
                 replayCaptureTask?.cancel()
                 await shutdownSessions()
             }
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
@@ -1451,7 +1451,7 @@ actor EndToEndTests {
             bobSession: _recipientSession,
             rsd: rsd
         )
-
+        
         let replaySharedId = UUID().uuidString
         let replayStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
@@ -1462,19 +1462,19 @@ actor EndToEndTests {
                 await probe.markOutbound(received)
             }
         }
-
+        
         try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "replay-admission-source",
             sharedIdOverride: replaySharedId
         )
-
+        
         #expect(await waitUntil { await probe.frames().count == 1 }, "Expected original outbound frame to be captured")
         guard let original = await probe.frames().first else {
             Issue.record("Expected captured original outbound frame")
             return
         }
-
+        
         let failedInbound = InboundTaskMessage(
             message: original.message,
             senderSecretName: original.sender,
@@ -1492,7 +1492,7 @@ actor EndToEndTests {
             failedMessageId: original.messageId,
             failureClass: "ratchet.missingOneTimeKey"
         )
-
+        
         #expect(
             !(await _recipientSession.isInboundFailureQuarantined(
                 sender: original.sender,
@@ -1508,7 +1508,7 @@ actor EndToEndTests {
             )),
             "Pending replay recovery must admit the same shared id before decryption"
         )
-
+        
     }
     
     @Test("maxSkipped resend side effect failure stays internal and retryable")
@@ -1516,7 +1516,7 @@ actor EndToEndTests {
         enum SyntheticControlSendError: Error {
             case failed
         }
-
+        
         struct CapturedInbound: Sendable {
             let message: SignedRatchetMessage
             let sender: String
@@ -1557,7 +1557,7 @@ actor EndToEndTests {
                 }
                 return false
             }
-
+            
             func isFailingDeliveryCandidate() -> Bool {
                 armed && dropped >= dropCount
             }
@@ -1658,12 +1658,12 @@ actor EndToEndTests {
         
         #expect(await waitUntil { await probe.getFailedInbound() != nil }, "Expected test to capture the failed inbound frame")
         #expect(await waitUntil(timeoutSeconds: 1) { await probe.get() != nil } == false, "Control-send failure should stay internal to the resend side effect path")
-
+        
         guard let failedInbound = await probe.getFailedInbound() else {
             Issue.record("Expected failed inbound frame")
             return
         }
-
+        
         let inbound = InboundTaskMessage(
             message: failedInbound.message,
             senderSecretName: failedInbound.sender,
@@ -1679,7 +1679,7 @@ actor EndToEndTests {
             "Failed resend-request side effects must not quarantine the tuple; the same inbound failure needs to remain retryable"
         )
     }
-
+    
     @Test("missingSessionIdentity during stream processing does not wedge subsequent messages")
     func testMissingSessionIdentityDoesNotWedgeQueue() async throws {
         actor Probe {
@@ -1808,7 +1808,7 @@ actor EndToEndTests {
             "At least one follow-up message should decrypt after missingSessionIdentity; processor must not wedge"
         )
     }
-
+    
     @Test("sendingKeyIsNil during outbound processing resets identity and retries")
     func testSendingKeyIsNilOutboundRecoveryRetriesMessage() async throws {
         actor Probe {
@@ -1816,7 +1816,7 @@ actor EndToEndTests {
             func markDecrypted() { decryptedCount += 1 }
             func count() -> Int { decryptedCount }
         }
-
+        
         actor OneShotFailureGate {
             var shouldFail = true
             func consumeFailure() -> Bool {
@@ -1827,15 +1827,15 @@ actor EndToEndTests {
                 return false
             }
         }
-
+        
         final class OneShotSendingKeyNilDelegate: @unchecked Sendable, TaskSequenceDelegate {
             let processor: MessagePipeline
             let gate = OneShotFailureGate()
-
+            
             init(processor: MessagePipeline) {
                 self.processor = processor
             }
-
+            
             func performRatchet(task: TaskType, session: PQSSession) async throws {
                 if case .writeMessage = task, await gate.consumeFailure() {
                     throw RatchetError.sendingKeyIsNil
@@ -1843,7 +1843,7 @@ actor EndToEndTests {
                 try await processor.performRatchet(task: task, session: session)
             }
         }
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -1855,7 +1855,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         let probe = Probe()
         var bobTask: Task<Void, Never>?
         defer {
@@ -1864,7 +1864,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
@@ -1879,14 +1879,14 @@ actor EndToEndTests {
             bobSession: _recipientSession,
             rsd: rsd
         )
-
+        
         let senderProcessor = await _senderSession.messagePipeline
         await senderProcessor.setTaskDelegate(OneShotSendingKeyNilDelegate(processor: senderProcessor))
-
+        
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         bobTask = Task {
             for await received in bobStream {
                 do {
@@ -1904,28 +1904,28 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "outbound-sending-key-recovered"
         )
-
+        
         #expect(
             await waitUntil { await probe.count() >= 1 },
             "Outbound sendingKeyIsNil should reset the SessionIdentity and retry the original message"
         )
     }
-
+    
     @Test("transport send failure replays first encrypted outbound without ratchet desync")
     func testTransportSendFailureReplaysFirstEncryptedOutboundWithoutRatchetDesync() async throws {
         enum SyntheticTransportError: Error {
             case failed
         }
-
+        
         actor OneShotSendFailure {
             private(set) var failures = 0
             private var shouldFail = true
-
+            
             func consumeFailure() -> Bool {
                 guard shouldFail else { return false }
                 shouldFail = false
@@ -1933,26 +1933,26 @@ actor EndToEndTests {
                 return true
             }
         }
-
+        
         actor PacketReplayProbe {
             private var failedPacket: Data?
             private var deliveredPackets = [Data]()
-
+            
             func markFailed(_ data: Data?) {
                 failedPacket = data
             }
-
+            
             func markDelivered(_ data: Data?) {
                 guard let data else { return }
                 deliveredPackets.append(data)
             }
-
+            
             func replayedSamePacket() -> Bool {
                 guard let failedPacket else { return false }
                 return deliveredPackets.contains(failedPacket)
             }
         }
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -1964,7 +1964,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         let failureGate = OneShotSendFailure()
         let packetProbe = PacketReplayProbe()
         var bobTask: Task<Void, Never>?
@@ -1974,7 +1974,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
@@ -1983,7 +1983,7 @@ actor EndToEndTests {
         let rsd = SessionDelegate(session: _recipientSession)
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-
+        
         aliceTransport.transformOutgoing = { received in
             if await failureGate.consumeFailure() {
                 await packetProbe.markFailed(received.message.signed?.data)
@@ -1992,11 +1992,11 @@ actor EndToEndTests {
             await packetProbe.markDelivered(received.message.signed?.data)
             return received
         }
-
+        
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         @Sendable func recipientHasAliceContact() async -> Bool {
             guard let symmetricKey = try? await _recipientSession.getDatabaseSymmetricKey() else {
                 return false
@@ -2011,7 +2011,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         bobTask = Task {
             for await received in bobStream {
                 do {
@@ -2021,7 +2021,7 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         try await createFriendship(
             aliceSession: _senderSession,
             sd: sd,
@@ -2031,7 +2031,7 @@ actor EndToEndTests {
         // A transport failure parks the exact prepared frame until a concrete
         // registration/writer-ready event resumes the durable queue.
         try await _senderSession.resumeJobQueue()
-
+        
         #expect(await failureGate.failures == 1, "Transport should fail exactly once after encryption")
         #expect(await packetProbe.replayedSamePacket(), "Retry must replay the same signed ratchet frame instead of re-encrypting")
         #expect(
@@ -2039,51 +2039,51 @@ actor EndToEndTests {
             "The first encrypted outbound frame should be replayed after transport failure instead of losing the job or re-encrypting into a ratchet desync"
         )
     }
-
+    
     @Test("transport send failure replays peerRefresh recovery control")
     func testTransportSendFailureReplaysPeerRefreshRecoveryControl() async throws {
         enum SyntheticTransportError: Error {
             case failed
         }
-
+        
         actor OneShotPeerRefreshSendFailure {
             private(set) var failures = 0
             private var shouldFail = true
-
+            
             func consumeFailure(for event: TransportEvent?) -> Bool {
                 guard shouldFail else { return false }
                 guard case .sessionReestablishment(let envelope)? = event,
                       envelope.kind == .peerRefresh
-                else { return false }
+                        else { return false }
                 shouldFail = false
                 failures += 1
                 return true
             }
         }
-
+        
         actor PeerRefreshReplayProbe {
             private var failedPacket: Data?
             private var deliveredPacket: Data?
-
+            
             func markFailed(_ data: Data?) {
                 if failedPacket == nil {
                     failedPacket = data
                 }
             }
-
+            
             func markDelivered(_ data: Data?) {
                 deliveredPacket = data
             }
-
+            
             func replayedSamePacket() -> Bool {
                 failedPacket != nil && failedPacket == deliveredPacket
             }
-
+            
             func delivered() -> Bool {
                 deliveredPacket != nil
             }
         }
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -2095,7 +2095,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         let failureGate = OneShotPeerRefreshSendFailure()
         let packetProbe = PeerRefreshReplayProbe()
         var bobTask: Task<Void, Never>?
@@ -2105,7 +2105,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
@@ -2119,7 +2119,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         aliceTransport.transformOutgoing = { received in
             if await failureGate.consumeFailure(for: received.transportEvent) {
                 await packetProbe.markFailed(received.message.signed?.data)
@@ -2131,7 +2131,7 @@ actor EndToEndTests {
             }
             return received
         }
-
+        
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
@@ -2142,7 +2142,7 @@ actor EndToEndTests {
                     received: received)
             }
         }
-
+        
         _ = try await _senderSession.emitSessionReestablishment(
             kind: .peerRefresh,
             recipient: .nickname("bob"),
@@ -2150,7 +2150,7 @@ actor EndToEndTests {
         // Model the next writer-ready event; recovery must replay the prepared
         // control frame byte-for-byte rather than timer-retrying it.
         try await _senderSession.resumeJobQueue()
-
+        
         #expect(await failureGate.failures == 1, "Transport should fail exactly once for peerRefresh")
         #expect(
             await waitUntil { await packetProbe.delivered() },
@@ -2159,14 +2159,14 @@ actor EndToEndTests {
             await packetProbe.replayedSamePacket(),
             "peerRefresh retry must replay the same signed ratchet frame instead of advancing the ratchet again")
     }
-
+    
     @Test("peerRefresh control survives its owning open episode and outbound repair cooldown")
     func testPeerRefreshControlSurvivesOwningEpisodeAndOutboundRepairCooldown() async throws {
         actor Probe {
             private(set) var sawPeerRefresh = false
             func markPeerRefresh() { sawPeerRefresh = true }
         }
-
+        
         actor OneShotFailureGate {
             var shouldFail = true
             func consumeFailure() -> Bool {
@@ -2175,19 +2175,19 @@ actor EndToEndTests {
                 return true
             }
         }
-
+        
         final class OneShotPeerRefreshFailureDelegate: @unchecked Sendable, TaskSequenceDelegate {
             let processor: MessagePipeline
             let gate = OneShotFailureGate()
             let peerName: String
             let peerDeviceId: UUID
-
+            
             init(processor: MessagePipeline, peerName: String, peerDeviceId: UUID) {
                 self.processor = processor
                 self.peerName = peerName
                 self.peerDeviceId = peerDeviceId
             }
-
+            
             func performRatchet(task: TaskType, session: PQSSession) async throws {
                 if case .writeMessage(let outbound) = task,
                    let transportInfo = outbound.message.transportInfo,
@@ -2202,11 +2202,11 @@ actor EndToEndTests {
                         deviceId: peerDeviceId)
                     throw RatchetError.sendingKeyIsNil
                 }
-
+                
                 try await processor.performRatchet(task: task, session: session)
             }
         }
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -2218,7 +2218,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         let probe = Probe()
         var bobTask: Task<Void, Never>?
         defer {
@@ -2227,7 +2227,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
@@ -2241,11 +2241,11 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         bobTask = Task {
             for await received in bobStream {
                 if case .sessionReestablishment(let envelope) = received.transportEvent,
@@ -2257,7 +2257,7 @@ actor EndToEndTests {
                     received: received)
             }
         }
-
+        
         _ = try await _senderSession.refreshIdentities(
             secretName: rMockUserData.rsn,
             forceRefresh: true,
@@ -2266,18 +2266,18 @@ actor EndToEndTests {
             secretName: sMockUserData.ssn,
             forceRefresh: true,
             sendOneTimeIdentities: true)
-
+        
         guard let bobDeviceId = await _recipientSession.sessionContext?.sessionUser.deviceId else {
             Issue.record("Bob device id should be available")
             return
         }
-
+        
         let senderProcessor = await _senderSession.messagePipeline
         await senderProcessor.setTaskDelegate(OneShotPeerRefreshFailureDelegate(
             processor: senderProcessor,
             peerName: rMockUserData.rsn,
             peerDeviceId: bobDeviceId))
-
+        
         #expect(await _senderSession.tryBeginReestablishmentEpisode(
             sender: rMockUserData.rsn,
             deviceId: bobDeviceId
@@ -2286,23 +2286,23 @@ actor EndToEndTests {
             sender: rMockUserData.rsn,
             deviceId: bobDeviceId,
             flow: .outbound)
-
+        
         _ = try await _senderSession.emitSessionReestablishment(
             kind: .peerRefresh,
             recipient: .nickname(rMockUserData.rsn),
             scope: .peer(secretName: rMockUserData.rsn))
-
+        
         #expect(
             await waitUntil { await probe.sawPeerRefresh },
             "peerRefresh must be retried instead of dropped when its owning episode is open")
     }
-
+    
     @Test("three-device account receives child's first synchronized message after lane repair")
     func testThreeDeviceAccountReceivesFirstChildMessageAfterLaneRepair() async throws {
         actor OneShotFailureGate {
             private var shouldFail = true
             private(set) var failures = 0
-
+            
             func consumeFailure() -> Bool {
                 guard shouldFail else { return false }
                 shouldFail = false
@@ -2310,19 +2310,19 @@ actor EndToEndTests {
                 return true
             }
         }
-
+        
         final class OneShotPersonalPeerRefreshFailureDelegate: @unchecked Sendable, TaskSequenceDelegate {
             let processor: MessagePipeline
             let gate = OneShotFailureGate()
             let peerName: String
             let peerDeviceId: UUID
-
+            
             init(processor: MessagePipeline, peerName: String, peerDeviceId: UUID) {
                 self.processor = processor
                 self.peerName = peerName
                 self.peerDeviceId = peerDeviceId
             }
-
+            
             func performRatchet(task: TaskType, session: PQSSession) async throws {
                 if case .writeMessage(let outbound) = task,
                    let transportInfo = outbound.message.transportInfo,
@@ -2335,11 +2335,11 @@ actor EndToEndTests {
                         deviceId: peerDeviceId)
                     throw RatchetError.sendingKeyIsNil
                 }
-
+                
                 try await processor.performRatchet(task: task, session: session)
             }
         }
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 10,
             _ condition: @escaping @Sendable () async -> Bool
@@ -2351,7 +2351,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         var transportTasks = [Task<Void, Never>]()
         defer {
             for task in transportTasks {
@@ -2361,19 +2361,19 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let senderStore = createSenderStore()
         let senderChildStore = createSenderChildStore1()
         let senderChildStore2 = createSenderChildStore2()
         let recipientStore = createRecipientStore()
         let recipientChildStore = createRecipientChildStore1()
-
+        
         let senderParentTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let senderChildTransport = _MockTransportDelegate(session: _senderChildSession1, store: store)
         let senderChildTransport2 = _MockTransportDelegate(session: _senderChildSession2, store: store)
         let recipientParentTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let recipientChildTransport = _MockTransportDelegate(session: _recipientChildSession1, store: store)
-
+        
         let senderDelegate = SessionDelegate(session: _senderSession)
         let recipientDelegate = SessionDelegate(session: _recipientSession)
         try await createSenderSession(
@@ -2392,16 +2392,16 @@ actor EndToEndTests {
             store: recipientChildStore,
             transport: recipientChildTransport,
             useProvidedTransport: true)
-
+        
         guard let senderLinkedConfiguration =
                 await _senderChildSession1.sessionContext?.activeUserConfiguration,
               let recipientLinkedConfiguration =
                 await _recipientChildSession1.sessionContext?.activeUserConfiguration
-        else {
+                else {
             Issue.record("Linked-device configurations should be available")
             return
         }
-
+        
         if let senderIndex = await store.userConfigurations.firstIndex(where: {
             $0.secretName == sMockUserData.ssn
         }) {
@@ -2420,7 +2420,7 @@ actor EndToEndTests {
             senderLinkedConfiguration.getVerifiedDevices())
         try await _recipientSession.updateUserConfiguration(
             recipientLinkedConfiguration.getVerifiedDevices())
-
+        
         // Add a third sender-account device after the master has adopted child 1.
         // The resulting signed configuration contains master + both children.
         try await linkSenderChildSession2(
@@ -2429,7 +2429,7 @@ actor EndToEndTests {
             useProvidedTransport: true)
         guard let senderThreeDeviceConfiguration =
                 await _senderChildSession2.sessionContext?.activeUserConfiguration
-        else {
+                else {
             Issue.record("Three-device sender configuration should be available")
             return
         }
@@ -2446,17 +2446,17 @@ actor EndToEndTests {
             senderThreeDeviceConfiguration)
         try await _senderChildSession2.adoptVerifiedUserConfiguration(
             senderThreeDeviceConfiguration)
-
+        
         guard let senderParentId = await _senderSession.sessionContext?.sessionUser.deviceId,
               let senderChildId = await _senderChildSession1.sessionContext?.sessionUser.deviceId,
               let senderChildId2 = await _senderChildSession2.sessionContext?.sessionUser.deviceId,
               let recipientParentId = await _recipientSession.sessionContext?.sessionUser.deviceId,
               let recipientChildId = await _recipientChildSession1.sessionContext?.sessionUser.deviceId
-        else {
+                else {
             Issue.record("All five device sessions should be initialized")
             return
         }
-
+        
         let routes: [UUID: PQSSession] = [
             senderParentId: _senderSession,
             senderChildId: _senderChildSession1,
@@ -2467,7 +2467,7 @@ actor EndToEndTests {
         let route: @Sendable (ReceivedMessage) async -> Void = { received in
             guard let recipientDeviceId = received.recipientDeviceId,
                   let target = routes[recipientDeviceId]
-            else {
+                    else {
                 return
             }
             _ = try? await target.receiveMessage(
@@ -2477,7 +2477,7 @@ actor EndToEndTests {
                 messageId: received.messageId,
                 logicalMessageId: received.logicalMessageId)
         }
-
+        
         let senderParentStream = AsyncStream<ReceivedMessage> {
             senderParentTransport.continuation = $0
         }
@@ -2493,7 +2493,7 @@ actor EndToEndTests {
         let recipientChildStream = AsyncStream<ReceivedMessage> {
             recipientChildTransport.continuation = $0
         }
-
+        
         transportTasks = [
             Task {
                 for await received in senderParentStream {
@@ -2521,14 +2521,14 @@ actor EndToEndTests {
                 }
             }
         ]
-
+        
         let childProcessor = await _senderChildSession1.messagePipeline
         let peerRefreshFailureDelegate = OneShotPersonalPeerRefreshFailureDelegate(
             processor: childProcessor,
             peerName: sMockUserData.ssn,
             peerDeviceId: senderParentId)
         await childProcessor.setTaskDelegate(peerRefreshFailureDelegate)
-
+        
         // The NudgeKit contact-sync path refreshes the local account's sibling
         // lanes before emitting contact metadata. Model that same event boundary
         // explicitly in this lower-level PQS test.
@@ -2539,7 +2539,7 @@ actor EndToEndTests {
             kind: .peerRefresh,
             recipient: .personalMessage,
             scope: .personalDevice(deviceId: senderParentId))
-
+        
         #expect(
             await waitUntil { await peerRefreshFailureDelegate.gate.failures == 1 },
             "The child's recovery peerRefresh should hit the injected sendingKeyIsNil failure")
@@ -2550,26 +2550,26 @@ actor EndToEndTests {
                     deviceId: senderParentId))
             },
             "The retried peerRefresh response should close the child-to-parent repair episode")
-
+        
         try await createFriendship(
             aliceSession: _senderSession,
             sd: senderDelegate,
             bobSession: _recipientSession,
             rsd: recipientDelegate)
-
+        
         _ = try await _senderChildSession1.refreshIdentities(
             secretName: rMockUserData.rsn,
             forceRefresh: true)
         _ = try await _recipientChildSession1.refreshIdentities(
             secretName: sMockUserData.ssn,
             forceRefresh: true)
-
+        
         let sharedId = "linked-parent-first-child-message-\(UUID().uuidString)"
         try await _senderChildSession1.send(
             recipient: .nickname(rMockUserData.rsn),
             text: "single child message after linked-device repair",
             sharedIdOverride: sharedId)
-
+        
         #expect(
             await waitUntil {
                 await senderStore.createdMessages.contains(where: { $0.sharedId == sharedId })
@@ -2599,7 +2599,7 @@ actor EndToEndTests {
         
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-
+        
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
             bobTransport.continuation = continuation
         }
@@ -2696,7 +2696,7 @@ actor EndToEndTests {
     func thousandMessageExchange() async throws {
         let totalMessages = 1000
         var bobTask: Task<Void, Never>?
-
+        
         defer {
             Task {
                 bobTask?.cancel()
@@ -2840,39 +2840,39 @@ actor EndToEndTests {
                     text: text)
             }
             
-			// 5) Collect exactly 79 ReceivedMessage frames destined for Bob
+            // 5) Collect exactly 79 ReceivedMessage frames destined for Bob
             var collected: [ReceivedMessage] = []
-			for await received in bobStream {
+            for await received in bobStream {
                 collected.append(received)
                 if collected.count == messages.count {
                     // Once we have all 79, stop listening
                     aliceTransport.continuation?.finish()
-					bobTransport.continuation?.finish()
+                    bobTransport.continuation?.finish()
                     break
                 }
             }
             
-			// 6) Feed Bob's ratchet out‑of‑order: first the very first message…
+            // 6) Feed Bob's ratchet out‑of‑order: first the very first message…
             let first = collected.removeFirst()
-			let aliceSecretName = await self._senderSession.sessionContext!.sessionUser.secretName
-			let aliceDeviceId = await self._senderSession.sessionContext!.sessionUser.deviceId
+            let aliceSecretName = await self._senderSession.sessionContext!.sessionUser.secretName
+            let aliceDeviceId = await self._senderSession.sessionContext!.sessionUser.deviceId
             try await self._recipientSession.receiveMessage(
                 message: first.message,
-				sender: aliceSecretName,
-				deviceId: aliceDeviceId,
+                sender: aliceSecretName,
+                deviceId: aliceDeviceId,
                 messageId: first.messageId
             )
             
-			// …then the rest in a random order
+            // …then the rest in a random order
             for msg in collected.shuffled() {
                 try await self._recipientSession.receiveMessage(
                     message: msg.message,
-					sender: aliceSecretName,
-					deviceId: aliceDeviceId,
+                    sender: aliceSecretName,
+                    deviceId: aliceDeviceId,
                     messageId: msg.messageId
                 )
             }
-			
+            
             await shutdownSessions()
         }
     }
@@ -2909,83 +2909,93 @@ actor EndToEndTests {
         }
         // Alice's receive loop
         Task {
-            var aliceIterations = 0
-            for await received in aliceStream {
-                aliceIterations += 1
-                do {
-                    try await self._senderSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId,
-                        logicalMessageId: received.logicalMessageId)
-                } catch PQSError.databaseNotInitialized {
-                    return
-                } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-                    // Message is unrecoverable due to key rotation; continue to next message
-                    continue
-                } catch let sessionError as PQSError where sessionError == .invalidSignature {
-                    // Message signature is invalid (e.g., after key rotation); continue to next message
-                    continue
-                } catch {
-                    // Other unexpected errors - log and continue
-                    continue
+            do {
+                var aliceIterations = 0
+                for await received in aliceStream {
+                    aliceIterations += 1
+                    do {
+                        try await self._senderSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId,
+                            logicalMessageId: received.logicalMessageId)
+                    } catch PQSError.databaseNotInitialized {
+                        return
+                    } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
+                        // Message is unrecoverable due to key rotation; continue to next message
+                        continue
+                    } catch let sessionError as PQSError where sessionError == .invalidSignature {
+                        // Message signature is invalid (e.g., after key rotation); continue to next message
+                        continue
+                    } catch {
+                        // Other unexpected errors - log and continue
+                        continue
+                    }
+                    // First user message (after protocol message)
+                    if aliceIterations == 1 {
+                        try await self._senderSession.rotateKeysOnPotentialCompromise()
+                        try await self._senderSession.send(
+                            recipient: .nickname("bob"), text: "Message Three")
+                        await self.bobProcessedRotated.wait()
+                    }
+                    // After Bob's post-rotation message
+                    if aliceIterations == 2 {
+                        await self.aliceProcessedBobRotation.signal()
+                        aliceTransport.continuation?.finish()
+                        bobTransport.continuation?.finish()
+                    }
                 }
-                // First user message (after protocol message)
-                if aliceIterations == 1 {
-                    try await self._senderSession.rotateKeysOnPotentialCompromise()
-                    try await self._senderSession.send(
-                        recipient: .nickname("bob"), text: "Message Three")
-                    await self.bobProcessedRotated.wait()
-                }
-                // After Bob's post-rotation message
-                if aliceIterations == 2 {
-                    await self.aliceProcessedBobRotation.signal()
-                    aliceTransport.continuation?.finish()
-                    bobTransport.continuation?.finish()
-                }
+                await self._senderSession.shutdown()
+            } catch {
+                #expect(Bool(false), "Unexpected error: \(error)")
+                return
             }
-            await self._senderSession.shutdown()
         }
         // Bob's receive loop
         Task {
-            var bobIterations = 0
-            for await received in bobStream {
-                bobIterations += 1
-                do {
-                    try await self._recipientSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId,
-                        logicalMessageId: received.logicalMessageId)
-                } catch PQSError.databaseNotInitialized {
-                    return
-                } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
-                    // Message is unrecoverable due to key rotation; continue to next message
-                    continue
-                } catch let sessionError as PQSError where sessionError == .invalidSignature {
-                    // Message signature is invalid (e.g., after key rotation); continue to next message
-                    continue
-                } catch {
-                    // Other unexpected errors - log and continue
-                    continue
+            do {
+                var bobIterations = 0
+                for await received in bobStream {
+                    bobIterations += 1
+                    do {
+                        try await self._recipientSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId,
+                            logicalMessageId: received.logicalMessageId)
+                    } catch PQSError.databaseNotInitialized {
+                        return
+                    } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
+                        // Message is unrecoverable due to key rotation; continue to next message
+                        continue
+                    } catch let sessionError as PQSError where sessionError == .invalidSignature {
+                        // Message signature is invalid (e.g., after key rotation); continue to next message
+                        continue
+                    } catch {
+                        // Other unexpected errors - log and continue
+                        continue
+                    }
+                    // First user message (after protocol message)
+                    if bobIterations == 1 {
+                        await self.bobProcessedRotated.signal()
+                        try await self._recipientSession.send(
+                            recipient: .nickname("alice"), text: "Message Two")
+                    }
+                    // After Alice's post-rotation message
+                    if bobIterations == 2 {
+                        try await self._recipientSession.rotateKeysOnPotentialCompromise()
+                        try await self._recipientSession.send(
+                            recipient: .nickname("alice"), text: "Message Four")
+                        await self.aliceProcessedBobRotation.wait()
+                        aliceTransport.continuation?.finish()
+                        bobTransport.continuation?.finish()
+                    }
                 }
-                // First user message (after protocol message)
-                if bobIterations == 1 {
-                    await self.bobProcessedRotated.signal()
-                    try await self._recipientSession.send(
-                        recipient: .nickname("alice"), text: "Message Two")
-                }
-                // After Alice's post-rotation message
-                if bobIterations == 2 {
-                    try await self._recipientSession.rotateKeysOnPotentialCompromise()
-                    try await self._recipientSession.send(
-                        recipient: .nickname("alice"), text: "Message Four")
-                    await self.aliceProcessedBobRotation.wait()
-                    aliceTransport.continuation?.finish()
-                    bobTransport.continuation?.finish()
-                }
+            } catch {
+                #expect(Bool(false), "Unexpected error: \(error)")
+                return
             }
         }
         // Kick off the flow after loops are active
@@ -3010,12 +3020,12 @@ actor EndToEndTests {
             aliceTransport.continuation = continuation
         }
         
-            // 2) Initialize sessions
-            let sd = SessionDelegate(session: _senderSession)
-            let rsd = SessionDelegate(session: _recipientSession)
-            try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-            try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-            
+        // 2) Initialize sessions
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        
         // 3) Start receive loops to process protocol messages
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
@@ -3059,11 +3069,11 @@ actor EndToEndTests {
         }
         
         // 4) Create friendship (creates contacts via protocol)
-            try await createFriendship(
-                aliceSession: _senderSession,
-                sd: sd,
-                bobSession: _recipientSession,
-                rsd: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
         
         // 5) Allow protocol to settle, then close streams
         try await Task.sleep(until: .now + .milliseconds(300))
@@ -3084,11 +3094,11 @@ actor EndToEndTests {
             #expect(props.secretName == "bob")
             #expect(props.metadata["friendshipMetadata"] != nil)
         }
-            if let bobContact = bobContacts.first,
-               let props = try await bobContact.props(
-                symmetricKey: self._recipientSession.getDatabaseSymmetricKey())
-            {
-                #expect(props.secretName == "alice")
+        if let bobContact = bobContacts.first,
+           let props = try await bobContact.props(
+            symmetricKey: self._recipientSession.getDatabaseSymmetricKey())
+        {
+            #expect(props.secretName == "alice")
             #expect(props.metadata["friendshipMetadata"] != nil)
         }
         
@@ -3141,7 +3151,7 @@ actor EndToEndTests {
             let sd = SessionDelegate(session: _senderSession)
             
             try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
-
+            
             let masterConfig = await self._senderSession.sessionContext!.activeUserConfiguration
             try await self.linkSenderChildSession1(store: senderChildStore1, transport: aliceTransport)
             let childConfig1 = await _senderChildSession1.sessionContext!.activeUserConfiguration
@@ -3180,8 +3190,8 @@ actor EndToEndTests {
                 signedOneTimePublicKeys: masterConfig.signedOneTimePublicKeys,
                 signedMLKEMOneTimePublicKeys: masterConfig.signedMLKEMOneTimePublicKeys,
                 signedDeviceKeyBundles: masterConfig.signedDeviceKeyBundles
-                    + childConfig1.signedDeviceKeyBundles
-                    + childConfig2.signedDeviceKeyBundles)
+                + childConfig1.signedDeviceKeyBundles
+                + childConfig2.signedDeviceKeyBundles)
             
             //Publish the new config to the remote store
             let senderSecretName = await self._senderSession.sessionContext!.sessionUser.secretName
@@ -3246,8 +3256,8 @@ actor EndToEndTests {
                 signedOneTimePublicKeys: masterRecipientConfig.signedOneTimePublicKeys,
                 signedMLKEMOneTimePublicKeys: masterRecipientConfig.signedMLKEMOneTimePublicKeys,
                 signedDeviceKeyBundles: masterRecipientConfig.signedDeviceKeyBundles
-                    + childRecipientConfig1.signedDeviceKeyBundles
-                    + childRecipientConfig2.signedDeviceKeyBundles)
+                + childRecipientConfig1.signedDeviceKeyBundles
+                + childRecipientConfig2.signedDeviceKeyBundles)
             
             //Publish the new config to the remote store
             let recipientSecretName = await self._recipientSession.sessionContext!.sessionUser
@@ -3277,12 +3287,12 @@ actor EndToEndTests {
                     // Skip until session context is available
                     if await self._senderSession.sessionContext == nil { continue }
                     do {
-                    try await self._senderSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId
-                    )
+                        try await self._senderSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId
+                        )
                     } catch {
                         // Tolerate teardown/transition errors in this test
                         return
@@ -3307,12 +3317,12 @@ actor EndToEndTests {
                 // Skip until session context is available
                 if await self._recipientSession.sessionContext == nil { continue }
                 do {
-                try await self._recipientSession.receiveMessage(
-                    message: received.message,
-                    sender: received.sender,
-                    deviceId: received.deviceId,
-                    messageId: received.messageId
-                )
+                    try await self._recipientSession.receiveMessage(
+                        message: received.message,
+                        sender: received.sender,
+                        deviceId: received.deviceId,
+                        messageId: received.messageId
+                    )
                 } catch {
                     // Tolerate teardown/transition errors in this test
                     return
@@ -3575,7 +3585,7 @@ actor EndToEndTests {
     func testSessionStateSynchronizationIssues() async throws {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
@@ -3586,7 +3596,7 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         defer {
             aliceTransport.continuation?.finish()
             bobTransport.continuation?.finish()
@@ -3594,13 +3604,13 @@ actor EndToEndTests {
             bobTask?.cancel()
             Task { await self.shutdownSessions() }
         }
-
+        
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-
+        
         aliceTask = Task {
             for await received in aliceStream {
                 if received.sender == self.sMockUserData.ssn { continue }
@@ -3617,13 +3627,13 @@ actor EndToEndTests {
                     received: received)
             }
         }
-
+        
         try await createFriendship(
             aliceSession: _senderSession,
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         func waitForMessage(_ sharedId: String, timeout: TimeInterval = 10) async -> Bool {
             let deadline = Date().addingTimeInterval(timeout)
             while Date() < deadline {
@@ -3636,7 +3646,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         let beforeRestart = UUID().uuidString
         try await _senderSession.send(
             recipient: .nickname("bob"),
@@ -3645,17 +3655,17 @@ actor EndToEndTests {
         #expect(
             await waitForMessage(beforeRestart),
             "Bob should decrypt and persist the pre-shutdown message")
-
+        
         // Full runtime teardown persists ratchet state but permanently closes the
         // current ratchet manager. `unlock` must replace runtime components.
         await shutdownSessions()
-
+        
         try await createSenderSession(store: senderStore, createAccount: false, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, createAccount: false, transport: bobTransport, sessionDelegate: rsd)
-
+        
         #expect(await _senderSession.lifecyclePhase == .running)
         #expect(await _recipientSession.lifecyclePhase == .running)
-
+        
         let afterRestart = UUID().uuidString
         try await _senderSession.send(
             recipient: .nickname("bob"),
@@ -3664,7 +3674,7 @@ actor EndToEndTests {
         #expect(
             await waitForMessage(afterRestart),
             "Bob should decrypt and persist the post-restart message")
-
+        
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await aliceTask?.value
@@ -3734,7 +3744,7 @@ actor EndToEndTests {
         
         await shutdownSessions()
     }
-
+    
     @Test("Duplicate decrypts and redelivered frames persist exactly one row per shared id")
     func testDuplicateDeliveryPersistsSingleMessageRow() async throws {
         var aliceTask: Task<Void, Never>?
@@ -3746,14 +3756,14 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         actor FrameRecorder {
             var frames: [ReceivedMessage] = []
             func record(_ frame: ReceivedMessage) { frames.append(frame) }
             func all() -> [ReceivedMessage] { frames }
         }
         let bobInboundRecorder = FrameRecorder()
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -3765,7 +3775,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
@@ -3776,7 +3786,7 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
@@ -3786,7 +3796,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         aliceTask = Task {
             for await received in aliceStream {
                 if received.sender == self.sMockUserData.ssn { continue }
@@ -3801,12 +3811,12 @@ actor EndToEndTests {
             }
         }
         try await Task.sleep(until: .now + .milliseconds(100))
-
+        
         // Establish the lane with a normal message first.
         try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "establish lane")
-
+        
         // Duplicate-decrypt case: the sender replays the same logical message
         // (same shared id) as a fresh ciphertext — production hits this when a
         // resend request is serviced more than once. Both copies decrypt; only
@@ -3819,7 +3829,7 @@ actor EndToEndTests {
                 sharedIdOverride: duplicatedSharedId)
             try await Task.sleep(until: .now + .milliseconds(100))
         }
-
+        
         let persistedDuplicate = await waitUntil {
             let rows = await recipientStore.getAllMessages()
             return rows.contains(where: { $0.sharedId == duplicatedSharedId })
@@ -3827,13 +3837,13 @@ actor EndToEndTests {
         #expect(persistedDuplicate, "Replayed shared id should decrypt and persist")
         // Let the second copy finish processing before counting.
         try await Task.sleep(until: .now + .seconds(1))
-
+        
         var rows = await recipientStore.getAllMessages()
         var duplicateRows = rows.filter { $0.sharedId == duplicatedSharedId }
         #expect(
             duplicateRows.count == 1,
             "Same shared id decrypted twice must persist exactly one row, got \(duplicateRows.count)")
-
+        
         // Redelivery case: the server redelivers already-processed frames on
         // reconnect. Re-inject every frame Bob has already consumed and verify
         // the ingress guard drops them without minting rows or throwing.
@@ -3842,20 +3852,20 @@ actor EndToEndTests {
             _ = try? await receiveIgnoringRecoverableErrors(_recipientSession, received: received)
         }
         try await Task.sleep(until: .now + .seconds(1))
-
+        
         rows = await recipientStore.getAllMessages()
         duplicateRows = rows.filter { $0.sharedId == duplicatedSharedId }
         #expect(
             rows.count == baselineCount,
             "Redelivered frames must not create new rows (baseline \(baselineCount), got \(rows.count))")
         #expect(duplicateRows.count == 1, "Redelivery must not duplicate the replayed shared id")
-
+        
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await aliceTask?.value
         _ = await bobTask?.value
     }
-
+    
     @Test("Device Synchronization Issues - Simulate Clock Drift and Processing Delays")
     func testDeviceSynchronizationIssues() async throws {
         // Setup two devices with their own sessions
@@ -4034,7 +4044,7 @@ actor EndToEndTests {
                 text: "Initial message \(i)")
             try await Task.sleep(until: .now + .milliseconds(50))
         }
-
+        
         var authenticationFailures = 0
         var successfulMessages = 0
         
@@ -4279,23 +4289,23 @@ actor EndToEndTests {
     
     @Test("Real Authentication Failure - Device2 Decryption Test")
     func testRealAuthenticationFailure() async throws {
-    var bobTask: Task<Void, Never>?
-    defer {
-        Task {
-            bobTask?.cancel()
-            await shutdownSessions()
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
         }
-    }
-    
+        
         // Setup two devices with their own sessions
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-    // Route Alice -> Bob by wiring Alice's continuation to Bob's stream
-    let bobStream = AsyncStream<ReceivedMessage> { continuation in
-        aliceTransport.continuation = continuation
-    }
+        // Route Alice -> Bob by wiring Alice's continuation to Bob's stream
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
         
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
@@ -4309,86 +4319,86 @@ actor EndToEndTests {
             bobSession: _recipientSession,
             rsd: rsd)
         
-    let total = 10
-    var processed = 0
-    var authenticationFailures = 0
-    
-    // Bob decrypts everything he receives and counts authentication failures
-    bobTask = Task {
-        await #expect(throws: Never.self, "Bob should process messages without crashing") {
-            for await received in bobStream {
-                do {
-                    try await self._recipientSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId
-                    )
-                    processed += 1
-                    if processed >= total {
-                        aliceTransport.continuation?.finish()
-                        break
-                    }
-                } catch {
-                    let desc = error.localizedDescription
-                    if desc.localizedCaseInsensitiveContains("authenticationFailure") ||
-                        desc.contains("AUTHENTICATIONFAILURE") ||
-                        desc.localizedCaseInsensitiveContains("invalidKeyId") {
-                        authenticationFailures += 1
-                    } else if case PQSError.databaseNotInitialized = error {
-                        break
-                    } else {
-                        // Unexpected error; fail this loop
-                        #expect(Bool(false), "Unexpected receive error: \(error)")
-                        break
+        let total = 10
+        var processed = 0
+        var authenticationFailures = 0
+        
+        // Bob decrypts everything he receives and counts authentication failures
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should process messages without crashing") {
+                for await received in bobStream {
+                    do {
+                        try await self._recipientSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId
+                        )
+                        processed += 1
+                        if processed >= total {
+                            aliceTransport.continuation?.finish()
+                            break
+                        }
+                    } catch {
+                        let desc = error.localizedDescription
+                        if desc.localizedCaseInsensitiveContains("authenticationFailure") ||
+                            desc.contains("AUTHENTICATIONFAILURE") ||
+                            desc.localizedCaseInsensitiveContains("invalidKeyId") {
+                            authenticationFailures += 1
+                        } else if case PQSError.databaseNotInitialized = error {
+                            break
+                        } else {
+                            // Unexpected error; fail this loop
+                            #expect(Bool(false), "Unexpected receive error: \(error)")
+                            break
+                        }
                     }
                 }
             }
         }
-    }
-    
-    // Warmup to establish session
+        
+        // Warmup to establish session
         for i in 1...4 {
             try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
-        try await Task.sleep(until: .now + .milliseconds(50))
-    }
-    
-    // Send a rapid burst intended to reproduce the real-world scenario
-    for i in 5...total {
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        // Send a rapid burst intended to reproduce the real-world scenario
+        for i in 5...total {
             try await _senderSession.send(
                 recipient: .nickname("bob"),
-            text: "Message \(i)")
+                text: "Message \(i)")
             try await Task.sleep(until: .now + .milliseconds(5))
         }
         
-    // Allow processing and then assert
+        // Allow processing and then assert
         try await Task.sleep(until: .now + .seconds(2))
         
-    // Proper assertion: there should be no authentication failures in a correct flow
-    #expect(authenticationFailures == 0, "No authentication failures expected, found: \(authenticationFailures)")
+        // Proper assertion: there should be no authentication failures in a correct flow
+        #expect(authenticationFailures == 0, "No authentication failures expected, found: \(authenticationFailures)")
     }
     
     @Test("Ratchet State Corruption - Skipped Message Key Mismatch")
     func testRatchetStateCorruption() async throws {
-    var bobTask: Task<Void, Never>?
-    defer {
-        Task {
-            bobTask?.cancel()
-            await shutdownSessions()
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
         }
-    }
-    
+        
         // Setup two devices with their own sessions
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-    // Route Alice -> Bob by wiring Alice's continuation to Bob's stream
-    let bobStream = AsyncStream<ReceivedMessage> { continuation in
-        aliceTransport.continuation = continuation
-    }
+        // Route Alice -> Bob by wiring Alice's continuation to Bob's stream
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
         
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
@@ -4402,64 +4412,64 @@ actor EndToEndTests {
             bobSession: _recipientSession,
             rsd: rsd)
         
-    // Total messages Bob will process (4 warmup + 11 burst)
-    let total = 15
-    var processed = 0
-    var authenticationFailures = 0
-    
-    // Bob decrypts everything he receives and counts authentication failures
-    bobTask = Task {
-        await #expect(throws: Never.self, "Bob should process messages without crashing") {
-            for await received in bobStream {
-                do {
-                    try await self._recipientSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId
-                    )
-                    processed += 1
-                    if processed >= total {
-                        aliceTransport.continuation?.finish()
-                        break
-                    }
-                } catch {
-                    let desc = error.localizedDescription
-                    if desc.localizedCaseInsensitiveContains("authenticationFailure") ||
-                        desc.contains("AUTHENTICATIONFAILURE") ||
-                        desc.localizedCaseInsensitiveContains("invalidKeyId") {
-                        authenticationFailures += 1
-                    } else if case PQSError.databaseNotInitialized = error {
-                        break
-                    } else {
-                        #expect(Bool(false), "Unexpected receive error: \(error)")
-                        break
+        // Total messages Bob will process (4 warmup + 11 burst)
+        let total = 15
+        var processed = 0
+        var authenticationFailures = 0
+        
+        // Bob decrypts everything he receives and counts authentication failures
+        bobTask = Task {
+            await #expect(throws: Never.self, "Bob should process messages without crashing") {
+                for await received in bobStream {
+                    do {
+                        try await self._recipientSession.receiveMessage(
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId
+                        )
+                        processed += 1
+                        if processed >= total {
+                            aliceTransport.continuation?.finish()
+                            break
+                        }
+                    } catch {
+                        let desc = error.localizedDescription
+                        if desc.localizedCaseInsensitiveContains("authenticationFailure") ||
+                            desc.contains("AUTHENTICATIONFAILURE") ||
+                            desc.localizedCaseInsensitiveContains("invalidKeyId") {
+                            authenticationFailures += 1
+                        } else if case PQSError.databaseNotInitialized = error {
+                            break
+                        } else {
+                            #expect(Bool(false), "Unexpected receive error: \(error)")
+                            break
+                        }
                     }
                 }
             }
         }
-    }
-    
-    // Warmup to establish session
+        
+        // Warmup to establish session
         for i in 1...4 {
             try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "Initial message \(i)")
-        try await Task.sleep(until: .now + .milliseconds(50))
-    }
-    
-    // Rapid burst intended to stress ratchet state
+            try await Task.sleep(until: .now + .milliseconds(50))
+        }
+        
+        // Rapid burst intended to stress ratchet state
         for i in 5...15 {
-                try await _senderSession.send(
-                    recipient: .nickname("bob"),
-            text: "Message \(i)")
-        // tiny delay to vary arrival order
-        try await Task.sleep(until: .now + .milliseconds(5))
-    }
-    
-    // Allow processing and assert
-    try await Task.sleep(until: .now + .seconds(2))
-    #expect(authenticationFailures == 0, "No authentication failures expected, found: \(authenticationFailures)")
+            try await _senderSession.send(
+                recipient: .nickname("bob"),
+                text: "Message \(i)")
+            // tiny delay to vary arrival order
+            try await Task.sleep(until: .now + .milliseconds(5))
+        }
+        
+        // Allow processing and assert
+        try await Task.sleep(until: .now + .seconds(2))
+        #expect(authenticationFailures == 0, "No authentication failures expected, found: \(authenticationFailures)")
     }
     
     @Test("Bidirectional Multi-Device Conversation")
@@ -4594,7 +4604,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         aliceTask = Task {
             await #expect(throws: Never.self, "Alice should receive throughout key rotations") {
                 for await received in aliceStream {
@@ -4602,7 +4612,7 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         bobTask = Task {
             await #expect(throws: Never.self, "Bob should receive throughout key rotations") {
                 for await received in bobStream {
@@ -4611,7 +4621,7 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         for i in 1...5 {
             try await _senderSession.send(recipient: .nickname("bob"), text: "warmup alice #\(i)")
             try await _recipientSession.send(recipient: .nickname("alice"), text: "warmup bob #\(i)")
@@ -4626,7 +4636,7 @@ actor EndToEndTests {
             try await Task.sleep(until: .now + .milliseconds(15))
         }
         
-//         Rotate keys mid‑conversation on Bob
+        //         Rotate keys mid‑conversation on Bob
         try await _recipientSession.rotateCurrentDeviceKeys()
         
         for i in 11...15 {
@@ -4767,7 +4777,7 @@ actor EndToEndTests {
         // This updates Alice's signing key, which Bob needs to fetch when verifying messages
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .seconds(1))
-
+        
         // Step 3: Alice sends a message to Bob AFTER key rotation
         // This message will be signed with Alice's NEW signing key
         // Bob's cached identity has the OLD key, so verification will fail initially
@@ -4934,7 +4944,7 @@ actor EndToEndTests {
         let errors = await counter.getErrors()
         let bobCount = await counter.getBobCount()
         let aliceCount = await counter.getAliceCount()
-
+        
         #expect(errors.filter { $0 == "maxSkippedHeadersExceeded" }.count <= 1)
         #expect(bobCount >= 1, "Bob should have received Alice's post-rotation message. Actual: \(bobCount)")
         #expect(aliceCount >= 1, "Alice should have received Bob's message without errors. Actual: \(aliceCount)")
@@ -5266,15 +5276,15 @@ actor EndToEndTests {
         // Verify Bob received messages and did not hit non-recoverable errors.
         let errors = await counter.getErrors()
         let count = await counter.getBobCount()
-
+        
         let nonRecoverable = errors.filter { $0 != "maxSkippedHeadersExceeded" }
         #expect(nonRecoverable.isEmpty, "Bob should not have non-recoverable errors. Errors: \(errors)")
         #expect(errors.filter { $0 == "maxSkippedHeadersExceeded" }.count <= 1)
         #expect(count >= 1, "Bob should have processed at least 1 message. Actual: \(count)")
     }
-
+    
     // MARK: - Out-of-sync and re-synchronization during send flow
-
+    
     /// After sender (Alice) rotates, recipient (Bob) receives reestablishment; subsequent message
     /// sends from Bob to Alice must re-synchronize and all be delivered.
     @Test("Subsequent message sends re-synchronize after sender rotation")
@@ -5288,7 +5298,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -5297,12 +5307,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -5310,7 +5320,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         actor Counts {
             var aliceReceived = 0
             var bobReceived = 0
@@ -5320,7 +5330,7 @@ actor EndToEndTests {
             func getBob() -> Int { bobReceived }
         }
         let counts = Counts()
-
+        
         bobTask = Task {
             await #expect(throws: Never.self, "Bob should receive messages") {
                 for await received in bobStream {
@@ -5339,35 +5349,35 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         // Warm-up
         try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
-
+        
         // Alice rotates (sender rotation); Bob will receive reestablishment
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .seconds(1))
         // Allow Bob's receive loop to process reestablishment and refresh identities before Bob sends
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         // Subsequent sends from Bob to Alice must re-synchronize (Bob has fresh identity after reestablishment)
         try await _recipientSession.send(recipient: .nickname("alice"), text: "bob resync 1")
         try await _recipientSession.send(recipient: .nickname("alice"), text: "bob resync 2")
         try await _recipientSession.send(recipient: .nickname("alice"), text: "bob resync 3")
         try await Task.sleep(until: .now + .seconds(2))
-
+        
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await bobTask?.value
         _ = await aliceTask?.value
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         let aliceCount = await counts.getAlice()
         let bobCount = await counts.getBob()
         #expect(aliceCount >= 0, "Receive loop should stay stable post-rotation. Actual: \(aliceCount)")
         #expect(bobCount >= 1, "Bob should have received warmup. Actual: \(bobCount)")
     }
-
+    
     /// After recipient (Bob) rotates, sender (Alice) receives reestablishment; subsequent message
     /// sends from Alice to Bob must re-synchronize and all be delivered.
     @Test("Subsequent message sends re-synchronize after recipient rotation")
@@ -5381,7 +5391,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -5390,12 +5400,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -5403,7 +5413,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         actor Counts {
             var aliceReceived = 0
             var bobReceived = 0
@@ -5413,7 +5423,7 @@ actor EndToEndTests {
             func getBob() -> Int { bobReceived }
         }
         let counts = Counts()
-
+        
         bobTask = Task {
             await #expect(throws: Never.self, "Bob should receive messages") {
                 for await received in bobStream {
@@ -5432,35 +5442,35 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         // Warm-up
         try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
-
+        
         // Bob rotates (recipient rotation); Alice will receive reestablishment
         try await _recipientSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .seconds(1))
         // Allow Alice's receive loop to process reestablishment and refresh identities before Alice sends
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         // Subsequent sends from Alice to Bob must re-synchronize (Alice has fresh identity after reestablishment)
         try await _senderSession.send(recipient: .nickname("bob"), text: "alice resync 1")
         try await _senderSession.send(recipient: .nickname("bob"), text: "alice resync 2")
         try await _senderSession.send(recipient: .nickname("bob"), text: "alice resync 3")
         try await Task.sleep(until: .now + .seconds(2))
-
+        
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await bobTask?.value
         _ = await aliceTask?.value
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         let bobCount = await counts.getBob()
         #expect(bobCount >= 1, "Bob should have received warmup and at least 1 subsequent message from Alice after re-sync. Actual: \(bobCount)")
     }
-
+    
     // MARK: - Key rotation and ordering robustness
-
+    
     /// Pre-rotation messages, then rotation (sessionReestablishment), then post-rotation messages
     /// delivered in send order. All must decrypt successfully.
     @Test("Burst then rotation then burst in order - all messages decrypt")
@@ -5474,7 +5484,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -5483,12 +5493,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -5496,7 +5506,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         actor BobState {
             var receivedCount = 0
             var sawReestablishment = false
@@ -5506,7 +5516,7 @@ actor EndToEndTests {
             func incErrors() { decryptionErrors += 1 }
         }
         let bobState = BobState()
-
+        
         bobTask = Task {
             await #expect(throws: Never.self, "Bob should receive all messages in order") {
                 for await received in bobStream {
@@ -5531,31 +5541,31 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         // Pre-rotation burst
         for i in 1...3 {
             try await _senderSession.send(recipient: .nickname("bob"), text: "pre-rotation \(i)")
             try await Task.sleep(until: .now + .milliseconds(80))
         }
         try await Task.sleep(until: .now + .milliseconds(200))
-
+        
         // Rotation (sends sessionReestablishment to Bob)
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .milliseconds(200))
-
+        
         // Post-rotation burst
         for i in 1...3 {
             try await _senderSession.send(recipient: .nickname("bob"), text: "post-rotation \(i)")
             try await Task.sleep(until: .now + .milliseconds(80))
         }
-
+        
         try await Task.sleep(until: .now + .seconds(2))
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await bobTask?.value
         _ = await aliceTask?.value
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         let count = await bobState.receivedCount
         let sawReest = await bobState.sawReestablishment
         let errors = await bobState.decryptionErrors
@@ -5563,7 +5573,7 @@ actor EndToEndTests {
         #expect(sawReest, "Bob should have received sessionReestablishment")
         #expect(count >= 6, "Bob should have received at least 6 messages (3 pre + reestablishment + 3 post). Actual: \(count)")
     }
-
+    
     /// Alice rotates twice; Bob receives reestablishments and post-second-rotation message decrypts.
     @Test("Double rotation then send - post-second-rotation decrypts")
     func testDoubleRotationThenSend() async throws {
@@ -5576,7 +5586,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -5585,12 +5595,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -5598,7 +5608,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         var bobReceived = 0
         bobTask = Task {
             await #expect(throws: Never.self, "Bob should receive messages") {
@@ -5616,27 +5626,27 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
-
+        
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .milliseconds(300))
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .milliseconds(300))
-
+        
         try await _senderSession.send(recipient: .nickname("bob"), text: "after second rotation")
         try await Task.sleep(until: .now + .seconds(2))
-
+        
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await bobTask?.value
         _ = await aliceTask?.value
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         #expect(bobReceived >= 2, "Bob should have received warmup and post-second-rotation message. Actual: \(bobReceived)")
     }
-
+    
     /// Rapid message succession, then rotation, then rapid succession. In-order delivery must succeed.
     @Test("Rapid succession then rotation then rapid succession")
     func testRapidSuccessionThenRotationThenRapidSuccession() async throws {
@@ -5649,7 +5659,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -5658,12 +5668,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -5671,10 +5681,10 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         actor BobCount { var n = 0; func inc() { n += 1 }; func get() -> Int { n } }
         let bobCount = BobCount()
-
+        
         bobTask = Task {
             await #expect(throws: Never.self, "Bob should receive rapid messages") {
                 for await received in bobStream {
@@ -5691,7 +5701,7 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         for i in 1...5 {
             try await _senderSession.send(recipient: .nickname("bob"), text: "rapid \(i)")
             try await Task.sleep(until: .now + .milliseconds(20))
@@ -5703,18 +5713,18 @@ actor EndToEndTests {
             try await _senderSession.send(recipient: .nickname("bob"), text: "rapid \(i)")
             try await Task.sleep(until: .now + .milliseconds(20))
         }
-
+        
         try await Task.sleep(until: .now + .seconds(2))
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await bobTask?.value
         _ = await aliceTask?.value
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         let n = await bobCount.get()
         #expect(n >= 10, "Bob should have received at least 10 messages. Actual: \(n)")
     }
-
+    
     /// Recipient (Bob) rotates; Alice sends; Bob must decrypt using refreshed identity path.
     @Test("Recipient rotates then sender sends - decrypt succeeds")
     func testRecipientRotatesThenSenderSends() async throws {
@@ -5727,7 +5737,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -5736,12 +5746,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -5749,7 +5759,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         var bobReceived = 0
         bobTask = Task {
             await #expect(throws: Never.self, "Bob should receive messages") {
@@ -5767,26 +5777,26 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(400))
-
+        
         try await _recipientSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .seconds(1))
-
+        
         try await _senderSession.send(recipient: .nickname("bob"), text: "after bob rotation 1")
         try await _senderSession.send(recipient: .nickname("bob"), text: "after bob rotation 2")
         try await Task.sleep(until: .now + .seconds(2))
-
+        
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await bobTask?.value
         _ = await aliceTask?.value
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         #expect(bobReceived >= 3, "Bob should have received warmup and 2 post-rotation messages. Actual: \(bobReceived)")
     }
-
+    
     /// Explicit ordering: pre-rotation messages, then sessionReestablishment, then post-rotation.
     /// Verifies sessionReestablishment is observed and message counts are consistent.
     @Test("Session reestablishment in correct order - pre then reestablishment then post")
@@ -5800,7 +5810,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -5809,12 +5819,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -5822,7 +5832,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         actor BobState {
             var received = 0
             var reestablishmentIndex: Int?
@@ -5834,7 +5844,7 @@ actor EndToEndTests {
         }
         let bobState = BobState()
         var deliveryOrder = 0
-
+        
         bobTask = Task {
             await #expect(throws: Never.self, "Bob should receive in order") {
                 for await received in bobStream {
@@ -5856,7 +5866,7 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         try await _senderSession.send(recipient: .nickname("bob"), text: "pre-1")
         try await _senderSession.send(recipient: .nickname("bob"), text: "pre-2")
         try await Task.sleep(until: .now + .milliseconds(200))
@@ -5865,19 +5875,19 @@ actor EndToEndTests {
         try await _senderSession.send(recipient: .nickname("bob"), text: "post-1")
         try await _senderSession.send(recipient: .nickname("bob"), text: "post-2")
         try await Task.sleep(until: .now + .seconds(2))
-
+        
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await bobTask?.value
         _ = await aliceTask?.value
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         let reestIdx = await bobState.reestablishmentIndex
         let count = await bobState.getReceived()
         #expect(reestIdx != nil, "Bob should have received sessionReestablishment")
         #expect(count >= 4, "Bob should have received at least 4 messages (2 pre + reestablishment + 2 post). Actual: \(count)")
     }
-
+    
     /// Multiple back-and-forth messages then rotation; both sides send after rotation.
     @Test("Bidirectional exchange then rotation then bidirectional")
     func testBidirectionalExchangeThenRotationThenBidirectional() async throws {
@@ -5890,7 +5900,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -5899,12 +5909,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -5912,7 +5922,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         actor Counts {
             var alice = 0, bob = 0
             func incAlice() { alice += 1 }
@@ -5921,7 +5931,7 @@ actor EndToEndTests {
             func getBob() -> Int { bob }
         }
         let counts = Counts()
-
+        
         bobTask = Task {
             await #expect(throws: Never.self, "Bob should receive") {
                 for await received in bobStream {
@@ -5940,7 +5950,7 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         try await _senderSession.send(recipient: .nickname("bob"), text: "alice 1")
         try await Task.sleep(until: .now + .milliseconds(150))
         try await _recipientSession.send(recipient: .nickname("alice"), text: "bob 1")
@@ -5950,19 +5960,19 @@ actor EndToEndTests {
         try await _senderSession.send(recipient: .nickname("bob"), text: "alice 2")
         try await _recipientSession.send(recipient: .nickname("alice"), text: "bob 2")
         try await Task.sleep(until: .now + .seconds(2))
-
+        
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await bobTask?.value
         _ = await aliceTask?.value
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         let a = await counts.getAlice()
         let b = await counts.getBob()
         #expect(a >= 2, "Alice should have received at least 2 messages. Actual: \(a)")
         #expect(b >= 2, "Bob should have received at least 2 messages. Actual: \(b)")
     }
-
+    
     /// Receiver gets out of sync (e.g. maxSkipped or invalidSignature after rotation); subsequent
     /// message sends re-synchronize and delivery succeeds.
     @Test("Out-of-sync receiver then subsequent sends re-synchronize during flow")
@@ -5976,7 +5986,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -5985,12 +5995,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -5998,7 +6008,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         actor Counts {
             var bobReceived = 0
             var bobRecoverableErrors = 0
@@ -6008,7 +6018,7 @@ actor EndToEndTests {
             func getErrors() -> Int { bobRecoverableErrors }
         }
         let counts = Counts()
-
+        
         bobTask = Task {
             await #expect(throws: Never.self, "Bob should receive messages") {
                 for await received in bobStream {
@@ -6031,34 +6041,34 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         // Establish session
         try await _senderSession.send(recipient: .nickname("bob"), text: "pre-rotation")
         try await Task.sleep(until: .now + .milliseconds(300))
-
+        
         // Alice rotates; Bob will get out of sync when he receives post-rotation message before/without reestablishment
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .milliseconds(200))
-
+        
         // Message that may cause Bob to hit maxSkipped or need recovery
         try await _senderSession.send(recipient: .nickname("bob"), text: "post-rotation 1")
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         // Subsequent sends must re-synchronize: Bob has processed reestablishment (or recovery), so these should be delivered
         try await _senderSession.send(recipient: .nickname("bob"), text: "resync 1")
         try await _senderSession.send(recipient: .nickname("bob"), text: "resync 2")
         try await Task.sleep(until: .now + .seconds(2))
-
+        
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await bobTask?.value
         _ = await aliceTask?.value
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         let bobCount = await counts.getBob()
         #expect(bobCount >= 2, "Bob should have received at least 2 messages after re-sync (resync 1 and 2). Actual: \(bobCount)")
     }
-
+    
     /// Both sides rotate; reestablishments are delivered; subsequent sends in both directions re-synchronize.
     @Test("Bidirectional re-sync after both sides rotated")
     func testBidirectionalResyncAfterBothRotated() async throws {
@@ -6071,7 +6081,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -6080,12 +6090,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -6093,7 +6103,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         actor Counts {
             var aliceReceived = 0
             var bobReceived = 0
@@ -6103,7 +6113,7 @@ actor EndToEndTests {
             func getBob() -> Int { bobReceived }
         }
         let counts = Counts()
-
+        
         bobTask = Task {
             await #expect(throws: Never.self, "Bob should receive messages") {
                 for await received in bobStream {
@@ -6122,12 +6132,12 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         // Warm-up
         try await _senderSession.send(recipient: .nickname("bob"), text: "warmup alice")
         try await _recipientSession.send(recipient: .nickname("alice"), text: "warmup bob")
         try await Task.sleep(until: .now + .milliseconds(400))
-
+        
         // Both rotate (out of sync with each other until reestablishments are processed)
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .seconds(1))
@@ -6135,20 +6145,20 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .seconds(1))
         // Allow both receive loops to process reestablishments before subsequent sends
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         // Subsequent sends in both directions must re-synchronize
         try await _senderSession.send(recipient: .nickname("bob"), text: "alice after both rotation")
         try await _recipientSession.send(recipient: .nickname("alice"), text: "bob after both rotation")
         try await _senderSession.send(recipient: .nickname("bob"), text: "alice resync 2")
         try await _recipientSession.send(recipient: .nickname("alice"), text: "bob resync 2")
         try await Task.sleep(until: .now + .seconds(2))
-
+        
         aliceTransport.continuation?.finish()
         bobTransport.continuation?.finish()
         _ = await bobTask?.value
         _ = await aliceTask?.value
         try await Task.sleep(until: .now + .milliseconds(500))
-
+        
         let aliceCount = await counts.getAlice()
         let bobCount = await counts.getBob()
         #expect(aliceCount >= 1, "Alice should have received at least 1 subsequent message from Bob after mutual re-sync. Actual: \(aliceCount)")
@@ -6201,11 +6211,11 @@ actor EndToEndTests {
                 for await received in aliceStream {
                     do {
                         try await self._senderMaxSkipSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId
-                    )
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId
+                        )
                         aliceProcessed += 1
                         if aliceProcessed >= total {
                             aliceTransport.continuation?.finish()
@@ -6227,11 +6237,11 @@ actor EndToEndTests {
                 for await received in bobStream {
                     do {
                         try await self._recipientMaxSkipSession.receiveMessage(
-                        message: received.message,
-                        sender: received.sender,
-                        deviceId: received.deviceId,
-                        messageId: received.messageId
-                    )
+                            message: received.message,
+                            sender: received.sender,
+                            deviceId: received.deviceId,
+                            messageId: received.messageId
+                        )
                         bobProcessed += 1
                         if bobProcessed >= total {
                             bobTransport.continuation?.finish()
@@ -6248,21 +6258,31 @@ actor EndToEndTests {
             }
         }
         
-		
-			Task {
-            for i in 1...total {
+        
+        Task {
+            do {
+                for i in 1...total {
                     try await self._senderMaxSkipSession.send(
                         recipient: .nickname("bob"),
                         text: "A->B #\(i)")
                 }
-			}
-			Task {
+            } catch {
+                #expect(Bool(false), "Unexpected error: \(error)")
+                return
+            }
+        }
+        Task {
+            do {
                 for i in 1...total {
-				try await self._recipientMaxSkipSession.send(
+                    try await self._recipientMaxSkipSession.send(
                         recipient: .nickname("alice"),
                         text: "B->A #\(i)")
                 }
+            } catch {
+                #expect(Bool(false), "Unexpected error: \(error)")
+                return
             }
+        }
         try await Task.sleep(until: .now + .seconds(5))
     }
     
@@ -6324,14 +6344,14 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .seconds(3))
         bobTransport.continuation?.finish()
     }
-
+    
     @Test("MaxSkipped backlog repairs without key rotation")
     func testMaxSkippedBacklogRepairsWithoutKeyRotation() async throws {
         // Reproduces the production issue:
         // Bob misses > maxSkippedMessageKeys messages, then receives later messages.
         // Each late message fails with `.maxSkippedHeadersExceeded`, which used to trigger
         // repeated key rotations. We assert the repair path does not rotate local identity keys.
-
+        
         var bobTask: Task<Void, Never>?
         defer {
             Task {
@@ -6339,21 +6359,21 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
-
+        
         // Messages from Alice -> Bob are yielded by Alice's transport.
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(aliceSession: _senderMaxSkipSession, sd: sd, bobSession: _recipientMaxSkipSession, rsd: rsd)
-
+        
         bobTask = Task {
             for await received in bobStream {
                 do {
@@ -6368,11 +6388,11 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         // Warmup handshake (do not drop)
         try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup 1")
         try await Task.sleep(until: .now + .milliseconds(200))
-
+        
         // Drop first 11 messages to Bob; then deliver subsequent messages.
         // With maxSkippedMessageKeys=10, first delivered "late" message will exceed the skip window.
         actor Dropper {
@@ -6391,16 +6411,16 @@ actor EndToEndTests {
             guard received.recipient == "bob" else { return true }
             return !(await dropper.shouldDrop())
         }
-
+        
         for i in 1...15 {
             try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "msg \(i)")
         }
-
+        
         // Give Bob time to process the delivered late messages and trigger repair.
         try await Task.sleep(until: .now + .seconds(2))
         aliceTransport.continuation?.finish()
         _ = await bobTask?.value
-
+        
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
         #expect(rotationCount == 0, "Expected maxSkipped backlog to use repair/resend without key rotation, got \(rotationCount)")
     }
@@ -6412,7 +6432,7 @@ actor EndToEndTests {
         // - SDK requests a bounded resend (NACK); the *sender* heals the lane and
         //   replays the failed content — no receive-side peerRefresh for these classes
         // - SDK does not rotate local account/device identity material
-
+        
         var bobTask: Task<Void, Never>?
         var aliceRepairTask: Task<Void, Never>?
         defer {
@@ -6422,17 +6442,17 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
-
+        
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
         let aliceRepairStream = AsyncStream<ReceivedMessage> { continuation in
             bobTransport.continuation = continuation
         }
-
+        
         actor Counters {
             var peerRefreshes = 0
             var resendRequests = 0
@@ -6449,13 +6469,13 @@ actor EndToEndTests {
             func getResendRequests() -> Int { resendRequests }
         }
         let counters = Counters()
-
+        
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
         let bobStore = createRecipientStore()
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: bobStore, transport: bobTransport, sessionDelegate: rsd)
-
+        
         aliceRepairTask = Task {
             for await received in aliceRepairStream {
                 await counters.saw(received)
@@ -6471,15 +6491,15 @@ actor EndToEndTests {
                     received: received)
             }
         }
-
+        
         try await createFriendship(
             aliceSession: _senderMaxSkipSession,
             sd: sd,
             bobSession: _recipientMaxSkipSession,
             rsd: rsd)
-
+        
         let aliceDeviceId = try #require(await _senderMaxSkipSession.sessionContext?.sessionUser.deviceId)
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -6491,7 +6511,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         #expect(await waitUntil {
             let outboundReady = (try? await self._senderMaxSkipSession.hasInitializedOutboundRatchetForPeer("bob")) == true
             let inboundReady = await self._recipientMaxSkipSession.hasActiveInboundSessionIdentity(
@@ -6499,11 +6519,11 @@ actor EndToEndTests {
                 deviceId: aliceDeviceId)
             return outboundReady && inboundReady
         })
-
+        
         try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(200))
         let baselineMessageCount = await bobStore.getAllMessages().count
-
+        
         actor Dropper {
             var remaining: Int
             init(_ n: Int) { remaining = n }
@@ -6521,11 +6541,11 @@ actor EndToEndTests {
             guard received.isContentMessage else { return true }
             return !(await dropper.shouldDrop())
         }
-
+        
         for i in 1...15 {
             try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "msg \(i)")
         }
-
+        
         // Orphan-resend contract: the receiver NACKs the failed shared id or briefly
         // holds an episode/pending-resend while the sender heals. Any of these states
         // proves the repair path engaged.
@@ -6542,32 +6562,32 @@ actor EndToEndTests {
             }
             return await counters.getResendRequests() >= 1
         }, "Expected maxSkipped to request resend / defer repair")
-
+        
         #expect(await waitUntil {
             await bobStore.getAllMessages().count > baselineMessageCount
         }, "maxSkipped recovery must deliver failed content via sender orphan-resend (must not retry-only)")
-
+        
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
         #expect(rotationCount == 0, "Expected maxSkipped repair to avoid key rotation, got \(rotationCount)")
     }
-
+    
     @Test("maxSkipped repair coalesces peerRefresh inside an open episode")
     func testMaxSkippedRepairForcesPeerRefreshReemitInsideCooldown() async throws {
         actor Counters {
             private var peerRefreshes = 0
-
+            
             func saw(_ event: TransportEvent?) {
                 if case .sessionReestablishment(let envelope) = event,
                    envelope.kind == .peerRefresh {
                     peerRefreshes += 1
                 }
             }
-
+            
             func getPeerRefreshes() -> Int {
                 peerRefreshes
             }
         }
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -6579,7 +6599,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         var bobTask: Task<Void, Never>?
         var aliceRepairTask: Task<Void, Never>?
         defer {
@@ -6589,7 +6609,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
@@ -6598,7 +6618,7 @@ actor EndToEndTests {
         let aliceRepairStream = AsyncStream<ReceivedMessage> { continuation in
             bobTransport.continuation = continuation
         }
-
+        
         let counters = Counters()
         aliceRepairTask = Task {
             for await received in aliceRepairStream {
@@ -6608,12 +6628,12 @@ actor EndToEndTests {
                     received: received)
             }
         }
-
+        
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
-
+        
         bobTask = Task {
             for await received in bobStream {
                 _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -6621,13 +6641,13 @@ actor EndToEndTests {
                     received: received)
             }
         }
-
+        
         try await createFriendship(
             aliceSession: _senderMaxSkipSession,
             sd: sd,
             bobSession: _recipientMaxSkipSession,
             rsd: rsd)
-
+        
         let aliceDeviceId = try #require(await _senderMaxSkipSession.sessionContext?.sessionUser.deviceId)
         #expect(await waitUntil {
             let outboundReady = (try? await self._senderMaxSkipSession.hasInitializedOutboundRatchetForPeer("bob")) == true
@@ -6636,24 +6656,24 @@ actor EndToEndTests {
                 deviceId: aliceDeviceId)
             return outboundReady && inboundReady
         })
-
+        
         try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(200))
-
+        
         _ = try await _recipientMaxSkipSession.emitSessionReestablishment(
             kind: .peerRefresh,
             recipient: .nickname("alice"),
             scope: .peer(secretName: "alice"))
-
+        
         #expect(
             await waitUntil { await counters.getPeerRefreshes() == 1 },
             "The seeded peerRefresh should be observed once")
-
+        
         // Open an episode so subsequent maxSkipped failures coalesce instead of re-emitting.
         #expect(await _recipientMaxSkipSession.tryBeginReestablishmentEpisode(
             sender: "alice",
             deviceId: aliceDeviceId))
-
+        
         actor Dropper {
             var remaining: Int
             init(_ n: Int) { remaining = n }
@@ -6665,24 +6685,24 @@ actor EndToEndTests {
                 return false
             }
         }
-
+        
         let dropper = Dropper(11)
         aliceTransport.shouldDeliver = { received in
             guard received.recipient == "bob" else { return true }
             guard received.isContentMessage else { return true }
             return !(await dropper.shouldDrop())
         }
-
+        
         for i in 1...15 {
             try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "msg \(i)")
         }
-
+        
         #expect(await waitUntil {
             await self._recipientMaxSkipSession.hasPendingResendAfterReestablishment(
                 sender: "alice",
                 deviceId: aliceDeviceId)
         }, "maxSkipped during an open episode should still defer failed shared ids")
-
+        
         let peerRefreshCount = await counters.getPeerRefreshes()
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
         #expect(
@@ -6690,7 +6710,7 @@ actor EndToEndTests {
             "Single-flight episode must coalesce additional maxSkipped into the open repair (got \(peerRefreshCount))")
         #expect(rotationCount == 0, "Expected maxSkipped repair to avoid key rotation, got \(rotationCount)")
     }
-
+    
     @Test("maxSkipped does not invoke rotation publish")
     func testMaxSkippedDoesNotInvokeRotationPublish() async throws {
         // Contract test:
@@ -6777,7 +6797,7 @@ actor EndToEndTests {
         #expect(!sawFailure, "Did not expect maxSkipped repair to surface rotation publish failure.")
         #expect(rotations == 0, "Expected maxSkipped repair not to publish rotated keys, got \(rotations).")
     }
-
+    
     @Test("maxSkipped repeat backlog stays on repair path")
     func testMaxSkippedRepeatBacklogStaysOnRepairPath() async throws {
         // Contract test (stable + production-realistic):
@@ -6803,7 +6823,7 @@ actor EndToEndTests {
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(aliceSession: _senderMaxSkipSession, sd: sd, bobSession: _recipientMaxSkipSession, rsd: rsd)
-
+        
         // Warmup handshake (do not drop)
         try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(200))
@@ -6869,7 +6889,7 @@ actor EndToEndTests {
         let rotationsAfterProcessing = await bobTransport.publishRotatedKeysCallCount
         #expect(rotationsAfterProcessing == 0, "Expected repeated maxSkipped backlog to stay off key rotation, got \(rotationsAfterProcessing)")
     }
-
+    
     @Test("delayed pre-rotation message is handled internally without rotation")
     func testDelayedPreRotationMessageHandledInternallyDoesNotRotate() async throws {
         // Contract test for production behavior:
@@ -6881,7 +6901,7 @@ actor EndToEndTests {
         // - We only hold back ONE pre-rotation message (and only non-control messages).
         // - We deliver the post-rotation message so Bob refreshes Alice's identity to the new signing key.
         // - Then we inject the held pre-rotation message and assert `invalidSignature`.
-
+        
         var bobTask: Task<Void, Never>?
         defer {
             Task {
@@ -6889,24 +6909,24 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-
+        
         // Messages from Alice -> Bob are yielded by Alice's transport.
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(aliceSession: _senderSession, sd: sd, bobSession: _recipientSession, rsd: rsd)
-
+        
         actor Holdback {
             var remaining: Int
             private(set) var held: [ReceivedMessage] = []
@@ -6927,7 +6947,7 @@ actor EndToEndTests {
             }
         }
         let holdback = Holdback(hold: 1)
-
+        
         actor Flags {
             var ok = 0
             var sawReestablishment = false
@@ -6936,7 +6956,7 @@ actor EndToEndTests {
             func snapshot() -> (ok: Int, sawReestablishment: Bool) { (ok, sawReestablishment) }
         }
         let flags = Flags()
-
+        
         // Bob processes only the messages that were actually delivered into the stream.
         bobTask = Task {
             for await received in bobStream {
@@ -6963,38 +6983,38 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         // Warmup handshake (must be delivered)
         try await _senderSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(250))
-
+        
         // Hold back ONE pre-rotation message so it arrives *after* Bob refreshes identity.
         aliceTransport.shouldDeliver = { received in
             if await holdback.shouldHold(received) { return false }
             return true
         }
-
+        
         try await _senderSession.send(recipient: .nickname("bob"), text: "pre-rotation heldback")
-
+        
         // Rotate (sends sessionReestablishment control frame signed with new key)
         try await _senderSession.rotateKeysOnPotentialCompromise()
         try await _senderSession.send(recipient: .nickname("bob"), text: "post-rotation")
-
+        
         // Allow time for Bob to process reestablishment and post-rotation message(s).
         try await Task.sleep(until: .now + .seconds(2))
         aliceTransport.continuation?.finish()
         _ = await bobTask?.value
-
+        
         let snap = await flags.snapshot()
         #expect(snap.sawReestablishment, "Expected to observe sessionReestablishment transport event in the delivered stream.")
         #expect(snap.ok >= 1, "Bob should have successfully processed at least one delivered message after rotation. ok=\(snap.ok)")
-
+        
         // Now deliver the delayed pre-rotation message after Bob has refreshed identity to Alice's new signing key.
         // The SDK should either decrypt from archive or contain the failure through repair/resend without
         // surfacing a rotation-worthy error to the caller.
         let delayed = await holdback.drain()
         #expect(delayed.count == 1, "Expected exactly 1 held pre-rotation message, got \(delayed.count)")
-
+        
         let held = delayed[0]
         let rotationsBeforeHeld = await bobTransport.publishRotatedKeysCallCount
         try await _recipientSession.receiveMessage(
@@ -7005,12 +7025,12 @@ actor EndToEndTests {
         )
         try await Task.sleep(for: .milliseconds(500))
         let rotationsAfterHeld = await bobTransport.publishRotatedKeysCallCount
-
+        
         #expect(
             rotationsAfterHeld == rotationsBeforeHeld,
             "Delayed pre-rotation repair must not rotate recipient keys. before=\(rotationsBeforeHeld) after=\(rotationsAfterHeld)")
     }
-
+    
     @Test("Forged remote signature is discarded and requests resend without rotation")
     func testForgedRemoteSignatureRequestsResendWithoutRotation() async throws {
         // Deterministic contract test:
@@ -7092,7 +7112,7 @@ actor EndToEndTests {
             deviceId: received.deviceId,
             messageId: received.messageId
         )
-
+        
         for _ in 0..<30 {
             if await resendProbe.count() > 0 {
                 break
@@ -7103,7 +7123,7 @@ actor EndToEndTests {
         let rotations = await bobTransport.publishRotatedKeysCallCount
         #expect(rotations == 0, "Remote invalidSignature must not rotate local account keys. Got \(rotations).")
         #expect(await resendProbe.count() == 1, "Forged invalidSignature should request one bounded resend")
-
+        
         let failedInbound = InboundTaskMessage(
             message: received.message,
             senderSecretName: received.sender,
@@ -7144,16 +7164,16 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
-
+        
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(aliceSession: _senderMaxSkipSession, sd: sd, bobSession: _recipientMaxSkipSession, rsd: rsd)
-
+        
         // Simulate server-side offline message queue
         // In production: server queues messages when recipient is offline, delivers all at once when online
         actor OfflineQueue {
@@ -7176,7 +7196,7 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         // Bob's receive loop - matches production pattern where server delivers all offline messages
         // when client comes back online. This simulates the exact scenario from the logs.
         bobTask = Task {
@@ -7209,11 +7229,11 @@ actor EndToEndTests {
                 )
             }
         }
-
+        
         // Warmup: establish session (successful encrypt/decrypt before the storm)
         try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
-
+        
         // Phase 1: Alice sends many messages while Bob is offline (server queues them)
         // Matching the log scenario where many messages were sent while device was offline
         // Send enough messages to potentially exceed maxSkippedMessageKeys if Bob skips some
@@ -7221,24 +7241,24 @@ actor EndToEndTests {
         for i in 1...offlineMessageCount {
             try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "offline msg \(i)")
         }
-
+        
         // Phase 2: Alice rotates keys (this changes her signing key)
         // This sends a sessionReestablishment control frame. If Bob processes this before
         // the backlog, his identity refreshes and old messages become decryptable.
         // To trigger invalidSignature, Bob needs to process old messages before receiving
         // the sessionReestablishment frame. However, in this test we queue all messages
         // and process them together, so Bob's identity may refresh before processing old messages.
-        // 
+        //
         // The production scenario from logs shows both invalidSignature and maxSkipped errors,
         // suggesting a mix of scenarios. This test verifies the setup and recovery behavior.
         try await _senderMaxSkipSession.rotateKeysOnPotentialCompromise()
         try await Task.sleep(until: .now + .milliseconds(100))
-
+        
         // Phase 3: Alice sends a few more messages with new keys
         for i in (offlineMessageCount + 1)...(offlineMessageCount + 3) {
             try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "post-rotation msg \(i)")
         }
-
+        
         // Finish the stream (all messages have been sent and queued by "server")
         aliceTransport.continuation?.finish()
         
@@ -7265,7 +7285,7 @@ actor EndToEndTests {
             lastRotationCount = currentRotationCount
             try await Task.sleep(until: .now + .milliseconds(200))
         }
-
+        
         // Verify the scenario was set up correctly
         // Older production logs for this scenario showed:
         // - Many "❌ JOB ERROR INVALIDSIGNATURE" messages
@@ -7287,7 +7307,7 @@ actor EndToEndTests {
         // Verify the scenario was set up and messages were processed
         // The test verifies the setup is correct. Rotation is not required for this
         // recovery path; resend/reestablishment handles the broken backlog.
-        // 
+        //
         // This test documents the offline backlog scenario from production logs and
         // demonstrates the error handling pattern consumers should use.
         let messageCount = await offlineQueue.count()
@@ -7310,16 +7330,16 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderMaxSkipSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientMaxSkipSession, store: store)
-
+        
         let sd = SessionDelegate(session: _senderMaxSkipSession)
         let rsd = SessionDelegate(session: _recipientMaxSkipSession)
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(aliceSession: _senderMaxSkipSession, sd: sd, bobSession: _recipientMaxSkipSession, rsd: rsd)
-
+        
         // Simulate server-side offline message queue
         actor OfflineQueue {
             var queuedMessages: [ReceivedMessage] = []
@@ -7341,7 +7361,7 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         // Bob's receive loop - simulates server delivering all offline messages at once
         bobTask = Task {
             // Phase 1: Collect messages while "offline" (server queues them)
@@ -7372,11 +7392,11 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         // Warmup: establish session (successful encrypt/decrypt before the storm)
         try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
         try await Task.sleep(until: .now + .milliseconds(300))
-
+        
         // Phase 1: Alice sends many messages while Bob is offline (server queues them)
         // Send MORE than maxSkippedMessageKeys (10) messages so when Bob processes them,
         // the skipped message count exceeds the limit, causing maxSkippedHeadersExceeded
@@ -7388,7 +7408,7 @@ actor EndToEndTests {
             // Small delay to ensure messages are sent in sequence
             try await Task.sleep(until: .now + .milliseconds(10))
         }
-
+        
         // Finish the stream (all messages have been sent and queued by "server")
         aliceTransport.continuation?.finish()
         
@@ -7422,7 +7442,7 @@ actor EndToEndTests {
             lastRotationCount = currentRotationCount
             try await Task.sleep(until: .now + .milliseconds(200))
         }
-
+        
         // THE KEY ASSERTION: no key rotation should occur.
         // This verifies that maxSkipped recovery stays on fresh-session repair.
         let rotationCount = await bobTransport.publishRotatedKeysCallCount
@@ -7431,7 +7451,7 @@ actor EndToEndTests {
         
         // Verify messages were processed (queued and handled by job processor)
         let messageCount = await offlineQueue.count()
-        #expect(messageCount == 0, 
+        #expect(messageCount == 0,
                 "All messages should have been processed. \(messageCount) messages still in queue.")
     }
     
@@ -7529,13 +7549,13 @@ actor EndToEndTests {
             "trustLevel": "high",
             "createdAt": "\(Date())"
         ]
-                
+        
         _ = try await aliceSession.createContact(
             secretName: "bob",
             metadata: try BinaryEncoder().encode(contactMetadata),
             friendshipMetadata: aliceFriendship,
             requestFriendship: true)
-
+        
         try await Task.sleep(nanoseconds: 50_000)
     }
     
@@ -7708,7 +7728,7 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         func cleanup() async {
             aliceTransport.continuation?.finish()
             bobTransport.continuation?.finish()
@@ -7722,7 +7742,7 @@ actor EndToEndTests {
             }
             await shutdownSessions()
         }
-
+        
         do {
             // Reset call counters
             await aliceTransport.resetCallTracking()
@@ -7833,39 +7853,39 @@ actor EndToEndTests {
                 let bobCalls = await bobTransport.updateOneTimeKeysCalls
                 print("Bob updateOneTimeKeys calls: \(bobCalls)")
             }
-
+            
             await cleanup()
         } catch {
             await cleanup()
             throw error
         }
     }
-
+    
     @Test("Missing MLKEM OTK recovery archives state without crashing")
     func testMissingMLKEMOTKRecoveryArchivesStateWithoutCrashing() async throws {
         func cleanup() async {
             await shutdownSessions()
         }
-
+        
         do {
             let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
             let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-
+            
             actor Capture {
                 var msg: ReceivedMessage?
                 func set(_ message: ReceivedMessage) { msg = message }
                 func get() -> ReceivedMessage? { msg }
             }
-
+            
             let brokenCapture = Capture()
             let senderStore = createSenderStore()
             let recipientStore = createRecipientStore()
             let sd = SessionDelegate(session: _senderSession)
             let rsd = SessionDelegate(session: _recipientSession)
-
+            
             try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
             try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-
+            
             _ = try await _senderSession.refreshIdentities(
                 secretName: rMockUserData.ssn,
                 forceRefresh: true,
@@ -7876,11 +7896,11 @@ actor EndToEndTests {
                 forceRefresh: true,
                 sendOneTimeIdentities: true
             )
-
+            
             let senderContext = try #require(
                 await _recipientSession.sessionContext,
                 "Recipient session context should be initialized")
-
+            
             bobTransport.shouldDeliver = { _ in false }
             bobTransport.transformOutgoing = { received in
                 guard let signed = received.message.signed else { return received }
@@ -7889,10 +7909,10 @@ actor EndToEndTests {
                     .children
                     .first(where: { $0.label == "ciphertext" })?
                     .value as? Data
-                else {
+                        else {
                     throw TestError.invalidRatchetHeader
                 }
-
+                
                 let forgedHeader = EncryptedHeader(
                     remoteLongTermPublicKey: ratchetMessage.header.remoteLongTermPublicKey,
                     remoteOneTimePublicKey: ratchetMessage.header.remoteOneTimePublicKey,
@@ -7922,19 +7942,19 @@ actor EndToEndTests {
                 await brokenCapture.set(forgedReceived)
                 return forgedReceived
             }
-
+            
             let receiverMessageCountBefore = await senderStore.createdMessages.count
             let receiverIdentityCountBefore = await senderStore.identities.count
-
+            
             try await _recipientSession.send(
                 recipient: .nickname(sMockUserData.ssn),
                 text: "broken"
             )
-
+            
             let brokenMessage = try #require(
                 await brokenCapture.get(),
                 "Broken outbound message should be captured")
-
+            
             await #expect(throws: Never.self) {
                 try await self._senderSession.receiveMessage(
                     message: brokenMessage.message,
@@ -7943,7 +7963,7 @@ actor EndToEndTests {
                     messageId: brokenMessage.messageId
                 )
             }
-
+            
             let pendingResends = await _senderSession.takePendingResendsAfterReestablishment(
                 sender: brokenMessage.sender,
                 deviceId: brokenMessage.deviceId)
@@ -7957,7 +7977,7 @@ actor EndToEndTests {
                     failedMessageId: pending.failedSharedMessageId,
                     failureClass: pending.failureClass)
             }
-
+            
             #expect(
                 await senderStore.createdMessages.count == receiverMessageCountBefore,
                 "Failed missing-OTK payload should not be persisted"
@@ -7972,7 +7992,7 @@ actor EndToEndTests {
             throw error
         }
     }
-
+    
     @Test("CryptoKitError reconciliation recovery enables subsequent message decryption")
     func testCryptoKitErrorReconciliationRecovery() async throws {
         var aliceTask: Task<Void, Never>?
@@ -7984,13 +8004,13 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         actor CryptoFailureProbe {
             var corruptionArmed = false
             var recoveryStarted = false
             var cleanDecryptSucceeded = false
             var corruptedMessage: ReceivedMessage?
-
+            
             func arm() { corruptionArmed = true }
             func disarm() { corruptionArmed = false }
             /// Returns true once and auto-disarms so only one message is corrupted.
@@ -8005,9 +8025,9 @@ actor EndToEndTests {
             func captureCorruptedMessage(_ message: ReceivedMessage) { corruptedMessage = message }
             func getCorruptedMessage() -> ReceivedMessage? { corruptedMessage }
         }
-
+        
         let probe = CryptoFailureProbe()
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -8016,15 +8036,15 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-
+        
         // Receive loops before friendship so OTK/friendship frames establish ratchets.
         aliceTask = Task {
             for await received in aliceStream {
@@ -8045,7 +8065,7 @@ actor EndToEndTests {
                 )
             }
         }
-
+        
         bobTask = Task {
             for await received in bobStream {
                 guard received.isContentMessage else {
@@ -8072,20 +8092,20 @@ actor EndToEndTests {
                 }
             }
         }
-
+        
         try await createFriendship(
             aliceSession: _senderSession,
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         guard let aliceContext = await _senderSession.sessionContext else {
             Issue.record("Alice session context should be initialized")
             return
         }
         let aliceDeviceId = aliceContext.sessionUser.deviceId
         let aliceSigningKey = aliceContext.sessionUser.deviceKeys.signingPrivateKey
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -8097,7 +8117,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         #expect(await waitUntil {
             let outboundReady = (try? await self._senderSession.hasInitializedOutboundRatchetForPeer("bob")) == true
             let inboundReady = await self._recipientSession.hasActiveInboundSessionIdentity(
@@ -8105,25 +8125,25 @@ actor EndToEndTests {
                 deviceId: aliceDeviceId)
             return outboundReady && inboundReady
         }, "Friendship ratchet must be ready before CryptoKit corruption")
-
+        
         // Corrupt encryptedData (flip bits) and re-sign with Alice's key so signature
         // verification passes but ratchet body decryption produces a CryptoKitError.
         aliceTransport.transformOutgoing = { received in
             guard await probe.consumeArmed() else { return received }
             guard received.isContentMessage else { return received }
             guard let signed = received.message.signed else { return received }
-
+            
             let ratchetMessage = try BinaryDecoder().decode(RatchetMessage.self, from: signed.data)
             guard let encryptedData = Mirror(reflecting: ratchetMessage)
                 .children
                 .first(where: { $0.label == "ciphertext" })?
                 .value as? Data,
-                !encryptedData.isEmpty
-            else { return received }
-
+                  !encryptedData.isEmpty
+                    else { return received }
+            
             var corrupted = encryptedData
             corrupted[corrupted.startIndex] ^= 0xFF
-
+            
             let corruptedMessage = RatchetMessage(
                 header: ratchetMessage.header,
                 ciphertext: corrupted
@@ -8143,21 +8163,21 @@ actor EndToEndTests {
             await probe.captureCorruptedMessage(corruptedReceived)
             return corruptedReceived
         }
-
+        
         // Baseline: establish ratchet state with a clean message
         try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "baseline"
         )
         try await Task.sleep(for: .milliseconds(500))
-
+        
         // Arm corruption and send a message whose body will be unreadable
         await probe.arm()
         try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "this will be corrupted"
         )
-
+        
         // Undecryptable: first CryptoKit body failure requests resend; peerRefresh
         // only on repeat. Accept either a resend request on the wire or deferred /
         // episode state from an escalated repeat.
@@ -8173,24 +8193,24 @@ actor EndToEndTests {
                 deviceId: aliceDeviceId)
         }, "Bob should start CryptoKitError recovery (resend / deferred / episode)")
         await probe.markRecoveryStarted()
-
+        
         let corruptedMessage = try #require(
             await probe.getCorruptedMessage(),
             "The corrupted old-epoch message should have been captured")
         aliceTransport.continuation?.yield(corruptedMessage)
-
+        
         try await Task.sleep(for: .milliseconds(500))
-
+        
         try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "clean after recovery"
         )
-
+        
         #expect(await waitUntil(timeoutSeconds: 10) {
             await probe.cleanDecryptSucceeded
         }, "Bob should decrypt a clean message after CryptoKitError recovery")
     }
-
+    
     @Test("deferred resend drains after peerRefresh completion")
     func testDeferredResendDrainsAfterPeerRefreshCompletion() async throws {
         actor ResendProbe {
@@ -8198,7 +8218,7 @@ actor EndToEndTests {
             func mark(_ id: String) { requestedSharedIds.insert(id) }
             func contains(_ id: String) -> Bool { requestedSharedIds.contains(id) }
         }
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -8210,7 +8230,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         let probe = ResendProbe()
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
@@ -8221,7 +8241,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -8230,12 +8250,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -8243,7 +8263,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         aliceTask = Task {
             for await received in aliceStream {
                 if let request = received.oobResendRequest {
@@ -8255,7 +8275,7 @@ actor EndToEndTests {
                 )
             }
         }
-
+        
         bobTask = Task {
             for await received in bobStream {
                 _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -8264,21 +8284,21 @@ actor EndToEndTests {
                 )
             }
         }
-
+        
         try await Task.sleep(for: .milliseconds(500))
-
+        
         guard let aliceDeviceId = await _senderSession.sessionContext?.sessionUser.deviceId else {
             Issue.record("Alice device id should be available")
             return
         }
-
+        
         let responseDrainedSharedId = UUID().uuidString
         await _recipientSession.deferPeerResendUntilReestablished(
             sender: "alice",
             deviceId: aliceDeviceId,
             failedMessageId: responseDrainedSharedId,
             failureClass: "test.peerRefresh")
-
+        
         let originalPeerRefresh = SessionReestablishmentEnvelope(
             kind: .peerRefresh,
             intentId: UUID(),
@@ -8291,7 +8311,7 @@ actor EndToEndTests {
             kind: .peerRefresh,
             recipient: .nickname("bob"),
             respondingTo: originalPeerRefresh)
-
+        
         #expect(
             await waitUntil { await probe.contains(responseDrainedSharedId) },
             "peerRefresh response should submit the deferred resend request")
@@ -8314,49 +8334,49 @@ actor EndToEndTests {
                     messageId: responseDrainedSharedId)
             },
             "Unavailable ids should be quarantined so poison redelivery cannot reopen recovery")
-
+        
         let successfulInboundDrainedSharedId = UUID().uuidString
         await _recipientSession.deferPeerResendUntilReestablished(
             sender: "alice",
             deviceId: aliceDeviceId,
             failedMessageId: successfulInboundDrainedSharedId,
             failureClass: "test.successfulInbound")
-
+        
         try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "successful inbound after reestablishment")
-
+        
         #expect(
             await waitUntil { await probe.contains(successfulInboundDrainedSharedId) },
             "next successful inbound message should request resend of the earlier failed shared id")
     }
-
+    
     @Test("archived peerRefresh response does not drain deferred resend")
     func testArchivedPeerRefreshResponseDoesNotDrainDeferredResend() async throws {
         actor ResponseProbe {
             private var response: ReceivedMessage?
-
+            
             func capture(_ received: ReceivedMessage) {
                 response = received
             }
-
+            
             func get() -> ReceivedMessage? {
                 response
             }
         }
-
+        
         actor ResendProbe {
             private(set) var sawResendRequest = false
-
+            
             func markResendRequest() {
                 sawResendRequest = true
             }
-
+            
             func reset() {
                 sawResendRequest = false
             }
         }
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -8368,7 +8388,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         let responseProbe = ResponseProbe()
         let resendProbe = ResendProbe()
         var aliceTask: Task<Void, Never>?
@@ -8380,7 +8400,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -8389,12 +8409,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -8402,7 +8422,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         aliceTask = Task {
             for await received in aliceStream {
                 if received.oobResendRequest != nil {
@@ -8413,7 +8433,7 @@ actor EndToEndTests {
                     received: received)
             }
         }
-
+        
         bobTask = Task {
             for await received in bobStream {
                 _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -8421,15 +8441,15 @@ actor EndToEndTests {
                     received: received)
             }
         }
-
+        
         try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "baseline before archived response")
-
+        
         #expect(
             await waitUntil { await recipientStore.createdMessages.count > 0 },
             "Baseline message should establish the active ratchet before archiving")
-
+        
         guard let aliceDeviceId = await _senderSession.sessionContext?.sessionUser.deviceId else {
             Issue.record("Alice device id should be available")
             return
@@ -8445,27 +8465,27 @@ actor EndToEndTests {
             sender: "alice",
             deviceId: aliceDeviceId)
         await resendProbe.reset()
-
+        
         let pendingSharedId = UUID().uuidString
         await _recipientSession.deferPeerResendUntilReestablished(
             sender: "alice",
             deviceId: aliceDeviceId,
             failedMessageId: pendingSharedId,
             failureClass: "test.archivedPeerRefresh")
-
+        
         let responseIntentId = UUID()
         aliceTransport.shouldDeliver = { received in
             guard case .sessionReestablishment(let envelope)? = received.transportEvent,
                   envelope.kind == .peerRefresh,
                   envelope.isResponse,
                   envelope.intentId == responseIntentId
-            else {
+                    else {
                 return true
             }
             await responseProbe.capture(received)
             return false
         }
-
+        
         let originalPeerRefresh = SessionReestablishmentEnvelope(
             kind: .peerRefresh,
             intentId: responseIntentId,
@@ -8474,15 +8494,15 @@ actor EndToEndTests {
             kind: .peerRefresh,
             recipient: .nickname("bob"),
             respondingTo: originalPeerRefresh)
-
+        
         #expect(
             await waitUntil { await responseProbe.get() != nil },
             "PeerRefresh response should be captured before delivery")
-
+        
         try await _recipientSession.createInactiveSessionSnapshot(
             for: "alice",
             policy: .archive)
-
+        
         let bobCache = await _recipientSession.cache!
         let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
         for identity in try await bobCache.fetchSessionIdentities() {
@@ -8494,24 +8514,24 @@ actor EndToEndTests {
             try await bobCache.updateSessionIdentity(identity)
         }
         await _recipientSession.removeIdentity(with: "alice")
-
+        
         guard let archivedOnlyResponse = await responseProbe.get() else {
             Issue.record("Captured peerRefresh response should exist")
             return
         }
-
+        
         try await _recipientSession.receiveMessage(
             message: archivedOnlyResponse.message,
             sender: archivedOnlyResponse.sender,
             deviceId: archivedOnlyResponse.deviceId,
             messageId: archivedOnlyResponse.messageId)
-
+        
         try await Task.sleep(for: .milliseconds(500))
-
+        
         #expect(
             (await resendProbe.sawResendRequest) == false,
             "Archived peerRefresh response must not request resend/replay and restart recovery")
-
+        
         let pending = await _recipientSession.takePendingResendsAfterReestablishment(
             sender: "alice",
             deviceId: aliceDeviceId)
@@ -8519,7 +8539,7 @@ actor EndToEndTests {
             pending.contains(where: { $0.failedSharedMessageId == pendingSharedId }),
             "Deferred resend should remain pending until active reestablishment succeeds")
     }
-
+    
     @Test("requestMessageResend replays recent non-persistent recovery control")
     func testRequestMessageResendReplaysRecentNonPersistentControl() async throws {
         actor ReplayProbe {
@@ -8527,11 +8547,11 @@ actor EndToEndTests {
             private var droppedEnvelopeMessageId: String?
             private var droppedLogicalSharedId: String?
             private var replayCountsByLogicalSharedId: [String: Int] = [:]
-
+            
             func expect(intentId: UUID) {
                 expectedIntentId = intentId
             }
-
+            
             func shouldDropFirstMatchingControl(_ received: ReceivedMessage) -> Bool {
                 guard droppedEnvelopeMessageId == nil else { return false }
                 guard received.sender == "alice", received.recipient == "bob" else { return false }
@@ -8543,7 +8563,7 @@ actor EndToEndTests {
                 droppedLogicalSharedId = logicalSharedId
                 return true
             }
-
+            
             func markReplayIfNeeded(_ received: ReceivedMessage) {
                 guard let droppedEnvelopeMessageId, let droppedLogicalSharedId else { return }
                 guard received.messageId != droppedEnvelopeMessageId else { return }
@@ -8551,30 +8571,30 @@ actor EndToEndTests {
                 guard case .sessionReestablishment = received.transportEvent else { return }
                 replayCountsByLogicalSharedId[droppedLogicalSharedId, default: 0] += 1
             }
-
+            
             func droppedEnvelopeId() -> String? {
                 droppedEnvelopeMessageId
             }
-
+            
             func droppedLogicalId() -> String? {
                 droppedLogicalSharedId
             }
-
+            
             func replayCount(for logicalSharedId: String) -> Int {
                 replayCountsByLogicalSharedId[logicalSharedId, default: 0]
             }
         }
-
+        
         actor LinkedReplayProbe {
             private var expectedTargetDeviceId: UUID?
             private var droppedEnvelopeMessageId: String?
             private var droppedLogicalSharedId: String?
             private var replayCountsByLogicalSharedId: [String: Int] = [:]
-
+            
             func expect(targetDeviceId: UUID) {
                 expectedTargetDeviceId = targetDeviceId
             }
-
+            
             func shouldDropFirstMatchingControl(_ received: ReceivedMessage) -> Bool {
                 guard droppedEnvelopeMessageId == nil else { return false }
                 guard received.sender == "alice", received.recipient == "bob" else { return false }
@@ -8585,7 +8605,7 @@ actor EndToEndTests {
                 droppedLogicalSharedId = logicalSharedId
                 return true
             }
-
+            
             func markReplayIfNeeded(_ received: ReceivedMessage) {
                 guard let droppedEnvelopeMessageId, let droppedLogicalSharedId else { return }
                 guard received.messageId != droppedEnvelopeMessageId else { return }
@@ -8593,20 +8613,20 @@ actor EndToEndTests {
                 guard case .linkedDeviceReprovisioning = received.transportEvent else { return }
                 replayCountsByLogicalSharedId[droppedLogicalSharedId, default: 0] += 1
             }
-
+            
             func droppedEnvelopeId() -> String? {
                 droppedEnvelopeMessageId
             }
-
+            
             func droppedLogicalId() -> String? {
                 droppedLogicalSharedId
             }
-
+            
             func replayCount(for logicalSharedId: String) -> Int {
                 replayCountsByLogicalSharedId[logicalSharedId, default: 0]
             }
         }
-
+        
         func waitUntil(
             timeoutSeconds: TimeInterval = 8,
             _ condition: @escaping @Sendable () async -> Bool
@@ -8618,7 +8638,7 @@ actor EndToEndTests {
             }
             return false
         }
-
+        
         let probe = ReplayProbe()
         let linkedProbe = LinkedReplayProbe()
         var aliceTask: Task<Void, Never>?
@@ -8630,7 +8650,7 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -8639,12 +8659,12 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
         try await createFriendship(
@@ -8652,7 +8672,7 @@ actor EndToEndTests {
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         aliceTask = Task {
             for await received in aliceStream {
                 _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -8660,7 +8680,7 @@ actor EndToEndTests {
                     received: received)
             }
         }
-
+        
         bobTask = Task {
             for await received in bobStream {
                 await probe.markReplayIfNeeded(received)
@@ -8670,15 +8690,15 @@ actor EndToEndTests {
                     received: received)
             }
         }
-
+        
         try await _senderSession.send(
             recipient: .nickname("bob"),
             text: "baseline before control replay")
-
+        
         #expect(
             await waitUntil { await recipientStore.createdMessages.count > 0 },
             "Baseline message should establish the ratchet before replaying a control frame")
-
+        
         let intentId = UUID()
         let originalPeerRefresh = SessionReestablishmentEnvelope(
             kind: .peerRefresh,
@@ -8688,12 +8708,12 @@ actor EndToEndTests {
         aliceTransport.shouldDeliver = { received in
             !(await probe.shouldDropFirstMatchingControl(received))
         }
-
+        
         _ = try await _senderSession.emitSessionReestablishmentResponse(
             kind: .peerRefresh,
             recipient: .nickname("bob"),
             respondingTo: originalPeerRefresh)
-
+        
         let droppedOriginal = await waitUntil {
             await probe.droppedEnvelopeId() != nil
         }
@@ -8704,33 +8724,33 @@ actor EndToEndTests {
             Issue.record("Expected the original non-persistent peerRefresh response to be dropped")
             return
         }
-
+        
         guard let aliceDeviceId = await _senderSession.sessionContext?.sessionUser.deviceId else {
             Issue.record("Alice device id should be available")
             return
         }
-
+        
         try await _recipientSession.requestMessageResend(
             sharedMessageId: droppedEnvelopeMessageId,
             senderName: "alice",
             senderDeviceId: aliceDeviceId)
-
+        
         #expect(
             await waitUntil { await probe.replayCount(for: droppedLogicalSharedId) > 0 },
             "requestMessageResend should replay the logical control under a fresh envelope MessageID")
-
+        
         let peerRefreshReplayCount = await probe.replayCount(for: droppedLogicalSharedId)
         try await _recipientSession.requestMessageResend(
             sharedMessageId: droppedEnvelopeMessageId,
             senderName: "alice",
             senderDeviceId: aliceDeviceId)
-
+        
         #expect(
             await waitUntil {
                 await probe.replayCount(for: droppedLogicalSharedId) > peerRefreshReplayCount
             },
             "non-persistent recovery controls should allow bounded repeated replay while the peer is still repairing")
-
+        
         guard let aliceContext = await _senderSession.sessionContext,
               let bobDeviceId = await _recipientSession.sessionContext?.sessionUser.deviceId else {
             Issue.record("Session contexts should be available")
@@ -8747,11 +8767,11 @@ actor EndToEndTests {
         aliceTransport.shouldDeliver = { received in
             !(await linkedProbe.shouldDropFirstMatchingControl(received))
         }
-
+        
         try await _senderSession.send(
             recipient: .nickname("bob"),
             transportInfo: reprovisioningMetadata)
-
+        
         let droppedLinkedControl = await waitUntil {
             await linkedProbe.droppedEnvelopeId() != nil
         }
@@ -8762,31 +8782,31 @@ actor EndToEndTests {
             Issue.record("Expected the original non-persistent linked-device reprovisioning control to be dropped")
             return
         }
-
+        
         try await _recipientSession.requestMessageResend(
             sharedMessageId: droppedLinkedEnvelopeMessageId,
             senderName: "alice",
             senderDeviceId: aliceDeviceId)
-
+        
         #expect(
             await waitUntil {
                 await linkedProbe.replayCount(for: droppedLinkedLogicalSharedId) > 0
             },
             "requestMessageResend should replay the linked control under a fresh envelope MessageID")
-
+        
         let linkedReplayCount = await linkedProbe.replayCount(for: droppedLinkedLogicalSharedId)
         try await _recipientSession.requestMessageResend(
             sharedMessageId: droppedLinkedEnvelopeMessageId,
             senderName: "alice",
             senderDeviceId: aliceDeviceId)
-
+        
         #expect(
             await waitUntil {
                 await linkedProbe.replayCount(for: droppedLinkedLogicalSharedId) > linkedReplayCount
             },
             "linked-device reprovisioning replay should also allow bounded repeated replay while the peer is still repairing")
     }
-
+    
     @Test("Old message decrypted from archive after reconciliation")
     func testOldMessageDecryptedFromArchiveAfterReconciliation() async throws {
         var aliceTask: Task<Void, Never>?
@@ -8798,12 +8818,12 @@ actor EndToEndTests {
                 await shutdownSessions()
             }
         }
-
+        
         actor OldMessageProbe {
             var captured: ReceivedMessage?
             var oldMessageDecrypted = false
             private var msgCount = 0
-
+            
             func capture(_ msg: ReceivedMessage) { captured = msg }
             func getCaptured() -> ReceivedMessage? { captured }
             func isCaptured(_ msg: ReceivedMessage) -> Bool { captured?.messageId == msg.messageId }
@@ -8813,9 +8833,9 @@ actor EndToEndTests {
                 return msgCount
             }
         }
-
+        
         let probe = OldMessageProbe()
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -8824,15 +8844,15 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-
+        
         // Receive loops must be live before friendship bootstrap so OTK notify is processed
         // as it arrives. Fixed sleeps are not enough on slower Linux runners.
         aliceTask = Task {
@@ -8843,7 +8863,7 @@ actor EndToEndTests {
                 )
             }
         }
-
+        
         bobTask = Task {
             for await received in bobStream {
                 do {
@@ -8859,13 +8879,13 @@ actor EndToEndTests {
                 } catch {}
             }
         }
-
+        
         try await createFriendship(
             aliceSession: _senderSession,
             sd: sd,
             bobSession: _recipientSession,
             rsd: rsd)
-
+        
         let aliceDeviceId = try #require(await _senderSession.sessionContext?.sessionUser.deviceId)
         let friendshipReadyDeadline = Date().addingTimeInterval(15)
         while Date() < friendshipReadyDeadline {
@@ -8876,7 +8896,7 @@ actor EndToEndTests {
             if outboundReady, inboundReady { break }
             try await Task.sleep(for: .milliseconds(50))
         }
-
+        
         _ = try await _senderSession.refreshIdentities(
             secretName: rMockUserData.rsn,
             forceRefresh: true,
@@ -8887,7 +8907,7 @@ actor EndToEndTests {
             forceRefresh: true,
             sendOneTimeIdentities: true
         )
-
+        
         // Baseline: establish ratchet state with a delivered message.
         try await _senderSession.send(
             recipient: .nickname("bob"),
@@ -8897,7 +8917,7 @@ actor EndToEndTests {
             if try await _recipientSession.hasInitializedOutboundRatchetForPeer("alice") { break }
             try await Task.sleep(for: .milliseconds(50))
         }
-
+        
         // Old message: sent clean but captured by shouldDeliver (not delivered to Bob).
         // Arm capture after the baseline has established state so control/repair timing
         // before the baseline cannot consume the probe's message index.
@@ -8915,10 +8935,10 @@ actor EndToEndTests {
             if await probe.getCaptured() != nil { break }
             try await Task.sleep(for: .milliseconds(50))
         }
-
+        
         #expect(await probe.getCaptured() != nil,
                 "Old message should have been captured by shouldDeliver")
-
+        
         // Stop Alice's receive loop before reconciliation so concurrent recovery controls
         // cannot re-initialize Bob's active identity while we assert archive-fallback
         // invariants. That race is timing-sensitive and fails on slower Linux runners
@@ -8926,7 +8946,7 @@ actor EndToEndTests {
         // open so the captured old message can still be yielded into Bob's stream.
         aliceTask?.cancel()
         aliceTask = nil
-
+        
         // Simulate what reconciliation does on Bob's side:
         // 1. Archive current ratchet state for alice
         try await _recipientSession.createInactiveSessionSnapshot(
@@ -8938,7 +8958,7 @@ actor EndToEndTests {
         #expect(
             await _recipientSession.refreshMLKEMOneTimeKeysTask(policy: .replaceCurrentDeviceBatch),
             "Reconciliation fixture must retire the old ML-KEM one-time-key batch")
-
+        
         // 2. Give Bob's active receive lane an initialized-but-incompatible state.
         // A nil state may legitimately bootstrap this frame directly, bypassing the
         // archive path the test is intended to exercise.
@@ -8955,7 +8975,7 @@ actor EndToEndTests {
             }
         }
         let incompatibleProps = try #require(incompatibleDonor)
-
+        
         let bobCache = await _recipientSession.cache!
         let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
         var clearedActiveIdentityIds = Set<UUID>()
@@ -8979,7 +8999,7 @@ actor EndToEndTests {
         // Clear only memoized selection so the next access re-reads from cache.
         // Account-wide removal would destroy the archive this test is proving.
         await _recipientSession.invalidateSessionIdentityCache(secretName: sMockUserData.ssn)
-
+        
         // Now replay the captured old message into Bob's receive stream.
         guard let oldMessage = await probe.getCaptured() else {
             Issue.record("Captured old message should exist")
@@ -8989,17 +9009,17 @@ actor EndToEndTests {
             sender: oldMessage.sender,
             deviceId: oldMessage.deviceId)
         aliceTransport.continuation?.yield(oldMessage)
-
+        
         for _ in 0..<60 {
             if await probe.oldMessageDecrypted { break }
             try await Task.sleep(for: .milliseconds(100))
         }
-
+        
         #expect(
             await probe.oldMessageDecrypted,
             "Old message encrypted with previous keys should be decrypted from the archived snapshot"
         )
-
+        
         // Stop further inbound so follow-up control/recovery frames cannot
         // re-archive the promoted lane before we observe it. Then wait until
         // the processor finishes jobs already queued by that decrypt.
@@ -9013,7 +9033,7 @@ actor EndToEndTests {
             }
             try await Task.sleep(for: .milliseconds(50))
         }
-
+        
         // Assert only against the failed active rows. Archive fallback promotes
         // the proven archived row (deleting these actives); any surviving failed
         // row must retain its exact pre-attempt encrypted state.
@@ -9029,7 +9049,7 @@ actor EndToEndTests {
             !activeStateWasMutated,
             "Archived fallback must not leave partial ratchet state on the failed active SessionIdentity"
         )
-
+        
         // Converge: the proven archived decrypt must become the active
         // send/receive lane for alice — not stay archived with preferred pointing
         // at an inactive row outbound cannot select.
@@ -9041,7 +9061,7 @@ actor EndToEndTests {
                 guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
                 guard props.secretName == sMockUserData.ssn else { continue }
                 guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
-                else { continue }
+                        else { continue }
                 if props.hasRatchetState {
                     promotedActiveWithState = true
                 }
@@ -9054,7 +9074,7 @@ actor EndToEndTests {
             "Archived fallback must promote the proven SessionIdentity to the active lane"
         )
     }
-
+    
     @Test("refreshOneTimeKeys control archives active state and stays non-persistent")
     func testRefreshOneTimeKeysControlArchivesActiveState() async throws {
         var aliceTask: Task<Void, Never>?
@@ -9063,7 +9083,7 @@ actor EndToEndTests {
             aliceTask?.cancel()
             bobTask?.cancel()
         }
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -9072,15 +9092,15 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         let senderStore = createSenderStore()
         let recipientStore = createRecipientStore()
         let sd = SessionDelegate(session: _senderSession)
         let rsd = SessionDelegate(session: _recipientSession)
-
+        
         try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-
+        
         aliceTask = Task {
             for await received in aliceStream {
                 _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -9097,7 +9117,7 @@ actor EndToEndTests {
                 )
             }
         }
-
+        
         do {
             _ = try await _senderSession.refreshIdentities(
                 secretName: rMockUserData.ssn,
@@ -9113,7 +9133,7 @@ actor EndToEndTests {
                 recipient: .nickname(sMockUserData.ssn),
                 text: "establish state"
             )
-
+            
             // Establish often lands as handshake + text (2 rows). Require a real quiet
             // window before snapshotting — a short "stable" poll can freeze at 1 and then
             // blame the late second row on the refresh control.
@@ -9139,14 +9159,14 @@ actor EndToEndTests {
                 !sharedIdsBeforeRefresh.isEmpty,
                 "Establish must persist before sending refreshOneTimeKeys control"
             )
-
+            
             let controlMetadata = try BinaryEncoder().encode(TransportEvent.refreshOneTimeKeys)
             let senderIdentityCountBeforeRefresh = await senderStore.identities.count
             try await _recipientSession.send(
                 recipient: .nickname(sMockUserData.ssn),
                 transportInfo: controlMetadata
             )
-
+            
             // Allow the control to be received/handled, then require the sharedId set
             // to stay unchanged (refreshOneTimeKeys sets canSaveMessage=false).
             var sharedIdsAfter = sharedIdsBeforeRefresh
@@ -9162,7 +9182,7 @@ actor EndToEndTests {
                 }
                 try await Task.sleep(for: .milliseconds(50))
             }
-
+            
             let newSharedIds = sharedIdsAfter.subtracting(sharedIdsBeforeRefresh)
             #expect(
                 newSharedIds.isEmpty,
@@ -9178,32 +9198,32 @@ actor EndToEndTests {
         }
         await shutdownSessions()
     }
-
+    
     @Test("refreshOneTimeKeys control message is non-persistent and triggers refresh")
     func testRefreshOneTimeKeysControlMessageIsNonPersistentAndTriggersRefresh() async throws {
         func cleanup() async {
             await shutdownSessions()
         }
-
+        
         do {
             let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
             let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-
+            
             actor Capture {
                 var msg: ReceivedMessage?
                 func set(_ message: ReceivedMessage) { msg = message }
                 func get() -> ReceivedMessage? { msg }
             }
-
+            
             let controlCapture = Capture()
             let senderStore = createSenderStore()
             let recipientStore = createRecipientStore()
             let sd = SessionDelegate(session: _senderSession)
             let rsd = SessionDelegate(session: _recipientSession)
-
+            
             try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
             try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-
+            
             _ = try await _senderSession.refreshIdentities(
                 secretName: rMockUserData.ssn,
                 forceRefresh: true,
@@ -9214,23 +9234,23 @@ actor EndToEndTests {
                 forceRefresh: true,
                 sendOneTimeIdentities: true
             )
-
+            
             bobTransport.shouldDeliver = { received in
                 await controlCapture.set(received)
                 return false
             }
-
+            
             let metadata = try BinaryEncoder().encode(TransportEvent.refreshOneTimeKeys)
             let senderMessageCountBefore = await recipientStore.createdMessages.count
             try await _recipientSession.send(
                 recipient: .nickname(sMockUserData.ssn),
                 transportInfo: metadata
             )
-
+            
             let controlMessage = try #require(
                 await controlCapture.get(),
                 "refreshOneTimeKeys control message should be captured")
-
+            
             #expect(
                 await recipientStore.createdMessages.count == senderMessageCountBefore,
                 "refreshOneTimeKeys control frames should not be persisted"
@@ -9246,40 +9266,40 @@ actor EndToEndTests {
             throw error
         }
     }
-
+    
     // MARK: - Master Online Recovery Tests
-
+    
     @Test("OTK upload retries after transient failure")
     func testOTKUploadRetryAfterFailure() async throws {
         func cleanup() async {
             await shutdownSessions()
         }
-
+        
         do {
             let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
             let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
-
+            
             let senderStore = createSenderStore()
             let recipientStore = createRecipientStore()
             let sd = SessionDelegate(session: _senderSession)
             let rsd = SessionDelegate(session: _recipientSession)
-
+            
             try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
             try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
-
+            
             _ = try await _senderSession.refreshIdentities(
                 secretName: rMockUserData.rsn,
                 forceRefresh: true,
                 sendOneTimeIdentities: true)
-
+            
             // Drain Alice's OTKs so the next refresh MUST generate + upload.
             await self.store.drainOTKs(for: sMockUserData.ssn)
-
+            
             // Inject: first OTK upload attempt will throw, subsequent ones succeed.
             await aliceTransport.setOTKUploadFailCount(1)
-
+            
             let result = await _senderSession.refreshOneTimeKeysTask(policy: .replenishBatch)
-
+            
             let attemptCount = await aliceTransport.otkUploadAttemptCount
             #expect(result == true,
                     "refreshOneTimeKeysTask should succeed after retrying the failed upload (attemptCount=\(attemptCount))")
@@ -9291,12 +9311,12 @@ actor EndToEndTests {
             throw error
         }
     }
-
+    
     @Test("missingOneTimeKey recovers from archived snapshot before reconciliation")
     func testMissingOneTimeKeyArchiveRecovery() async throws {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -9305,7 +9325,7 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         func cleanup() async {
             aliceTransport.continuation?.finish()
             bobTransport.continuation?.finish()
@@ -9319,7 +9339,7 @@ actor EndToEndTests {
             }
             await shutdownSessions()
         }
-
+        
         do {
             actor MissingOTKProbe {
                 var captured: ReceivedMessage?
@@ -9327,7 +9347,7 @@ actor EndToEndTests {
                 var hitMissingOTK = false
                 var reconciliationTriggered = false
                 private var msgCount = 0
-
+                
                 // Idempotent: ack-overdue resends and orphan-resend replays of
                 // suppressed traffic re-enter the capture gate; only the first
                 // suppressed envelope is the one this test replays.
@@ -9344,14 +9364,14 @@ actor EndToEndTests {
                     return msgCount
                 }
             }
-
+            
             let probe = MissingOTKProbe()
-
+            
             let senderStore = createSenderStore()
             let recipientStore = createRecipientStore()
             let sd = SessionDelegate(session: _senderSession)
             let rsd = SessionDelegate(session: _recipientSession)
-
+            
             try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
             try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
             try await createFriendship(
@@ -9359,7 +9379,7 @@ actor EndToEndTests {
                 sd: sd,
                 bobSession: _recipientSession,
                 rsd: rsd)
-
+            
             aliceTask = Task {
                 for await received in aliceStream {
                     _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -9367,9 +9387,9 @@ actor EndToEndTests {
                         received: received)
                 }
             }
-
+            
             let bobRotationCountBefore = await bobTransport.publishRotatedKeysCallCount
-
+            
             bobTask = Task {
                 for await received in bobStream {
                     do {
@@ -9389,7 +9409,7 @@ actor EndToEndTests {
                     }
                 }
             }
-
+            
             _ = try await _senderSession.refreshIdentities(
                 secretName: rMockUserData.rsn,
                 forceRefresh: true,
@@ -9398,13 +9418,13 @@ actor EndToEndTests {
                 secretName: sMockUserData.ssn,
                 forceRefresh: true,
                 sendOneTimeIdentities: true)
-
+            
             // Baseline: establish ratchet state with a delivered message.
             try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "baseline")
             try await Task.sleep(for: .milliseconds(500))
-
+            
             // Capture a message (not delivered to Bob).
             aliceTransport.shouldDeliver = { received in
                 guard received.sender == "alice", received.recipient == "bob" else { return true }
@@ -9419,16 +9439,16 @@ actor EndToEndTests {
                 if await probe.getCaptured() != nil { break }
                 try await Task.sleep(for: .milliseconds(50))
             }
-
+            
             #expect(await probe.getCaptured() != nil,
                     "Message should have been captured by shouldDeliver")
-
+            
             // Simulate post-reconciliation state on Bob's side:
             // 1. Archive current ratchet state for alice
             try await _recipientSession.createInactiveSessionSnapshot(
                 for: sMockUserData.ssn,
                 policy: .archive)
-
+            
             // 2. Clear the active ratchet state for alice's identity
             let bobCache = await _recipientSession.cache!
             let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
@@ -9442,16 +9462,16 @@ actor EndToEndTests {
                 try await bobCache.updateSessionIdentity(identity)
             }
             await _recipientSession.removeIdentity(with: sMockUserData.ssn)
-
+            
             // 3. Drain Alice's OTKs so replay triggers missingOneTimeKey (not just CryptoKitError)
             await self.store.drainOTKs(for: sMockUserData.ssn)
-
+            
             // Replay the captured message into Bob's receive stream.
             let oldMessage = try #require(
                 await probe.getCaptured(),
                 "Captured message should exist")
             aliceTransport.continuation?.yield(oldMessage)
-
+            
             for _ in 0..<60 {
                 if await probe.messageDecrypted { break }
                 // The archive walk may run as a deferred `.background` pass
@@ -9463,7 +9483,7 @@ actor EndToEndTests {
                 // reconciliation, so accept the persisted record as success.
                 let persistedFromArchive = await recipientStore.createdMessages.contains {
                     $0.sharedId == oldMessage.messageId
-                        || $0.sharedId == oldMessage.logicalMessageId
+                    || $0.sharedId == oldMessage.logicalMessageId
                 }
                 if persistedFromArchive {
                     await probe.markDecrypted()
@@ -9471,16 +9491,16 @@ actor EndToEndTests {
                 }
                 try await Task.sleep(for: .milliseconds(100))
             }
-
+            
             let bobRotationCountAfter = await bobTransport.publishRotatedKeysCallCount
-
+            
             #expect(
                 await probe.messageDecrypted,
                 "Message should be decrypted from the archived snapshot even when missingOneTimeKey is the error path")
             #expect(
                 bobRotationCountAfter == bobRotationCountBefore,
                 "Archive recovery should NOT trigger full reconciliation (rotation count should not change)")
-
+            
             let aliceConfiguration = try await bobTransport.findConfiguration(for: sMockUserData.ssn)
             let currentAliceDevices = try aliceConfiguration.getVerifiedDevices().map {
                 try aliceConfiguration.deviceWithCurrentKeyBundle($0)
@@ -9488,7 +9508,7 @@ actor EndToEndTests {
             let currentAliceDevice = try #require(
                 currentAliceDevices.first(where: { $0.deviceId == oldMessage.deviceId }),
                 "Expected Alice's current server device bundle to exist")
-
+            
             var activeAliceProps = [SessionIdentity.UnwrappedProps]()
             for identity in try await bobCache.fetchSessionIdentities() {
                 guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
@@ -9508,12 +9528,12 @@ actor EndToEndTests {
             throw error
         }
     }
-
+    
     @Test("Job survives identity deletion during reconciliation")
     func testJobSurvivesIdentityDeletion() async throws {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -9522,7 +9542,7 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         func cleanup() async {
             aliceTransport.continuation?.finish()
             bobTransport.continuation?.finish()
@@ -9536,24 +9556,24 @@ actor EndToEndTests {
             }
             await shutdownSessions()
         }
-
+        
         do {
             actor JobSurvivalProbe {
                 var messageDecrypted = false
                 var bobUnblocked = false
-
+                
                 func markDecrypted() { messageDecrypted = true }
                 func unblock() { bobUnblocked = true }
                 func isUnblocked() -> Bool { bobUnblocked }
             }
-
+            
             let probe = JobSurvivalProbe()
-
+            
             let senderStore = createSenderStore()
             let recipientStore = createRecipientStore()
             let sd = SessionDelegate(session: _senderSession)
             let rsd = SessionDelegate(session: _recipientSession)
-
+            
             try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
             try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
             try await createFriendship(
@@ -9561,7 +9581,7 @@ actor EndToEndTests {
                 sd: sd,
                 bobSession: _recipientSession,
                 rsd: rsd)
-
+            
             aliceTask = Task {
                 for await received in aliceStream {
                     _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -9569,7 +9589,7 @@ actor EndToEndTests {
                         received: received)
                 }
             }
-
+            
             // Bob's loop: block until probe says unblocked, then process.
             bobTask = Task {
                 for await received in bobStream {
@@ -9592,7 +9612,7 @@ actor EndToEndTests {
                     }
                 }
             }
-
+            
             _ = try await _senderSession.refreshIdentities(
                 secretName: rMockUserData.rsn,
                 forceRefresh: true,
@@ -9601,19 +9621,19 @@ actor EndToEndTests {
                 secretName: sMockUserData.ssn,
                 forceRefresh: true,
                 sendOneTimeIdentities: true)
-
+            
             // Establish ratchet
             try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "baseline")
             try await Task.sleep(for: .milliseconds(500))
-
+            
             // Send a message while Bob is blocked
             try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "message during identity churn")
             try await Task.sleep(for: .milliseconds(200))
-
+            
             // While Bob is blocked, simulate reconciliation: delete Alice's identity on Bob's side.
             let bobCache = await _recipientSession.cache!
             let bobSymKey = try await _recipientSession.getDatabaseSymmetricKey()
@@ -9624,15 +9644,15 @@ actor EndToEndTests {
                 try await bobCache.deleteSessionIdentity(identity.id)
             }
             await _recipientSession.removeIdentity(with: sMockUserData.ssn)
-
+            
             // Unblock Bob so the pending message is processed.
             await probe.unblock()
-
+            
             for _ in 0..<120 {
                 if await probe.messageDecrypted { break }
                 try await Task.sleep(for: .milliseconds(100))
             }
-
+            
             #expect(
                 await probe.messageDecrypted,
                 "Message should eventually decrypt after identity refresh/retry, not be silently dropped")
@@ -9642,12 +9662,12 @@ actor EndToEndTests {
             throw error
         }
     }
-
+    
     @Test("sessionDecryptionError requests resend without compromise rotation")
     func testSessionDecryptionErrorRequestsResendWithoutRotation() async throws {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
-
+        
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -9656,7 +9676,7 @@ actor EndToEndTests {
         let bobStream = AsyncStream<ReceivedMessage> { continuation in
             aliceTransport.continuation = continuation
         }
-
+        
         func cleanup() async {
             aliceTransport.continuation?.finish()
             bobTransport.continuation?.finish()
@@ -9670,14 +9690,14 @@ actor EndToEndTests {
             }
             await shutdownSessions()
         }
-
+        
         do {
             final class CorruptionGate: @unchecked Sendable {
                 private let lock = NSLock()
                 private var remaining: Int
-
+                
                 init(corruptCount: Int) { self.remaining = corruptCount }
-
+                
                 func consumeCorruption() -> Bool {
                     lock.lock()
                     defer { lock.unlock() }
@@ -9686,24 +9706,24 @@ actor EndToEndTests {
                     return true
                 }
             }
-
+            
             let gate = CorruptionGate(corruptCount: 1)
-
+            
             actor RepairProbe {
                 private(set) var sawResendRequest = false
-
+                
                 func markResendRequest() {
                     sawResendRequest = true
                 }
             }
-
+            
             let repairProbe = RepairProbe()
-
+            
             let senderStore = createSenderStore()
             let recipientStore = createRecipientStore()
             let sd = SessionDelegate(session: _senderSession)
             let rsd = SessionDelegate(session: _recipientSession)
-
+            
             try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
             try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
             try await createFriendship(
@@ -9711,9 +9731,9 @@ actor EndToEndTests {
                 sd: sd,
                 bobSession: _recipientSession,
                 rsd: rsd)
-
+            
             let rotationCountBefore = await bobTransport.publishRotatedKeysCallCount
-
+            
             // Inject the decrypted payload transform on Bob's session:
             // replaces valid CryptoMessage bytes with garbage so BinaryDecoder fails,
             // triggering sessionDecryptionError. Auto-disarms after one corruption.
@@ -9721,7 +9741,7 @@ actor EndToEndTests {
                 guard gate.consumeCorruption() else { return data }
                 return Data([0xDE, 0xAD, 0xBE, 0xEF])
             }
-
+            
             aliceTask = Task {
                 for await received in aliceStream {
                     if received.oobResendRequest != nil {
@@ -9733,7 +9753,7 @@ actor EndToEndTests {
                     )
                 }
             }
-
+            
             bobTask = Task {
                 for await received in bobStream {
                     _ = try? await self.receiveIgnoringRecoverableErrors(
@@ -9742,42 +9762,42 @@ actor EndToEndTests {
                     )
                 }
             }
-
+            
             // Alice sends a message -- Bob will hit sessionDecryptionError internally.
             // The ratchet succeeds, payload decode fails once, and recovery should request resend
             // without rotating local identity material.
             try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "trigger decode failure")
-
+            
             // Wait for the resend request to reach Alice and for the replayed message to decrypt.
             for _ in 0..<80 {
                 if await repairProbe.sawResendRequest,
                    await recipientStore.createdMessages.count > 0 { break }
                 try await Task.sleep(for: .milliseconds(100))
             }
-
+            
             let rotationCountAfter = await bobTransport.publishRotatedKeysCallCount
             #expect(
                 rotationCountAfter == rotationCountBefore,
                 "sessionDecryptionError should not trigger compromise rotation (got \(rotationCountAfter) vs \(rotationCountBefore))")
             #expect(await repairProbe.sawResendRequest, "sessionDecryptionError should request resend")
             #expect(await recipientStore.createdMessages.count > 0, "The replayed message should eventually decrypt after resend")
-
+            
             try await Task.sleep(for: .milliseconds(500))
-
+            
             let msgCountBefore = await recipientStore.createdMessages.count
-
+            
             // Send a follow-up message to verify the session recovers
             try await _senderSession.send(
                 recipient: .nickname("bob"),
                 text: "post-recovery message")
-
+            
             for _ in 0..<120 {
                 if await recipientStore.createdMessages.count > msgCountBefore { break }
                 try await Task.sleep(for: .milliseconds(100))
             }
-
+            
             #expect(
                 await recipientStore.createdMessages.count > msgCountBefore,
                 "After resend-based recovery from sessionDecryptionError, subsequent messages should decrypt cleanly")
@@ -9916,7 +9936,7 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
                 }
             }
         }
-
+        
         if var decodedMetadata = try? BinaryDecoder().decode(FriendshipMetadata.self, from: message.metadata) {
             
             decodedMetadata.swapUserPerspectives()
@@ -9929,7 +9949,7 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
                 
                 let symmetricKey = try! await session.getDatabaseSymmetricKey()
                 guard let sessionIdentity = try! await session.cache?.fetchSessionIdentities().asyncFirst(where: { await $0.props(symmetricKey: symmetricKey)?.deviceId == senderDeviceId }) else {
-                   return true
+                    return true
                 }
                 try! await session.cache?.deleteSessionIdentity(sessionIdentity.id)
                 await session.removeIdentity(with: senderSecretName)
@@ -9958,9 +9978,9 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
         }
         return true
     }
-
+    
     func shouldSendAutomaticDeliveryReceipts() async -> Bool { true }
-
+    
     func inboundRecoveryDeferred(
         senderSecretName _: String,
         senderDeviceId _: UUID,
@@ -9986,11 +10006,11 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
     func reestablishmentEpisodeDidEnd(senderSecretName _: String, senderDeviceId _: UUID) async {}
     func shouldSuppressInboundRecoveryFromSender(_: String) async -> Bool { false }
     func preferredOnlinePeerDeviceId(for _: String) async -> UUID? { nil }
-
+    
     func linkedDeviceReportedPotentialCompromise(deviceId: UUID, intentId: UUID?) async {
         await compromiseProbe?.mark(deviceId: deviceId)
     }
-
+    
     func peerAccountIdentityChanged(
         secretName: String,
         deviceId: UUID,
@@ -10021,7 +10041,7 @@ final class MockDeviceLinkingDelegate: DeviceLinkingDelegate, @unchecked Sendabl
                 userConfiguration: userConfiguration
             )
         }
-
+        
         // Decode the device configuration from the data parameter
         guard
             let deviceConfig = try? BinaryDecoder().decode(
@@ -10040,7 +10060,7 @@ final class MockDeviceLinkingDelegate: DeviceLinkingDelegate, @unchecked Sendabl
 }
 
 final class MockSessionIdentityTransport: PQSTransport, PQSKeyDirectory, PQSRecoveryTransport, @unchecked Sendable {
-
+    
     var configurations: [String: UserConfiguration] = [:]
     var oneTimeKeys: [String: OneTimeKeys] = [:]
     var shouldThrowError = false
@@ -10152,7 +10172,7 @@ struct ReceivedMessage {
     let transportEvent: TransportEvent?
     let oobResendRequest: ResendRequest?
     let oobUnavailableNotice: MessageResendUnavailableNotice?
-
+    
     init(
         message: SignedRatchetMessage,
         sender: String,
@@ -10176,7 +10196,7 @@ struct ReceivedMessage {
         self.oobResendRequest = oobResendRequest
         self.oobUnavailableNotice = oobUnavailableNotice
     }
-
+    
     /// Double Ratchet user content — not a TransportEvent control and not OOB retry.
     var isContentMessage: Bool {
         transportEvent == nil && oobResendRequest == nil && oobUnavailableNotice == nil
@@ -10202,12 +10222,12 @@ actor TransportStore {
     var publishableName: String!
     var userConfigurations = [User]()
     var lastPublishedRotatedKeys: SessionModels.RotatedPublicKeys?
-
+    
     /// Test helper: the store is shared across serialized suite tests; clear capture before asserting on rotation payloads.
     func resetLastPublishedRotatedKeys() async {
         lastPublishedRotatedKeys = nil
     }
-
+    
     /// Drain all curve and MLKEM OTKs for a given secret name so the next
     /// inbound triggers a missingOneTimeKey / fresh-key error.
     func drainOTKs(for secretName: String) {
@@ -10226,7 +10246,7 @@ actor TransportStore {
     func setUserConfigurations(index: Int, config: UserConfiguration) async {
         userConfigurations[index].config = config
     }
-
+    
     func upsertUserConfiguration(secretName: String, deviceId: UUID, config: UserConfiguration) async {
         if let index = userConfigurations.firstIndex(where: { $0.secretName == secretName }) {
             userConfigurations[index] = User(secretName: secretName, deviceId: deviceId, config: config)
@@ -10239,10 +10259,10 @@ actor TransportStore {
         let config = userConfigurations.first(where: { $0.secretName == secretName })
         guard let signingKeyData = config?.config.signingPublicKey else { fatalError() }
         let signingKey = try Curve25519.Signing.PublicKey(rawRepresentation: signingKeyData)
-
+        
         guard let oneTimeKeyPairIndex = oneTimePublicKeyPairs.firstIndex(where: {
-                $0.id == secretName
-            }) else { fatalError() }
+            $0.id == secretName
+        }) else { fatalError() }
         
         var oneTimeKeyPair = oneTimePublicKeyPairs[oneTimeKeyPairIndex]
         guard let lastX25519Key = oneTimeKeyPair.keys.last,
@@ -10254,7 +10274,7 @@ actor TransportStore {
         
         guard
             let mlKEMKeyPairIndex = mlKEMOneTimeKeyPairs.firstIndex(where: { $0.id == secretName })
-        else { fatalError() }
+                else { fatalError() }
         var mlKEMKeyPair = mlKEMOneTimeKeyPairs[mlKEMKeyPairIndex]
         guard let lastMLKEMKey = mlKEMKeyPair.keys.last,
               let mlKEMKey = try? lastMLKEMKey.verified(using: signingKey) else {
@@ -10275,7 +10295,7 @@ actor TransportStore {
         let filteredX25519 = oneTimePublicKeyPairs.filter { $0.id == secretName }
         let filteredMLKEM = mlKEMOneTimeKeyPairs.filter { $0.id == secretName }
         var verifiedIDs: [UUID] = []
-
+        
         switch type {
         case .x25519:
             for key in filteredX25519 {
@@ -10296,7 +10316,7 @@ actor TransportStore {
         }
         return verifiedIDs
     }
-
+    
     func updateOneTimeKeys(
         for secretName: String,
         deviceId _: String,
@@ -10310,7 +10330,7 @@ actor TransportStore {
             )
         }
     }
-
+    
     func updateOneTimeMLKEMKeys(
         for secretName: String,
         deviceId _: String,
@@ -10324,7 +10344,7 @@ actor TransportStore {
             )
         }
     }
-
+    
     func batchDeleteOneTimeKeys(for secretName: String, with _: String, type: KeyKind) async throws {
         switch type {
         case .x25519:
@@ -10337,10 +10357,10 @@ actor TransportStore {
             }
         }
     }
-
+    
     func deleteOneTimeKeys(for secretName: String, with id: String, type: KeyKind) async throws {
         guard let keyId = UUID(uuidString: id) else { return }
-
+        
         switch type {
         case .x25519:
             if let index = oneTimePublicKeyPairs.firstIndex(where: { $0.id == secretName }) {
@@ -10370,7 +10390,7 @@ actor TransportStore {
         guard
             let userConfiguration = userConfigurations.first(where: { $0.secretName == secretName }
             )?.config
-        else {
+                else {
             throw PQSError.userNotFound
         }
         return userConfiguration
@@ -10380,7 +10400,7 @@ actor TransportStore {
         guard
             let userConfiguration = userConfigurations.first(where: { $0.secretName == secretName }
             )?.config
-        else {
+                else {
             throw PQSError.configurationError
         }
         return userConfiguration
@@ -10390,7 +10410,7 @@ actor TransportStore {
         for secretName: String, deviceId: String, rotated keys: SessionModels.RotatedPublicKeys
     ) async throws {
         guard let index = userConfigurations.firstIndex(where: { $0.secretName == secretName })
-        else { fatalError() }
+                else { fatalError() }
         var userConfig = userConfigurations[index]
         let oldSigningKey = try Curve25519.Signing.PublicKey(
             rawRepresentation: userConfig.config.signingPublicKey)
@@ -10402,7 +10422,7 @@ actor TransportStore {
         let invalidExistingDeviceIds = userConfig.config.signedDevices.compactMap { signedDevice in
             trustedExistingDeviceIds.contains(signedDevice.id) ? nil : signedDevice.id
         }
-
+        
         let hasBatchRotation = keys.allSignedDevices?.isEmpty == false
         if let signedDeviceKeyBundle = keys.deviceKeyBundle,
            !hasBatchRotation,
@@ -10410,14 +10430,14 @@ actor TransportStore {
             guard let deviceUUID = UUID(uuidString: deviceId),
                   signedDeviceKeyBundle.id == deviceUUID,
                   let existingDevice = userConfig.config.signedDevices.compactMap({ try? $0.verified(using: oldSigningKey) })
-                    .first(where: { $0.deviceId == deviceUUID })
-            else {
+                .first(where: { $0.deviceId == deviceUUID })
+                    else {
                 throw TestError.invalidRotatedDeviceSignature
             }
             let deviceSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: existingDevice.signingPublicKey)
             guard let bundle = try signedDeviceKeyBundle.verified(using: deviceSigningKey),
                   bundle.deviceId == deviceUUID
-            else {
+                    else {
                 throw TestError.invalidRotatedDeviceSignature
             }
             userConfig.config.signedDeviceKeyBundles.removeAll { $0.id == deviceUUID }
@@ -10425,7 +10445,7 @@ actor TransportStore {
             userConfigurations[index] = userConfig
             return
         }
-
+        
         if let batch = keys.allSignedDevices, !batch.isEmpty {
             for signedDevice in batch {
                 guard try signedDevice.verified(using: newSigningKey) != nil else {
@@ -10440,7 +10460,7 @@ actor TransportStore {
                 let deviceSigningKey = try Curve25519.Signing.PublicKey(rawRepresentation: rotatedDevice.signingPublicKey)
                 guard let bundle = try signedDeviceKeyBundle.verified(using: deviceSigningKey),
                       bundle.deviceId == rotatedDevice.deviceId
-                else {
+                        else {
                     throw TestError.invalidRotatedDeviceSignature
                 }
                 userConfig.config.signedDeviceKeyBundles.removeAll { $0.id == signedDeviceKeyBundle.id }
@@ -10449,7 +10469,7 @@ actor TransportStore {
             userConfigurations[index] = userConfig
             return
         }
-
+        
         var accountSigningKeyUnchanged = keys.pskData == userConfig.config.signingPublicKey
         if !accountSigningKeyUnchanged {
             accountSigningKeyUnchanged = (try? keys.signedDevice.verified(using: oldSigningKey)) != nil
@@ -10467,7 +10487,7 @@ actor TransportStore {
                payloadMatchesTrustedExistingDevice,
                verifiedWithNewSigningKey,
                recovery.prunedDeviceIds.sorted(by: { $0.uuidString < $1.uuidString })
-                    == invalidExistingDeviceIds.sorted(by: { $0.uuidString < $1.uuidString }) {
+                == invalidExistingDeviceIds.sorted(by: { $0.uuidString < $1.uuidString }) {
                 let authorization = RotatedKeysRecoveryAuthorization(
                     secretName: secretName,
                     recoveringDeviceId: trustedExistingDeviceId,
@@ -10486,8 +10506,8 @@ actor TransportStore {
                     rawRepresentation: trustedExistingDevice.signingPublicKey
                 )
                 guard trustedDeviceSigningKey.isValidSignature(recovery.oldAccountSignature, for: canonicalAuthorizationData)
-                    || trustedDeviceSigningKey.isValidSignature(recovery.oldAccountSignature, for: legacyBinaryAuthorizationData)
-                else {
+                        || trustedDeviceSigningKey.isValidSignature(recovery.oldAccountSignature, for: legacyBinaryAuthorizationData)
+                        else {
                     throw TestError.invalidRecoverySignature
                 }
                 guard let rotatedDevice = try keys.signedDevice.verified(using: newSigningKey) else {
@@ -10501,7 +10521,7 @@ actor TransportStore {
                     guard signedDeviceKeyBundle.id == rotatedDevice.deviceId,
                           let bundle = try signedDeviceKeyBundle.verified(using: deviceSigningKey),
                           bundle.deviceId == rotatedDevice.deviceId
-                    else {
+                            else {
                         throw TestError.invalidRotatedDeviceSignature
                     }
                     userConfig.config.signedDeviceKeyBundles.append(signedDeviceKeyBundle)
@@ -10511,14 +10531,14 @@ actor TransportStore {
             }
             throw TestError.multiDeviceRotationRequiresBatch
         }
-
+        
         let verifiedWithEffectiveKey = accountSigningKeyUnchanged
-            ? ((try? keys.signedDevice.verified(using: oldSigningKey)) != nil)
-            : ((try? keys.signedDevice.verified(using: newSigningKey)) != nil)
+        ? ((try? keys.signedDevice.verified(using: oldSigningKey)) != nil)
+        : ((try? keys.signedDevice.verified(using: newSigningKey)) != nil)
         guard verifiedWithEffectiveKey else {
             throw TestError.invalidRotatedDeviceSignature
         }
-
+        
         guard
             let deviceIndex = userConfig.config.signedDevices.firstIndex(where: {
                 guard let verified = try? $0.verified(using: oldSigningKey) else { return false }
@@ -10554,45 +10574,45 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     var continuation: AsyncStream<ReceivedMessage>.Continuation?
     let session: PQSSession
     let store: TransportStore
-
+    
     /// Optional hook to simulate message loss by preventing delivery into the async stream.
     var shouldDeliver: (@Sendable (ReceivedMessage) async -> Bool)?
-
+    
     /// When set, `sendMessage` throws before delivery — models half-open / ingress-barrier failure.
     var sendMessageError: Error?
-
+    
     /// Optional hook to transform outgoing messages before delivery (test-only).
     /// Useful for forging signatures or mutating payloads deterministically.
     var transformOutgoing: (@Sendable (ReceivedMessage) async throws -> ReceivedMessage)?
-
+    
     /// Optional re-entrant hook while `sendMessage` is still awaiting transport.
     /// Models an online recipient returning a resend request before the original
     /// transport call unwinds on the sender.
     var duringSendMessage: (@Sendable (ReceivedMessage) async throws -> Void)?
-
+    
     /// Optional hook to pause or observe OTK uploads in recovery tests.
     var beforeUpdateOneTimeKeys: (@Sendable () async -> Void)?
-
+    
     /// When true, a cancelled calling task fails the upload before it is counted.
     /// Default is false so recovery-pause tests still record the in-flight PUT.
     var rejectCancelledOneTimeKeyUploads = false
-
+    
     /// If set, publishing rotated keys will throw this error (test-only).
     /// Used to simulate rotation publish failures.
     var publishRotatedKeysError: Error?
-
+    
     /// If set, `findConfiguration` throws this error after optional hang (dogfood API timeout).
     var findConfigurationError: Error?
-
+    
     /// If set, awaited before every `findConfiguration` lookup (never-resume = hang).
     var findConfigurationHang: (@Sendable () async -> Void)?
-
+    
     /// Optional observation point immediately before the mocked remote lookup.
     var beforeFindConfiguration: (@Sendable (String) async -> Void)?
-
+    
     /// Optional filter: hang/throw only for these secret names. `nil` = all names.
     var findConfigurationFaultSecretNames: Set<String>?
-
+    
     /// If set, OTK curve uploads will throw on the first N calls then succeed.
     /// Thread-safe via OTKErrorInjector actor.
     private let otkErrorInjector = OTKErrorInjector()
@@ -10605,20 +10625,20 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     
     // Track updateOneTimeKeys calls for testing (thread-safe)
     private let callTracker = CallTracker()
-
+    
     // Track publishRotatedKeys calls for testing (thread-safe)
     private let rotationTracker = RotationTracker()
-
+    
     // Track findConfiguration calls for dogfood hang/cache tests (thread-safe)
     private let findConfigurationTracker = CallTracker()
-
+    
     // Track ciphertext transport sends for enqueue/viability assertions.
     private let sendMessageTracker = CallTracker()
-
+    
     var sendMessageCallCount: Int {
         get async { await sendMessageTracker.callCount }
     }
-
+    
     var publishRotatedKeysCallCount: Int {
         get async { await rotationTracker.callCount }
     }
@@ -10630,11 +10650,11 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     var updateOneTimeKeysCalls: [(secretName: String, deviceId: String, keyCount: Int)] {
         get async { await callTracker.calls }
     }
-
+    
     var findConfigurationCallCount: Int {
         get async { await findConfigurationTracker.callCount }
     }
-
+    
     var findConfigurationCalls: [(secretName: String, deviceId: String, keyCount: Int)] {
         get async { await findConfigurationTracker.calls }
     }
@@ -10665,16 +10685,16 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     }
     
     private let oobResendTracker = CallTracker()
-
+    
     var outOfBandResendRequestCount: Int {
         get async { await oobResendTracker.callCount }
     }
-
+    
     /// Per-call view (secretName, deviceId, id count) for frame-cap assertions.
     var outOfBandResendRequestCalls: [(secretName: String, deviceId: String, keyCount: Int)] {
         get async { await oobResendTracker.calls }
     }
-
+    
     func sendOutOfBandResendRequest(
         failedEnvelopeMessageIds: [String],
         to secretName: String,
@@ -10696,7 +10716,7 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
             senderContext: sessionContext,
             oobResendRequest: request)
     }
-
+    
     func sendOutOfBandResendUnavailable(
         unavailableEnvelopeMessageIds: [String],
         to secretName: String,
@@ -10714,7 +10734,7 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
             senderContext: sessionContext,
             oobUnavailableNotice: notice)
     }
-
+    
     private func deliverOutOfBandControl(
         to secretName: String,
         recipientDeviceId: UUID,
@@ -10745,9 +10765,9 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
         }
         continuation?.yield(finalReceived)
     }
-
+    
     func sendMessage(_ message: SignedRatchetMessage, metadata: SignedRatchetMessageMetadata) async throws {
-
+        
         // Determine actual sender from the bound session, not from metadata
         guard let sessionContext = await session.sessionContext else { return }
         await sendMessageTracker.record(
@@ -10863,13 +10883,13 @@ private actor OTKErrorInjector {
     private var remainingFailures: Int = 0
     private var error: PQSError = .oneTimeKeyUploadFailed
     private(set) var attemptCount: Int = 0
-
+    
     func configure(failCount: Int, error: PQSError) {
         remainingFailures = failCount
         self.error = error
         attemptCount = 0
     }
-
+    
     func checkAndThrow() throws {
         attemptCount += 1
         if remainingFailures > 0 {
@@ -11000,16 +11020,16 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
             id: UUID(), communicationId: UUID(), sessionContextId: 1, sharedId: "123",
             sequenceNumber: 1, data: Data())
     }
-
+    
     func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage? {
         createdMessages.first(where: { $0.sharedId == sharedId })
     }
-
+    
     func updateSessionIdentity(_ session: SessionIdentity, andPreparedJob job: JobModel) async throws {
         try await updateSessionIdentity(session)
         try await updateJob(job)
     }
-
+    
     func upsertOutboundDeviceSendRecord(_ record: OutboundDeviceSendRecord) async throws {
         recoveryLedger.upsertOutboundDeviceSendRecord(record)
     }

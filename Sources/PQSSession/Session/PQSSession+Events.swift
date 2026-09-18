@@ -102,7 +102,7 @@ public extension PQSSession {
                 transportInfo: transportInfo,
                 sentDate: Date(),
                 destructionTime: destructionTime)
-
+            
             try await processWrite(
                 message: message,
                 session: self,
@@ -116,7 +116,7 @@ public extension PQSSession {
             throw error
         }
     }
-
+    
     /// Receives and processes an inbound encrypted message from another user.
     ///
     /// This method handles the complete inbound message lifecycle including automatic key refresh,
@@ -158,7 +158,7 @@ public extension PQSSession {
     ///   receiving messages from the network. It handles all the cryptographic processing automatically.
     /// - Note: The method automatically refreshes keys when needed, ensuring continuous communication
     ///   capability without manual intervention.
-    public func receiveMessage(
+    func receiveMessage(
         message: SignedRatchetMessage,
         sender: String,
         deviceId: UUID,
@@ -195,7 +195,7 @@ public extension PQSSession {
             throw error
         }
     }
-  
+    
     func requestMessageResend(
         sharedMessageId: String,
         senderName: String,
@@ -206,7 +206,7 @@ public extension PQSSession {
             senderName: senderName,
             senderDeviceId: senderDeviceId)
     }
-
+    
     func requestMessageResend(
         sharedMessageIds: [String],
         senderName: String,
@@ -214,11 +214,11 @@ public extension PQSSession {
     ) async throws {
         let sharedMessageIds = sharedMessageIds.filter { !$0.isEmpty }
         guard !sharedMessageIds.isEmpty else { return }
-
+        
         guard let context = await sessionContext else {
             throw PQSError.sessionNotInitialized
         }
-
+        
         // Strict §4.1: retry requests are out-of-band. They must not
         // select a Double Ratchet session, mint/demote/promote a lane, or encrypt.
         let requestingDeviceId = context.sessionUser.deviceId
@@ -241,7 +241,7 @@ public extension PQSSession {
             level: .info,
             message: "pqs.recovery.resendRequestSubmittedOutOfBand sender=\(senderName) deviceId=\(senderDeviceId) requestingDeviceId=\(requestingDeviceId) requestedCount=\(sharedMessageIds.count) ids=\(sharedMessageIds.joined(separator: ","))")
     }
-
+    
     @discardableResult
     func handleOutOfBandResendRequest(
         from senderName: String,
@@ -254,7 +254,7 @@ public extension PQSSession {
             failedSharedMessageIds: failedSharedMessageIds,
             session: self)
     }
-
+    
     /// Applies an authenticated transport-level terminal-unavailable notice.
     /// The transport must verify origin/signature before invoking this method.
     func handleOutOfBandResendUnavailable(
@@ -286,7 +286,7 @@ public extension PQSSession {
     }
     
     // MARK: Outbound
-
+    
     /// Processes an outbound message by encrypting and sending it to all target devices.
     ///
     /// This internal method handles the outbound message processing pipeline, including session validation,
@@ -332,9 +332,9 @@ public extension PQSSession {
         
         let symmetricKey = try await getDatabaseSymmetricKey()
         let mySecretName = sessionContext.sessionUser.secretName
-
+        
         var shouldPersist = shouldPersistOverride ?? (sessionDelegate?.shouldPersist(transportInfo: message.transportInfo) == false ? false : true)
-
+        
         if let data = message.transportInfo {
             do {
                 let event = try BinaryDecoder().decode(TransportEvent.self, from: data)
@@ -367,7 +367,7 @@ public extension PQSSession {
             logger: logger)
     }
     
-    public func createConversation(
+    func createConversation(
         sender: String,
         recipient: MessageRecipient,
         channelName: String,
@@ -382,7 +382,7 @@ public extension PQSSession {
         guard let cache else {
             throw PQSError.databaseNotInitialized
         }
-
+        
         let info = ChannelInfo(
             name: channelName,
             administrator: administrator,
@@ -438,7 +438,7 @@ public extension PQSSession {
             cache: cache,
             metadata: metadata)
     }
-
+    
     func updateChannelMembership(
         channelName: String,
         administrator: String,
@@ -491,18 +491,18 @@ extension PQSSession: ContactService {
             throw PQSError.sessionNotInitialized
         }
         let symmetricKey = try await getDatabaseSymmetricKey()
-
+        
         return (sessionContext, cache, transportDelegate, receiverDelegate, sessionDelegate, symmetricKey)
     }
-
+    
     /// Requires session parameters excluding the transport delegate.
     /// - Returns: A tuple containing the required session parameters.
     /// - Throws: An error if any of the required parameters are not initialized.
     func requireSessionParametersWithoutTransportDelegate() async throws -> (sessionContext: SessionContext,
-                                                                                     cache: PQSPersistenceHost,
-                                                                                     receiverDelegate: MessageStoreObserver,
-                                                                                     sessionDelegate: PQSHostDelegate,
-                                                                                     symmetricKey: SymmetricKey)
+                                                                             cache: PQSPersistenceHost,
+                                                                             receiverDelegate: MessageStoreObserver,
+                                                                             sessionDelegate: PQSHostDelegate,
+                                                                             symmetricKey: SymmetricKey)
     {
         guard let sessionContext = await sessionContext else {
             throw PQSError.sessionNotInitialized
@@ -517,18 +517,18 @@ extension PQSSession: ContactService {
             throw PQSError.sessionNotInitialized
         }
         let symmetricKey = try await getDatabaseSymmetricKey()
-
+        
         return (sessionContext, cache, receiverDelegate, sessionDelegate, symmetricKey)
     }
-
+    
     // MARK: - Contact Management
-
+    
     /// Adds a list of contacts to the session.
     /// - Parameter infos: An array of shared contact information to be added.
     /// - Throws: An error if the addition of contacts fails.
     public func addContacts(_ infos: [SharedContactInfo]) async throws {
         let params = try await requireAllSessionParameters()
-
+        
         if let eventDelegate {
             try await eventDelegate.addContacts(
                 infos,
@@ -553,7 +553,7 @@ extension PQSSession: ContactService {
             )
         }
     }
-
+    
     /// Updates or creates a contact with the specified secret name and metadata.
     /// - Parameters:
     ///   - secretName: The secret name of the contact to be updated or created.
@@ -602,7 +602,7 @@ extension PQSSession: ContactService {
             )
         }
     }
-
+    
     /// Sends a communication synchronization request for the specified contact.
     /// - Parameter secretName: The secret name of the contact to synchronize with.
     /// - Throws: An error if the synchronization request fails.
@@ -630,7 +630,7 @@ extension PQSSession: ContactService {
                 logger: logger)
         }
     }
-
+    
     /// Requests a change in the friendship state for a specified contact.
     /// - Parameters:
     ///   - state: The new friendship state to be set.
@@ -641,7 +641,7 @@ extension PQSSession: ContactService {
         contact: Contact
     ) async throws {
         let params = try await requireSessionParametersWithoutTransportDelegate()
-
+        
         if let eventDelegate {
             return try await eventDelegate.requestFriendshipStateChange(
                 state: state,
@@ -664,7 +664,7 @@ extension PQSSession: ContactService {
             )
         }
     }
-
+    
     /// Updates the delivery state of a specified message.
     /// - Parameters:
     ///   - message: The encrypted message whose delivery state is to be updated.
@@ -679,7 +679,7 @@ extension PQSSession: ContactService {
         allowExternalUpdate: Bool = false
     ) async throws {
         let params = try await requireSessionParametersWithoutTransportDelegate()
-
+        
         if let eventDelegate {
             return try await eventDelegate.updateMessageDeliveryState(
                 message,
@@ -704,7 +704,7 @@ extension PQSSession: ContactService {
             )
         }
     }
-
+    
     /// Sends an acknowledgment that a contact has been created to the specified recipient.
     /// - Parameter secretName: The secret name of the recipient to acknowledge.
     /// - Throws: An error if the acknowledgment fails.
@@ -724,7 +724,7 @@ extension PQSSession: ContactService {
             )
         }
     }
-
+    
     /// Requests metadata from a specified contact.
     /// - Parameter secretName: The secret name of the contact to request metadata from.
     /// - Throws: An error if the request fails.
@@ -744,7 +744,7 @@ extension PQSSession: ContactService {
             )
         }
     }
-
+    
     /// Requests the metadata of the current user.
     /// - Throws: An error if the request fails.
     public func requestMyMetadata() async throws {
@@ -761,7 +761,7 @@ extension PQSSession: ContactService {
             )
         }
     }
-
+    
     /// Edits the current message with new text.
     /// - Parameters:
     ///   - message: The encrypted message to be edited.
@@ -772,7 +772,7 @@ extension PQSSession: ContactService {
         guard let receiverDelegate else { throw PQSError.receiverDelegateNotSet }
         guard let sessionDelegate else { throw PQSError.sessionNotInitialized }
         let symmetricKey = try await getDatabaseSymmetricKey()
-
+        
         if let eventDelegate {
             return try await eventDelegate.editCurrentMessage(
                 message,
@@ -795,7 +795,7 @@ extension PQSSession: ContactService {
             )
         }
     }
-
+    
     /// Finds the communication associated with a specified message recipient.
     /// - Parameter messageRecipient: The recipient of the message to find communication for.
     /// - Returns: A `BaseCommunication` object representing the found communication.
@@ -803,7 +803,7 @@ extension PQSSession: ContactService {
     public func conversation(for messageRecipient: MessageRecipient) async throws -> BaseCommunication {
         guard let cache else { throw PQSError.databaseNotInitialized }
         let symmetricKey = try await getDatabaseSymmetricKey()
-
+        
         if let eventDelegate {
             return try await eventDelegate.conversation(
                 for: messageRecipient,
