@@ -812,6 +812,35 @@ struct DogfoodRecoveryStormPolicyTests {
             "BUG: reminted CT token must retain an independent archive pass")
         #expect(InboundRecoveryStormPolicy.tokensAreIndependent(prior, remint))
     }
+
+    @Test("dogfood C2h: pending archive pass defers dead-epoch terminalization")
+    func dogfoodC2h_pendingArchivePassDefersDeadEpochTerminalization() {
+        let token = ArchivedInboundFallbackToken(
+            senderSecretName: "nudge",
+            senderDeviceId: UUID(),
+            envelopeMessageId: "B07A45EC-780E-4B5C-AEAB-D5DAB91B9292",
+            fingerprint: Data("archive-pending-ct".utf8))
+        #expect(
+            !InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
+                token: token,
+                pendingPass: [token.storageKey]),
+            "BUG: terminalizing while archive pass is queued false-positives contentUnrecoverable")
+        #expect(
+            InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
+                token: token,
+                pendingPass: []),
+            "Absent pending pass must still terminalize (archive pass exhausted or never deferred)")
+        let other = ArchivedInboundFallbackToken(
+            senderSecretName: token.senderSecretName,
+            senderDeviceId: token.senderDeviceId,
+            envelopeMessageId: token.envelopeMessageId,
+            fingerprint: Data("different-ct".utf8))
+        #expect(
+            InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
+                token: other,
+                pendingPass: [token.storageKey]),
+            "Independent fingerprint token must not inherit another frame's deferral")
+    }
 }
 
 // MARK: - C3: same sharedId must not remint on every rearmNack (CHILD_DEVICE 2FA48892)

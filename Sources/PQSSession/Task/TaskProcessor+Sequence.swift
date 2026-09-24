@@ -752,7 +752,12 @@ extension MessagePipeline {
                     // episode. Terminalize now, not at episode TTL — a placeholder
                     // left non-terminal outlives the process and is re-armed on
                     // every relaunch (dogfood 2026-09-17 `0B969E92`).
-                    await terminalizeDeadEpochInbound(message, session: session)
+                    //
+                    // Exception: an active-first try-all may already have queued an
+                    // archive fallback for this ciphertext. Terminalizing before
+                    // that pass runs false-positives contentUnrecoverable on frames
+                    // that then decrypt via lanePromotedFromArchive (dogfood Sep 19/23).
+                    await maybeTerminalizeDeadEpochInbound(message, session: session)
                     try await cache.deleteJob(job)
                     return .deleted
                 }
@@ -782,7 +787,8 @@ extension MessagePipeline {
                 await session.markInboundFailure(message, failureClass: failureClass)
                 // Dead-epoch frames never heal by re-decrypt. Terminalize this sharedId
                 // so spool redelivery is swallowed without another OTK/peerRefresh storm.
-                await terminalizeDeadEpochInbound(message, session: session)
+                // Same archive-pass gate as the coalesce branch above.
+                await maybeTerminalizeDeadEpochInbound(message, session: session)
 
                 // The published-batch replacement (key generation + two uploads with
                 // retry backoff) and the subsequent peerRefresh emit must not block the
@@ -1230,6 +1236,32 @@ extension MessagePipeline {
     /// drops its placeholder + durable ledger row instead of re-arming it on
     /// every relaunch. `markInboundContentUnrecoverable` is once-per-tuple, so
     /// redelivered copies do not re-notify the host.
+    ///
+    /// When an archive fallback pass is already queued for this ciphertext,
+    /// defer terminalization: the pass removes the token at start and rethrows
+    /// on failure, so the next handler invocation terminalizes with no timer.
+    private func maybeTerminalizeDeadEpochInbound(
+        _ message: InboundTaskMessage,
+        session: PQSSession
+    ) async {
+        let token = ArchivedInboundFallbackToken(
+            senderSecretName: message.senderSecretName,
+            senderDeviceId: message.senderDeviceId,
+            envelopeMessageId: message.sharedMessageId,
+            fingerprint: PQSSession.nackFrameFingerprint(for: message))
+        let pendingPass = archivedInboundFallbackPasses
+        guard InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
+            token: token,
+            pendingPass: pendingPass
+        ) else {
+            audit(
+                .recovery,
+                "pqs.recovery.deadEpochTerminalizationDeferred reason=archivePassPending sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
+            return
+        }
+        await terminalizeDeadEpochInbound(message, session: session)
+    }
+
     private func terminalizeDeadEpochInbound(
         _ message: InboundTaskMessage,
         session: PQSSession

@@ -109,6 +109,66 @@ struct SessionReestablishmentCoalescingTests {
             sender: sender, deviceId: deviceId, sharedId: sharedId))
     }
 
+    @Test("settlePendingResendForAcceptedEnvelope removes settled id, retains others, clears terminal mark")
+    func settlePendingResendForAcceptedEnvelopeSettlesOnlyThatId() async throws {
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let sender = "acceptWithoutChatPeer"
+        let deviceId = UUID()
+        let settledId = "9A7D575B-FDED-4953-B4E4-BB71AE4AC5B2"
+        let retainedId = "retained-pending-nack"
+
+        await session.deferPeerResendUntilReestablished(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: settledId,
+            failureClass: "ratchet.maxSkippedHeadersExceeded",
+            notifyDelegate: false)
+        await session.deferPeerResendUntilReestablished(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: retainedId,
+            failureClass: "ratchet.maxSkippedHeadersExceeded",
+            notifyDelegate: false)
+        #expect(await session.markInboundContentUnrecoverable(
+            sender: sender, deviceId: deviceId, sharedId: settledId))
+
+        await session.settlePendingResendForAcceptedEnvelope(
+            sender: sender,
+            deviceId: deviceId,
+            sharedId: settledId)
+
+        #expect(
+            !(await session.hasPendingResendAfterReestablishment(
+                sender: sender,
+                deviceId: deviceId,
+                failedMessageId: settledId)),
+            "Accepted envelope must clear its own pending NACK")
+        #expect(
+            await session.hasPendingResendAfterReestablishment(
+                sender: sender,
+                deviceId: deviceId,
+                failedMessageId: retainedId),
+            "Sibling pending NACKs on the same peer-device must remain")
+        #expect(
+            !(await session.isInboundContentUnrecoverable(
+                sender: sender, deviceId: deviceId, sharedId: settledId)),
+            "Accepted decrypt must lift a prior false terminal mark")
+
+        // Hot path: an accepted control frame with no pending NACK is a no-op for
+        // siblings (no take/re-defer churn).
+        await session.settlePendingResendForAcceptedEnvelope(
+            sender: sender,
+            deviceId: deviceId,
+            sharedId: "never-pending-control-frame")
+        #expect(
+            await session.hasPendingResendAfterReestablishment(
+                sender: sender,
+                deviceId: deviceId,
+                failedMessageId: retainedId),
+            "Settling a non-pending id must not disturb sibling pending NACKs")
+    }
+
     @Test("Aged pending resend is not wall-clock terminal")
     func pendingResendTTLExpiryMarksInboundContentUnrecoverable() async throws {
         // Idle senders must not silently lose deferred NACKs to wall-clock

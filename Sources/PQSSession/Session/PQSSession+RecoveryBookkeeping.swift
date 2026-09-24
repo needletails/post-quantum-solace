@@ -1090,6 +1090,35 @@ extension PQSSession {
         }
     }
 
+    /// Settles deferred NACK bookkeeping for an envelope that decrypted and was
+    /// accepted without a chat row (TransportEvent / `shouldPersist == false`).
+    ///
+    /// The persist branch already clears the satisfied id via
+    /// `takePendingResendsAfterReestablishment(satisfiedSharedMessageId:)`.
+    /// Without this, a control frame that decrypts keeps its pending NACK,
+    /// re-NACKs on later drains, and can hit `resendSubmissionCap` /
+    /// `oobUnavailable` after the content was already accepted. Does not end
+    /// the episode or drain sibling NACKs.
+    func settlePendingResendForAcceptedEnvelope(
+        sender: String,
+        deviceId: UUID,
+        sharedId: String
+    ) async {
+        // O(1) lift of a prior false terminal mark; a no-op when absent.
+        clearInboundTerminalOutcome(
+            sender: sender,
+            deviceId: deviceId,
+            sharedId: sharedId)
+        // Hot path: control frames (receipts, typing) arrive constantly and almost
+        // never have a pending NACK. Only touch sibling entries when this id is
+        // actually pending, so their `createdAt` LRU order is left alone.
+        let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: sharedId)
+        guard pendingResendAfterReestablishment.removeValue(forKey: requestKey) != nil else {
+            return
+        }
+        auditSink.log(.recovery, "pqs.recovery.pendingResendSettled reason=acceptedWithoutChatRow sharedId=\(sharedId) sender=\(sender) deviceId=\(deviceId.uuidString)")
+    }
+
     private func cleanupPendingResendAfterReestablishment(now: Date = Date()) async {
         // Event-driven terminality only (unavailable / submission cap / dead-epoch).
         // Wall-clock age must not terminalize deferred NACKs for idle senders.

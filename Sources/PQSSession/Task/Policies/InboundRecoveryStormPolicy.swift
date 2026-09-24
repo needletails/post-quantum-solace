@@ -56,6 +56,22 @@ public enum InboundRecoveryStormPolicy: Sendable {
         return !exhausted.contains(key) && !pendingPass.contains(key)
     }
 
+    /// Whether a `missingOneTimeKey` frame may be terminalized *now*.
+    ///
+    /// An active-first try-all that fails with archives present inserts the
+    /// token and queues a `.background` archive pass before throwing
+    /// `preferredError`. Terminalizing at that throw falsely marks content
+    /// unrecoverable that the archive pass then decrypts
+    /// (`lanePromotedFromArchive` within ~1s; dogfood Sep 19/23). Gate on
+    /// the pending set: absent → terminalize; present → wait for the pass
+    /// (which removes the token at start and rethrows on failure).
+    public static func shouldTerminalizeDeadEpochNow(
+        token: ArchivedInboundFallbackToken,
+        pendingPass: Set<String>
+    ) -> Bool {
+        !pendingPass.contains(token.storageKey)
+    }
+
     /// After one completed archive pass, further redeliveries of the *same*
     /// token must not re-walk archives until a heal event.
     public static func exhaustedAfterArchivePassCompleted(

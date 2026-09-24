@@ -1986,6 +1986,168 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    /// Dogfood Sep 19/23: active-first try-all queues an archive fallback before
+    /// throwing `missingOneTimeKey`. Terminalizing at that throw marks content
+    /// unrecoverable that the archive pass then decrypts (`lanePromotedFromArchive`).
+    @Test("missingOneTimeKey leader with pending archive token is not terminalized")
+    func testMissingOneTimeKeyLeaderWithPendingArchiveTokenIsNotTerminalized() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        let probe = EpisodeEndProbe()
+        await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
+        await session.messagePipeline.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+
+        let uploadPause = OTKUploadPause()
+        transport.beforeUpdateOneTimeKeys = {
+            await uploadPause.beforeFirstUpload()
+        }
+        defer {
+            transport.beforeUpdateOneTimeKeys = nil
+        }
+
+        let sender = "bob_missing_otk_archive_leader"
+        let peerDeviceId = UUID()
+        let leaderId = "missing_otk_archive_leader"
+        let leader = try makeTestInboundTaskMessage(
+            senderSecretName: sender,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: leaderId)
+        let token = ArchivedInboundFallbackToken(
+            senderSecretName: sender,
+            senderDeviceId: peerDeviceId,
+            envelopeMessageId: leaderId,
+            fingerprint: PQSSession.nackFrameFingerprint(for: leader))
+        await session.messagePipeline.test_insertArchivedInboundFallbackPass(token.storageKey)
+
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .streamMessage(leader)),
+            session: session
+        )
+        let hasPendingRepair = try await waitForPendingRepair(sender: sender, deviceId: peerDeviceId)
+        #expect(hasPendingRepair, "First missingOneTimeKey should start a recovery episode")
+        let uploadPaused = try await waitUntil {
+            await uploadPause.isPaused()
+        }
+        #expect(uploadPaused, "First missingOneTimeKey recovery should reach OTK upload")
+
+        #expect(
+            !(await session.isInboundContentUnrecoverable(
+                sender: sender,
+                deviceId: peerDeviceId,
+                sharedId: leaderId)),
+            "Leader must not terminalize while its archive fallback pass is still queued")
+        let hostNotified = await probe.unrecoverableContent().contains {
+            $0.0 == sender && $0.1 == peerDeviceId && $0.2 == leaderId
+        }
+        #expect(!hostNotified, "Host must not receive inboundContentUnrecoverable while archive pass is pending")
+
+        await uploadPause.release()
+        await session.shutdown()
+    }
+
+    /// Same gate for coalesced frames: pending archive token ⇒ not terminal; after
+    /// the pass removes the token, a redelivery terminalizes once.
+    @Test("missingOneTimeKey coalesced with pending archive token defers terminalization until pass starts")
+    func testMissingOneTimeKeyCoalescedPendingArchiveTokenDefersThenTerminalizes() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        let probe = EpisodeEndProbe()
+        await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
+        await session.messagePipeline.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+
+        let uploadPause = OTKUploadPause()
+        transport.beforeUpdateOneTimeKeys = {
+            await uploadPause.beforeFirstUpload()
+        }
+        defer {
+            transport.beforeUpdateOneTimeKeys = nil
+        }
+
+        let sender = "bob_missing_otk_archive_coalesced"
+        let peerDeviceId = UUID()
+        let leaderId = "missing_otk_archive_coalesced_leader"
+        let coalescedId = "missing_otk_archive_coalesced_frame"
+        let leader = try makeTestInboundTaskMessage(
+            senderSecretName: sender,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: leaderId)
+        let coalesced = try makeTestInboundTaskMessage(
+            senderSecretName: sender,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: coalescedId)
+        let coalescedToken = ArchivedInboundFallbackToken(
+            senderSecretName: sender,
+            senderDeviceId: peerDeviceId,
+            envelopeMessageId: coalescedId,
+            fingerprint: PQSSession.nackFrameFingerprint(for: coalesced))
+
+        // Open the episode with a leader that has no pending archive token so it
+        // terminalizes normally; then enqueue the coalesced frame under a pending token.
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .streamMessage(leader)),
+            session: session
+        )
+        let hasPendingRepair = try await waitForPendingRepair(sender: sender, deviceId: peerDeviceId)
+        #expect(hasPendingRepair, "First missingOneTimeKey should start a recovery episode")
+        let uploadPaused = try await waitUntil {
+            await uploadPause.isPaused()
+        }
+        #expect(uploadPaused, "First missingOneTimeKey recovery should reach OTK upload")
+
+        await session.messagePipeline.test_insertArchivedInboundFallbackPass(coalescedToken.storageKey)
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .streamMessage(coalesced)),
+            session: session
+        )
+        let coalescedRecorded = try await waitUntil { [session] in
+            await session.hasPendingResendAfterReestablishment(
+                sender: sender,
+                deviceId: peerDeviceId,
+                failedMessageId: coalescedId)
+        }
+        #expect(coalescedRecorded, "Coalesced frame is still deferred for the post-peerRefresh resend round")
+        #expect(
+            !(await session.isInboundContentUnrecoverable(
+                sender: sender,
+                deviceId: peerDeviceId,
+                sharedId: coalescedId)),
+            "Coalesced frame must not terminalize while its archive fallback pass is queued")
+        #expect(
+            !(await probe.unrecoverableContent().contains {
+                $0.0 == sender && $0.1 == peerDeviceId && $0.2 == coalescedId
+            }),
+            "Host must not be notified while archive pass is pending")
+
+        // Archive pass start removes the token; a redelivery then terminalizes once.
+        await session.messagePipeline.test_removeArchivedInboundFallbackPass(coalescedToken.storageKey)
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .streamMessage(coalesced)),
+            session: session
+        )
+        let nowTerminal = try await waitUntil { [session] in
+            await session.isInboundContentUnrecoverable(
+                sender: sender,
+                deviceId: peerDeviceId,
+                sharedId: coalescedId)
+        }
+        #expect(nowTerminal, "After the archive token is removed, redelivery must terminalize")
+        let hostNotified = try await waitUntil {
+            await probe.unrecoverableContent().contains {
+                $0.0 == sender && $0.1 == peerDeviceId && $0.2 == coalescedId
+            }
+        }
+        #expect(hostNotified, "Host must receive inboundContentUnrecoverable once the pass is exhausted")
+        let coalescedNotifications = await probe.unrecoverableContent().filter { $0.2 == coalescedId }.count
+        #expect(coalescedNotifications == 1, "Terminal notification is once per sharedId")
+
+        await uploadPause.release()
+        await session.shutdown()
+    }
+
     /// `tryBeginReestablishmentEpisode(heldOfflineFramesCanHeal: false)` documents
     /// that the dead-epoch mark "also applies when the episode is already open",
     /// but the `missingOneTimeKey` coalesce branch never called it. A healable
@@ -3795,6 +3957,19 @@ private actor OTKUploadPause {
         isReleased = true
         continuation?.resume()
         continuation = nil
+    }
+}
+
+extension MessagePipeline {
+    /// Test-only: insert an archive-fallback pending token (simulates
+    /// `deferArchivedInboundFallback` after active-first try-all failure).
+    func test_insertArchivedInboundFallbackPass(_ storageKey: String) {
+        archivedInboundFallbackPasses.insert(storageKey)
+    }
+
+    /// Test-only: remove a pending token (simulates archive-pass start).
+    func test_removeArchivedInboundFallbackPass(_ storageKey: String) {
+        archivedInboundFallbackPasses.remove(storageKey)
     }
 }
 

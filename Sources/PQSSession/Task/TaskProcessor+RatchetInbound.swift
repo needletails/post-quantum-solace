@@ -683,6 +683,14 @@ extension MessagePipeline {
                     headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
                     acknowledgeTransport: false)
                 didAcceptInbound = true
+                // Persist branch settles pending resend under `if canSaveMessage`
+                // below. Non-persist accepts must clear this frame's own NACK too,
+                // or later drains re-NACK an already-accepted envelope until
+                // `resendSubmissionCap`.
+                await session.settlePendingResendForAcceptedEnvelope(
+                    sender: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId,
+                    sharedId: inboundTask.sharedMessageId)
             }
 
             if canSaveMessage {
