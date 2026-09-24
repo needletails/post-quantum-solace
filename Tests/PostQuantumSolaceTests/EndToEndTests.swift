@@ -6266,6 +6266,10 @@ actor EndToEndTests {
                         recipient: .nickname("bob"),
                         text: "A->B #\(i)")
                 }
+            } catch PQSError.databaseNotInitialized, PQSError.sessionNotInitialized {
+                // The test body returns after a fixed wait and shuts the session
+                // down while this unstructured send loop may still be in flight.
+                return
             } catch {
                 #expect(Bool(false), "Unexpected error: \(error)")
                 return
@@ -6278,6 +6282,8 @@ actor EndToEndTests {
                         recipient: .nickname("alice"),
                         text: "B->A #\(i)")
                 }
+            } catch PQSError.databaseNotInitialized, PQSError.sessionNotInitialized {
+                return
             } catch {
                 #expect(Bool(false), "Unexpected error: \(error)")
                 return
