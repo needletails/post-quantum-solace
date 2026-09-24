@@ -2231,11 +2231,6 @@ actor TaskProcessorSequenceTests {
         defer {
             transport.beforeUpdateOneTimeKeys = nil
         }
-        // The suite shares one mock transport. Prior tests (and createSenderSession)
-        // may already have incremented the counter; this assertion is about *this*
-        // recovery's single curve upload. macOS CI runs other suites in parallel
-        // and the 3s wait for an absolute `== 1` timed out there.
-        await transport.resetCallTracking()
 
         let peerDeviceId = UUID()
         let first = try makeTestInboundTaskMessage(
@@ -2267,39 +2262,25 @@ actor TaskProcessorSequenceTests {
             session: session
         )
 
-        await uploadPause.release()
-        try await firstFeed
-        try await secondFeed
-
-        // Once the pause is released the recovery episode can complete and
-        // flushPendingResends drains pending entries into submitted resend
-        // requests. On slow runners that drain wins the race with this
-        // assertion, so accept either state: still pending, or already
-        // drained into a submitted request (which implies it was recorded
-        // inside the episode).
+        // Keep the first upload paused while proving the second failure joined
+        // the same live episode. Releasing first lets peerRefresh completion
+        // drain the pending id and makes this assertion scheduler-dependent.
         let secondRecorded = try await waitUntil { [session] in
-            if await session.hasPendingResendAfterReestablishment(
+            await session.hasPendingResendAfterReestablishment(
                 sender: "bob_missing_otk_inflight",
                 deviceId: peerDeviceId,
-                failedMessageId: "missing_otk_inflight_2") {
-                return true
-            }
-            return await session.resendRequestSubmissionCount(
-                sender: "bob_missing_otk_inflight",
-                deviceId: peerDeviceId,
-                failedMessageId: "missing_otk_inflight_2") > 0
+                failedMessageId: "missing_otk_inflight_2")
         }
         #expect(
             secondRecorded,
             "Second missingOneTimeKey should be recorded inside the in-flight recovery episode")
-
-        let sawSingleX25519Upload = try await waitUntil(timeout: 10) {
-            await self.transport.updateOneTimeKeysCallCount == 1
-        }
-        #expect(sawSingleX25519Upload, "Only the first in-flight recovery should upload a replacement curve OTK batch")
         #expect(
-            await transport.updateOneTimeKeysCallCount == 1,
-            "A second in-flight recovery must not start another curve OTK upload")
+            await uploadPause.uploadInvocationCount() == 1,
+            "The coalesced recovery must join the in-flight replacement instead of starting another curve upload")
+
+        await uploadPause.release()
+        try await firstFeed
+        try await secondFeed
 
         await session.shutdown()
     }
@@ -3945,9 +3926,11 @@ final class MockTaskDelegateWithAlwaysOutboundError: TaskSequenceDelegate, @unch
 private actor OTKUploadPause {
     private var didPause = false
     private var isReleased = false
+    private var invocations = 0
     private var continuation: CheckedContinuation<Void, Never>?
 
     func beforeFirstUpload() async {
+        invocations += 1
         guard !didPause else { return }
         didPause = true
         guard !isReleased else { return }
@@ -3958,6 +3941,10 @@ private actor OTKUploadPause {
 
     func isPaused() -> Bool {
         didPause && !isReleased
+    }
+
+    func uploadInvocationCount() -> Int {
+        invocations
     }
 
     func release() {

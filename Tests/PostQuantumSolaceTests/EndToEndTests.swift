@@ -6169,10 +6169,14 @@ actor EndToEndTests {
     func testBidirectionalHighConcurrencyBurst() async throws {
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
+        var aliceSendTask: Task<Void, Error>?
+        var bobSendTask: Task<Void, Error>?
         defer {
             Task {
                 aliceTask?.cancel()
                 bobTask?.cancel()
+                aliceSendTask?.cancel()
+                bobSendTask?.cancel()
                 await shutdownSessions()
             }
         }
@@ -6259,37 +6263,30 @@ actor EndToEndTests {
         }
         
         
-        Task {
-            do {
-                for i in 1...total {
-                    try await self._senderMaxSkipSession.send(
-                        recipient: .nickname("bob"),
-                        text: "A->B #\(i)")
-                }
-            } catch PQSError.databaseNotInitialized, PQSError.sessionNotInitialized {
-                // The test body returns after a fixed wait and shuts the session
-                // down while this unstructured send loop may still be in flight.
-                return
-            } catch {
-                #expect(Bool(false), "Unexpected error: \(error)")
-                return
+        aliceSendTask = Task {
+            for i in 1...total {
+                try await self._senderMaxSkipSession.send(
+                    recipient: .nickname("bob"),
+                    text: "A->B #\(i)")
             }
         }
-        Task {
-            do {
-                for i in 1...total {
-                    try await self._recipientMaxSkipSession.send(
-                        recipient: .nickname("alice"),
-                        text: "B->A #\(i)")
-                }
-            } catch PQSError.databaseNotInitialized, PQSError.sessionNotInitialized {
-                return
-            } catch {
-                #expect(Bool(false), "Unexpected error: \(error)")
-                return
+        bobSendTask = Task {
+            for i in 1...total {
+                try await self._recipientMaxSkipSession.send(
+                    recipient: .nickname("alice"),
+                    text: "B->A #\(i)")
             }
         }
-        try await Task.sleep(until: .now + .seconds(5))
+
+        // The send loops are part of the test, not fire-and-forget work. Await
+        // them before teardown so a slow runner cannot close the cache while a
+        // send is still resolving device lanes.
+        try await aliceSendTask?.value
+        try await bobSendTask?.value
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await aliceTask?.value
+        _ = await bobTask?.value
     }
     
     @Test("SKIP_MESS Rekey")
