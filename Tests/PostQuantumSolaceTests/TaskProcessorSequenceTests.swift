@@ -633,6 +633,13 @@ actor TaskProcessorSequenceTests {
 
         try await session.resumeJobQueue()
 
+        let drained = try await waitUntil(timeout: 5) {
+            let didFailOnce = await failingDelegate.getErrorCount() == 1
+            let didContinue = await failingDelegate.getProcessedMessages() == ["processed_after_resume"]
+            let jobsAreEmpty = (try? await cache.fetchJobs().isEmpty) == true
+            return didFailOnce && didContinue && jobsAreEmpty
+        }
+        #expect(drained, "Invalid signature job should be dropped and the later job should drain")
         #expect(await failingDelegate.getErrorCount() == 1, "Expected one invalid signature failure")
         #expect(
             await failingDelegate.getProcessedMessages() == ["processed_after_resume"],
