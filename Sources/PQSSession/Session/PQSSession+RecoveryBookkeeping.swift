@@ -543,20 +543,36 @@ extension PQSSession {
         unavailableResendIds[peerResendServiceKey(requestingDeviceId: requestingDeviceId, sharedId: sharedId)] != nil
     }
 
+    /// - Parameter logicalSharedId: Logical id from the wire packet
+    ///   (`MessagePacket.logicalMessageId`). Stored only when it differs from the
+    ///   envelope id so `settlePendingResendsForAcceptedInbound` can match a
+    ///   sender resend that arrives under a new envelope MessageID.
     func deferPeerResendUntilReestablished(
         sender: String,
         deviceId: UUID,
         failedMessageId: String,
+        logicalSharedId: String? = nil,
         failureClass: String,
         now: Date = Date(),
         notifyDelegate: Bool = true
     ) async {
         await cleanupPendingResendAfterReestablishment(now: now)
         let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        let normalizedLogical = logicalSharedId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let retainedLogical: String? = {
+            guard let normalizedLogical, !normalizedLogical.isEmpty, normalizedLogical != failedMessageId else {
+                return nil
+            }
+            return normalizedLogical
+        }()
+        // A re-defer of an existing entry (drain re-arm, awaiting peerRefresh) may
+        // arrive without the logical id; never downgrade one we already learned.
+        let priorLogical = pendingResendAfterReestablishment[requestKey]?.logicalSharedId
         pendingResendAfterReestablishment[requestKey] = PendingResendAfterReestablishment(
             senderName: sender,
             senderDeviceId: deviceId,
             failedSharedMessageId: failedMessageId,
+            logicalSharedId: retainedLogical ?? priorLogical,
             failureClass: failureClass,
             createdAt: now)
         guard notifyDelegate else { return }
@@ -1117,6 +1133,73 @@ extension PQSSession {
             return
         }
         auditSink.log(.recovery, "pqs.recovery.pendingResendSettled reason=acceptedWithoutChatRow sharedId=\(sharedId) sender=\(sender) deviceId=\(deviceId.uuidString)")
+    }
+
+    /// Settles every deferred NACK on this peer-device lane that the accepted
+    /// inbound frame satisfies, and returns the settled **envelope** ids.
+    ///
+    /// Pending entries are keyed by the failed envelope MessageID (§4.1), but a
+    /// sender resend keeps the logical sharedId and mints a **new** envelope id
+    /// (S12). Matching only on the envelope therefore never settles a replay:
+    /// the original envelope stays pending, is re-NACKed at every drain boundary
+    /// (`offlineReplayComplete`, next successful decrypt, peerRefresh response),
+    /// the sender replays again, and the loop only ends at `resendSubmissionCap`
+    /// — observed as repeated `resendRequestReceived` for identical ids after the
+    /// content had already been delivered (dogfood 2026-09-24, same-account
+    /// sibling bootstrap; also cross-account `sunflower`/`sdx26`).
+    ///
+    /// An entry is satisfied when any of these hold:
+    /// - its envelope id equals the accepted envelope id (exact redelivery), or
+    /// - its envelope id equals the accepted logical id (host re-arm entries are
+    ///   keyed by the placeholder row's logical id), or
+    /// - its recorded logical id equals the accepted logical id (orphan resend).
+    ///
+    /// For each settled entry the terminal mark and failure-class suppression for
+    /// that envelope are lifted as well, so the heal is visible as
+    /// `pqs.recovery.recovered` instead of being inferred from silence.
+    @discardableResult
+    func settlePendingResendsForAcceptedInbound(
+        sender: String,
+        deviceId: UUID,
+        envelopeMessageId: String,
+        logicalSharedId: String,
+        now: Date = Date()
+    ) async -> [String] {
+        let logical = logicalSharedId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let satisfied = pendingResendAfterReestablishment.filter { _, pending in
+            guard pending.senderName == sender, pending.senderDeviceId == deviceId else {
+                return false
+            }
+            if pending.failedSharedMessageId == envelopeMessageId { return true }
+            guard !logical.isEmpty else { return false }
+            if pending.failedSharedMessageId == logical { return true }
+            return pending.logicalSharedId == logical
+        }
+        guard !satisfied.isEmpty else {
+            // Hot path for control frames: still lift a possible false terminal
+            // mark on the exact envelope (late replay after write-off).
+            clearInboundTerminalOutcome(sender: sender, deviceId: deviceId, sharedId: envelopeMessageId)
+            return []
+        }
+        var settledIds: [String] = []
+        for (key, pending) in satisfied.sorted(by: { $0.value.createdAt < $1.value.createdAt }) {
+            pendingResendAfterReestablishment.removeValue(forKey: key)
+            let settledEnvelope = pending.failedSharedMessageId
+            settledIds.append(settledEnvelope)
+            clearInboundTerminalOutcome(sender: sender, deviceId: deviceId, sharedId: settledEnvelope)
+            let priorFailureClasses = takeInboundFailureClasses(
+                sender: sender,
+                deviceId: deviceId,
+                messageId: settledEnvelope,
+                now: now)
+            let reason = settledEnvelope == envelopeMessageId ? "exactEnvelope" : "logicalReplay"
+            auditSink.log(.recovery, "pqs.recovery.pendingResendSettled reason=\(reason) sharedId=\(settledEnvelope) logical=\(logical) acceptedEnvelope=\(envelopeMessageId) sender=\(sender) deviceId=\(deviceId.uuidString)")
+            if !priorFailureClasses.isEmpty {
+                auditSink.log(.recovery, "pqs.recovery.recovered sharedId=\(settledEnvelope) logical=\(logical) sender=\(sender) deviceId=\(deviceId.uuidString) priorFailureClasses=\(priorFailureClasses.joined(separator: ","))")
+            }
+        }
+        clearInboundTerminalOutcome(sender: sender, deviceId: deviceId, sharedId: envelopeMessageId)
+        return settledIds
     }
 
     private func cleanupPendingResendAfterReestablishment(now: Date = Date()) async {

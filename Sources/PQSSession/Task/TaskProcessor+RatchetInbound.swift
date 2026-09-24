@@ -686,11 +686,13 @@ extension MessagePipeline {
                 // Persist branch settles pending resend under `if canSaveMessage`
                 // below. Non-persist accepts must clear this frame's own NACK too,
                 // or later drains re-NACK an already-accepted envelope until
-                // `resendSubmissionCap`.
-                await session.settlePendingResendForAcceptedEnvelope(
+                // `resendSubmissionCap`. Match by logical id as well: a sender
+                // resend of a failed control frame arrives under a new envelope id.
+                await session.settlePendingResendsForAcceptedInbound(
                     sender: inboundTask.senderSecretName,
                     deviceId: inboundTask.senderDeviceId,
-                    sharedId: inboundTask.sharedMessageId)
+                    envelopeMessageId: inboundTask.sharedMessageId,
+                    logicalSharedId: inboundTask.resolvedLogicalSharedId)
             }
 
             if canSaveMessage {
@@ -721,6 +723,16 @@ extension MessagePipeline {
                     sender: inboundTask.senderSecretName,
                     deviceId: inboundTask.senderDeviceId)
 
+                // Settle the deferred NACK this frame satisfies *before* taking the
+                // lane for drain. A sender resend (S12) carries the original logical
+                // id under a new envelope id; matching only `satisfiedSharedMessageId`
+                // (envelope) re-drained the original envelope's NACK on every
+                // successful decrypt and every replay boundary.
+                await session.settlePendingResendsForAcceptedInbound(
+                    sender: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId,
+                    envelopeMessageId: inboundTask.sharedMessageId,
+                    logicalSharedId: inboundTask.resolvedLogicalSharedId)
                 let pending = await session.takePendingResendsAfterReestablishment(
                     sender: inboundTask.senderSecretName,
                     deviceId: inboundTask.senderDeviceId,
@@ -747,6 +759,7 @@ extension MessagePipeline {
                             sender: pendingRequest.senderName,
                             deviceId: pendingRequest.senderDeviceId,
                             failedMessageId: pendingRequest.failedSharedMessageId,
+                            logicalSharedId: pendingRequest.logicalSharedId,
                             failureClass: pendingRequest.failureClass)
                     }
                 } else {

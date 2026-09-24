@@ -53,4 +53,7 @@ public enum PQSError: Error, Equatable, Sendable {
     case deviceIdentityCorrupted
     case encryptionFailed
     case decryptionFailed
+    /// `addContacts` finished the batch but one or more entries could not be
+    /// created. The host can latch these names for an event-driven re-sync.
+    case contactSyncIncomplete(failedSecretNames: [String])
 }

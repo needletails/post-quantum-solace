@@ -668,7 +668,12 @@ public actor PQSSession: SessionCacheSynchronizer {
     struct PendingResendAfterReestablishment: Sendable, Equatable {
         let senderName: String
         let senderDeviceId: UUID
+        /// Failed **envelope** MessageID (§4.1) — what the OOB retry cites.
         let failedSharedMessageId: String
+        /// Logical sharedId the wire packet carried for that envelope, when it
+        /// differs. A sender resend keeps this id and mints a new envelope, so
+        /// this is the only key under which a replay can settle the entry.
+        let logicalSharedId: String?
         let failureClass: String
         let createdAt: Date
     }

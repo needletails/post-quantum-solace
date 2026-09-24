@@ -169,6 +169,126 @@ struct SessionReestablishmentCoalescingTests {
             "Settling a non-pending id must not disturb sibling pending NACKs")
     }
 
+    @Test("Orphan replay under a new envelope id settles the original envelope's pending NACK by logical id")
+    func replayUnderNewEnvelopeSettlesPendingNackByLogicalId() async throws {
+        // Dogfood 2026-09-24 sibling 16EB82F8: envelopes EFD69153/AE44C4DE failed,
+        // orphan resend replayed the same logical ids under new envelope ids
+        // (A9F9746E/8FA8325F), the replay decrypted, yet the same two envelope ids
+        // were NACKed again at the next drain boundary. Pending NACKs are keyed by
+        // the failed *envelope* id (§4.1) but a resend always mints a new envelope,
+        // so settlement has to match on the logical id the wire packet carried.
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let sender = "nudge"
+        let deviceId = UUID()
+        let failedEnvelope = "EFD69153-1514-4C9D-8618-7A8E79CEA62D"
+        let logical = "99F4AD74-7040-40F2-98CC-3C78CEC907DF"
+        let replayEnvelope = "A9F9746E-B8FA-418F-9C62-B845ACB25032"
+        let siblingEnvelope = "AE44C4DE-7E72-407F-B663-BAAC3A64D615"
+        let siblingLogical = "A9E43F36-5754-4C58-AD6E-CD9EC57E6495"
+
+        await session.deferPeerResendUntilReestablished(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: failedEnvelope,
+            logicalSharedId: logical,
+            failureClass: "ratchet.missingOneTimeKey",
+            notifyDelegate: false)
+        await session.deferPeerResendUntilReestablished(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: siblingEnvelope,
+            logicalSharedId: siblingLogical,
+            failureClass: "ratchet.missingOneTimeKey",
+            notifyDelegate: false)
+        #expect(await session.markInboundContentUnrecoverable(
+            sender: sender, deviceId: deviceId, sharedId: failedEnvelope))
+
+        let settled = await session.settlePendingResendsForAcceptedInbound(
+            sender: sender,
+            deviceId: deviceId,
+            envelopeMessageId: replayEnvelope,
+            logicalSharedId: logical)
+
+        #expect(settled == [failedEnvelope], "The replay must settle exactly the failed envelope carrying the same logical id")
+        #expect(
+            !(await session.hasPendingResendAfterReestablishment(
+                sender: sender, deviceId: deviceId, failedMessageId: failedEnvelope)),
+            "A decrypted replay must not leave the original envelope's NACK pending")
+        #expect(
+            await session.hasPendingResendAfterReestablishment(
+                sender: sender, deviceId: deviceId, failedMessageId: siblingEnvelope),
+            "A different logical id on the same lane must stay pending")
+        #expect(
+            !(await session.isInboundContentUnrecoverable(
+                sender: sender, deviceId: deviceId, sharedId: failedEnvelope)),
+            "Settling by logical id must lift the failed envelope's terminal mark")
+
+        // The remaining drain must not re-NACK the settled envelope.
+        let remaining = await session.takePendingResendsAfterReestablishment(
+            sender: sender, deviceId: deviceId)
+        #expect(remaining.map(\.failedSharedMessageId) == [siblingEnvelope])
+        #expect(remaining.map(\.logicalSharedId) == [siblingLogical])
+    }
+
+    @Test("Host re-armed NACK keyed by logical id is settled when that logical content decrypts")
+    func hostRearmLogicalKeyedNackSettledByReplay() async throws {
+        // After relaunch the host re-arms from its durable ledger, which knows only
+        // the placeholder row's sharedId (the logical id). A replay under any
+        // envelope id must settle it.
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let deviceId = UUID()
+        let logical = "rearm-logical-shared"
+
+        await session.rearmInboundRecoveryPendingResend(
+            sender: "alice",
+            deviceId: deviceId,
+            sharedMessageId: logical)
+
+        let settled = await session.settlePendingResendsForAcceptedInbound(
+            sender: "alice",
+            deviceId: deviceId,
+            envelopeMessageId: UUID().uuidString,
+            logicalSharedId: logical)
+
+        #expect(settled == [logical])
+        #expect(!(await session.hasPendingResendAfterReestablishment(
+            sender: "alice", deviceId: deviceId, failedMessageId: logical)))
+    }
+
+    @Test("Exact envelope redelivery still settles when the wire packet carried no logical id")
+    func exactEnvelopeRedeliverySettlesWithoutLogicalId() async throws {
+        // Legacy packets (T18 dual-read): `logicalMessageId` absent, so the logical
+        // id resolves to the envelope id. Settlement must keep working by envelope.
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let deviceId = UUID()
+        let envelope = "legacy-envelope-only"
+
+        await session.deferPeerResendUntilReestablished(
+            sender: "legacy",
+            deviceId: deviceId,
+            failedMessageId: envelope,
+            failureClass: "crypto.bodyDecryptionFailed",
+            notifyDelegate: false)
+
+        let settled = await session.settlePendingResendsForAcceptedInbound(
+            sender: "legacy",
+            deviceId: deviceId,
+            envelopeMessageId: envelope,
+            logicalSharedId: envelope)
+        #expect(settled == [envelope])
+
+        // A no-op settle for an unrelated envelope must not disturb anything.
+        let untouched = await session.settlePendingResendsForAcceptedInbound(
+            sender: "legacy",
+            deviceId: deviceId,
+            envelopeMessageId: "unrelated",
+            logicalSharedId: "unrelated")
+        #expect(untouched.isEmpty)
+    }
+
     @Test("Aged pending resend is not wall-clock terminal")
     func pendingResendTTLExpiryMarksInboundContentUnrecoverable() async throws {
         // Idle senders must not silently lose deferred NACKs to wall-clock

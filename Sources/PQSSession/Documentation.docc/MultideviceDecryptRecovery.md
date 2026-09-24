@@ -42,6 +42,7 @@ sender orphan-resend.
 | Retry request is unencrypted | §4.1 | `PQSRecoveryTransport.sendOutOfBandResendRequest` | S1, S7, S13 |
 | Retry cites unique MessageID of failed envelope | §4.1 | `failedEnvelopeMessageIds` | S11–S13 |
 | MessageRecord per (device, envelope), new ID on resend | §4.1 | `OutboundDeviceSendRecord` envelope index | S11, S12 |
+| Replay settles the failed envelope's deferred NACK by logical id | §4.1 | `settlePendingResendsForAcceptedInbound` | S12a |
 | Remint only when active SessionID matches MessageRecord | §4.1 | `OrphanResendRemintPolicy` | S15 |
 | Bounded resend attempts | §4.1 | peer-resend / honor caps | S15 |
 | Offline spool / replay waves | out of scope | Transport extension (T11–T18) | Offline coordinator tests |
@@ -233,6 +234,34 @@ recipient device. Wire `MessagePacket.id` = envelope;
 
 **Invariant.** Resend keeps logical ID, mints new envelope, supersedes
 old MessageRecord; never overwrites old envelope ID in place.
+
+### S12a — Replay settles the failed envelope's NACK by logical id
+
+|                             |                                      |
+| --------------------------- | ------------------------------------ |
+| **Topology**                | Receiver deferred a NACK for envelope E1; sender replays logical L under E2 |
+| **Severity**                | Critical (dogfood 2026-09-24, same-account sibling bootstrap) |
+| **Behavioral test**         | `SessionReestablishmentCoalescingTests.replayUnderNewEnvelopeSettlesPendingNackByLogicalId` |
+
+**Failure mode.** Pending NACKs are keyed by the failed envelope id (S13),
+and a resend mints a new envelope (S12). Settling only on the accepted
+envelope id never matched a replay: E1 stayed pending, was re-NACKed at
+every drain boundary (`offlineReplayComplete`, next successful decrypt,
+`peerRefresh response transported`), the sender replayed again, and the
+loop ended only at `resendSubmissionCap` — identical
+`resendRequestReceived` ids after the content had already landed. Hosts
+that keyed the placeholder row by E1 also never saw `placeholderHealed`.
+
+**Invariant.** `PendingResendAfterReestablishment` records the wire
+`logicalMessageId` at failure time. On accept (persist **and**
+accept-without-chat-row) `settlePendingResendsForAcceptedInbound` clears
+every entry on that peer-device lane whose envelope id, or recorded
+logical id, equals the accepted envelope/logical id, lifts the terminal
+mark, and audits `pendingResendSettled reason=logicalReplay` /
+`recovered`. Host placeholder rows and the durable ledger are keyed by
+the logical id (`resolveInboundLogicalSharedId` in nudge-kit) so the
+replay heals in place and `inboundCiphertextAccepted` clears the entry.
+Legacy packets without a logical id keep envelope-only matching (T18).
 
 ### S13 — OOB retry names exact envelope + requester device
 

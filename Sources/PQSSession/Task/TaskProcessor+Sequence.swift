@@ -742,6 +742,7 @@ extension MessagePipeline {
                         sender: message.senderSecretName,
                         deviceId: message.senderDeviceId,
                         failedMessageId: message.sharedMessageId,
+                        logicalSharedId: message.logicalSharedId,
                         failureClass: failureClass)
                     logger.log(
                         level: .info,
@@ -776,6 +777,7 @@ extension MessagePipeline {
                     sender: message.senderSecretName,
                     deviceId: message.senderDeviceId,
                     failedMessageId: message.sharedMessageId,
+                    logicalSharedId: message.logicalSharedId,
                     failureClass: failureClass)
                 logger.log(
                     level: .info,
@@ -1074,6 +1076,7 @@ extension MessagePipeline {
                         sender: senderSecretName,
                         deviceId: senderDeviceId,
                         failedMessageId: sharedMessageId,
+                        logicalSharedId: inbound.logicalSharedId,
                         failureClass: "inbound.missingIdentity")
                     // Identity misses never open a reestablishment episode, so no
                     // episode-end event would ever drain this lane. Flush on this
@@ -1385,6 +1388,7 @@ extension MessagePipeline {
                 sender: message.senderSecretName,
                 deviceId: message.senderDeviceId,
                 failedMessageId: message.sharedMessageId,
+                logicalSharedId: message.logicalSharedId,
                 failureClass: failureClass)
             await session.markInboundFailure(message, failureClass: failureClass)
             logger.log(
@@ -1495,6 +1499,7 @@ extension MessagePipeline {
                 sender: message.senderSecretName,
                 deviceId: message.senderDeviceId,
                 failedMessageId: message.sharedMessageId,
+                logicalSharedId: message.logicalSharedId,
                 failureClass: failureClass)
             await session.markInboundFailure(message, failureClass: failureClass)
             logger.log(
@@ -1875,6 +1880,7 @@ extension MessagePipeline {
                 sender: message.senderSecretName,
                 deviceId: message.senderDeviceId,
                 failedMessageId: message.sharedMessageId,
+                logicalSharedId: message.logicalSharedId,
                 failureClass: failureClass)
             // Same single-flight treatment as fresh-session repair: only the episode
             // leader emits (forced past the cooldown, since the episode is the gate),

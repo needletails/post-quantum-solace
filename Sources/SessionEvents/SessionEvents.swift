@@ -473,51 +473,72 @@ package extension ContactService {
         let mySecretName = sessionContext.sessionUser.secretName
         let contacts = try await cache.fetchContacts()
 
+        // The master sends the whole contact list in one `addContacts` payload, so
+        // this loop is the linked child's only chance to adopt each contact. One
+        // failing entry (a contact whose account is gone, a one-time-key fetch that
+        // fails, a peer send that cannot bootstrap yet) used to abort the batch:
+        // every later contact was silently dropped and `requestMyMetadata` below
+        // never ran, so the child also never received the account's profile.
+        // Process every entry, then report the failures once.
+        var failedSecretNames: [String] = []
+
         for contactInfo in contactInfos {
             // Linked-device contact sync can include the local account. Skip it
             // so one self row cannot abort the rest of the batch with error 8.
             if SecretName.areEqual(contactInfo.secretName, mySecretName) {
                 continue
             }
-            let contactAlreadyExists = await contacts.asyncContains { contact in
-                await contact.props(symmetricKey: symmetricKey)?.secretName == contactInfo.secretName
-            }
-
-            // Linked-device sync is also a repair event. A restored or partially
-            // synchronized device may already have the contact row but not its
-            // nickname communication, so never skip communication convergence.
-            if contactAlreadyExists {
-                _ = try await updateOrCreateCommunication(
+            do {
+                try await addContact(
+                    contactInfo,
+                    existingContacts: contacts,
                     mySecretName: mySecretName,
-                    recipient: .nickname(contactInfo.secretName),
-                    preferredSharedIdentifier: contactInfo.sharedCommunicationId,
+                    sessionContext: sessionContext,
                     cache: cache,
+                    transport: transport,
                     receiver: receiver,
+                    sessionDelegate: sessionDelegate,
                     symmetricKey: symmetricKey,
                     logger: logger)
-                continue
+            } catch {
+                failedSecretNames.append(contactInfo.secretName)
+                logger.log(
+                    level: .error,
+                    message: "addContacts: could not adopt \(contactInfo.secretName); continuing with remaining \(contactInfos.count) entries: \(error)")
             }
+        }
 
-            let userConfiguration = try await transport.findConfiguration(for: contactInfo.secretName)
-            
-            let contact = Contact(
-                id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
-                secretName: contactInfo.secretName,
-                configuration: userConfiguration,
-                metadata: contactInfo.metadata)
-            
-            let contactModel = try ContactModel(
-                id: contact.id, // Use the same UUID
-                props: .init(
-                    secretName: contact.secretName,
-                    configuration: contact.configuration,
-                    metadata: contact.metadata
-                ),
-                symmetricKey: symmetricKey
-            )
-            
-            try await cache.createContact(contactModel)
-            
+        // The account profile (nickname, avatar, ...) rides the master's reply to this
+        // request. It must go out regardless of individual contact failures.
+        try await requestMyMetadata(sessionDelegate: sessionDelegate, logger: logger)
+
+        if !failedSecretNames.isEmpty {
+            throw PQSError.contactSyncIncomplete(failedSecretNames: failedSecretNames)
+        }
+    }
+
+    /// Adopts one linked-device contact: creates the row if missing, converges its
+    /// nickname communication, notifies the UI, then refreshes metadata with the peer.
+    private func addContact(
+        _ contactInfo: SharedContactInfo,
+        existingContacts: [ContactModel],
+        mySecretName: String,
+        sessionContext: SessionContext,
+        cache: PQSPersistenceHost,
+        transport: PQSNetworkHost,
+        receiver: MessageStoreObserver,
+        sessionDelegate: PQSHostDelegate,
+        symmetricKey: SymmetricKey,
+        logger: NeedleTailLogger
+    ) async throws {
+        let contactAlreadyExists = await existingContacts.asyncContains { contact in
+            await contact.props(symmetricKey: symmetricKey)?.secretName == contactInfo.secretName
+        }
+
+        // Linked-device sync is also a repair event. A restored or partially
+        // synchronized device may already have the contact row but not its
+        // nickname communication, so never skip communication convergence.
+        if contactAlreadyExists {
             _ = try await updateOrCreateCommunication(
                 mySecretName: mySecretName,
                 recipient: .nickname(contactInfo.secretName),
@@ -526,17 +547,53 @@ package extension ContactService {
                 receiver: receiver,
                 symmetricKey: symmetricKey,
                 logger: logger)
-            logger.log(level: .debug, message: "Created Communication Model for \(contactInfo.secretName)")
-            
-            // Notify UI only after the communication shell exists so sidebar loaders
-            // can resolve the nickname bundle immediately (QR / friendship inbound).
-            try await receiver.createdContact(contact)
-            
+            return
+        }
+
+        let userConfiguration = try await transport.findConfiguration(for: contactInfo.secretName)
+
+        let contact = Contact(
+            id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
+            secretName: contactInfo.secretName,
+            configuration: userConfiguration,
+            metadata: contactInfo.metadata)
+
+        let contactModel = try ContactModel(
+            id: contact.id, // Use the same UUID
+            props: .init(
+                secretName: contact.secretName,
+                configuration: contact.configuration,
+                metadata: contact.metadata
+            ),
+            symmetricKey: symmetricKey
+        )
+
+        try await cache.createContact(contactModel)
+
+        _ = try await updateOrCreateCommunication(
+            mySecretName: mySecretName,
+            recipient: .nickname(contactInfo.secretName),
+            preferredSharedIdentifier: contactInfo.sharedCommunicationId,
+            cache: cache,
+            receiver: receiver,
+            symmetricKey: symmetricKey,
+            logger: logger)
+        logger.log(level: .debug, message: "Created Communication Model for \(contactInfo.secretName)")
+
+        // Notify UI only after the communication shell exists so sidebar loaders
+        // can resolve the nickname bundle immediately (QR / friendship inbound).
+        try await receiver.createdContact(contact)
+
+        // The row is persisted and visible from here on. The two peer sends below are
+        // refreshes (the master already supplied the contact's metadata in
+        // `contactInfo.metadata`); a bootstrap failure to this one peer must not count
+        // as a failed adoption.
+        do {
             try await requestMetadata(
                 from: contact.secretName,
                 sessionDelegate: sessionDelegate,
                 logger: logger)
-            
+
             try await sendCommunicationSynchronization(
                 recipient: .nickname(contactInfo.secretName),
                 sessionContext: sessionContext,
@@ -545,11 +602,11 @@ package extension ContactService {
                 receiver: receiver,
                 symmetricKey: symmetricKey,
                 logger: logger)
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "addContacts: adopted \(contactInfo.secretName) but peer metadata/sync send failed (will converge on next contact event): \(error)")
         }
-        
-        try await requestMyMetadata(sessionDelegate: sessionDelegate, logger: logger)
-        
-        // Synchronize with other devices if necessary
     }
     
     /// Updates or creates a contact in the local cached database and notifies the client of the changes.

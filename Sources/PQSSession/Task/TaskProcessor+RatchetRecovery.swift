@@ -1411,6 +1411,7 @@ extension MessagePipeline {
                         sender: pending.senderName,
                         deviceId: pending.senderDeviceId,
                         failedMessageId: pending.failedSharedMessageId,
+                        logicalSharedId: pending.logicalSharedId,
                         failureClass: pending.failureClass)
                     logger.log(
                         level: .info,
@@ -1444,6 +1445,7 @@ extension MessagePipeline {
                             sender: pending.senderName,
                             deviceId: pending.senderDeviceId,
                             failedMessageId: pending.failedSharedMessageId,
+                            logicalSharedId: pending.logicalSharedId,
                             failureClass: pending.failureClass,
                             notifyDelegate: false)
                     }
@@ -1477,6 +1479,7 @@ extension MessagePipeline {
                             sender: pending.senderName,
                             deviceId: pending.senderDeviceId,
                             failedMessageId: pending.failedSharedMessageId,
+                            logicalSharedId: pending.logicalSharedId,
                             failureClass: pending.failureClass)
                     }
                     logger.log(
