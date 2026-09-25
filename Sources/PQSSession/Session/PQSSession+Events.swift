@@ -171,10 +171,10 @@ public extension PQSSession {
         }
         do {
             if !otkUploadCircuitOpen {
-                if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                if let sessionContext = await sessionContext, Self.localDeviceOneTimeKeysAreLow(in: sessionContext, type: .x25519) {
                     async let _ = await refreshOneTimeKeysTask()
                 }
-                if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+                if let sessionContext = await sessionContext, Self.localDeviceOneTimeKeysAreLow(in: sessionContext, type: .mlKEM) {
                     async let _ = await refreshMLKEMOneTimeKeysTask()
                 }
             }

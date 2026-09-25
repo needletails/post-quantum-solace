@@ -32,6 +32,30 @@ extension PQSSession {
         refreshMLKEMOTKeysTask = nil
     }
 
+    /// Whether *this device's* published one-time keys are at or below the low watermark.
+    ///
+    /// `signedOneTimePublicKeys` / `signedMLKEMOneTimePublicKeys` hold the whole
+    /// account's pool: every linked device publishes into the same array. The
+    /// account-wide count therefore hides an exhausted device behind its siblings'
+    /// keys — a freshly linked child holding its single starter key never trips the
+    /// watermark while the master still holds a full batch, so it never replenishes
+    /// and the next fresh lane the master opens to it fails with `missingOneTimeKey`.
+    /// Peers only ever draw from the recipient device's keys, so the watermark has to
+    /// be evaluated per device.
+    static func localDeviceOneTimeKeysAreLow(in context: SessionContext, type: KeyKind) -> Bool {
+        localDevicePublishedOneTimeKeyCount(in: context, type: type) <= PQSSessionConstants.oneTimeKeyLowWatermark
+    }
+
+    static func localDevicePublishedOneTimeKeyCount(in context: SessionContext, type: KeyKind) -> Int {
+        let deviceId = context.sessionUser.deviceId
+        switch type {
+        case .x25519:
+            return context.activeUserConfiguration.signedOneTimePublicKeys.filter { $0.deviceId == deviceId }.count
+        case .mlKEM:
+            return context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.filter { $0.deviceId == deviceId }.count
+        }
+    }
+
     /// Manually triggers a refresh of Curve25519 one-time keys
     ///
     /// By default this matches automatic refresh: after syncing with the server, new keys are

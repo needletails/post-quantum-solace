@@ -1144,12 +1144,18 @@ public extension PQSSession {
                 for: secretName,
                 deviceId: deviceId,
                 type: .mlKEM)
-            if x25519Ids.isEmpty || mlKEMIds.isEmpty {
+            // Same watermark the receive path applies, evaluated against the server's
+            // view of *this device's* pool. A linked child enters the account with a
+            // single starter key per kind; "empty" alone left it at one key until a peer
+            // consumed it and the next fresh lane failed with `missingOneTimeKey`.
+            let x25519Low = x25519Ids.count <= PQSSessionConstants.oneTimeKeyLowWatermark
+            let mlKEMLow = mlKEMIds.count <= PQSSessionConstants.oneTimeKeyLowWatermark
+            if x25519Low || mlKEMLow {
                 logger.log(
                     level: .info,
-                    message: "ensurePublishedOneTimeKeysOnServerIfNeeded: server pool empty; replenishing for \(secretName)")
-                async let x25519Refresh = refreshOneTimeKeysTask(policy: .replenishBatch)
-                async let mlKEMRefresh = refreshMLKEMOneTimeKeysTask(policy: .replenishBatch)
+                    message: "ensurePublishedOneTimeKeysOnServerIfNeeded: server pool low (x25519=\(x25519Ids.count), mlKEM=\(mlKEMIds.count)); replenishing for \(secretName)")
+                async let x25519Refresh = x25519Low ? refreshOneTimeKeysTask(policy: .replenishBatch) : true
+                async let mlKEMRefresh = mlKEMLow ? refreshMLKEMOneTimeKeysTask(policy: .replenishBatch) : true
                 _ = await (x25519Refresh, mlKEMRefresh)
             }
         } catch {
@@ -1916,10 +1922,10 @@ public extension PQSSession {
     ) async throws -> [SessionIdentity] {
         
         if !otkUploadCircuitOpen {
-            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+            if let sessionContext = await sessionContext, Self.localDeviceOneTimeKeysAreLow(in: sessionContext, type: .x25519) {
                 await refreshOneTimeKeysTask()
             }
-            if let sessionContext = await sessionContext, sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count <= PQSSessionConstants.oneTimeKeyLowWatermark {
+            if let sessionContext = await sessionContext, Self.localDeviceOneTimeKeysAreLow(in: sessionContext, type: .mlKEM) {
                 await refreshMLKEMOneTimeKeysTask()
             }
         }

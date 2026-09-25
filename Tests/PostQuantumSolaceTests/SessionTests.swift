@@ -1024,4 +1024,80 @@ actor OTKSyncRaceTests {
 
         await session.shutdown()
     }
+
+    /// The published one-time-key arrays are account-wide. A linked child that owns a
+    /// single starter key must read as "low" even though its master's full batch sits
+    /// in the same array; otherwise it never replenishes and the master's next fresh
+    /// lane to it fails with `missingOneTimeKey`.
+    @Test
+    func lowWatermarkIsEvaluatedPerDeviceNotPerAccount() async throws {
+        let masterDeviceId = UUID()
+        let childDeviceId = UUID()
+        let spk = crypto.generateCurve25519SigningPrivateKey()
+
+        func curveKeys(_ count: Int, deviceId: UUID) throws -> [UserConfiguration.SignedOneTimePublicKey] {
+            try (0 ..< count).map { _ in
+                let id = UUID()
+                let priv = crypto.generateCurve25519PrivateKey()
+                return try UserConfiguration.SignedOneTimePublicKey(
+                    key: .init(id: id, priv.publicKey.rawRepresentation),
+                    deviceId: deviceId,
+                    signingKey: spk)
+            }
+        }
+        func mlKEMKeys(_ count: Int, deviceId: UUID) throws -> [UserConfiguration.SignedMLKEMOneTimeKey] {
+            try (0 ..< count).map { _ in
+                let id = UUID()
+                let pk = try crypto.generateMLKem1024PrivateKey()
+                return try UserConfiguration.SignedMLKEMOneTimeKey(
+                    key: MLKEMPublicKey(id: id, pk.publicKey.rawRepresentation),
+                    deviceId: deviceId,
+                    signingKey: spk)
+            }
+        }
+
+        let masterBatch = PQSSessionConstants.oneTimeKeyBatchSize
+        let configuration = try UserConfiguration(
+            signingPublicKey: spk.publicKey.rawRepresentation,
+            signedDevices: [],
+            signedOneTimePublicKeys: curveKeys(masterBatch, deviceId: masterDeviceId) + curveKeys(1, deviceId: childDeviceId),
+            signedMLKEMOneTimePublicKeys: mlKEMKeys(PQSSessionConstants.oneTimeKeyLowWatermark + 1, deviceId: masterDeviceId)
+                + mlKEMKeys(1, deviceId: childDeviceId))
+
+        func context(for deviceId: UUID) throws -> SessionContext {
+            let ltpk = crypto.generateCurve25519PrivateKey()
+            let finalKEM = try crypto.generateMLKem1024PrivateKey()
+            return SessionContext(
+                sessionUser: try SessionUser(
+                    secretName: "alice",
+                    deviceId: deviceId,
+                    deviceKeys: .init(
+                        deviceId: deviceId,
+                        signingPrivateKey: spk.rawRepresentation,
+                        longTermPrivateKey: ltpk.rawRepresentation,
+                        oneTimePrivateKeys: [],
+                        mlKEMOneTimePrivateKeys: [],
+                        finalMLKEMPrivateKey: .init(finalKEM.encode()))),
+                databaseEncryptionKey: SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) },
+                sessionContextId: 1,
+                activeUserConfiguration: configuration,
+                registrationState: .registered)
+        }
+
+        let child = try context(for: childDeviceId)
+        let master = try context(for: masterDeviceId)
+
+        // Account-wide counts are comfortably above the watermark; the child alone is not.
+        #expect(configuration.signedOneTimePublicKeys.count > PQSSessionConstants.oneTimeKeyLowWatermark)
+        #expect(configuration.signedMLKEMOneTimePublicKeys.count > PQSSessionConstants.oneTimeKeyLowWatermark)
+
+        #expect(PQSSession.localDevicePublishedOneTimeKeyCount(in: child, type: .x25519) == 1)
+        #expect(PQSSession.localDevicePublishedOneTimeKeyCount(in: child, type: .mlKEM) == 1)
+        #expect(PQSSession.localDeviceOneTimeKeysAreLow(in: child, type: .x25519))
+        #expect(PQSSession.localDeviceOneTimeKeysAreLow(in: child, type: .mlKEM))
+
+        #expect(PQSSession.localDevicePublishedOneTimeKeyCount(in: master, type: .x25519) == masterBatch)
+        #expect(!PQSSession.localDeviceOneTimeKeysAreLow(in: master, type: .x25519))
+        #expect(!PQSSession.localDeviceOneTimeKeysAreLow(in: master, type: .mlKEM))
+    }
 }
