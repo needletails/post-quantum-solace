@@ -231,16 +231,16 @@ extension PQSSession {
             shouldReplenish = false
         }
         if shouldReplenish {
-            // 1. Delete all local keys that are not on the server
-            let config = try await cache.fetchLocalSessionContext()
-
-            // Decrypt the session context data using the app's symmetric key
-            guard let configurationData = try await crypto.decrypt(data: config, symmetricKey: getAppSymmetricKey()) else {
-                throw PQSError.sessionDecryptionError
-            }
-
-            // Decode the session context from the decrypted data
-            var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+            // Identity inputs only. The new batch is merged into the *live* context after
+            // the upload (`commitSessionContextMutation`), never written back from this
+            // snapshot: the curve and ML-KEM refreshes run concurrently, and a snapshot
+            // taken before the network round-trip would drop the sibling's committed
+            // private keys while their publics are already on the server.
+            let snapshot = try await currentSessionContext(cache: cache)
+            let secretName = snapshot.sessionUser.secretName
+            let deviceId = snapshot.sessionUser.deviceId
+            let signingKey = try Curve25519.Signing.PrivateKey(
+                rawRepresentation: snapshot.sessionUser.deviceKeys.signingPrivateKey)
             let keyPairsToCreate = max(0, PQSSessionConstants.oneTimeKeyBatchSize - publicKeysCount)
 
             logger.log(level: .info, message: "Creating Key Pairs, count: \(keyPairsToCreate)")
@@ -255,21 +255,23 @@ extension PQSSession {
                     return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
                 }
 
-                sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
                 let signedOneTimePublicKeys: [UserConfiguration.SignedOneTimePublicKey] = try privateOneTimeKeyPairs.map { keyPair in
                     try UserConfiguration.SignedOneTimePublicKey(
                         key: keyPair.publicKey,
-                        deviceId: sessionContext.sessionUser.deviceId,
-                        signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey))
+                        deviceId: deviceId,
+                        signingKey: signingKey)
                 }
 
                 try await transportDelegate?.updateOneTimeKeys(
-                    for: sessionContext.sessionUser.secretName,
-                    deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                    for: secretName,
+                    deviceId: deviceId.uuidString,
                     keys: signedOneTimePublicKeys
                 )
 
-                sessionContext.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
+                try await commitSessionContextMutation(cache: cache) { context in
+                    context.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
+                    context.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
+                }
 
             case .mlKEM:
                 // Create needed key pairs
@@ -281,35 +283,69 @@ extension PQSSession {
                     return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
                 }
 
-                sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
                 let signedMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
                     try UserConfiguration.SignedMLKEMOneTimeKey(
                         key: keyPair.publicKey,
-                        deviceId: sessionContext.sessionUser.deviceId,
-                        signingKey: Curve25519.Signing.PrivateKey(rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey)
+                        deviceId: deviceId,
+                        signingKey: signingKey
                     )
                 }
 
                 try await transportDelegate?.updateOneTimeMLKEMKeys(
-                    for: sessionContext.sessionUser.secretName,
-                    deviceId: sessionContext.sessionUser.deviceId.uuidString,
+                    for: secretName,
+                    deviceId: deviceId.uuidString,
                     keys: signedMLKEMOneTimeKeys
                 )
 
-                sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
+                try await commitSessionContextMutation(cache: cache) { context in
+                    context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
+                    context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
+                }
             }
-
-            sessionContext.updateSessionUser(sessionContext.sessionUser)
-            await setSessionContext(sessionContext)
-
-            // Encrypt and persist
-            let encodedData = try BinaryEncoder().encode(sessionContext)
-            guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
-                throw PQSError.sessionEncryptionError
-            }
-
-            try await cache.updateLocalSessionContext(encryptedConfig)
         }
+    }
+
+    /// The live context when a session is active, otherwise the persisted one
+    /// (store-only setups before `unlock`, and tests that seed the store directly).
+    private func currentSessionContext(cache: SessionCache) async throws -> SessionContext {
+        if let live = _sessionContext {
+            return live
+        }
+        return try await decodePersistedSessionContext(cache: cache)
+    }
+
+    private func decodePersistedSessionContext(cache: SessionCache) async throws -> SessionContext {
+        let data = try await cache.fetchLocalSessionContext()
+        guard let decrypted = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
+            throw PQSError.sessionDecryptionError
+        }
+        return try BinaryDecoder().decode(SessionContext.self, from: decrypted)
+    }
+
+    /// Applies `mutate` to the live context and persists it as one exclusive commit
+    /// (`commitLiveSessionContextMutation`). One-time-key workers of different kinds run
+    /// concurrently and each awaits the network before committing; writing a pre-upload
+    /// snapshot back would overwrite whatever a sibling committed in the meantime (its
+    /// new private keys, its pruned publics), leaving the server advertising keys this
+    /// device cannot open. Falls back to the persisted context only when no live session
+    /// exists (store-only setups before `unlock`).
+    @discardableResult
+    private func commitSessionContextMutation(
+        cache: SessionCache,
+        _ mutate: (inout SessionContext) throws -> Void
+    ) async throws -> SessionContext {
+        if let live = try await commitLiveSessionContextMutation(mutate) {
+            return live
+        }
+
+        var persisted = try await decodePersistedSessionContext(cache: cache)
+        try mutate(&persisted)
+        let encodedData = try BinaryEncoder().encode(persisted)
+        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
+            throw PQSError.sessionEncryptionError
+        }
+        try await cache.updateLocalSessionContext(encryptedConfig)
+        return persisted
     }
 
     /// Replaces this device's one-time-key batch on the server.
@@ -329,17 +365,15 @@ extension PQSSession {
             throw PQSError.transportNotInitialized
         }
 
-        let config = try await cache.fetchLocalSessionContext()
-        guard let configurationData = try await crypto.decrypt(data: config, symmetricKey: getAppSymmetricKey()) else {
-            throw PQSError.sessionDecryptionError
-        }
-
-        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+        // Identity inputs only; the batch swap is merged into the live context after the
+        // upload (see `commitSessionContextMutation`) so a concurrent refresh of the other
+        // key kind is not overwritten by this pre-upload snapshot.
+        let snapshot = try await currentSessionContext(cache: cache)
         let signingKey = try Curve25519.Signing.PrivateKey(
-            rawRepresentation: sessionContext.sessionUser.deviceKeys.signingPrivateKey
+            rawRepresentation: snapshot.sessionUser.deviceKeys.signingPrivateKey
         )
-        let secretName = sessionContext.sessionUser.secretName
-        let deviceId = sessionContext.sessionUser.deviceId
+        let secretName = snapshot.sessionUser.secretName
+        let deviceId = snapshot.sessionUser.deviceId
 
         try await transportDelegate.batchDeleteOneTimeKeys(
             for: secretName,
@@ -349,11 +383,6 @@ extension PQSSession {
 
         switch refreshType {
         case .x25519:
-            if !retainLocalPrivateKeys {
-                sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
-            }
-            sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
-
             let privateOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
                 let id = UUID()
                 let privateKey = crypto.generateCurve25519PrivateKey()
@@ -362,7 +391,6 @@ extension PQSSession {
                 return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
             }
 
-            sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
             let signedOneTimePublicKeys: [UserConfiguration.SignedOneTimePublicKey] = try privateOneTimeKeyPairs.map { keyPair in
                 try UserConfiguration.SignedOneTimePublicKey(
                     key: keyPair.publicKey,
@@ -377,22 +405,24 @@ extension PQSSession {
                 keys: signedOneTimePublicKeys
             )
 
-            sessionContext.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
-            if retainLocalPrivateKeys {
-                let overflow = sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.count
-                    - PQSSessionConstants.retainedOneTimePrivateKeyCap
-                if overflow > 0 {
-                    sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeFirst(overflow)
+            let updated = try await commitSessionContextMutation(cache: cache) { context in
+                if !retainLocalPrivateKeys {
+                    context.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
+                }
+                context.activeUserConfiguration.signedOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
+                context.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
+                context.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
+                if retainLocalPrivateKeys {
+                    let overflow = context.sessionUser.deviceKeys.oneTimePrivateKeys.count
+                        - PQSSessionConstants.retainedOneTimePrivateKeyCap
+                    if overflow > 0 {
+                        context.sessionUser.deviceKeys.oneTimePrivateKeys.removeFirst(overflow)
+                    }
                 }
             }
-            logger.log(level: .debug, message: "Replaced published curve OTK batch; count=\(signedOneTimePublicKeys.count) retainedPrivates=\(retainLocalPrivateKeys ? sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.count : 0)")
+            logger.log(level: .debug, message: "Replaced published curve OTK batch; count=\(signedOneTimePublicKeys.count) retainedPrivates=\(retainLocalPrivateKeys ? updated.sessionUser.deviceKeys.oneTimePrivateKeys.count : 0)")
 
         case .mlKEM:
-            if !retainLocalPrivateKeys {
-                sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
-            }
-            sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
-
             let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
                 let id = UUID()
                 let privateKey = try crypto.generateMLKem1024PrivateKey()
@@ -401,7 +431,6 @@ extension PQSSession {
                 return KeyPair(id: id, publicKey: publicKey, privateKey: privateKeyRep)
             }
 
-            sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
             let signedMLKEMOneTimeKeys: [UserConfiguration.SignedMLKEMOneTimeKey] = try mlKEMOneTimeKeyPairs.map { keyPair in
                 try UserConfiguration.SignedMLKEMOneTimeKey(
                     key: keyPair.publicKey,
@@ -416,114 +445,75 @@ extension PQSSession {
                 keys: signedMLKEMOneTimeKeys
             )
 
-            sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
-            if retainLocalPrivateKeys {
-                let overflow = sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count
-                    - PQSSessionConstants.retainedOneTimePrivateKeyCap
-                if overflow > 0 {
-                    sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeFirst(overflow)
+            let updated = try await commitSessionContextMutation(cache: cache) { context in
+                if !retainLocalPrivateKeys {
+                    context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
+                }
+                context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
+                context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
+                context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
+                if retainLocalPrivateKeys {
+                    let overflow = context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count
+                        - PQSSessionConstants.retainedOneTimePrivateKeyCap
+                    if overflow > 0 {
+                        context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeFirst(overflow)
+                    }
                 }
             }
-            logger.log(level: .debug, message: "Replaced published MLKEM OTK batch; count=\(signedMLKEMOneTimeKeys.count) retainedPrivates=\(retainLocalPrivateKeys ? sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count : 0)")
+            logger.log(level: .debug, message: "Replaced published MLKEM OTK batch; count=\(signedMLKEMOneTimeKeys.count) retainedPrivates=\(retainLocalPrivateKeys ? updated.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count : 0)")
         }
-
-        sessionContext.updateSessionUser(sessionContext.sessionUser)
-        await setSessionContext(sessionContext)
-
-        let encodedData = try BinaryEncoder().encode(sessionContext)
-        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
-            throw PQSError.sessionEncryptionError
-        }
-
-        try await cache.updateLocalSessionContext(encryptedConfig)
     }
 
     func synchronizeLocalKeys(cache: SessionCache, keys: [UUID], type: KeyKind) async throws -> Int {
-        let data = try await cache.fetchLocalSessionContext()
-        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
-            throw PQSError.sessionDecryptionError
-        }
+        let snapshot = try await currentSessionContext(cache: cache)
+        let deviceId = snapshot.sessionUser.deviceId
+        let secretName = snapshot.sessionUser.secretName
+        let remoteKeySet = Set(keys)
 
-        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
-        var didUpdate = false
-
+        // Only prune the public key list to stop advertising keys the server
+        // no longer holds (an empty server list prunes all of this device's publics).
+        // Private keys are preserved — a consumed-on-server key means an in-flight
+        // message needs the private counterpart for decryption. Private keys are
+        // removed after use via updateOneTimeKey(remove:).
+        //
+        // The prune is applied to the live context, not written back from `snapshot`:
+        // a concurrent refresh of the other key kind may commit its new private keys
+        // between our read and our write.
         switch type {
         case .x25519:
-            let deviceId = sessionContext.sessionUser.deviceId
-            let publicKeys = sessionContext.activeUserConfiguration.signedOneTimePublicKeys
-            let currentDevicePublicKeys = publicKeys.filter { $0.deviceId == deviceId }
-            let otherDevicePublicKeys = publicKeys.filter { $0.deviceId != deviceId }
-            let remoteKeySet = Set(keys)
+            let currentDevicePublicKeys = snapshot.activeUserConfiguration.signedOneTimePublicKeys.filter { $0.deviceId == deviceId }
+            guard currentDevicePublicKeys.contains(where: { !remoteKeySet.contains($0.id) }) else {
+                return currentDevicePublicKeys.count
+            }
 
-            // Only prune the public key list to stop advertising keys the server
-            // no longer holds. Private keys are preserved — a consumed-on-server
-            // key means an in-flight message needs the private counterpart for
-            // decryption. Private keys are removed after use via updateOneTimeKey(remove:).
-            if remoteKeySet.isEmpty {
-                if !currentDevicePublicKeys.isEmpty {
-                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys = otherDevicePublicKeys
-                    didUpdate = true
-                }
-            } else {
-                let filteredPublic = currentDevicePublicKeys.filter { remoteKeySet.contains($0.id) }
-                if filteredPublic.count != currentDevicePublicKeys.count {
-                    sessionContext.activeUserConfiguration.signedOneTimePublicKeys = otherDevicePublicKeys + filteredPublic
-                    didUpdate = true
+            let updated = try await commitSessionContextMutation(cache: cache) { context in
+                context.activeUserConfiguration.signedOneTimePublicKeys.removeAll {
+                    $0.deviceId == deviceId && !remoteKeySet.contains($0.id)
                 }
             }
 
-            if didUpdate {
-                sessionContext.updateSessionUser(sessionContext.sessionUser)
-                await setSessionContext(sessionContext)
-
-                let encodedData = try BinaryEncoder().encode(sessionContext)
-                guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
-                    throw PQSError.sessionEncryptionError
-                }
-
-                try await cache.updateLocalSessionContext(encryptedConfig)
-
-                if sessionContext.activeUserConfiguration.signedOneTimePublicKeys.allSatisfy({ $0.deviceId != deviceId }) {
-                    try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
-                }
+            let remaining = updated.activeUserConfiguration.signedOneTimePublicKeys.filter { $0.deviceId == deviceId }
+            if remaining.isEmpty {
+                try await transportDelegate?.batchDeleteOneTimeKeys(for: secretName, with: deviceId.uuidString, type: type)
             }
-            return sessionContext.activeUserConfiguration.signedOneTimePublicKeys.filter { $0.deviceId == deviceId }.count
+            return remaining.count
         case .mlKEM:
-            let deviceId = sessionContext.sessionUser.deviceId
-            let publicKeys = sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys
-            let currentDevicePublicKeys = publicKeys.filter { $0.deviceId == deviceId }
-            let otherDevicePublicKeys = publicKeys.filter { $0.deviceId != deviceId }
-            let remoteKeySet = Set(keys)
+            let currentDevicePublicKeys = snapshot.activeUserConfiguration.signedMLKEMOneTimePublicKeys.filter { $0.deviceId == deviceId }
+            guard currentDevicePublicKeys.contains(where: { !remoteKeySet.contains($0.id) }) else {
+                return currentDevicePublicKeys.count
+            }
 
-            if remoteKeySet.isEmpty {
-                if !currentDevicePublicKeys.isEmpty {
-                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys = otherDevicePublicKeys
-                    didUpdate = true
-                }
-            } else {
-                let filteredPublic = currentDevicePublicKeys.filter { remoteKeySet.contains($0.id) }
-                if filteredPublic.count != currentDevicePublicKeys.count {
-                    sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys = otherDevicePublicKeys + filteredPublic
-                    didUpdate = true
+            let updated = try await commitSessionContextMutation(cache: cache) { context in
+                context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll {
+                    $0.deviceId == deviceId && !remoteKeySet.contains($0.id)
                 }
             }
 
-            if didUpdate {
-                sessionContext.updateSessionUser(sessionContext.sessionUser)
-                await setSessionContext(sessionContext)
-
-                let encodedData = try BinaryEncoder().encode(sessionContext)
-                guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
-                    throw PQSError.sessionEncryptionError
-                }
-
-                try await cache.updateLocalSessionContext(encryptedConfig)
-
-                if sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.allSatisfy({ $0.deviceId != deviceId }) {
-                    try await transportDelegate?.batchDeleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: sessionContext.sessionUser.deviceId.uuidString, type: type)
-                }
+            let remaining = updated.activeUserConfiguration.signedMLKEMOneTimePublicKeys.filter { $0.deviceId == deviceId }
+            if remaining.isEmpty {
+                try await transportDelegate?.batchDeleteOneTimeKeys(for: secretName, with: deviceId.uuidString, type: type)
             }
-            return sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.filter { $0.deviceId == deviceId }.count
+            return remaining.count
         }
     }
 

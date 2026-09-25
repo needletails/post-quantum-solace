@@ -184,6 +184,9 @@ public actor PQSSession: SessionCacheSynchronizer {
     // module can access them; they are not part of the public API.
     var _sessionContext: SessionContext?
     var _appPassword = ""
+    /// See `withExclusiveSessionContextCommit`.
+    var sessionContextCommitInProgress = false
+    var sessionContextCommitWaiters: [CheckedContinuation<Void, Never>] = []
     private let ratchetConfiguration: RatchetConfiguration?
     nonisolated let auditSink: any PQSAuditSink
     private(set) var messagePipeline: MessagePipeline
@@ -840,6 +843,49 @@ public actor PQSSession: SessionCacheSynchronizer {
         try mutate(&context)
         _sessionContext = context
         return context
+    }
+
+    /// Runs `body` as the only mutate-then-persist commit in flight (FIFO).
+    ///
+    /// Persisting is not a pure write: `SessionCache` re-installs the stored blob as
+    /// the live context (`synchronizeLocalConfiguration`). A commit whose store write
+    /// lands inside another commit's mutate→store window therefore rolls the other's
+    /// mutation back, even though both applied their deltas to the live context.
+    func withExclusiveSessionContextCommit<T>(_ body: () async throws -> T) async rethrows -> T {
+        if sessionContextCommitInProgress {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                sessionContextCommitWaiters.append(continuation)
+            }
+        }
+        sessionContextCommitInProgress = true
+        defer {
+            if sessionContextCommitWaiters.isEmpty {
+                sessionContextCommitInProgress = false
+            } else {
+                // Ownership passes directly to the next waiter.
+                sessionContextCommitWaiters.removeFirst().resume()
+            }
+        }
+        return try await body()
+    }
+
+    /// Applies `mutate` to the live context and persists the result under
+    /// `withExclusiveSessionContextCommit`. Returns `nil` when no session is active.
+    /// Without a store (teardown in progress) the live mutation still applies.
+    func commitLiveSessionContextMutation(
+        _ mutate: (inout SessionContext) throws -> Void
+    ) async throws -> SessionContext? {
+        try await withExclusiveSessionContextCommit {
+            guard let updated = try mutateSessionContext(mutate) else { return nil }
+            guard let cache else { return updated }
+            let encodedData = try BinaryEncoder().encode(updated)
+            let symmetricKey = try await getAppSymmetricKey()
+            guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: symmetricKey) else {
+                throw PQSError.sessionEncryptionError
+            }
+            try await cache.updateLocalSessionContext(encryptedConfig)
+            return updated
+        }
     }
 
     /// Asynchronously retrieves the application password

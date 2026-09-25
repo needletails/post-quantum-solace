@@ -415,6 +415,81 @@ actor SessionTests {
         await session.shutdown()
     }
 
+    /// Curve and ML-KEM replenishment run concurrently (post-link warm-up, low-watermark
+    /// refresh on inbound). Each awaits its upload before committing; if either wrote a
+    /// pre-upload snapshot back, the other's freshly generated private keys would vanish
+    /// while their publics were already advertised on the server, and a peer picking one
+    /// of them would hit `missingOneTimeKey`.
+    @Test
+    func concurrentCurveAndMLKEMReplenishmentPreservesBothPrivateBatches() async throws {
+        let mockCache = MockCache()
+        let appSymmetricKey = await self.crypto.deriveStrictSymmetricKey(
+            data: "secret".data(using: .utf8)!,
+            salt: Data()
+        )
+
+        let bundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let sessionUser = SessionUser(
+            secretName: "u1",
+            deviceId: bundle.deviceKeys.deviceId,
+            deviceKeys: bundle.deviceKeys)
+        let sessionContext = SessionContext(
+            sessionUser: sessionUser,
+            databaseEncryptionKey: SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) },
+            sessionContextId: .random(in: 1 ..< .max),
+            activeUserConfiguration: bundle.userConfiguration,
+            registrationState: .unregistered
+        )
+        let mockTransport = MockTransport(
+            cache: mockCache,
+            appKey: appSymmetricKey,
+            publicKeys: bundle.userConfiguration.signedOneTimePublicKeys
+        )
+        // Server holds none of the starter batch, so both kinds replenish a full batch,
+        // and neither upload completes until both workers hold a pre-upload snapshot.
+        await mockTransport.setKeyIdentityOverride(x25519: [], mlKEM: [])
+        await mockTransport.holdUploadsUntilCount(2)
+
+        let data = try BinaryEncoder().encode(sessionContext)
+        let encrypted = try self.crypto.encrypt(data: data, symmetricKey: appSymmetricKey)!
+        try await mockCache.createLocalSessionContext(encrypted)
+        await session.setSessionContext(sessionContext)
+        await session.setTransportDelegate(conformer: mockTransport)
+        await session.setDatabaseDelegate(conformer: mockCache)
+        await session.setAppPassword("secret")
+
+        let startingCurvePrivates = bundle.deviceKeys.oneTimePrivateKeys.count
+        let startingMLKEMPrivates = bundle.deviceKeys.mlKEMOneTimePrivateKeys.count
+        let batch = PQSSessionConstants.oneTimeKeyBatchSize
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            let session = self.session
+            group.addTask { try await session.refreshOneTimeKeys(refreshType: .x25519, policy: .replenishBatch) }
+            group.addTask { try await session.refreshOneTimeKeys(refreshType: .mlKEM, policy: .replenishBatch) }
+            try await group.waitForAll()
+        }
+
+        let live = try #require(await session.sessionContext)
+        #expect(live.sessionUser.deviceKeys.oneTimePrivateKeys.count == startingCurvePrivates + batch)
+        #expect(live.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count == startingMLKEMPrivates + batch)
+
+        let persistedData = try await mockCache.fetchLocalSessionContext()
+        let persistedConfig = try self.crypto.decrypt(data: persistedData, symmetricKey: appSymmetricKey)!
+        let persisted = try BinaryDecoder().decode(SessionContext.self, from: persistedConfig)
+        #expect(persisted.sessionUser.deviceKeys.oneTimePrivateKeys.count == startingCurvePrivates + batch)
+        #expect(persisted.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count == startingMLKEMPrivates + batch)
+
+        // Every advertised public key can be opened locally.
+        let curvePrivateIds = Set(persisted.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        let mlKEMPrivateIds = Set(persisted.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.map(\.id))
+        #expect(persisted.activeUserConfiguration.signedOneTimePublicKeys.count == batch)
+        #expect(persisted.activeUserConfiguration.signedMLKEMOneTimePublicKeys.count == batch)
+        #expect(persisted.activeUserConfiguration.signedOneTimePublicKeys.allSatisfy { curvePrivateIds.contains($0.id) })
+        #expect(persisted.activeUserConfiguration.signedMLKEMOneTimePublicKeys.allSatisfy { mlKEMPrivateIds.contains($0.id) })
+
+        await session.shutdown()
+    }
+
     @Test
     func refreshOneTimeKeys_doesNotPersistGeneratedX25519Keys_whenUploadFails() async throws {
         let mockCache = MockCache()
@@ -715,6 +790,35 @@ actor MockTransport: PQSTransport, PQSKeyDirectory, PQSRecoveryTransport {
         mlKEMUpdateError = error
     }
 
+    // Upload barrier: parks one-time-key uploads until `count` of them are in flight,
+    // then releases them all. Forces every concurrent refresh to hold its pre-upload
+    // snapshot while the others commit — the lost-update interleaving.
+    var uploadBarrierTarget = 0
+    var uploadBarrierArrivals = 0
+    var uploadBarrierWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func holdUploadsUntilCount(_ count: Int) {
+        uploadBarrierTarget = count
+        uploadBarrierArrivals = 0
+    }
+
+    private func passUploadBarrier() async {
+        guard uploadBarrierTarget > 0 else { return }
+        uploadBarrierArrivals += 1
+        if uploadBarrierArrivals >= uploadBarrierTarget {
+            let waiters = uploadBarrierWaiters
+            uploadBarrierWaiters.removeAll()
+            uploadBarrierTarget = 0
+            for waiter in waiters {
+                waiter.resume()
+            }
+            return
+        }
+        await withCheckedContinuation { continuation in
+            uploadBarrierWaiters.append(continuation)
+        }
+    }
+
     // MARK: - Transport Methods
 
     func sendMessage(_: SessionModels.SignedRatchetMessage, metadata _: SignedRatchetMessageMetadata) async throws {}
@@ -748,6 +852,7 @@ actor MockTransport: PQSTransport, PQSKeyDirectory, PQSRecoveryTransport {
         if let x25519UpdateError {
             throw x25519UpdateError
         }
+        await passUploadBarrier()
         publicKeys.append(contentsOf: keys)
     }
 
@@ -773,6 +878,7 @@ actor MockTransport: PQSTransport, PQSKeyDirectory, PQSRecoveryTransport {
         if let mlKEMUpdateError {
             throw mlKEMUpdateError
         }
+        await passUploadBarrier()
     }
     func deleteOneTimeKeys(for _: String, with _: String, type _: KeyKind) async throws {}
     func sendOutOfBandResendRequest(failedEnvelopeMessageIds: [String], to secretName: String, deviceId: UUID, requestingDeviceId: UUID) async throws {}

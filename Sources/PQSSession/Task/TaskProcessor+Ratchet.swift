@@ -198,7 +198,11 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
                 // sibling replacement may have committed in the meantime, and writing the
                 // snapshot back would resurrect its spent public key and drop its new
                 // private key (the peer could then pick an OTK we cannot decrypt).
-                guard let updated = await session.mutateSessionContext({ context in
+                //
+                // Mutation and persistence run as one exclusive commit: persisting
+                // re-installs the stored blob as the live context, so an overlapping
+                // sibling commit would otherwise roll this delta back.
+                guard try await session.commitLiveSessionContextMutation({ context in
                     var deviceKeys = context.sessionUser.deviceKeys
                     // Deferred consumption: retain the spent private key until the
                     // reverse handshake confirms; only append the replacement here.
@@ -208,19 +212,9 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
                     context.updateSessionUser(user)
                     context.activeUserConfiguration.signedOneTimePublicKeys.removeAll { $0.id == id }
                     context.activeUserConfiguration.signedOneTimePublicKeys.append(newSignedKey)
-                }) else {
+                }) != nil else {
                     throw PQSError.sessionNotInitialized
                 }
-                
-                // Persist whatever is current now, not only this task's returned
-                // snapshot: a sibling may have committed between mutate and here.
-                let toPersist = await session.sessionContext ?? updated
-                let encodedData = try BinaryEncoder().encode(toPersist)
-                guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: session.getAppSymmetricKey()) else {
-                    throw PQSError.sessionEncryptionError
-                }
-                
-                try await session.cache?.updateLocalSessionContext(encryptedConfig)
                 await retireUpdateKeyTask(taskId)
             } catch is CancellationError {
                 // Only session shutdown cancels these tasks now; nothing to report.
