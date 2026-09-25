@@ -39,7 +39,7 @@ func isTransientFriendshipState(_ state: FriendshipMetadata.State) -> Bool {
     case .pending, .requested:
         return true
     case .accepted, .rejected, .rejectedByOther, .mutuallyRejected,
-         .blocked, .blockedByOther, .unblocked:
+            .blocked, .blockedByOther, .unblocked:
         return false
     }
 }
@@ -117,7 +117,7 @@ public enum FriendshipMetadataConflictPolicy: Sendable {
     case preferSettled
     case incoming
     case inboundFriendship
-
+    
     func resolve(passed: FriendshipMetadata, stored: FriendshipMetadata) -> FriendshipMetadata {
         let resolved: FriendshipMetadata
         switch self {
@@ -472,7 +472,7 @@ package extension ContactService {
     ) async throws {
         let mySecretName = sessionContext.sessionUser.secretName
         let contacts = try await cache.fetchContacts()
-
+        
         // The master sends the whole contact list in one `addContacts` payload, so
         // this loop is the linked child's only chance to adopt each contact. One
         // failing entry (a contact whose account is gone, a one-time-key fetch that
@@ -481,7 +481,7 @@ package extension ContactService {
         // never ran, so the child also never received the account's profile.
         // Process every entry, then report the failures once.
         var failedSecretNames: [String] = []
-
+        
         for contactInfo in contactInfos {
             // Linked-device contact sync can include the local account. Skip it
             // so one self row cannot abort the rest of the batch with error 8.
@@ -507,16 +507,28 @@ package extension ContactService {
                     message: "addContacts: could not adopt \(contactInfo.secretName); continuing with remaining \(contactInfos.count) entries: \(error)")
             }
         }
-
-        // The account profile (nickname, avatar, ...) rides the master's reply to this
-        // request. It must go out regardless of individual contact failures.
-        try await requestMyMetadata(sessionDelegate: sessionDelegate, logger: logger)
-
+        
+        // The account profile normally arrives as the master's reply to this request.
+        // A linked child now receives that profile before addContacts, on the same
+        // inbound lane. Asking again sends requestMetadata while the rest of the
+        // master's burst is still decrypting, and the reply fails authentication.
+        let profile = sessionContext.sessionUser.metadata
+        let named = [profile.status, profile.nickname, profile.firstName, profile.lastName, profile.email, profile.phone].contains {
+    ($0 ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+}
+        if named || profile.image?.isEmpty == false {
+            logger.log(
+                level: .info,
+                message: "addContacts: local profile already applied; skipping requestMyMetadata")
+        } else {
+            try await requestMyMetadata(sessionDelegate: sessionDelegate, logger: logger)
+        }
+        
         if !failedSecretNames.isEmpty {
             throw PQSError.contactSyncIncomplete(failedSecretNames: failedSecretNames)
         }
     }
-
+    
     /// Adopts one linked-device contact: creates the row if missing, converges its
     /// nickname communication, notifies the UI, then refreshes metadata with the peer.
     private func addContact(
@@ -534,7 +546,7 @@ package extension ContactService {
         let contactAlreadyExists = await existingContacts.asyncContains { contact in
             await contact.props(symmetricKey: symmetricKey)?.secretName == contactInfo.secretName
         }
-
+        
         // Linked-device sync is also a repair event. A restored or partially
         // synchronized device may already have the contact row but not its
         // nickname communication, so never skip communication convergence.
@@ -549,15 +561,15 @@ package extension ContactService {
                 logger: logger)
             return
         }
-
+        
         let userConfiguration = try await transport.findConfiguration(for: contactInfo.secretName)
-
+        
         let contact = Contact(
             id: UUID(), // Consider using the same UUID for both Contact and ContactModel if they are linked
             secretName: contactInfo.secretName,
             configuration: userConfiguration,
             metadata: contactInfo.metadata)
-
+        
         let contactModel = try ContactModel(
             id: contact.id, // Use the same UUID
             props: .init(
@@ -567,9 +579,9 @@ package extension ContactService {
             ),
             symmetricKey: symmetricKey
         )
-
+        
         try await cache.createContact(contactModel)
-
+        
         _ = try await updateOrCreateCommunication(
             mySecretName: mySecretName,
             recipient: .nickname(contactInfo.secretName),
@@ -579,11 +591,11 @@ package extension ContactService {
             symmetricKey: symmetricKey,
             logger: logger)
         logger.log(level: .debug, message: "Created Communication Model for \(contactInfo.secretName)")
-
+        
         // Notify UI only after the communication shell exists so sidebar loaders
         // can resolve the nickname bundle immediately (QR / friendship inbound).
         try await receiver.createdContact(contact)
-
+        
         // The row is persisted and visible from here on. The two peer sends below are
         // refreshes (the master already supplied the contact's metadata in
         // `contactInfo.metadata`); a bootstrap failure to this one peer must not count
@@ -593,7 +605,7 @@ package extension ContactService {
                 from: contact.secretName,
                 sessionDelegate: sessionDelegate,
                 logger: logger)
-
+            
             try await sendCommunicationSynchronization(
                 recipient: .nickname(contactInfo.secretName),
                 sessionContext: sessionContext,
@@ -658,7 +670,7 @@ package extension ContactService {
             friendshipMetadataConflictPolicy: .preferSettled
         )
     }
-
+    
     /// Extension overload: threads `notifyPeerOfCreation` into
     /// `receiver.synchronize`. Not a protocol requirement — additive for 3.3.x.
     func createContact(
@@ -704,7 +716,7 @@ package extension ContactService {
             } else {
                 storedFriendshipMetadata = nil
             }
-
+            
             // Prefer the *more settled* of (passed, stored) so an out-of-order
             // `synchronizeContacts` message (which still carries the old pending/
             // requested state) can't downgrade an already accepted/blocked/rejected
@@ -741,7 +753,7 @@ package extension ContactService {
                 configuration: configuration,
                 metadata: updatedMetadata
             )
-
+            
             let contactModel = try ContactModel(
                 id: updatedContact.id, // Use the same UUID
                 props: .init(
@@ -753,7 +765,7 @@ package extension ContactService {
             )
             
             try await cache.updateContact(contactModel)
-
+            
             // Contact and communication rows can arrive independently on linked
             // devices, and a best-effort delete can leave only the contact row.
             // Repair the communication shell before notifying the UI or starting
@@ -766,7 +778,7 @@ package extension ContactService {
                 symmetricKey: symmetricKey,
                 logger: logger)
             try await receiver.updateContact(updatedContact)
-
+            
             // Mirror the new-contact branch: when a UI add (re-)requests friendship,
             // ensure a request actually goes out. Without this, re-adding a contact
             // that was created by side-channel sync would update local state but
@@ -1059,7 +1071,7 @@ package extension ContactService {
         let priorMyState = currentMetadata.myState
         let priorTheirState = currentMetadata.theirState
         let wasBlocked = (priorMyState == .blocked || priorTheirState == .blocked)
-
+        
         // Throw a typed error rather than silently `return`ing so the UI can
         // surface a banner explaining why the action did nothing — the previous
         // silent no-op masked legitimate user feedback (e.g. tapping "Add" on
@@ -1108,7 +1120,7 @@ package extension ContactService {
         guard let updatedProps else {
             throw PQSError.propsError
         }
-
+        
         // `updatePropsMetadata` mutated `foundContact` in place (reference type),
         // so persisting the same instance writes the new friendship state through.
         try await cache.updateContact(foundContact)
@@ -1161,7 +1173,7 @@ package extension ContactService {
             blockData: blockUnblockData,
             metadata: metadata,
             currentState: currentMetadata.myState)
-
+        
         if state == .accepted {
             try await receiver.pushContactMetadata(to: contact.secretName)
         }
