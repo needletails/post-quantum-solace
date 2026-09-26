@@ -1897,17 +1897,117 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    /// Dogfood 2026-09-26 (nudge `75F0CD4F` ← mm26 `C4D6F976`/`67F2B938`): sixteen
+    /// `missingOneTimeKey` envelopes were terminalized at the failure event
+    /// (`contentUnrecoverable reason=missingOneTimeKeyDeadEpoch`, host told
+    /// `inboundContentUnrecoverable`, `failed("unrecoverable")` receipt sent to the
+    /// author) while `deferPeerResendUntilReestablished` had just registered a NACK
+    /// for the very same envelope. The NACK went out at the next drain
+    /// (`resendDrainSubmitted … EA1AA846`), the sender re-encrypted on a fresh
+    /// initiating lane, and all sixteen later logged `pendingResendSettled
+    /// reason=logicalReplay` → `recovered`. The dead epoch kills the *envelope*,
+    /// not the content: sender re-encryption heals it. Terminal must therefore be
+    /// owned by the events that prove the sender cannot answer — `oobUnavailable`
+    /// or `resendSubmissionCap` — not by the first failure.
+    @Test("missingOneTimeKey with a pending NACK defers terminalization until the peer answers")
+    func testMissingOneTimeKeyWithPendingResendDefersTerminalizationUntilPeerAnswers() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        let probe = EpisodeEndProbe()
+        await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
+        await session.messagePipeline.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+
+        let uploadPause = OTKUploadPause()
+        transport.beforeUpdateOneTimeKeys = {
+            await uploadPause.beforeFirstUpload()
+        }
+        defer {
+            transport.beforeUpdateOneTimeKeys = nil
+        }
+
+        let sender = "bob_missing_otk_pending_nack"
+        let peerDeviceId = UUID()
+        let leaderId = "missing_otk_pending_nack_leader"
+        let leader = try makeTestInboundTaskMessage(
+            senderSecretName: sender,
+            senderDeviceId: peerDeviceId,
+            sharedMessageId: leaderId)
+
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .streamMessage(leader)),
+            session: session
+        )
+        let hasPendingRepair = try await waitForPendingRepair(sender: sender, deviceId: peerDeviceId)
+        #expect(hasPendingRepair, "First missingOneTimeKey should start a recovery episode")
+        let uploadPaused = try await waitUntil {
+            await uploadPause.isPaused()
+        }
+        #expect(uploadPaused, "First missingOneTimeKey recovery should reach OTK upload")
+
+        // The NACK is registered for this envelope: a sender re-encryption is
+        // still expected, so nothing may call the content lost yet.
+        #expect(
+            await session.hasPendingResendAfterReestablishment(
+                sender: sender,
+                deviceId: peerDeviceId,
+                failedMessageId: leaderId),
+            "Dead-epoch leader keeps its deferred NACK for the post-peerRefresh drain")
+        let hostDeferred = try await waitUntil {
+            await probe.deferredRecoveries().contains {
+                $0.0 == sender && $0.1 == peerDeviceId && $0.2 == leaderId
+            }
+        }
+        #expect(hostDeferred, "Host learns the frame is pending recovery (placeholder), not lost")
+        #expect(
+            !(await session.isInboundContentUnrecoverable(
+                sender: sender,
+                deviceId: peerDeviceId,
+                sharedId: leaderId)),
+            "BUG: dead-epoch leader terminalized while its own NACK is pending")
+        #expect(
+            !(await probe.unrecoverableContent().contains {
+                $0.0 == sender && $0.1 == peerDeviceId && $0.2 == leaderId
+            }),
+            "BUG: host told inboundContentUnrecoverable for content the sender can still re-encrypt")
+
+        // The peer proves it cannot answer: the existing unavailable path owns terminal.
+        await session.handleOutOfBandResendUnavailable(
+            from: sender,
+            deviceId: peerDeviceId,
+            unavailableEnvelopeMessageIds: [leaderId])
+        #expect(
+            await session.isInboundContentUnrecoverable(
+                sender: sender,
+                deviceId: peerDeviceId,
+                sharedId: leaderId),
+            "oobUnavailable still terminalizes the dead-epoch envelope")
+        let hostNotified = try await waitUntil {
+            await probe.unrecoverableContent().contains {
+                $0.0 == sender && $0.1 == peerDeviceId && $0.2 == leaderId
+            }
+        }
+        #expect(hostNotified, "Host receives inboundContentUnrecoverable once the peer says unavailable")
+        let notifications = await probe.unrecoverableContent().filter { $0.2 == leaderId }.count
+        #expect(notifications == 1, "Terminal notification is once per sharedId")
+
+        await uploadPause.release()
+        await session.shutdown()
+    }
+
     /// Dogfood 2026-09-17 (sunflower ← nudge `3D60FE0A`): seven `missingOneTimeKey`
-    /// frames landed in one burst. Only the episode leader was terminalized
-    /// (`contentUnrecoverable reason=missingOneTimeKeyDeadEpoch`); the six
-    /// coalesced frames were merely deferred. The host's durable placeholder row
-    /// for one of them (`0B969E92`) outlived the process and was re-armed on every
-    /// relaunch (`pendingResendRearmed failureClass=hostRearm` → OOB NACK) for
-    /// content the sender can never re-encrypt from a dead epoch. A dead-epoch
-    /// frame is terminal at the failure event regardless of which frame opened
-    /// the episode, so the coalesce path must terminalize exactly like the leader.
-    @Test("missingOneTimeKey coalesced frames are terminalized like the episode leader")
-    func testMissingOneTimeKeyCoalescedFrameIsTerminalizedLikeLeader() async throws {
+    /// frames landed in one burst and only the episode leader was terminalized;
+    /// the six coalesced frames were treated differently. Leader and coalesced
+    /// frames reference the same consumed key, so they must follow one rule.
+    /// That rule is now "defer while the NACK is pending" (see the 2026-09-26
+    /// test above): neither frame is terminal at the failure event, both keep
+    /// their deferred NACK, and the host sees `inboundRecoveryDeferred` for both.
+    /// The relaunch re-arm this test originally guarded (`0B969E92`) stays bounded
+    /// by `peerResendRequestMaxSubmissions` and ends at the first
+    /// `messageResendUnavailable` the peer delivers.
+    @Test("missingOneTimeKey coalesced frames are deferred like the episode leader")
+    func testMissingOneTimeKeyCoalescedFrameIsDeferredLikeLeader() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         let probe = EpisodeEndProbe()
@@ -1949,13 +2049,18 @@ actor TaskProcessorSequenceTests {
             await uploadPause.isPaused()
         }
         #expect(uploadPaused, "First missingOneTimeKey recovery should reach OTK upload")
-        // Existing contract: the leader is terminal at the failure event.
         #expect(
-            await session.isInboundContentUnrecoverable(
+            await session.hasPendingResendAfterReestablishment(
                 sender: sender,
                 deviceId: peerDeviceId,
-                sharedId: leaderId),
-            "Episode leader must be terminal (missingOneTimeKeyDeadEpoch)")
+                failedMessageId: leaderId),
+            "Leader keeps its deferred NACK")
+        #expect(
+            !(await session.isInboundContentUnrecoverable(
+                sender: sender,
+                deviceId: peerDeviceId,
+                sharedId: leaderId)),
+            "Episode leader is deferred, not terminal, while its NACK is pending")
 
         try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(coalesced)),
@@ -1968,26 +2073,22 @@ actor TaskProcessorSequenceTests {
                 failedMessageId: coalescedId)
         }
         #expect(coalescedRecorded, "Coalesced frame is still deferred for the post-peerRefresh resend round")
-
-        // RED: the coalesced dead-epoch frame must be terminal at defer time, not
-        // left for an episode TTL / OOB round trip that may never run before exit.
         #expect(
-            await session.isInboundContentUnrecoverable(
+            !(await session.isInboundContentUnrecoverable(
                 sender: sender,
                 deviceId: peerDeviceId,
-                sharedId: coalescedId),
-            "Coalesced missingOneTimeKey frame must be terminalized like the leader")
+                sharedId: coalescedId)),
+            "Coalesced missingOneTimeKey frame is deferred exactly like the leader")
 
-        // The host must be told once per newly terminal id so it drops the
-        // placeholder + durable ledger row instead of re-arming it on relaunch.
-        let hostNotified = try await waitUntil {
-            await probe.unrecoverableContent().contains {
-                $0.0 == sender && $0.1 == peerDeviceId && $0.2 == coalescedId
-            }
+        // Host sees a placeholder signal for both frames and a loss signal for neither.
+        let hostDeferredBoth = try await waitUntil {
+            let deferred = await probe.deferredRecoveries()
+            return deferred.contains { $0.2 == leaderId } && deferred.contains { $0.2 == coalescedId }
         }
-        #expect(hostNotified, "Host must receive inboundContentUnrecoverable for the coalesced frame")
-        let coalescedNotifications = await probe.unrecoverableContent().filter { $0.2 == coalescedId }.count
-        #expect(coalescedNotifications == 1, "Terminal notification is once per sharedId")
+        #expect(hostDeferredBoth, "Host must receive inboundRecoveryDeferred for leader and coalesced frame")
+        #expect(
+            await probe.unrecoverableContent().isEmpty,
+            "Host must not receive inboundContentUnrecoverable while either NACK is pending")
 
         await uploadPause.release()
         await session.shutdown()
@@ -2054,10 +2155,11 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
-    /// Same gate for coalesced frames: pending archive token ⇒ not terminal; after
-    /// the pass removes the token, a redelivery terminalizes once.
-    @Test("missingOneTimeKey coalesced with pending archive token defers terminalization until pass starts")
-    func testMissingOneTimeKeyCoalescedPendingArchiveTokenDefersThenTerminalizes() async throws {
+    /// Same gate for coalesced frames: pending archive token ⇒ not terminal. After
+    /// the pass removes the token, a redelivery is still deferred because the
+    /// envelope's NACK is pending; the peer's unavailable answer terminalizes once.
+    @Test("missingOneTimeKey coalesced with pending archive token stays deferred until the peer answers")
+    func testMissingOneTimeKeyCoalescedPendingArchiveTokenDefersUntilPeerAnswers() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
         try await createSenderSession(store: store)
         let probe = EpisodeEndProbe()
@@ -2129,25 +2231,48 @@ actor TaskProcessorSequenceTests {
             }),
             "Host must not be notified while archive pass is pending")
 
-        // Archive pass start removes the token; a redelivery then terminalizes once.
+        // Archive pass start removes the token. A redelivery re-coalesces (the
+        // pending NACK bypasses failure-class suppression) and is still deferred:
+        // the NACK for this envelope is outstanding, so the sender may yet
+        // re-encrypt it. Terminal is owned by the peer's answer, not the redelivery.
         await session.messagePipeline.test_removeArchivedInboundFallbackPass(coalescedToken.storageKey)
         try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(coalesced)),
             session: session
         )
-        let nowTerminal = try await waitUntil { [session] in
+        let redeliveryCoalesced = try await waitUntil {
+            await probe.deferredRecoveries().filter { $0.2 == coalescedId }.count >= 2
+        }
+        #expect(redeliveryCoalesced, "Redelivery after token removal re-coalesces into the open episode")
+        #expect(
+            !(await session.isInboundContentUnrecoverable(
+                sender: sender,
+                deviceId: peerDeviceId,
+                sharedId: coalescedId)),
+            "Redelivery must not terminalize while the NACK for this envelope is pending")
+        #expect(
+            !(await probe.unrecoverableContent().contains {
+                $0.0 == sender && $0.1 == peerDeviceId && $0.2 == coalescedId
+            }),
+            "Host must not be told the content is lost while the sender can still answer the NACK")
+
+        // Peer answers unavailable: terminal lands once through the existing path.
+        await session.handleOutOfBandResendUnavailable(
+            from: sender,
+            deviceId: peerDeviceId,
+            unavailableEnvelopeMessageIds: [coalescedId])
+        #expect(
             await session.isInboundContentUnrecoverable(
                 sender: sender,
                 deviceId: peerDeviceId,
-                sharedId: coalescedId)
-        }
-        #expect(nowTerminal, "After the archive token is removed, redelivery must terminalize")
+                sharedId: coalescedId),
+            "oobUnavailable terminalizes the coalesced dead-epoch envelope")
         let hostNotified = try await waitUntil {
             await probe.unrecoverableContent().contains {
                 $0.0 == sender && $0.1 == peerDeviceId && $0.2 == coalescedId
             }
         }
-        #expect(hostNotified, "Host must receive inboundContentUnrecoverable once the pass is exhausted")
+        #expect(hostNotified, "Host must receive inboundContentUnrecoverable once the peer says unavailable")
         let coalescedNotifications = await probe.unrecoverableContent().filter { $0.2 == coalescedId }.count
         #expect(coalescedNotifications == 1, "Terminal notification is once per sharedId")
 
@@ -2208,9 +2333,11 @@ actor TaskProcessorSequenceTests {
         #expect(
             !(await session.shouldHoldOfflineCiphertextDuringRecovery(sender: sender, deviceId: peerDeviceId)),
             "missingOneTimeKey proves the epoch dead; the open healable episode must stop holding offline ciphertext")
+        // Dead epoch ≠ dead content: the deferred NACK above is how this frame
+        // heals (sender re-encryption). Terminal waits for the peer's answer.
         #expect(
-            await session.isInboundContentUnrecoverable(sender: sender, deviceId: peerDeviceId, sharedId: sharedId),
-            "Coalesced dead-epoch frame is terminal")
+            !(await session.isInboundContentUnrecoverable(sender: sender, deviceId: peerDeviceId, sharedId: sharedId)),
+            "Coalesced dead-epoch frame stays deferred while its NACK is pending")
 
         await session.endReestablishmentEpisode(sender: sender, deviceId: peerDeviceId)
         await session.shutdown()
@@ -2787,6 +2914,87 @@ actor TaskProcessorSequenceTests {
             failedSharedMessageIds: unknownIds)
         #expect(second.queuedIds.isEmpty)
         #expect(Set(second.permanentlyUnavailableIds) == Set(unknownIds))
+
+        await session.shutdown()
+    }
+
+    /// Dogfood 2026-09-26 (nudge master `75F0CD4F` → mm26): the owner's
+    /// `messageResendUnavailable` for ten ids failed with
+    /// `connectionIsNonViable` because the path changed mid-send. The notice was
+    /// dropped; the requester only converged via `resendSubmissionCap` (three
+    /// more NACK rounds). The notice must ride the next false→true viability
+    /// edge instead.
+    @Test("Unavailable-notice transport failure parks ids until viability is restored")
+    func testUnavailableNoticeParksOnEmitFailureAndFlushesOnReconnect() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let requester = "bob_unavailable_park"
+        let requesterDeviceId = UUID()
+        let ids = ["park-a", "park-b"]
+        transport.sendOutOfBandResendUnavailableError = PQSError.connectionIsNonViable
+
+        let sent = await session.sendUnavailableNoticeOrPark(
+            requester: requester,
+            deviceId: requesterDeviceId,
+            envelopeMessageIds: ids,
+            reason: "test")
+        #expect(!sent)
+        #expect(
+            Set(await session.pendingUnavailableNoticeIds(
+                requester: requester,
+                deviceId: requesterDeviceId)) == Set(ids),
+            "A connectionIsNonViable emit must park the notice for the viability edge")
+
+        // Still non-viable on the edge: the flush must re-park, not drop.
+        let failedAttempts = await transport.outOfBandResendUnavailableCount
+        await session.setConnectivity(false)
+        await session.setConnectivity(true)
+        let retried = try await waitUntil { [transport] in
+            await transport.outOfBandResendUnavailableCount > failedAttempts
+        }
+        #expect(retried, "false→true viability must attempt the parked notice")
+        #expect(
+            Set(await session.pendingUnavailableNoticeIds(
+                requester: requester,
+                deviceId: requesterDeviceId)) == Set(ids),
+            "A failed flush leaves the ids parked")
+
+        // Path restored: the next edge delivers and clears the park.
+        transport.sendOutOfBandResendUnavailableError = nil
+        let attemptsBeforeRestore = await transport.outOfBandResendUnavailableCount
+        await session.setConnectivity(false)
+        await session.setConnectivity(true)
+        let flushed = try await waitUntil { [transport] in
+            await transport.outOfBandResendUnavailableCount > attemptsBeforeRestore
+        }
+        #expect(flushed, "false→true viability must re-emit the parked unavailable notice")
+        let cleared = try await waitUntil { [session] in
+            await session.pendingUnavailableNoticeIds(
+                requester: requester,
+                deviceId: requesterDeviceId).isEmpty
+        }
+        #expect(cleared, "A successful viability flush must clear the parked notice")
+        #expect(Set(transport.lastUnavailableEnvelopeIds) == Set(ids))
+
+        await session.shutdown()
+    }
+
+    @Test("Successful unavailable emit does not park a notice")
+    func testSuccessfulUnavailableEmitDoesNotPark() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+
+        let requester = "bob_unavailable_ok"
+        let requesterDeviceId = UUID()
+        let sent = await session.sendUnavailableNoticeOrPark(
+            requester: requester,
+            deviceId: requesterDeviceId,
+            envelopeMessageIds: ["ok-a"],
+            reason: "test")
+        #expect(sent)
+        #expect(await session.pendingUnavailableNoticesByPeer.isEmpty)
+        #expect(transport.lastUnavailableEnvelopeIds == ["ok-a"])
 
         await session.shutdown()
     }

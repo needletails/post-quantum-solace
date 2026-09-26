@@ -10688,9 +10688,19 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     }
     
     private let oobResendTracker = CallTracker()
+    private let oobUnavailableTracker = CallTracker()
+
+    /// When set, `sendOutOfBandResendUnavailable` throws before delivery.
+    var sendOutOfBandResendUnavailableError: Error?
+
+    var lastUnavailableEnvelopeIds: [String] = []
     
     var outOfBandResendRequestCount: Int {
         get async { await oobResendTracker.callCount }
+    }
+
+    var outOfBandResendUnavailableCount: Int {
+        get async { await oobUnavailableTracker.callCount }
     }
     
     /// Per-call view (secretName, deviceId, id count) for frame-cap assertions.
@@ -10726,6 +10736,14 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
         deviceId: UUID,
         respondingDeviceId: UUID
     ) async throws {
+        lastUnavailableEnvelopeIds = unavailableEnvelopeMessageIds
+        await oobUnavailableTracker.record(
+            secretName: secretName,
+            deviceId: deviceId.uuidString,
+            keyCount: unavailableEnvelopeMessageIds.count)
+        if let sendOutOfBandResendUnavailableError {
+            throw sendOutOfBandResendUnavailableError
+        }
         guard let sessionContext = await session.sessionContext else { return }
         let notice = MessageResendUnavailableNotice(
             unavailableSharedMessageIds: unavailableEnvelopeMessageIds,

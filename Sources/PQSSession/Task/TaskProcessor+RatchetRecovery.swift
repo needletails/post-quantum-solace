@@ -350,9 +350,8 @@ extension MessagePipeline {
     /// stops re-requesting them. Delivered on the requester device's existing active
     /// lane — an unanswerable retry request must never reset session state. An
     /// initiating row is minted only when no active session exists for that device.
-    /// Send failures are non-fatal: the requester-side attempt
-    /// cap (`PQSSessionConstants.peerResendRequestMaxSubmissions`) still bounds the loop
-    /// when the notice is lost.
+    /// Send failures park the notice and re-emit on the next viability restore;
+    /// the requester-side attempt cap still bounds the loop if that flush is lost.
     private func emitResendUnavailableNotice(
         to fallbackIdentity: SessionIdentity,
         requesterName: String,
@@ -362,34 +361,31 @@ extension MessagePipeline {
         session: PQSSession
     ) async {
         guard !unavailableIds.isEmpty else { return }
-        guard let context = await session.sessionContext else { return }
-        _ = fallbackIdentity
 
         // Strict §4.1: unavailable notices are out-of-band — no DR encrypt /
-        // surgical lane selection (closes S7 for the response leg).
-        do {
-            try await session.transportDelegate?.sendOutOfBandResendUnavailable(
-                unavailableEnvelopeMessageIds: unavailableIds,
-                to: requesterName,
-                deviceId: requesterDeviceId,
-                respondingDeviceId: context.sessionUser.deviceId)
-            logger.log(
-                level: .info,
-                message: "pqs.recovery.resendUnavailableSentOutOfBand requester=\(requesterName) unavailableCount=\(unavailableIds.count) ids=\(unavailableIds.joined(separator: ","))")
-            audit(.recovery, "pqs.recovery.resendUnavailableSentOutOfBand requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) unavailableCount=\(unavailableIds.count) ids=\(unavailableIds.joined(separator: ","))")
-            if laneHealActive {
-                // A remint (or a live prior heal mark) already owns the lane
-                // toward this requester; the old NoRemint audit would read as
-                // a contradiction right after resendUnavailableLaneReminted.
-                audit(.recovery, "pqs.recovery.resendUnavailableAfterLaneHeal requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(fallbackIdentity.id.uuidString) unavailableCount=\(unavailableIds.count)")
-            } else {
-                audit(.recovery, "pqs.recovery.resendUnavailableSameAccountNoRemint requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(fallbackIdentity.id.uuidString) unavailableCount=\(unavailableIds.count)")
-            }
-        } catch {
+        // surgical lane selection (closes S7 for the response leg). Transport
+        // failure parks the ids on the session for the next viability restore.
+        let sent = await session.sendUnavailableNoticeOrPark(
+            requester: requesterName,
+            deviceId: requesterDeviceId,
+            envelopeMessageIds: unavailableIds,
+            reason: "resendServiced")
+        guard sent else {
             logger.log(
                 level: .warning,
-                message: "pqs.recovery.resendUnavailableEmitFailed requester=\(requesterName) unavailableCount=\(unavailableIds.count) error=\(error)")
-            audit(.recovery, "pqs.recovery.resendUnavailableEmitFailed requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) unavailableCount=\(unavailableIds.count) error=\(error)")
+                message: "pqs.recovery.resendUnavailableEmitFailed requester=\(requesterName) unavailableCount=\(unavailableIds.count) parkedUntilViable=true")
+            return
+        }
+        logger.log(
+            level: .info,
+            message: "pqs.recovery.resendUnavailableSentOutOfBand requester=\(requesterName) unavailableCount=\(unavailableIds.count) ids=\(unavailableIds.joined(separator: ","))")
+        if laneHealActive {
+            // A remint (or a live prior heal mark) already owns the lane
+            // toward this requester; the old NoRemint audit would read as
+            // a contradiction right after resendUnavailableLaneReminted.
+            audit(.recovery, "pqs.recovery.resendUnavailableAfterLaneHeal requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(fallbackIdentity.id.uuidString) unavailableCount=\(unavailableIds.count)")
+        } else {
+            audit(.recovery, "pqs.recovery.resendUnavailableSameAccountNoRemint requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(fallbackIdentity.id.uuidString) unavailableCount=\(unavailableIds.count)")
         }
     }
 

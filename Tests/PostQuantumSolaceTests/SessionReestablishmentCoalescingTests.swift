@@ -109,6 +109,41 @@ struct SessionReestablishmentCoalescingTests {
             sender: sender, deviceId: deviceId, sharedId: sharedId))
     }
 
+    @Test("Parked unavailable notices merge per requester and clear per id")
+    func parkedUnavailableNoticesMergeAndClear() async {
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let requester = "sunflower"
+        let deviceId = UUID()
+
+        await session.deferUnavailableNoticeUntilViable(
+            requester: requester,
+            deviceId: deviceId,
+            envelopeMessageIds: ["a", "b"])
+        await session.deferUnavailableNoticeUntilViable(
+            requester: requester,
+            deviceId: deviceId,
+            envelopeMessageIds: ["b", "c"])
+        #expect(await session.pendingUnavailableNoticesByPeer.count == 1)
+        #expect(
+            Set(await session.pendingUnavailableNoticeIds(requester: requester, deviceId: deviceId))
+                == Set(["a", "b", "c"]))
+
+        await session.clearPendingUnavailableNotice(
+            requester: requester,
+            deviceId: deviceId,
+            envelopeMessageIds: ["b"])
+        #expect(
+            Set(await session.pendingUnavailableNoticeIds(requester: requester, deviceId: deviceId))
+                == Set(["a", "c"]))
+
+        await session.clearPendingUnavailableNotice(
+            requester: requester,
+            deviceId: deviceId,
+            envelopeMessageIds: ["a", "c"])
+        #expect(await session.pendingUnavailableNoticesByPeer.isEmpty)
+    }
+
     @Test("settlePendingResendForAcceptedEnvelope removes settled id, retains others, clears terminal mark")
     func settlePendingResendForAcceptedEnvelopeSettlesOnlyThatId() async throws {
         let session = PQSSession()

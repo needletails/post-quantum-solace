@@ -1331,8 +1331,135 @@ extension PQSSession {
         return settledIds
     }
 
+    /// Parks an owner-side unavailable notice that failed to transport so the
+    /// next viability restore can re-emit it. Merges ids for the same requester.
+    func deferUnavailableNoticeUntilViable(
+        requester: String,
+        deviceId: UUID,
+        envelopeMessageIds: [String],
+        now: Date = Date()
+    ) {
+        let unique = Array(Set(
+            envelopeMessageIds
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+        ))
+        guard !unique.isEmpty else { return }
+        let key = automaticRotationPeerKey(sender: requester, deviceId: deviceId)
+        if var existing = pendingUnavailableNoticesByPeer[key] {
+            var merged = Set(existing.envelopeMessageIds)
+            merged.formUnion(unique)
+            existing.envelopeMessageIds = Array(merged)
+            pendingUnavailableNoticesByPeer[key] = existing
+        } else {
+            let cap = PQSSessionConstants.recoveryTrackingMaxEntries
+            if pendingUnavailableNoticesByPeer.count >= cap {
+                let overflowKeys = pendingUnavailableNoticesByPeer
+                    .sorted { $0.value.createdAt < $1.value.createdAt }
+                    .prefix(pendingUnavailableNoticesByPeer.count - cap + 1)
+                    .map(\.key)
+                for overflowKey in overflowKeys {
+                    pendingUnavailableNoticesByPeer.removeValue(forKey: overflowKey)
+                }
+            }
+            pendingUnavailableNoticesByPeer[key] = PendingUnavailableNotice(
+                requesterName: requester,
+                requesterDeviceId: deviceId,
+                envelopeMessageIds: unique,
+                createdAt: now)
+        }
+    }
+
+    func pendingUnavailableNoticeIds(requester: String, deviceId: UUID) -> [String] {
+        pendingUnavailableNoticesByPeer[
+            automaticRotationPeerKey(sender: requester, deviceId: deviceId)
+        ]?.envelopeMessageIds ?? []
+    }
+
+    func clearPendingUnavailableNotice(
+        requester: String,
+        deviceId: UUID,
+        envelopeMessageIds: [String]
+    ) {
+        let key = automaticRotationPeerKey(sender: requester, deviceId: deviceId)
+        guard var existing = pendingUnavailableNoticesByPeer[key] else { return }
+        let drop = Set(envelopeMessageIds)
+        let remaining = existing.envelopeMessageIds.filter { !drop.contains($0) }
+        if remaining.isEmpty {
+            pendingUnavailableNoticesByPeer.removeValue(forKey: key)
+        } else {
+            existing.envelopeMessageIds = remaining
+            pendingUnavailableNoticesByPeer[key] = existing
+        }
+    }
+
+    /// Transports one out-of-band unavailable notice. On failure the ids are
+    /// parked for the next viability restore instead of being dropped.
+    ///
+    /// - Returns: `true` when the transport accepted the notice.
+    @discardableResult
+    func sendUnavailableNoticeOrPark(
+        requester: String,
+        deviceId: UUID,
+        envelopeMessageIds: [String],
+        reason: String
+    ) async -> Bool {
+        guard !envelopeMessageIds.isEmpty else { return true }
+        guard let context = await sessionContext else {
+            deferUnavailableNoticeUntilViable(
+                requester: requester,
+                deviceId: deviceId,
+                envelopeMessageIds: envelopeMessageIds)
+            return false
+        }
+        do {
+            try await transportDelegate?.sendOutOfBandResendUnavailable(
+                unavailableEnvelopeMessageIds: envelopeMessageIds,
+                to: requester,
+                deviceId: deviceId,
+                respondingDeviceId: context.sessionUser.deviceId)
+            clearPendingUnavailableNotice(
+                requester: requester,
+                deviceId: deviceId,
+                envelopeMessageIds: envelopeMessageIds)
+            auditSink.log(
+                .recovery,
+                "pqs.recovery.resendUnavailableSentOutOfBand requester=\(requester) deviceId=\(deviceId.uuidString) unavailableCount=\(envelopeMessageIds.count) ids=\(envelopeMessageIds.joined(separator: ",")) reason=\(reason)")
+            return true
+        } catch {
+            deferUnavailableNoticeUntilViable(
+                requester: requester,
+                deviceId: deviceId,
+                envelopeMessageIds: envelopeMessageIds)
+            auditSink.log(
+                .recovery,
+                "pqs.recovery.resendUnavailableEmitFailed requester=\(requester) deviceId=\(deviceId.uuidString) unavailableCount=\(envelopeMessageIds.count) error=\(error) reason=\(reason)")
+            return false
+        }
+    }
+
+    /// Re-emits parked unavailable notices after a concrete viability restore.
+    /// `sendUnavailableNoticeOrPark` clears ids on success and leaves them
+    /// parked on failure, so nothing is taken or re-parked here. Merged ids for
+    /// one requester may exceed the §4.1 frame cap, so each send is chunked.
+    func flushPendingUnavailableNotices(reason: String) async {
+        guard isViable, !pendingUnavailableNoticesByPeer.isEmpty else { return }
+        let maxPerFrame = OutOfBandResendControl.maxMessageIds
+        for notice in Array(pendingUnavailableNoticesByPeer.values) {
+            let ids = notice.envelopeMessageIds
+            for start in stride(from: 0, to: ids.count, by: maxPerFrame) {
+                await sendUnavailableNoticeOrPark(
+                    requester: notice.requesterName,
+                    deviceId: notice.requesterDeviceId,
+                    envelopeMessageIds: Array(ids[start ..< min(start + maxPerFrame, ids.count)]),
+                    reason: reason)
+            }
+        }
+    }
+
     private func cleanupPendingResendAfterReestablishment(now: Date = Date()) async {
-        // Event-driven terminality only (unavailable / submission cap / dead-epoch).
+        // Event-driven terminality only (unavailable / submission cap; dead-epoch
+        // only once no NACK is pending for the tuple).
         // Wall-clock age must not terminalize deferred NACKs for idle senders.
         // Bound the in-memory queue by LRU only.
         _ = now

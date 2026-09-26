@@ -212,6 +212,12 @@ public actor PQSSession: SessionCacheSynchronizer {
         let wasViable = isViable
         isViable = value
         guard value, !wasViable else { return }
+        // Independent of the job-queue coalesce: a parked unavailable notice
+        // must ride this viability edge even when resume is already in flight.
+        _ = await scheduleTransportProtocolWork { [weak self] in
+            guard let self else { return }
+            await self.flushPendingUnavailableNotices(reason: "viabilityRestored")
+        }
         guard !jobQueueResumeCoalesced else { return }
         jobQueueResumeCoalesced = true
         _ = await scheduleBackgroundWork { [weak self] in
@@ -681,9 +687,22 @@ public actor PQSSession: SessionCacheSynchronizer {
         let createdAt: Date
     }
 
+    /// Owner-side unavailable notice that failed to leave the device (typically
+    /// `connectionIsNonViable`). Flushed on the next false→true viability edge
+    /// so a path change does not wait for the requester's next NACK / cap.
+    struct PendingUnavailableNotice: Sendable {
+        let requesterName: String
+        let requesterDeviceId: UUID
+        var envelopeMessageIds: [String]
+        let createdAt: Date
+    }
+
     /// Failed inbound messages whose replay should be requested only after the
     /// peer/device has completed the reestablishment round.
     var pendingResendAfterReestablishment: [String: PendingResendAfterReestablishment] = [:]
+
+    /// Parked `messageResendUnavailable` notices keyed by `"secretName|deviceUUID"`.
+    var pendingUnavailableNoticesByPeer: [String: PendingUnavailableNotice] = [:]
 
     /// Open single-flight reestablishment episodes keyed by `"secretName|deviceUUID"`.
     /// While an episode is open, additional decrypt failures for that peer device

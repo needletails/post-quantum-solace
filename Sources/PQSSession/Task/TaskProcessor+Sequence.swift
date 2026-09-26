@@ -748,16 +748,9 @@ extension MessagePipeline {
                         level: .info,
                         message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=pendingPeerRefresh")
                     await session.markInboundFailure(message, failureClass: failureClass)
-                    // Coalesced frames are as dead as the leader: the key they
-                    // reference is consumed regardless of which frame opened the
-                    // episode. Terminalize now, not at episode TTL — a placeholder
-                    // left non-terminal outlives the process and is re-armed on
-                    // every relaunch (dogfood 2026-09-17 `0B969E92`).
-                    //
-                    // Exception: an active-first try-all may already have queued an
-                    // archive fallback for this ciphertext. Terminalizing before
-                    // that pass runs false-positives contentUnrecoverable on frames
-                    // that then decrypt via lanePromotedFromArchive (dogfood Sep 19/23).
+                    // Coalesced frames follow the leader's rule: the NACK just
+                    // deferred above owns recovery, so this only terminalizes when
+                    // no NACK is pending (see `maybeTerminalizeDeadEpochInbound`).
                     await maybeTerminalizeDeadEpochInbound(message, session: session)
                     try await cache.deleteJob(job)
                     return .deleted
@@ -787,9 +780,10 @@ extension MessagePipeline {
                 // redelivery of the same frame is suppressed instead of repeating the OTK
                 // batch replacement and the cooldown-bypassing peerRefresh re-emit.
                 await session.markInboundFailure(message, failureClass: failureClass)
-                // Dead-epoch frames never heal by re-decrypt. Terminalize this sharedId
-                // so spool redelivery is swallowed without another OTK/peerRefresh storm.
-                // Same archive-pass gate as the coalesce branch above.
+                // Dead-epoch frames never heal by re-decrypt, only by the sender
+                // answering the NACK deferred above. Terminal is owned by
+                // oobUnavailable / resendSubmissionCap while that NACK is pending;
+                // this only terminalizes a tuple with no NACK left to answer.
                 await maybeTerminalizeDeadEpochInbound(message, session: session)
 
                 // The published-batch replacement (key generation + two uploads with
@@ -1230,17 +1224,27 @@ extension MessagePipeline {
     }
 
     /// `missingOneTimeKey` proves the sender's session epoch is dead: the
-    /// referenced one-time key is consumed, so this frame can never decrypt
-    /// locally and only heals via sender re-encryption on the healed lane.
-    /// Terminalize the sharedId at the failure event — episode leader and
-    /// coalesced frames alike — so spool redelivery is swallowed and the host
-    /// drops its placeholder + durable ledger row instead of re-arming it on
-    /// every relaunch. `markInboundContentUnrecoverable` is once-per-tuple, so
-    /// redelivered copies do not re-notify the host.
+    /// referenced one-time key is consumed, so this *envelope* can never decrypt
+    /// locally. The *content* still heals via sender re-encryption on the healed
+    /// lane — every caller has just registered a deferred NACK for this envelope
+    /// (`deferPeerResendUntilReestablished`), and dogfood 2026-09-26 showed
+    /// sixteen dead-epoch envelopes terminalized here and then settled via
+    /// `logicalReplay` after that NACK drained. Terminalizing at the failure
+    /// event told the host `inboundContentUnrecoverable` (spool purge + a
+    /// `failed` receipt to the author) for content that arrived minutes later.
+    ///
+    /// Terminal for a dead-epoch envelope is therefore owned by the events that
+    /// prove the sender cannot answer the NACK: `oobUnavailable`
+    /// (`handleOutOfBandResendUnavailable`) or `resendSubmissionCap`
+    /// (`sendDeferredResendRequests`). This path only terminalizes when no NACK
+    /// is pending for the tuple, so a redelivery of an already-settled or
+    /// cleared envelope is still swallowed without another OTK/peerRefresh storm.
+    /// `markInboundContentUnrecoverable` is once-per-tuple, so redelivered
+    /// copies do not re-notify the host.
     ///
     /// When an archive fallback pass is already queued for this ciphertext,
-    /// defer terminalization: the pass removes the token at start and rethrows
-    /// on failure, so the next handler invocation terminalizes with no timer.
+    /// defer as well: the pass removes the token at start and rethrows on
+    /// failure, so the next handler invocation re-evaluates with no timer.
     private func maybeTerminalizeDeadEpochInbound(
         _ message: InboundTaskMessage,
         session: PQSSession
@@ -1258,6 +1262,16 @@ extension MessagePipeline {
             audit(
                 .recovery,
                 "pqs.recovery.deadEpochTerminalizationDeferred reason=archivePassPending sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
+            return
+        }
+        if await session.hasPendingResendAfterReestablishment(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            failedMessageId: message.sharedMessageId)
+        {
+            audit(
+                .recovery,
+                "pqs.recovery.deadEpochTerminalizationDeferred reason=resendPending sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
             return
         }
         await terminalizeDeadEpochInbound(message, session: session)
