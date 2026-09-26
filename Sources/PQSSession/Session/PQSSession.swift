@@ -726,6 +726,12 @@ public actor PQSSession: SessionCacheSynchronizer {
     /// network configuration fetch on warm sends when local lanes already match.
     var lastVerifiedDeviceIdsBySecretName: [String: Set<UUID>] = [:]
 
+    /// Seeds the directory memo. Production writes it from identity refresh.
+    /// Tests use this because the stored property cannot be mutated off the actor.
+    func setVerifiedDeviceIds(_ ids: Set<UUID>, for secretName: String) {
+        lastVerifiedDeviceIdsBySecretName[secretName] = ids
+    }
+
     /// Accounts the transport definitively reported deleted (HTTP 404 / `userNotFound`).
     /// Excluded from identity refresh / fan-out so ghost channel roster members stop
     /// receiving encrypted traffic on stale device lanes. Cleared by any successful

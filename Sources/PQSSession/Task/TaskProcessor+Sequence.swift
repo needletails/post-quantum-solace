@@ -1060,36 +1060,24 @@ extension MessagePipeline {
                 let senderSecretName = inbound.senderSecretName
                 let senderDeviceId = inbound.senderDeviceId
                 let sharedMessageId = inbound.sharedMessageId
-                if case JobProcessorErrors.missingIdentity = error {
-                    // Identity resolution failed even after a forced directory
-                    // refresh. This is not a decrypt outcome, so the recovery ring
-                    // never claimed a durable resend for this sharedId — notifying
-                    // the host alone would purge the spool copy with zero §4.1
-                    // retry attempts (silent content loss). Register the bounded
-                    // OOB resend first; the defer itself fires
-                    // `inboundRecoveryDeferred`, keeping the host's claim-and-purge
-                    // contract true. A transient miss heals on sender resend; a
-                    // genuinely unlinked device terminates at the submission cap
-                    // via `pendingResendExhausted`.
-                    audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error) failureClass=inbound.missingIdentity")
-                    await session.deferPeerResendUntilReestablished(
+                if case JobProcessorErrors.missingSessionRow = error {
+                    // No row after the refresh that wrote the verified-device memo.
+                    // A device the directory no longer lists cannot resend; drop
+                    // the spool. A device still in the memo keeps the resend path.
+                    await session.resolveInboundMissingSessionRow(
                         sender: senderSecretName,
                         deviceId: senderDeviceId,
                         failedMessageId: sharedMessageId,
-                        logicalSharedId: inbound.logicalSharedId,
-                        failureClass: "inbound.missingIdentity")
-                    // Identity misses never open a reestablishment episode, so no
-                    // episode-end event would ever drain this lane. Flush on this
-                    // concrete failure event instead; cooldown and the attempt cap
-                    // still gate the actual submission.
-                    if await !session.hasOpenReestablishmentEpisode(
+                        logicalSharedId: inbound.logicalSharedId)
+                } else if case JobProcessorErrors.missingIdentity = error {
+                    // A row exists but props failed to unwrap, or a later persist
+                    // step lost the identity. That is a mint/read miss, not a
+                    // replaced install.
+                    await session.deferInboundMissingIdentityResend(
                         sender: senderSecretName,
-                        deviceId: senderDeviceId) {
-                        await session.flushPendingResends(
-                            sender: senderSecretName,
-                            deviceId: senderDeviceId,
-                            reason: "missingIdentity")
-                    }
+                        deviceId: senderDeviceId,
+                        failedMessageId: sharedMessageId,
+                        logicalSharedId: inbound.logicalSharedId)
                 } else {
                     audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
                     await session.scheduleTransportProtocolWork {
@@ -1126,10 +1114,20 @@ extension MessagePipeline {
     // MARK: - Errors
     
     enum JobProcessorErrors: Error, LocalizedError {
+        /// A session row exists but its props could not be read, or a later
+        /// persist step could not resolve it. Still a resend candidate.
         case missingIdentity
-        
+        /// `bestSessionIdentity` was nil after the directory refresh. The
+        /// verified-device memo decides drop versus resend.
+        case missingSessionRow
+
         var errorDescription: String? {
-            "Job references a missing session identity"
+            switch self {
+            case .missingIdentity:
+                "Job references a missing session identity"
+            case .missingSessionRow:
+                "Job references a sender device with no session row"
+            }
         }
         
         var recoverySuggestion: String? {

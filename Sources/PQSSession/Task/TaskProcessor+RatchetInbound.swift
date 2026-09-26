@@ -1661,7 +1661,10 @@ extension MessagePipeline {
         }
         
         guard let sessionIdentity else {
-            throw JobProcessorErrors.missingIdentity
+            // No row after the force refresh that wrote the verified-device memo.
+            // A props unwrap failure below stays `missingIdentity` so it keeps
+            // the resend path.
+            throw JobProcessorErrors.missingSessionRow
         }
         
         // Unwrap properties and retrieve the public signing key

@@ -576,6 +576,9 @@ public extension PQSSession {
                     logger.log(level: .info, message: "Did remove stale session identity for recipient: \(secretName)")
                     auditSink.log(.recovery, "pqs.recovery.laneStalePruned peer=\(secretName) deviceId=\(deviceId.uuidString) verifiedDeviceCount=\(verifiedDeviceIds.count)")
                     identities.removeAll { $0.id == identityToRemove.id }
+                    await dropPendingResendsForRemovedDevice(
+                        sender: secretName,
+                        deviceId: deviceId)
                 } catch {
                     logger.log(
                         level: .warning,

@@ -676,6 +676,19 @@ extension PQSSession {
         sharedMessageId: String,
         now: Date = Date()
     ) async {
+        let verified = lastVerifiedDeviceIdsBySecretName[sender] ?? []
+        if StaleInboundDevicePolicy.shouldDrop(
+            senderDeviceId: deviceId,
+            verifiedDeviceIds: verified)
+        {
+            await dropReplacedDeviceInbound(
+                sender: sender,
+                deviceId: deviceId,
+                failedMessageId: sharedMessageId,
+                reason: "hostRearm",
+                hostSignal: .terminal)
+            return
+        }
         await deferPeerResendUntilReestablished(
             sender: sender,
             deviceId: deviceId,
@@ -684,6 +697,122 @@ extension PQSSession {
             now: now,
             notifyDelegate: false)
         auditSink.log(.recovery, "pqs.recovery.pendingResendRearmed sharedId=\(sharedMessageId) sender=\(sender) deviceId=\(deviceId.uuidString)")
+    }
+
+    /// No session row after the directory refresh. Drops mail from a device the
+    /// non-empty verified memo no longer lists. A device still in the memo, or
+    /// an empty memo, keeps the bounded resend.
+    func resolveInboundMissingSessionRow(
+        sender: String,
+        deviceId: UUID,
+        failedMessageId: String,
+        logicalSharedId: String?
+    ) async {
+        let verified = lastVerifiedDeviceIdsBySecretName[sender] ?? []
+        if StaleInboundDevicePolicy.shouldDrop(
+            senderDeviceId: deviceId,
+            verifiedDeviceIds: verified)
+        {
+            await dropReplacedDeviceInbound(
+                sender: sender,
+                deviceId: deviceId,
+                failedMessageId: failedMessageId,
+                reason: "missingSessionRow",
+                hostSignal: .purgeSpool)
+            return
+        }
+        await deferInboundMissingIdentityResend(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: failedMessageId,
+            logicalSharedId: logicalSharedId)
+    }
+
+    /// Props-unwrap and persist misses: the directory still lists the device,
+    /// so claim one bounded resend and flush it now. Identity misses do not
+    /// open a reestablishment episode, so no episode-end event would drain
+    /// this lane.
+    func deferInboundMissingIdentityResend(
+        sender: String,
+        deviceId: UUID,
+        failedMessageId: String,
+        logicalSharedId: String?
+    ) async {
+        auditSink.log(
+            .recovery,
+            "pqs.recovery.unhandledInboundError sharedId=\(failedMessageId) sender=\(sender) deviceId=\(deviceId.uuidString) error=missingIdentity failureClass=inbound.missingIdentity")
+        await deferPeerResendUntilReestablished(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: failedMessageId,
+            logicalSharedId: logicalSharedId,
+            failureClass: "inbound.missingIdentity")
+        if await !hasOpenReestablishmentEpisode(sender: sender, deviceId: deviceId) {
+            await flushPendingResends(
+                sender: sender,
+                deviceId: deviceId,
+                reason: "missingIdentity")
+        }
+    }
+
+    /// Lane prune already decided this device is gone. Clear its pending
+    /// resends and tell the host so the durable ledger cannot rearm them.
+    func dropPendingResendsForRemovedDevice(sender: String, deviceId: UUID) async {
+        let pending = await takePendingResendsAfterReestablishment(
+            sender: sender,
+            deviceId: deviceId)
+        for item in pending {
+            await dropReplacedDeviceInbound(
+                sender: sender,
+                deviceId: deviceId,
+                failedMessageId: item.failedSharedMessageId,
+                reason: "lanePruned",
+                hostSignal: .terminal)
+        }
+    }
+
+    private enum ReplacedDeviceHostSignal: Sendable {
+        /// New inbound miss: delete the spool copy without a placeholder.
+        case purgeSpool
+        /// Pending id or relaunch rearm: clear the durable recovery ledger.
+        case terminal
+    }
+
+    private func dropReplacedDeviceInbound(
+        sender: String,
+        deviceId: UUID,
+        failedMessageId: String,
+        reason: String,
+        hostSignal: ReplacedDeviceHostSignal
+    ) async {
+        quarantineInboundFailure(
+            sender: sender,
+            deviceId: deviceId,
+            messageId: failedMessageId)
+        _ = await clearPendingResends(
+            sender: sender,
+            deviceId: deviceId,
+            messageIds: [failedMessageId])
+        auditSink.log(
+            .recovery,
+            "pqs.recovery.staleDeviceDropped sharedId=\(failedMessageId) sender=\(sender) deviceId=\(deviceId.uuidString) reason=\(reason)")
+        let delegate = sessionDelegate
+        let sharedId = failedMessageId
+        await scheduleTransportProtocolWork {
+            switch hostSignal {
+            case .purgeSpool:
+                await delegate?.inboundRecoveryDeferred(
+                    senderSecretName: sender,
+                    senderDeviceId: deviceId,
+                    failedSharedMessageId: sharedId,
+                    failureClass: "inbound.staleDevice")
+            case .terminal:
+                await delegate?.inboundContentUnrecoverable(
+                    senderSecretName: sender,
+                    senderDeviceId: deviceId,
+                    sharedMessageId: sharedId)
+            }
+        }
     }
 
     func hasPendingResendAfterReestablishment(
