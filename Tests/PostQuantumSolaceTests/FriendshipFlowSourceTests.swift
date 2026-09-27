@@ -257,6 +257,7 @@ struct FriendshipFlowSourceTests {
         _ = ExplicitOutboundRecipientPinPolicy.shouldHonorExplicitRecipient
         _ = OrphanReplayRearmPolicy.shouldRearm
         _ = MessagePipeline.isReplaceableInboundRecoveryPlaceholder
+        _ = MessagePipeline.inboundConversationType
     }
 
     @Test("Inactive session retention supports multi-device offline lag")

@@ -1336,6 +1336,11 @@ extension MessagePipeline {
     {
         guard let cache = await session.cache else { throw PQSError.databaseNotInitialized }
         let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
+        let mySecretName = await session.sessionContext?.sessionUser.secretName
+        let conversationType = Self.inboundConversationType(
+            recipient: decodedMessage.recipient,
+            sender: inboundTask.senderSecretName,
+            mySecretName: mySecretName)
 
         // Duplicate-persist guard: the same logical message can decrypt twice
         // (an orphan replay landing after the original, or a redelivery racing
@@ -1352,37 +1357,43 @@ extension MessagePipeline {
            existingProps.senderDeviceId == inboundTask.senderDeviceId
         {
             if Self.isReplaceableInboundRecoveryPlaceholder(existingProps) {
-                var healedProps = existingProps
-                healedProps.message = decodedMessage
-                healedProps.deliveryState = .received
-                let healed = try await existing.updateMessage(
-                    with: healedProps,
-                    symmetricKey: databaseSymmetricKey)
-                try await cache.updateMessage(healed, symmetricKey: databaseSymmetricKey)
-                audit(.recovery, "pqs.recovery.placeholderHealed envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-                await session.receiverDelegate?.createdMessage(healed)
-                await sendAutomaticDeliveredReceiptIfNeeded(
-                    session: session,
-                    inboundTask: inboundTask,
-                    sharedId: healed.sharedId,
-                    conversationRecipient: decodedMessage.recipient)
+                let target = try? await conversation(
+                    cache: cache,
+                    communicationType: conversationType,
+                    session: session)
+                if target?.id == existing.communicationId {
+                    var healedProps = existingProps
+                    healedProps.message = decodedMessage
+                    healedProps.deliveryState = .received
+                    let healed = try await existing.updateMessage(
+                        with: healedProps,
+                        symmetricKey: databaseSymmetricKey)
+                    try await cache.updateMessage(healed, symmetricKey: databaseSymmetricKey)
+                    audit(.recovery, "pqs.recovery.placeholderHealed envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                    await session.receiverDelegate?.createdMessage(healed)
+                    await sendAutomaticDeliveredReceiptIfNeeded(
+                        session: session,
+                        inboundTask: inboundTask,
+                        sharedId: healed.sharedId,
+                        conversationRecipient: decodedMessage.recipient)
+                    return
+                }
+                try await cache.deleteMessage(existing)
+                audit(.recovery, "pqs.recovery.placeholderRefiled envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+            } else {
+                audit(.recovery, "pqs.recovery.duplicateInboundPersistSkipped envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
                 return
             }
-            audit(.recovery, "pqs.recovery.duplicateInboundPersistSkipped envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-            return
         }
         
         switch decodedMessage.recipient {
         case let .nickname(recipient):
             var communicationModel: BaseCommunication
             var shouldUpdateCommunication = false
-            // This can happen on multidevice support when a sender is also sending a message to it's master/child device.
-            let isMe = await inboundTask.senderSecretName == session.sessionContext?.sessionUser.secretName
             do {
-                // Need to flip recipient
                 communicationModel = try await conversation(
                     cache: cache,
-                    communicationType: .nickname(isMe ? recipient : inboundTask.senderSecretName),
+                    communicationType: conversationType,
                     session: session
                 )
                 
@@ -1405,10 +1416,9 @@ extension MessagePipeline {
                 
                 shouldUpdateCommunication = true
             } catch {
-                // Need to flip recipient
                 communicationModel = try await createCommunicationModel(
                     recipients: [recipient, inboundTask.senderSecretName],
-                    communicationType: .nickname(isMe ? recipient : inboundTask.senderSecretName),
+                    communicationType: conversationType,
                     metadata: decodedMessage.metadata,
                     symmetricKey: databaseSymmetricKey
                 )
@@ -1587,7 +1597,31 @@ extension MessagePipeline {
             break
         }
     }
-    
+
+    /// Conversation a decrypted inbound row belongs to. Same-account copies key on
+    /// the addressed peer; other senders key on the sender; personal/channel pass through.
+    static func inboundConversationType(
+        recipient: MessageRecipient,
+        sender: String,
+        mySecretName: String?
+    ) -> MessageRecipient {
+        guard case .nickname(let peer) = recipient else { return recipient }
+        return .nickname(sender == mySecretName ? peer : sender)
+    }
+
+    /// Host-inserted inbound recovery placeholders use `.waitingDelivery` / `.failed` until
+    /// an orphan resend decrypts into the same logical sharedId.
+    static func isReplaceableInboundRecoveryPlaceholder(
+        _ props: EncryptedMessage.UnwrappedProps
+    ) -> Bool {
+        switch props.deliveryState {
+        case .waitingDelivery, .failed:
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Verifies and decrypts an encrypted message received in an inbound task.
     ///
     /// This method extracts the ratchet message and the associated session identity
@@ -1623,19 +1657,6 @@ extension MessagePipeline {
     /// - Returns: A tuple containing the verified `RatchetMessage` and the associated `SessionIdentity`.
     /// - Throws: An error if the verification or decryption fails due to issues such as invalid message format,
     ///           session errors, or decryption errors.
-    /// Host-inserted inbound recovery placeholders use `.waitingDelivery` / `.failed` until
-    /// an orphan resend decrypts into the same logical sharedId.
-    static func isReplaceableInboundRecoveryPlaceholder(
-        _ props: EncryptedMessage.UnwrappedProps
-    ) -> Bool {
-        switch props.deliveryState {
-        case .waitingDelivery, .failed:
-            return true
-        default:
-            return false
-        }
-    }
-
     private func verifyEncryptedMessage(
         session: PQSSession,
         inboundTask: InboundTaskMessage

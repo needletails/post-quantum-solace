@@ -3865,6 +3865,146 @@ actor EndToEndTests {
         _ = await aliceTask?.value
         _ = await bobTask?.value
     }
+
+    @Test("Same-account placeholder under the wrong conversation is refiled on heal")
+    func testMisfiledPlaceholderRefilesIntoRecipientConversation() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 8,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(until: .now + .milliseconds(50))
+            }
+            return false
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        aliceTask = Task {
+            for await received in aliceStream {
+                if received.sender == self.sMockUserData.ssn { continue }
+                _ = try? await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
+            }
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                if received.sender == self.rMockUserData.rsn { continue }
+                _ = try? await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received)
+            }
+        }
+        try await Task.sleep(until: .now + .milliseconds(100))
+
+        try await _senderSession.send(
+            recipient: .nickname("bob"),
+            text: "establish lane")
+        #expect(
+            await waitUntil {
+                await recipientStore.getAllMessages().contains { $0.sharedId != "" }
+            },
+            "Establish message must persist before staging the placeholder")
+
+        guard let aliceDeviceId = await _senderSession.sessionContext?.sessionUser.deviceId else {
+            Issue.record("Alice device id missing")
+            return
+        }
+        let databaseKey = try await _recipientSession.getDatabaseSymmetricKey()
+        let sessionContextId = await _recipientSession.sessionContext?.sessionContextId ?? 0
+        let misfiled = try BaseCommunication(
+            id: UUID(),
+            props: .init(
+                messageCount: 0,
+                members: ["alice", "bob"],
+                metadata: Data(),
+                blockedMembers: [],
+                communicationType: .nickname("carol")),
+            symmetricKey: databaseKey)
+        try await recipientStore.createCommunication(misfiled)
+
+        let sharedId = UUID().uuidString
+        let messageId = UUID()
+        let placeholder = try EncryptedMessage(
+            id: messageId,
+            communicationId: misfiled.id,
+            sessionContextId: sessionContextId,
+            sharedId: sharedId,
+            sequenceNumber: 1,
+            props: EncryptedMessage.UnwrappedProps(
+                id: messageId,
+                base: misfiled,
+                sentDate: Date(),
+                receiveDate: Date(),
+                deliveryState: .waitingDelivery,
+                message: CryptoMessage(
+                    text: "",
+                    metadata: Data(),
+                    recipient: .nickname("carol"),
+                    sentDate: Date(),
+                    destructionTime: nil),
+                senderSecretName: "alice",
+                senderDeviceId: aliceDeviceId),
+            symmetricKey: databaseKey)
+        try await recipientStore.createMessage(placeholder, symmetricKey: databaseKey)
+
+        try await _senderSession.send(
+            recipient: .nickname("bob"),
+            text: "refiled body",
+            sharedIdOverride: sharedId)
+
+        let refiled = await waitUntil {
+            let rows = await recipientStore.getAllMessages().filter { $0.sharedId == sharedId }
+            guard rows.count == 1, rows[0].communicationId != misfiled.id else { return false }
+            guard let props = await rows[0].props(symmetricKey: databaseKey) else { return false }
+            return props.deliveryState == .received && props.message.text == "refiled body"
+        }
+        #expect(refiled, "Decrypted placeholder must leave the self-thread and land in the recipient conversation")
+
+        let rows = await recipientStore.getAllMessages().filter { $0.sharedId == sharedId }
+        let communications = try await recipientStore.fetchCommunications()
+        var aliceConversationId: UUID?
+        for communication in communications {
+            let props = await communication.props(symmetricKey: databaseKey)
+            if props?.communicationType == .nickname("alice") {
+                aliceConversationId = communication.id
+            }
+        }
+        #expect(rows.count == 1)
+        #expect(rows.first?.communicationId == aliceConversationId)
+
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await aliceTask?.value
+        _ = await bobTask?.value
+    }
     
     @Test("Device Synchronization Issues - Simulate Clock Drift and Processing Delays")
     func testDeviceSynchronizationIssues() async throws {
@@ -11091,7 +11231,9 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     func updateMessage(_: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws
     {}
     func removeMessage(_: SessionModels.EncryptedMessage) async throws {}
-    func deleteMessage(_: SessionModels.EncryptedMessage) async throws {}
+    func deleteMessage(_ message: SessionModels.EncryptedMessage) async throws {
+        createdMessages.removeAll(where: { $0.id == message.id })
+    }
     func streamMessages(sharedIdentifier _: UUID) async throws -> (
         AsyncThrowingStream<SessionModels.EncryptedMessage, any Error>,
         AsyncThrowingStream<SessionModels.EncryptedMessage, any Error>.Continuation?

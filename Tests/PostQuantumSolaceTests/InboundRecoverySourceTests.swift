@@ -71,6 +71,35 @@ struct InboundRecoverySourceTests {
             placeholderProps(deliveryState: .sending)))
     }
 
+    @Test("same-account nickname copies key on the addressed peer")
+    func sameAccountNicknameKeysOnPeer() {
+        #expect(
+            MessagePipeline.inboundConversationType(
+                recipient: .nickname("mm26"),
+                sender: "nudge",
+                mySecretName: "nudge") == .nickname("mm26"))
+        #expect(
+            MessagePipeline.inboundConversationType(
+                recipient: .nickname("mm26"),
+                sender: "alice",
+                mySecretName: "bob") == .nickname("alice"))
+        #expect(
+            MessagePipeline.inboundConversationType(
+                recipient: .nickname("mm26"),
+                sender: "alice",
+                mySecretName: nil) == .nickname("alice"))
+        #expect(
+            MessagePipeline.inboundConversationType(
+                recipient: .personalMessage,
+                sender: "nudge",
+                mySecretName: "nudge") == .personalMessage)
+        #expect(
+            MessagePipeline.inboundConversationType(
+                recipient: .channel("room"),
+                sender: "nudge",
+                mySecretName: "nudge") == .channel("room"))
+    }
+
     /// Covered by SessionReestablishmentCoalescingTests.transportedResendRequestAttemptsSurvivePastTheFailurePolicyCooldown.
     @Test("resend-request attempt window outlives the failure-policy cooldown")
     func resendRequestAttemptWindowOutlivesFailurePolicyCooldown() async {
