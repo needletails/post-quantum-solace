@@ -59,8 +59,13 @@ extension MessagePipeline {
     }
 
     /// Restart the accept deadline for one envelope (e.g. backlog still draining).
+    /// A silent-window entry is waiting for registration replay, not another timer
+    /// on the socket that stopped delivering accepts.
     func rearmServerAcceptDeadline(envelopeMessageId: String, session: PQSSession) {
-        guard unackedServerAcceptByEnvelopeId[envelopeMessageId] != nil else { return }
+        guard let entry = unackedServerAcceptByEnvelopeId[envelopeMessageId] else { return }
+        if entry.resendAttempts >= maxServerAcceptResendAttempts, !entry.readSideRecycleConsumed {
+            return
+        }
         unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)?.cancel()
         startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
     }
@@ -84,8 +89,8 @@ extension MessagePipeline {
                 continue
             }
 
-            if entry.resendAttempts >= maxServerAcceptResendAttempts {
-                // Keep the identical ciphertext so a user Retry can re-arm the send.
+            if entry.resendAttempts >= maxServerAcceptResendAttempts, entry.readSideRecycleConsumed {
+                // Registration already replayed this envelope and the accept is still missing.
                 unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)?.cancel()
                 entry.connectionEpoch = currentEpoch
                 unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
@@ -98,6 +103,8 @@ extension MessagePipeline {
                 continue
             }
 
+            let replayingSilentWindow = entry.resendAttempts >= maxServerAcceptResendAttempts
+
             guard let transportDelegate = await session.transportDelegate else {
                 audit(
                     .send,
@@ -108,7 +115,13 @@ extension MessagePipeline {
 
             do {
                 try await transportDelegate.sendMessage(entry.pending.message, metadata: entry.pending.metadata)
-                entry.resendAttempts += 1
+                if replayingSilentWindow {
+                    // One accept window on the new connection. The next miss fails the bubble.
+                    entry.readSideRecycleConsumed = true
+                    entry.resendAttempts = maxServerAcceptResendAttempts
+                } else {
+                    entry.resendAttempts += 1
+                }
                 entry.connectionEpoch = currentEpoch
                 unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
                 unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)?.cancel()
@@ -126,8 +139,10 @@ extension MessagePipeline {
         }
     }
 
-    /// Message-delivery recovery only: resend identical ciphertext while still unacked,
-    /// then fail the persisted bubble. Never owns connection health / core recycle.
+    /// Resend identical ciphertext while the accept budget remains.
+    /// Spending that budget on the current connection asks the host to recycle
+    /// the socket instead of failing the bubble. The bubble fails only after a
+    /// post-recycle registration replay is also unacknowledged.
     func handleServerAcceptAckOverdue(
         envelopeMessageId: String,
         session: PQSSession
@@ -148,6 +163,16 @@ extension MessagePipeline {
 
         if entry.resendAttempts >= maxServerAcceptResendAttempts {
             unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
+            guard entry.readSideRecycleConsumed else {
+                // Budget spent on one connection with no accept: the read side is
+                // silent, not the server. Keep the ciphertext; the host recycles.
+                audit(
+                    .send,
+                    "pqs.send.ackOverdueReadSideSilent envelopeMessageId=\(envelopeMessageId) sharedId=\(entry.sharedId) epoch=\(entry.connectionEpoch)",
+                    level: .warning)
+                await session.notifyServerAcceptReadSideSilent(envelopeMessageId: envelopeMessageId)
+                return
+            }
             if entry.isPersistedOutbound {
                 await markPersistedOutboundFailed(
                     session: session,
@@ -215,6 +240,7 @@ extension MessagePipeline {
         var didSend = false
         for (envelopeMessageId, var entry) in matching {
             entry.resendAttempts = 0
+            entry.readSideRecycleConsumed = false
             entry.connectionEpoch = messagingConnectionEpoch
             guard let transportDelegate = await session.transportDelegate else {
                 unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry

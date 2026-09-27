@@ -142,12 +142,16 @@ struct ServerAcceptAckTests {
         await session.shutdown()
     }
 
-    @Test("ack deadline exhaustion marks failed and keeps ciphertext")
-    func testAckDeadlineExhaustionMarksFailed() async throws {
+    @Test("same-connection exhaustion keeps the bubble and signals recycle")
+    func testAckDeadlineExhaustionRecyclesInsteadOfFailing() async throws {
         let processor = MessagePipeline()
         let session = PQSSession()
         let transport = PreparedTransportProbe()
+        let silent = ServerAcceptAckEventRecorder()
         await session.setTransportDelegate(conformer: transport)
+        await session.setServerAcceptReadSideSilentHandler { envelopeId in
+            await silent.record(envelopeId)
+        }
         let localId = UUID()
         let outbound = pending(envelopeMessageId: "exhausted-deadline")
         await processor.testInsertUnackedForTests(
@@ -160,12 +164,16 @@ struct ServerAcceptAckTests {
                 connectionEpoch: 0,
                 resendAttempts: 5))
         await processor.testSetAckDeadlineNanosecondsForTests(10_000_000)
-        // Manually fire overdue path (entry already at cap).
         await processor.handleServerAcceptAckOverdue(
             envelopeMessageId: "exhausted-deadline",
             session: session)
+        #expect(await silent.all() == ["exhausted-deadline"])
         #expect(await processor.isAwaitingServerAccept("exhausted-deadline") == true)
+        #expect(await processor.unackedServerAcceptByEnvelopeId["exhausted-deadline"]?.readSideRecycleConsumed == false)
         #expect(await transport.capturedPayloads().isEmpty)
+        // Backlog rearm must not start another timer on the silent socket.
+        await processor.rearmAllServerAcceptDeadlines(session: session)
+        #expect(await processor.unackedServerAcceptDeadlineTasks["exhausted-deadline"] == nil)
         try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
     }
@@ -286,10 +294,16 @@ struct ServerAcceptAckTests {
         await session.shutdown()
     }
 
-    @Test("resend exhaustion marks failed but keeps ciphertext for retry")
-    func testExhaustionAfterCapMarksFailed() async {
+    @Test("registration replays a silent envelope; the next miss fails the bubble")
+    func testReplayAfterRecycleThenFail() async {
         let processor = MessagePipeline()
         let session = PQSSession()
+        let transport = PreparedTransportProbe()
+        let silent = ServerAcceptAckEventRecorder()
+        await session.setTransportDelegate(conformer: transport)
+        await session.setServerAcceptReadSideSilentHandler { envelopeId in
+            await silent.record(envelopeId)
+        }
         let outbound = pending(envelopeMessageId: "exhausted")
         let localId = UUID()
         await processor.testInsertUnackedForTests(
@@ -301,17 +315,21 @@ struct ServerAcceptAckTests {
                 isPersistedOutbound: true,
                 connectionEpoch: 0,
                 resendAttempts: 5))
+        await processor.testSetAckDeadlineNanosecondsForTests(60_000_000_000)
 
-        await processor.resendUnackedOutboundEnvelopes(reason: "registered", session: session)
-        // Ciphertext is retained so a user Retry can re-arm the send.
-        #expect(await processor.testUnackedCountForTests() == 1)
+        await processor.resendUnackedOutboundEnvelopes(reason: "IRC registered", session: session)
+        #expect(await transport.capturedEnvelopeMessageIds() == ["exhausted"])
+        #expect(await processor.unackedServerAcceptByEnvelopeId["exhausted"]?.readSideRecycleConsumed == true)
+        #expect(await processor.unackedServerAcceptDeadlineTasks["exhausted"] != nil)
 
-        let didRetry = await processor.retryFailedServerAcceptOutbound(
-            localMessageId: localId,
+        await processor.handleServerAcceptAckOverdue(
+            envelopeMessageId: "exhausted",
             session: session)
-        // No transport delegate in this harness — retry still re-arms the entry (attempts reset).
-        #expect(didRetry == false || didRetry == true)
-        #expect(await processor.testUnackedCountForTests() == 1)
+        // Second silent window: no recycle signal, no resend, entry kept for user Retry.
+        #expect(await silent.all().isEmpty)
+        #expect(await processor.isAwaitingServerAccept("exhausted") == true)
+        #expect(await processor.unackedServerAcceptDeadlineTasks["exhausted"] == nil)
+        #expect(await transport.capturedEnvelopeMessageIds() == ["exhausted"])
 
         try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()

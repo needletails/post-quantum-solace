@@ -283,6 +283,9 @@ actor MessagePipeline {
         let isPersistedOutbound: Bool
         var connectionEpoch: UInt64
         var resendAttempts: Int
+        /// True after a registration replayed this envelope following a silent
+        /// accept window. The next exhausted budget fails the bubble.
+        var readSideRecycleConsumed: Bool = false
     }
 
     var unackedServerAcceptByEnvelopeId: [String: UnackedOutboundEnvelope] = [:]

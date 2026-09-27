@@ -198,6 +198,7 @@ public actor PQSSession: SessionCacheSynchronizer {
     var refreshMLKEMOTKeysTask: Task<Bool, Never>?
     var otkBatchReplacementPairTask: Task<Bool, Never>?
     private var serverAcceptAckOverdueHandler: (@Sendable (String) async -> Void)?
+    private var serverAcceptReadSideSilentHandler: (@Sendable (String) async -> Void)?
 
     /// Bounded FIFO coordinator for session-scoped background / protocol work.
     private var sessionWorkCoordinator: SessionWorkCoordinator?
@@ -334,6 +335,21 @@ public actor PQSSession: SessionCacheSynchronizer {
     public func notifyServerAcceptAckOverdue(envelopeMessageId: String) async {
         if let serverAcceptAckOverdueHandler {
             await serverAcceptAckOverdueHandler(envelopeMessageId)
+        }
+    }
+
+    /// Fired once when accept-ack resends are exhausted on the current connection.
+    /// The envelope stays queued. The host should recycle the messaging socket;
+    /// the next registration replays the ciphertext.
+    public func setServerAcceptReadSideSilentHandler(
+        _ handler: (@Sendable (String) async -> Void)?
+    ) {
+        serverAcceptReadSideSilentHandler = handler
+    }
+
+    public func notifyServerAcceptReadSideSilent(envelopeMessageId: String) async {
+        if let serverAcceptReadSideSilentHandler {
+            await serverAcceptReadSideSilentHandler(envelopeMessageId)
         }
     }
 
