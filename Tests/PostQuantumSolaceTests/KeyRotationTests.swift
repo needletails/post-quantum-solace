@@ -1302,26 +1302,32 @@ actor KeyRotationTests {
         await session.shutdown()
     }
 
-    /// Parks the first upload until the test opens the gate, and exposes
-    /// `entered == 2` as the event that both tasks have reached the transport.
+    /// Parks the first upload until the test opens the gate.
     private actor UploadGate {
         private var parked: CheckedContinuation<Void, Never>?
-        private var secondEntered: CheckedContinuation<Void, Never>?
         private var isOpen = false
         private(set) var entries = 0
 
         func enter() -> Int {
             entries += 1
-            if entries >= 2, let secondEntered {
-                self.secondEntered = nil
-                secondEntered.resume()
-            }
             return entries
         }
 
-        func waitUntilBothEntered() async {
-            if entries >= 2 { return }
-            await withCheckedContinuation { secondEntered = $0 }
+        private var sawFinish = false
+        private var firstFinish: CheckedContinuation<Void, Never>?
+
+        /// The fast replacement's `Task` body returning is the event that it has
+        /// retired itself. A yield spin misses that on a busy macOS runner.
+        func notifyFinished() {
+            guard !sawFinish else { return }
+            sawFinish = true
+            firstFinish?.resume()
+            firstFinish = nil
+        }
+
+        func waitForFirstFinish() async {
+            if sawFinish { return }
+            await withCheckedContinuation { firstFinish = $0 }
         }
 
         func park() async {
@@ -1365,16 +1371,17 @@ actor KeyRotationTests {
         await pipeline.updateOneTimeKey(remove: spent[0].id)
         await pipeline.updateOneTimeKey(remove: spent[1].id)
         try #require(await pipeline.updateKeyTasks.count == 2)
-
-        // Both tasks have reached the transport; one is parked, the other can
-        // finish and retire. Wait for that retirement — callCount ticks before
-        // the task drops itself from the dictionary.
-        await gate.waitUntilBothEntered()
-        var spins = 0
-        while await pipeline.updateKeyTasks.count != 1 && spins < 2_000 {
-            await Task.yield()
-            spins += 1
+        let inFlight = Array(await pipeline.updateKeyTasks.values)
+        for task in inFlight {
+            Task {
+                await task.value
+                await gate.notifyFinished()
+            }
         }
+
+        // The parked upload never returns until `gate.open()`. The first task
+        // to return is the fast replacement, and it retires itself before returning.
+        await gate.waitForFirstFinish()
 
         #expect(await pipeline.updateKeyTasks.count == 1,
                 "The slow upload must remain tracked after its sibling completes")
