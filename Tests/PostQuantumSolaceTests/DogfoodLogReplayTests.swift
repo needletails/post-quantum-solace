@@ -841,6 +841,37 @@ struct DogfoodRecoveryStormPolicyTests {
                 pendingPass: [token.storageKey]),
             "Independent fingerprint token must not inherit another frame's deferral")
     }
+
+    @Test("dogfood C2i: preferred expiredKey promotes only when an alternate proved maxSkipped")
+    func dogfoodC2i_expiredKeyPromotesWhenAlternateProvedMaxSkipped() {
+        let promoted = InboundRecoveryStormPolicy.terminalTryAllError(
+            preferred: RatchetError.expiredKey,
+            alternates: [RatchetError.maxSkippedHeadersExceeded])
+        #expect(
+            (promoted as? RatchetError) == .maxSkippedHeadersExceeded,
+            "BUG: archived maxSkipped is hidden by preferred expiredKey and the frame is deleted")
+
+        let pqxdhStyle = NSError(domain: "corecrypto", code: 503_316_581)
+        let nonProving = InboundRecoveryStormPolicy.terminalTryAllError(
+            preferred: RatchetError.expiredKey,
+            alternates: [pqxdhStyle, RatchetError.stateUninitialized])
+        #expect((nonProving as? RatchetError) == .expiredKey)
+
+        let lone = InboundRecoveryStormPolicy.terminalTryAllError(
+            preferred: RatchetError.expiredKey,
+            alternates: [])
+        #expect((lone as? RatchetError) == .expiredKey)
+
+        let alreadyMaxSkipped = InboundRecoveryStormPolicy.terminalTryAllError(
+            preferred: RatchetError.maxSkippedHeadersExceeded,
+            alternates: [RatchetError.expiredKey])
+        #expect((alreadyMaxSkipped as? RatchetError) == .maxSkippedHeadersExceeded)
+
+        let decryptionFailed = InboundRecoveryStormPolicy.terminalTryAllError(
+            preferred: RatchetError.decryptionFailed,
+            alternates: [RatchetError.maxSkippedHeadersExceeded])
+        #expect((decryptionFailed as? RatchetError) == .decryptionFailed)
+    }
 }
 
 // MARK: - C3: same sharedId must not remint on every rearmNack (CHILD_DEVICE 2FA48892)

@@ -253,6 +253,7 @@ struct FriendshipFlowSourceTests {
         _ = InboundInitiatingSlotPolicy.shouldEnsureInboundBlank
         _ = OrphanResendRemintPolicy.decision
         _ = InboundRecoveryStormPolicy.shouldDeferArchivedFallback
+        _ = InboundRecoveryStormPolicy.terminalTryAllError
         _ = ExplicitOutboundRecipientPinPolicy.shouldHonorExplicitRecipient
         _ = OrphanReplayRearmPolicy.shouldRearm
         _ = MessagePipeline.isReplaceableInboundRecoveryPlaceholder

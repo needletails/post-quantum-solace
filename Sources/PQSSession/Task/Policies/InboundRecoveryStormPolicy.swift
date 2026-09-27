@@ -10,6 +10,7 @@
 //  fingerprint cannot consume an older archive-only pass (T17).
 //
 
+import DoubleRatchetKit
 import Foundation
 
 /// Immutable archive-fallback pass token (transport-safe; no timers).
@@ -89,5 +90,16 @@ public enum InboundRecoveryStormPolicy: Sendable {
         _ b: ArchivedInboundFallbackToken
     ) -> Bool {
         a.storageKey != b.storageKey
+    }
+
+    /// Terminal error for a failed try-all. `maxSkippedHeadersExceeded` from any
+    /// alternate is thrown only after that snapshot's header key authenticated
+    /// the frame, so it proves this lane cannot decrypt it locally; surface the
+    /// resend-owning class instead of the preferred session's `expiredKey`.
+    static func terminalTryAllError(preferred: Error, alternates: [Error]) -> Error {
+        guard (preferred as? RatchetError) == .expiredKey,
+              alternates.contains(where: { ($0 as? RatchetError) == .maxSkippedHeadersExceeded })
+        else { return preferred }
+        return RatchetError.maxSkippedHeadersExceeded
     }
 }

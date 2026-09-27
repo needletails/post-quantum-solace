@@ -186,10 +186,10 @@ extension MessagePipeline {
                 let shouldMarkArchivePassExhausted = includeArchivedFallback
 
                 var fallbackData: Data?
-                // Per-candidate failure classes for the rollback audit; without this the
-                // try-all loop swallows every error and only the preferred error surfaces.
-                var attemptFailures: [String] = [
-                    "preferred:\(preferredSessionIdentity.id.uuidString.prefix(8)):\(preferredError)"
+                // Per-candidate failure classes for the rollback audit and terminal
+                // error. Without this the try-all loop swallows every alternate.
+                var attemptFailures: [(label: String, error: Error)] = [
+                    ("preferred:\(preferredSessionIdentity.id.uuidString.prefix(8))", preferredError)
                 ]
 
                 func tryDecryptCandidates(
@@ -214,8 +214,9 @@ extension MessagePipeline {
                             fallbackData = data
                             return
                         } catch {
-                            attemptFailures.append(
-                                "\(candidate.kind):\(fallbackIdentity.id.uuidString.prefix(8)):\(error)")
+                            attemptFailures.append((
+                                "\(candidate.kind):\(fallbackIdentity.id.uuidString.prefix(8))",
+                                error))
                             try? await restoreSessionIdentityData(
                                 fallbackIdentity,
                                 data: fallbackDataBeforeAttempt,
@@ -322,8 +323,9 @@ extension MessagePipeline {
                                     decryptionSessionIdentity = ensured
                                     fallbackData = data
                                 } catch {
-                                    attemptFailures.append(
-                                        "ensured:\(ensured.id.uuidString.prefix(8)):\(error)")
+                                    attemptFailures.append((
+                                        "ensured:\(ensured.id.uuidString.prefix(8))",
+                                        error))
                                     try? await restoreSessionIdentityData(
                                         ensured,
                                         data: ensuredDataBeforeAttempt,
@@ -362,13 +364,15 @@ extension MessagePipeline {
                         data: preferredSessionIdentityDataBeforeAttempt,
                         session: session,
                         reason: "active and archived inbound decrypt attempts failed")
-                    audit(.recovery, "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) attempts=[\(attemptFailures.joined(separator: "; "))]")
+                    audit(.recovery, "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) attempts=[\(attemptFailures.map { "\($0.label):\($0.error)" }.joined(separator: "; "))]")
                     // Do NOT write the failed try-first id into the preference map here.
                     // Dogfood 2026-07-25: that armed preferredFailedInTryAll on every
                     // poison redelivery → demoteProveFailedActive walked unique session
                     // ids (nudge primary: 92 demotes / 4k blankForHeader skips against
                     // linked). Preference stays success-only; demote remains rearm-gated.
-                    throw preferredError
+                    throw InboundRecoveryStormPolicy.terminalTryAllError(
+                        preferred: preferredError,
+                        alternates: attemptFailures.dropFirst().map(\.error))
                 }
                 if shouldMarkArchivePassExhausted {
                     markArchivedInboundFallbackExhausted(
