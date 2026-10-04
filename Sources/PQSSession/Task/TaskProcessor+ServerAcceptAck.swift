@@ -32,6 +32,39 @@ extension MessagePipeline {
         return unackedServerAcceptByEnvelopeId.removeValue(forKey: envelopeMessageId)
     }
 
+    /// Whether this envelope participates in the bubble's `.sending` → sent transition.
+    ///
+    /// Only persisted envelopes addressed to the peer's devices gate "sent" (Signal
+    /// semantics). Copies to the sender's own linked devices are sibling sync: they
+    /// are still sent, resent, and acked, but never hold or fail the bubble.
+    /// Notes-to-self (`.personalMessage`) have no peer, so every copy gates.
+    /// When `mySecretName` is unknown, fall back to gating on every persisted copy.
+    private func gatesSentState(
+        _ entry: UnackedOutboundEnvelope,
+        mySecretName: String?
+    ) -> Bool {
+        guard entry.isPersistedOutbound else { return false }
+        guard let mySecretName else { return true }
+        if case .personalMessage = entry.pending.metadata.recipient {
+            return true
+        }
+        return entry.pending.metadata.secretName != mySecretName
+    }
+
+    /// Marks the persisted row failed only when this envelope gates the bubble.
+    private func failPersistedOutboundIfGating(
+        _ entry: UnackedOutboundEnvelope,
+        reason: String,
+        session: PQSSession
+    ) async {
+        let mySecretName = await session.sessionContext?.sessionUser.secretName
+        guard gatesSentState(entry, mySecretName: mySecretName) else { return }
+        await markPersistedOutboundFailed(
+            session: session,
+            localMessageId: entry.localId,
+            reason: reason)
+    }
+
     func confirmServerAcceptedEnvelope(_ envelopeMessageId: String, session: PQSSession) async {
         guard let entry = unackedServerAcceptByEnvelopeId.removeValue(forKey: envelopeMessageId) else {
             return
@@ -43,8 +76,9 @@ extension MessagePipeline {
             level: .info)
 
         guard entry.isPersistedOutbound else { return }
+        let mySecretName = await session.sessionContext?.sessionUser.secretName
         let stillAwaitingAnotherDevice = unackedServerAcceptByEnvelopeId.values.contains {
-            $0.localId == entry.localId && $0.isPersistedOutbound
+            $0.localId == entry.localId && gatesSentState($0, mySecretName: mySecretName)
         }
         if !stillAwaitingAnotherDevice {
             await markPersistedOutboundPastSendingIfNeeded(
@@ -94,12 +128,10 @@ extension MessagePipeline {
                 unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)?.cancel()
                 entry.connectionEpoch = currentEpoch
                 unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
-                if entry.isPersistedOutbound {
-                    await markPersistedOutboundFailed(
-                        session: session,
-                        localMessageId: entry.localId,
-                        reason: "serverAcceptExhausted")
-                }
+                await failPersistedOutboundIfGating(
+                    entry,
+                    reason: "serverAcceptExhausted",
+                    session: session)
                 continue
             }
 
@@ -173,12 +205,10 @@ extension MessagePipeline {
                 await session.notifyServerAcceptReadSideSilent(envelopeMessageId: envelopeMessageId)
                 return
             }
-            if entry.isPersistedOutbound {
-                await markPersistedOutboundFailed(
-                    session: session,
-                    localMessageId: entry.localId,
-                    reason: "serverAcceptExhausted")
-            }
+            await failPersistedOutboundIfGating(
+                entry,
+                reason: "serverAcceptExhausted",
+                session: session)
             audit(
                 .send,
                 "pqs.send.ackOverdueExhausted envelopeMessageId=\(envelopeMessageId) sharedId=\(entry.sharedId)",
@@ -317,6 +347,13 @@ extension MessagePipeline {
         serverAcceptAckDeadlineNanosecondsOverride = nanoseconds
     }
 
+    func testGatesSentStateForTests(
+        _ entry: UnackedOutboundEnvelope,
+        mySecretName: String?
+    ) -> Bool {
+        gatesSentState(entry, mySecretName: mySecretName)
+    }
+
     private func startServerAcceptDeadline(envelopeMessageId: String, session: PQSSession) {
         let deadline = serverAcceptAckDeadlineNanosecondsOverride ?? serverAcceptAckDeadlineNanoseconds
         unackedServerAcceptDeadlineTasks[envelopeMessageId] = Task { [weak self, weak session] in
@@ -342,12 +379,10 @@ extension MessagePipeline {
                 continue
             }
             unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)?.cancel()
-            if entry.isPersistedOutbound {
-                await markPersistedOutboundFailed(
-                    session: session,
-                    localMessageId: entry.localId,
-                    reason: "serverAcceptTTL")
-            }
+            await failPersistedOutboundIfGating(
+                entry,
+                reason: "serverAcceptTTL",
+                session: session)
         }
 
         while unackedServerAcceptByEnvelopeId.count >= unackedServerAcceptLimit,
@@ -358,12 +393,10 @@ extension MessagePipeline {
                 break
             }
             unackedServerAcceptDeadlineTasks.removeValue(forKey: oldest)?.cancel()
-            if entry.isPersistedOutbound {
-                await markPersistedOutboundFailed(
-                    session: session,
-                    localMessageId: entry.localId,
-                    reason: "serverAcceptLimit")
-            }
+            await failPersistedOutboundIfGating(
+                entry,
+                reason: "serverAcceptLimit",
+                session: session)
         }
     }
 }

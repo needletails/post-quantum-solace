@@ -615,6 +615,11 @@ actor SessionTests {
 actor MockCache: PQSStore, PQSRecoveryStore {
     var localSessionData: Data = .init()
     let recoveryLedger = InMemoryRecoveryLedger()
+    var storedMessages: [UUID: SessionModels.EncryptedMessage] = [:]
+
+    func storeMessage(_ message: SessionModels.EncryptedMessage) {
+        storedMessages[message.id] = message
+    }
 
     // MARK: - Session Context Methods
 
@@ -665,8 +670,11 @@ actor MockCache: PQSStore, PQSRecoveryStore {
 
     func fetchMessages(sharedCommunicationId _: UUID) async throws -> [MessageRecord] { [] }
 
-    func fetchMessage(id _: UUID) async throws -> SessionModels.EncryptedMessage {
-        try .init(id: UUID(), communicationId: UUID(), sessionContextId: 0, sharedId: "", sequenceNumber: 0, data: Data())
+    func fetchMessage(id: UUID) async throws -> SessionModels.EncryptedMessage {
+        if let stored = storedMessages[id] {
+            return stored
+        }
+        return try .init(id: UUID(), communicationId: UUID(), sessionContextId: 0, sharedId: "", sequenceNumber: 0, data: Data())
     }
 
     func fetchMessage(sharedId _: String) async throws -> SessionModels.EncryptedMessage {
@@ -710,7 +718,9 @@ actor MockCache: PQSStore, PQSRecoveryStore {
     }
 
     func createMessage(_: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws {}
-    func updateMessage(_: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws {}
+    func updateMessage(_ message: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws {
+        storedMessages[message.id] = message
+    }
     func deleteMessage(_: SessionModels.EncryptedMessage) async throws {}
 
     func streamMessages(sharedIdentifier _: UUID) async throws -> (AsyncThrowingStream<SessionModels.EncryptedMessage, any Error>, AsyncThrowingStream<SessionModels.EncryptedMessage, any Error>.Continuation?) {

@@ -3,7 +3,10 @@
 //  post-quantum-solace
 //
 
+import Crypto
+import DoubleRatchetKit
 import Foundation
+import NeedleTailCrypto
 @testable import PQSSession
 import SessionModels
 import Testing
@@ -35,14 +38,16 @@ private actor ServerAcceptAckEventRecorder {
 struct ServerAcceptAckTests {
     private func pending(
         envelopeMessageId: String,
-        sharedId: String = "shared-id"
+        sharedId: String = "shared-id",
+        secretName: String = "bob",
+        recipient: MessageRecipient? = nil
     ) -> MessagePipeline.PendingOutboundTransport {
         .init(
             message: SignedRatchetMessage(outOfBandPlaceholder: ()),
             metadata: .init(
-                secretName: "bob",
+                secretName: secretName,
                 deviceId: UUID(),
-                recipient: .nickname("bob"),
+                recipient: recipient ?? .nickname(secretName),
                 transportMetadata: nil,
                 sharedMessageId: sharedId,
                 envelopeMessageId: envelopeMessageId,
@@ -53,6 +58,61 @@ struct ServerAcceptAckTests {
             x25519OneTimeKeyId: nil,
             mlKEMOneTimeKeyId: "mlkem",
             createdAt: Date())
+    }
+
+    private func makeSessionContext(
+        secretName: String,
+        databaseKey: Data
+    ) throws -> SessionContext {
+        let crypto = NeedleTailCrypto()
+        let mlkem = try crypto.generateMLKem1024PrivateKey()
+        let deviceId = UUID()
+        return SessionContext(
+            sessionUser: SessionUser(
+                secretName: secretName,
+                deviceId: deviceId,
+                deviceKeys: DeviceKeys(
+                    deviceId: deviceId,
+                    signingPrivateKey: Data(repeating: 1, count: 32),
+                    longTermPrivateKey: Data(repeating: 2, count: 32),
+                    oneTimePrivateKeys: [],
+                    mlKEMOneTimePrivateKeys: [],
+                    finalMLKEMPrivateKey: try MLKEMPrivateKey(id: UUID(), mlkem.encode()))),
+            databaseEncryptionKey: databaseKey,
+            sessionContextId: 1,
+            activeUserConfiguration: UserConfiguration(
+                signingPublicKey: Data(),
+                signedDevices: [],
+                signedOneTimePublicKeys: [],
+                signedMLKEMOneTimePublicKeys: []),
+            registrationState: .registered)
+    }
+
+    private func makeSendingMessage(
+        id: UUID,
+        symmetricKey: SymmetricKey
+    ) throws -> EncryptedMessage {
+        try EncryptedMessage(
+            id: id,
+            communicationId: UUID(),
+            sessionContextId: 1,
+            sharedId: "shared-id",
+            sequenceNumber: 1,
+            props: .init(
+                id: id,
+                base: BaseCommunication(id: UUID(), data: Data()),
+                sentDate: Date(),
+                receiveDate: nil,
+                deliveryState: .sending,
+                message: CryptoMessage(
+                    text: "hello",
+                    metadata: Data(),
+                    recipient: .nickname("bob"),
+                    sentDate: Date(),
+                    destructionTime: nil),
+                senderSecretName: "alice",
+                senderDeviceId: UUID()),
+            symmetricKey: symmetricKey)
     }
 
     @Test("persisted send stays pending until server ack")
@@ -330,6 +390,107 @@ struct ServerAcceptAckTests {
         #expect(await processor.isAwaitingServerAccept("exhausted") == true)
         #expect(await processor.unackedServerAcceptDeadlineTasks["exhausted"] == nil)
         #expect(await transport.capturedEnvelopeMessageIds() == ["exhausted"])
+
+        try? await processor.ratchetManager.flushAndClose()
+        await session.shutdown()
+    }
+
+    @Test("gatesSentState is peer and personal only")
+    func testGatesSentStatePeerAndPersonalOnly() async {
+        let processor = MessagePipeline()
+        let peer = MessagePipeline.UnackedOutboundEnvelope(
+            pending: pending(envelopeMessageId: "peer", secretName: "bob"),
+            localId: UUID(),
+            sharedId: "shared-id",
+            isPersistedOutbound: true,
+            connectionEpoch: 0,
+            resendAttempts: 0)
+        let sibling = MessagePipeline.UnackedOutboundEnvelope(
+            pending: pending(envelopeMessageId: "sibling", secretName: "alice"),
+            localId: UUID(),
+            sharedId: "shared-id",
+            isPersistedOutbound: true,
+            connectionEpoch: 0,
+            resendAttempts: 0)
+        let personal = MessagePipeline.UnackedOutboundEnvelope(
+            pending: pending(
+                envelopeMessageId: "personal",
+                secretName: "alice",
+                recipient: .personalMessage),
+            localId: UUID(),
+            sharedId: "shared-id",
+            isPersistedOutbound: true,
+            connectionEpoch: 0,
+            resendAttempts: 0)
+        let ephemeral = MessagePipeline.UnackedOutboundEnvelope(
+            pending: pending(envelopeMessageId: "ephemeral", secretName: "bob"),
+            localId: UUID(),
+            sharedId: "shared-id",
+            isPersistedOutbound: false,
+            connectionEpoch: 0,
+            resendAttempts: 0)
+        #expect(await processor.testGatesSentStateForTests(peer, mySecretName: "alice"))
+        #expect(await processor.testGatesSentStateForTests(sibling, mySecretName: "alice") == false)
+        #expect(await processor.testGatesSentStateForTests(personal, mySecretName: "alice"))
+        #expect(await processor.testGatesSentStateForTests(ephemeral, mySecretName: "alice") == false)
+        // Unknown local identity: fall back to gating on every persisted copy.
+        #expect(await processor.testGatesSentStateForTests(sibling, mySecretName: nil))
+        #expect(await processor.testGatesSentStateForTests(ephemeral, mySecretName: nil) == false)
+    }
+
+    @Test("peer accept advances sent without waiting on sibling")
+    func testPeerAcceptAdvancesSentWithoutWaitingOnSibling() async throws {
+        let processor = MessagePipeline()
+        let session = PQSSession()
+        let store = MockCache()
+        let databaseKey = Data(repeating: 7, count: 32)
+        await session.setSessionContext(try makeSessionContext(secretName: "alice", databaseKey: databaseKey))
+        await session.setDatabaseDelegate(conformer: store)
+
+        let localId = UUID()
+        let symmetricKey = SymmetricKey(data: databaseKey)
+        let message = try makeSendingMessage(id: localId, symmetricKey: symmetricKey)
+        await store.storeMessage(message)
+
+        await processor.registerUnackedServerAccept(
+            pending: pending(envelopeMessageId: "peer", secretName: "bob"),
+            localId: localId,
+            sharedId: "shared-id",
+            isPersistedOutbound: true,
+            session: session)
+        await processor.registerUnackedServerAccept(
+            pending: pending(envelopeMessageId: "sibling", secretName: "alice"),
+            localId: localId,
+            sharedId: "shared-id",
+            isPersistedOutbound: true,
+            session: session)
+
+        await processor.confirmServerAcceptedEnvelope("peer", session: session)
+        #expect(await processor.isAwaitingServerAccept("peer") == false)
+        #expect(await processor.isAwaitingServerAccept("sibling") == true)
+
+        let cache = try #require(await session.cache)
+        let advanced = try await cache.fetchMessage(id: localId)
+        let props = await advanced.props(symmetricKey: symmetricKey)
+        #expect(props?.deliveryState == .waitingDelivery)
+
+        guard var sibling = await processor.unackedServerAcceptByEnvelopeId["sibling"] else {
+            Issue.record("sibling envelope should still be awaiting accept")
+            try? await processor.ratchetManager.flushAndClose()
+            await session.shutdown()
+            return
+        }
+        sibling.resendAttempts = 5
+        sibling.readSideRecycleConsumed = true
+        await processor.testInsertUnackedForTests(envelopeMessageId: "sibling", entry: sibling)
+        await processor.handleServerAcceptAckOverdue(
+            envelopeMessageId: "sibling",
+            session: session)
+
+        #expect(await processor.isAwaitingServerAccept("sibling") == true)
+        let afterSiblingExhaustion = try await cache.fetchMessage(id: localId)
+        let afterProps = await afterSiblingExhaustion.props(symmetricKey: symmetricKey)
+        #expect(afterProps?.deliveryState == .waitingDelivery)
 
         try? await processor.ratchetManager.flushAndClose()
         await session.shutdown()
