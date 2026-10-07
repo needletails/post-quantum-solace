@@ -9950,6 +9950,501 @@ actor EndToEndTests {
             throw error
         }
     }
+    
+    
+    /// Milliseconds for a `Duration`, for the performance prints below.
+    private func milliseconds(_ duration: Duration) -> Double {
+        let components = duration.components
+        return Double(components.seconds) * 1_000 + Double(components.attoseconds) / 1e15
+    }
+    
+    /// The link helpers publish each child's configuration on its own and the last publish
+    /// wins in `TransportStore`, so peers only see one linked device. Merge every child's
+    /// signed material into one configuration so the account exposes all of its devices.
+    private func publishAllLinkedDevices(
+        secretName: String,
+        masterSession: PQSSession,
+        childDelegates: [MockDeviceLinkingDelegate]
+    ) async throws {
+        guard let masterContext = await masterSession.sessionContext else {
+            throw PQSError.sessionNotInitialized
+        }
+        var merged = masterContext.activeUserConfiguration
+        for delegate in childDelegates {
+            guard let childConfig = delegate.userConfiguration else { continue }
+            for device in childConfig.signedDevices
+            where !merged.signedDevices.contains(where: { $0.id == device.id }) {
+                merged.signedDevices.append(device)
+            }
+            for key in childConfig.signedOneTimePublicKeys
+            where !merged.signedOneTimePublicKeys.contains(where: { $0.id == key.id }) {
+                merged.signedOneTimePublicKeys.append(key)
+            }
+            for key in childConfig.signedMLKEMOneTimePublicKeys
+            where !merged.signedMLKEMOneTimePublicKeys.contains(where: { $0.id == key.id }) {
+                merged.signedMLKEMOneTimePublicKeys.append(key)
+            }
+            for bundle in childConfig.signedDeviceKeyBundles
+            where !merged.signedDeviceKeyBundles.contains(where: { $0.id == bundle.id }) {
+                merged.signedDeviceKeyBundles.append(bundle)
+            }
+        }
+        await store.upsertUserConfiguration(
+            secretName: secretName,
+            deviceId: masterContext.sessionUser.deviceId,
+            config: merged)
+    }
+    
+    /// Polls `condition` until it holds or `timeout` elapses. Returns the final evaluation.
+    private func pollUntil(
+        timeout: TimeInterval,
+        _ condition: @Sendable () async -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return await condition()
+    }
+    
+    @Test("Encrypt duration for one message fanned out to every device")
+    func encryptDurationForFanoutToEveryDevice() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+        
+        actor CiphertextCounter {
+            private var count = 0
+            func increment() { count += 1 }
+            func value() -> Int { count }
+        }
+        let ciphertexts = CiphertextCounter()
+        
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+        
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        
+        // Every device on both accounts. One send from alice's master must encrypt one
+        // ciphertext per bob device plus one sibling copy per linked alice device.
+        try await linkSenderChildSession1(store: createSenderChildStore1(), transport: aliceTransport)
+        try await linkSenderChildSession2(store: createSenderChildStore2(), transport: aliceTransport)
+        try await linkRecipientChildSession1(store: createRecipientChildStore1(), transport: bobTransport)
+        try await linkRecipientChildSession2(store: createRecipientChildStore2(), transport: bobTransport)
+        
+        let aliceSession = _senderSession
+        let bobSession = _recipientSession
+        let aliceDeviceId = try #require(await aliceSession.sessionContext?.sessionUser.deviceId)
+        let bobDeviceId = try #require(await bobSession.sessionContext?.sessionUser.deviceId)
+        
+        // Route like a server: each master only processes frames addressed to its own device.
+        aliceTask = Task {
+            for await received in aliceStream {
+                guard received.recipient == "alice",
+                      received.recipientDeviceId == nil || received.recipientDeviceId == aliceDeviceId
+                else { continue }
+                _ = try? await self.receiveIgnoringRecoverableErrors(aliceSession, received: received)
+            }
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                guard received.recipient == "bob",
+                      received.recipientDeviceId == nil || received.recipientDeviceId == bobDeviceId
+                else { continue }
+                _ = try? await self.receiveIgnoringRecoverableErrors(bobSession, received: received)
+            }
+        }
+        
+        try await publishAllLinkedDevices(
+            secretName: "alice",
+            masterSession: aliceSession,
+            childDelegates: [senderChild1LinkDelegate, senderChild2LinkDelegate])
+        try await publishAllLinkedDevices(
+            secretName: "bob",
+            masterSession: bobSession,
+            childDelegates: [recipientChild1LinkDelegate, recipientChild2LinkDelegate])
+        
+        try await createFriendship(aliceSession: aliceSession, sd: sd, bobSession: bobSession, rsd: rsd)
+        
+        let laneReady = await pollUntil(timeout: 15) {
+            let outboundReady = (try? await aliceSession.hasInitializedOutboundRatchetForPeer("bob")) ?? false
+            let inboundReady = await bobSession.hasActiveInboundSessionIdentity(
+                secretName: "alice",
+                deviceId: aliceDeviceId)
+            return outboundReady && inboundReady
+        }
+        #expect(laneReady, "friendship bootstrap should establish the alice→bob lane before timing")
+        
+        _ = try await aliceSession.refreshIdentities(secretName: "bob", forceRefresh: true)
+        _ = try await aliceSession.refreshIdentities(secretName: "alice", forceRefresh: true)
+        
+        // Warm-up: the first send pays PQXDH and identity refresh for every device lane.
+        // Only steady-state fan-out is timed.
+        try await aliceSession.send(recipient: .nickname("bob"), text: "fan-out warm-up")
+        #expect(
+            await pollUntil(timeout: 30) { await recipientStore.createdMessages.count >= 1 },
+            "warm-up message should decrypt on bob before timing")
+        
+        let bobDeviceCount = try await aliceSession.getSessionIdentities(with: "bob").count
+        let aliceSiblingCount = try await aliceSession.getSessionIdentities(with: "alice").count
+        let ciphertextsPerMessage = bobDeviceCount + aliceSiblingCount
+        #expect(bobDeviceCount >= 3, "alice should hold a lane for bob's master and both linked devices (got \(bobDeviceCount))")
+        #expect(aliceSiblingCount >= 2, "alice should hold a sibling lane for both of her linked devices (got \(aliceSiblingCount))")
+        
+        // Count every content ciphertext alice's master hands to transport.
+        aliceTransport.shouldDeliver = { received in
+            if received.sender == "alice",
+               received.deviceId == aliceDeviceId,
+               received.isContentMessage {
+                await ciphertexts.increment()
+            }
+            return true
+        }
+        
+        let messageCount = 25
+        let baseline = await ciphertexts.value()
+        let expectedTotal = baseline + messageCount * ciphertextsPerMessage
+        
+        let clock = ContinuousClock()
+        let start = clock.now
+        for index in 1...messageCount {
+            try await aliceSession.send(recipient: .nickname("bob"), text: "fan-out #\(index)")
+        }
+        let enqueueDuration = clock.now - start
+        let allEncrypted = await pollUntil(timeout: 60) { await ciphertexts.value() >= expectedTotal }
+        let fanoutDuration = clock.now - start
+        aliceTransport.shouldDeliver = nil
+        
+        let observed = await ciphertexts.value() - baseline
+        #expect(
+            allEncrypted,
+            "expected \(messageCount) × \(ciphertextsPerMessage) = \(expectedTotal - baseline) ciphertexts, observed \(observed)")
+        
+        let totalMs = milliseconds(fanoutDuration)
+        print("""
+            🔵 Fan-out encrypt: \(messageCount) messages × \(ciphertextsPerMessage) devices \
+            (\(bobDeviceCount) bob + \(aliceSiblingCount) alice siblings) = \(observed) ciphertexts
+               send() enqueue loop: \(String(format: "%.1f", milliseconds(enqueueDuration))) ms
+               all ciphertexts at transport: \(String(format: "%.1f", totalMs)) ms
+               per message: \(String(format: "%.2f", totalMs / Double(messageCount))) ms, \
+            per ciphertext: \(String(format: "%.2f", totalMs / Double(max(observed, 1)))) ms
+            """)
+        
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await aliceTask?.value
+        _ = await bobTask?.value
+    }
+    
+    @Test("Decrypt duration across peers while switching active and archived identities")
+    func decryptDurationAcrossPeersSwitchingActiveAndArchivedIdentities() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+        
+        actor CaptureProbe {
+            private(set) var captured: [ReceivedMessage] = []
+            func capture(_ message: ReceivedMessage) { captured.append(message) }
+            func count() -> Int { captured.count }
+        }
+        let probe = CaptureProbe()
+        
+        // Three sender lanes into bob: alice's master and both linked devices. Each is a
+        // distinct (secretName, deviceId) lane on bob with its own active/archived rows.
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let aliceChild1Transport = _MockTransportDelegate(session: _senderChildSession1, store: store)
+        let aliceChild2Transport = _MockTransportDelegate(session: _senderChildSession2, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+            aliceChild1Transport.continuation = continuation
+            aliceChild2Transport.continuation = continuation
+        }
+        
+        let senderStore = createSenderStore()
+        let senderChildStore1 = createSenderChildStore1()
+        let senderChildStore2 = createSenderChildStore2()
+        let recipientStore = createRecipientStore()
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await linkSenderChildSession1(
+            store: senderChildStore1,
+            transport: aliceChild1Transport,
+            useProvidedTransport: true)
+        try await linkSenderChildSession2(
+            store: senderChildStore2,
+            transport: aliceChild2Transport,
+            useProvidedTransport: true)
+        
+        let aliceSession = _senderSession
+        let aliceChild1 = _senderChildSession1
+        let aliceChild2 = _senderChildSession2
+        let bobSession = _recipientSession
+        let aliceDeviceId = try #require(await aliceSession.sessionContext?.sessionUser.deviceId)
+        let aliceChild1DeviceId = try #require(await aliceChild1.sessionContext?.sessionUser.deviceId)
+        let aliceChild2DeviceId = try #require(await aliceChild2.sessionContext?.sessionUser.deviceId)
+        let bobDeviceId = try #require(await bobSession.sessionContext?.sessionUser.deviceId)
+        let senders: [(name: String, session: PQSSession, deviceId: UUID, store: MockIdentityStore)] = [
+            ("alice(master)", aliceSession, aliceDeviceId, senderStore),
+            ("alice(child1)", aliceChild1, aliceChild1DeviceId, senderChildStore1),
+            ("alice(child2)", aliceChild2, aliceChild2DeviceId, senderChildStore2),
+        ]
+        let aliceSessionsByDevice: [UUID: PQSSession] = [
+            aliceDeviceId: aliceSession,
+            aliceChild1DeviceId: aliceChild1,
+            aliceChild2DeviceId: aliceChild2,
+        ]
+        
+        try await publishAllLinkedDevices(
+            secretName: "alice",
+            masterSession: aliceSession,
+            childDelegates: [senderChild1LinkDelegate, senderChild2LinkDelegate])
+        
+        // Route like a server: bob's frames reach the alice device they are addressed to.
+        aliceTask = Task {
+            for await received in aliceStream {
+                guard received.recipient == "alice" else { continue }
+                let targets: [PQSSession]
+                if let recipientDeviceId = received.recipientDeviceId {
+                    guard let session = aliceSessionsByDevice[recipientDeviceId] else { continue }
+                    targets = [session]
+                } else {
+                    targets = Array(aliceSessionsByDevice.values)
+                }
+                for session in targets {
+                    _ = try? await self.receiveIgnoringRecoverableErrors(session, received: received)
+                }
+            }
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                guard received.recipient == "bob",
+                      received.recipientDeviceId == nil || received.recipientDeviceId == bobDeviceId
+                else { continue }
+                _ = try? await self.receiveIgnoringRecoverableErrors(bobSession, received: received)
+            }
+        }
+        
+        try await createFriendship(aliceSession: aliceSession, sd: sd, bobSession: bobSession, rsd: rsd)
+        
+        let laneReady = await pollUntil(timeout: 15) {
+            let outboundReady = (try? await aliceSession.hasInitializedOutboundRatchetForPeer("bob")) ?? false
+            let inboundReady = await bobSession.hasActiveInboundSessionIdentity(
+                secretName: "alice",
+                deviceId: aliceDeviceId)
+            return outboundReady && inboundReady
+        }
+        #expect(laneReady, "friendship bootstrap should establish the alice→bob lane before timing")
+        _ = try await bobSession.refreshIdentities(secretName: "alice", forceRefresh: true)
+        
+        // Baseline 1: every alice device bootstraps its lane into bob.
+        for sender in senders {
+            try await sender.session.send(recipient: .nickname("bob"), text: "baseline from \(sender.name)")
+        }
+        #expect(
+            await pollUntil(timeout: 30) { await recipientStore.createdMessages.count >= senders.count },
+            "bob should decrypt one baseline message from each alice device")
+        
+        // Bob replies on every lane. Until an initiator processes the responder's first reply
+        // it keeps sending PQXDH-initiating headers, and bob could bootstrap a fresh session
+        // from such a header instead of walking the archive.
+        try await bobSession.send(recipient: .nickname("alice"), text: "reply from bob")
+        for sender in senders {
+            #expect(
+                await pollUntil(timeout: 30) { await sender.store.createdMessages.count >= 1 },
+                "\(sender.name) should decrypt bob's reply so its lane leaves the initiating phase")
+        }
+        
+        // Baseline 2: confirmed lanes, so bob's active rows carry post-handshake state.
+        let confirmedTarget = await recipientStore.createdMessages.count + senders.count
+        for sender in senders {
+            try await sender.session.send(recipient: .nickname("bob"), text: "confirmed baseline from \(sender.name)")
+        }
+        #expect(
+            await pollUntil(timeout: 30) { await recipientStore.createdMessages.count >= confirmedTarget },
+            "bob should decrypt a post-handshake message from each alice device")
+        
+        // Capture the next burst instead of delivering it. These frames are encrypted against
+        // the lane state bob is about to archive.
+        let messagesPerSender = 5
+        let capture: @Sendable (ReceivedMessage) async -> Bool = { received in
+            guard received.recipient == "bob", received.isContentMessage else { return true }
+            await probe.capture(received)
+            return false
+        }
+        aliceTransport.shouldDeliver = capture
+        aliceChild1Transport.shouldDeliver = capture
+        aliceChild2Transport.shouldDeliver = capture
+        for index in 1...messagesPerSender {
+            for sender in senders {
+                try await sender.session.send(recipient: .nickname("bob"), text: "in-flight #\(index) from \(sender.name)")
+            }
+        }
+        let expectedCaptured = messagesPerSender * senders.count
+        #expect(
+            await pollUntil(timeout: 30) { await probe.count() >= expectedCaptured },
+            "every in-flight frame should be captured before archiving")
+        
+        // Isolate the replay: bob's acks and recovery controls do not reach alice, and nothing
+        // alice emits meanwhile (ack-overdue resends, controls) reaches bob. Only the captured
+        // frames, injected below, enter bob's stream. Same isolation as the archive tests.
+        let dropAll: @Sendable (ReceivedMessage) async -> Bool = { _ in false }
+        aliceTransport.shouldDeliver = dropAll
+        aliceChild1Transport.shouldDeliver = dropAll
+        aliceChild2Transport.shouldDeliver = dropAll
+        bobTransport.shouldDeliver = dropAll
+        
+        // Archive every active alice lane on bob, then give each active an initialized but
+        // incompatible state so the replay must miss the active and decrypt from the archive.
+        try await bobSession.createInactiveSessionSnapshot(for: "alice", policy: .archive)
+        
+        let aliceCache = try #require(await aliceSession.cache)
+        let aliceSymKey = try await aliceSession.getDatabaseSymmetricKey()
+        var incompatibleDonor: SessionIdentity.UnwrappedProps?
+        for identity in try await aliceCache.fetchSessionIdentities() {
+            guard let props = await identity.props(symmetricKey: aliceSymKey) else { continue }
+            guard props.secretName == "bob", props.hasRatchetState else { continue }
+            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+            incompatibleDonor = props
+            break
+        }
+        let incompatibleProps = try #require(incompatibleDonor)
+        
+        let bobCache = try #require(await bobSession.cache)
+        let bobSymKey = try await bobSession.getDatabaseSymmetricKey()
+        var poisonedActiveIds = Set<UUID>()
+        for identity in try await bobCache.fetchSessionIdentities() {
+            guard var props = await identity.props(symmetricKey: bobSymKey) else { continue }
+            guard props.secretName == "alice", props.hasRatchetState else { continue }
+            guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+            props.copyRatchetState(from: incompatibleProps)
+            try await identity.update(props, symmetricKey: bobSymKey)
+            try await bobCache.updateSessionIdentity(identity)
+            poisonedActiveIds.insert(identity.id)
+        }
+        #expect(poisonedActiveIds.count == senders.count, "bob should hold one stateful active row per alice device")
+        let bobRatchetManager = await bobSession.messagePipeline.ratchetManager
+        for identityId in poisonedActiveIds {
+            await bobRatchetManager.discardCachedLane(identityId)
+        }
+        await bobSession.invalidateSessionIdentityCache(secretName: "alice")
+        for sender in senders {
+            _ = await bobSession.takePendingResendsAfterReestablishment(sender: "alice", deviceId: sender.deviceId)
+        }
+        
+        @Sendable func activeAliceLanesWithState() async throws -> Int {
+            var count = 0
+            for identity in try await bobCache.fetchSessionIdentities() {
+                guard let props = await identity.props(symmetricKey: bobSymKey) else { continue }
+                guard props.secretName == "alice", props.hasRatchetState else { continue }
+                guard !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) else { continue }
+                count += 1
+            }
+            return count
+        }
+        
+        // Split the capture: the first frame per lane forces the active→archived switch;
+        // the rest decrypt on the lane that switch promoted.
+        let captured = await probe.captured
+        var firstFrames: [ReceivedMessage] = []
+        var remainingFrames: [ReceivedMessage] = []
+        var seenDevices = Set<UUID>()
+        for frame in captured {
+            if seenDevices.insert(frame.deviceId).inserted {
+                firstFrames.append(frame)
+            } else {
+                remainingFrames.append(frame)
+            }
+        }
+        #expect(firstFrames.count == senders.count, "each alice device should have a captured first frame")
+        
+        let clock = ContinuousClock()
+        
+        // Phase 1: active row misses, archive walk decrypts, archived row is promoted.
+        let archiveTarget = await recipientStore.createdMessages.count + firstFrames.count
+        let archiveStart = clock.now
+        for frame in firstFrames {
+            aliceTransport.continuation?.yield(frame)
+        }
+        let archiveDecrypted = await pollUntil(timeout: 90) { await recipientStore.createdMessages.count >= archiveTarget }
+        let archiveDuration = clock.now - archiveStart
+        #expect(archiveDecrypted, "first frame from every alice device should decrypt from its archived snapshot")
+        let promoted = await pollUntil(timeout: 15) { (try? await activeAliceLanesWithState()) ?? 0 >= senders.count }
+        #expect(promoted, "archive fallback should promote one stateful active row per alice device")
+        
+        // Phase 2: the remaining captured frames decrypt on the promoted active rows.
+        let promotedTarget = await recipientStore.createdMessages.count + remainingFrames.count
+        let promotedStart = clock.now
+        for frame in remainingFrames {
+            aliceTransport.continuation?.yield(frame)
+        }
+        let promotedDecrypted = await pollUntil(timeout: 90) { await recipientStore.createdMessages.count >= promotedTarget }
+        let promotedDuration = clock.now - promotedStart
+        #expect(promotedDecrypted, "remaining in-flight frames should decrypt on the promoted lanes")
+        
+        // Phase 3: fresh live traffic from all three devices on the now-active lanes.
+        aliceTransport.shouldDeliver = nil
+        aliceChild1Transport.shouldDeliver = nil
+        aliceChild2Transport.shouldDeliver = nil
+        bobTransport.shouldDeliver = nil
+        let liveTarget = await recipientStore.createdMessages.count + expectedCaptured
+        let liveStart = clock.now
+        for index in 1...messagesPerSender {
+            for sender in senders {
+                try await sender.session.send(recipient: .nickname("bob"), text: "live #\(index) from \(sender.name)")
+            }
+        }
+        let liveDecrypted = await pollUntil(timeout: 90) { await recipientStore.createdMessages.count >= liveTarget }
+        let liveDuration = clock.now - liveStart
+        #expect(liveDecrypted, "live messages after promotion should decrypt on the active lanes")
+        
+        let archiveMs = milliseconds(archiveDuration)
+        let promotedMs = milliseconds(promotedDuration)
+        let liveMs = milliseconds(liveDuration)
+        print("""
+            🔵 Multi-peer decrypt on bob (\(senders.count) alice devices)
+               active→archived switch: \(firstFrames.count) frames in \(String(format: "%.1f", archiveMs)) ms \
+            (\(String(format: "%.2f", archiveMs / Double(max(firstFrames.count, 1)))) ms/frame)
+               replay on promoted lanes: \(remainingFrames.count) frames in \(String(format: "%.1f", promotedMs)) ms \
+            (\(String(format: "%.2f", promotedMs / Double(max(remainingFrames.count, 1)))) ms/frame)
+               live send+decrypt on active lanes: \(expectedCaptured) frames in \(String(format: "%.1f", liveMs)) ms \
+            (\(String(format: "%.2f", liveMs / Double(expectedCaptured))) ms/frame)
+            """)
+        
+        bobTransport.continuation?.finish()
+        aliceTransport.continuation?.finish()
+        _ = await aliceTask?.value
+        _ = await bobTask?.value
+    }
 }
 
 
