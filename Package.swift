@@ -1,4 +1,4 @@
-// swift-tools-version: 6.3
+// swift-tools-version: 6.4
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
@@ -6,8 +6,8 @@ import PackageDescription
 let package = Package(
     name: "post-quantum-solace",
     platforms: [
-        .macOS(.v15),
-        .iOS(.v18),
+        .iOS("26.0"),
+        .macOS("26.0"),
     ],
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
@@ -29,7 +29,8 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/needletails/binary-codable.git", from: "1.0.5"),
-        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "4.1.0"),
+        .package(path: "../double-ratchet-kit"),
+//        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "4.1.0"),
         .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.1.5"),
         .package(url: "https://github.com/needletails/needletail-algorithms.git", from: "2.0.5")
     ],

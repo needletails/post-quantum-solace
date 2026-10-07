@@ -60,7 +60,7 @@ jobs:
             exit 1
           fi
 
-      - name: Require Swift 6.3+ (macOS)
+      - name: Require Swift 6.4+ (macOS)
         if: ${{ runner.os == 'macOS' }}
         shell: bash
         run: |
@@ -73,8 +73,8 @@ jobs:
           fi
           SWIFT_MAJOR="${BASH_REMATCH[1]}"
           SWIFT_MINOR="${BASH_REMATCH[2]}"
-          if (( SWIFT_MAJOR < 6 )) || { (( SWIFT_MAJOR == 6 )) && (( SWIFT_MINOR < 3 )); }; then
-            echo "Swift 6.3+ is required (swift-tools-version: 6.3). Found: $SWIFT_VERSION_LINE" >&2
+          if (( SWIFT_MAJOR < 6 )) || { (( SWIFT_MAJOR == 6 )) && (( SWIFT_MINOR < 4 )); }; then
+            echo "Swift 6.4+ is required (swift-tools-version: 6.4). Found: $SWIFT_VERSION_LINE" >&2
             exit 1
           fi
 
@@ -90,7 +90,7 @@ jobs:
           sudo apt-get update
           sudo apt-get -y install libcurl4-openssl-dev
 
-      - name: Install Swift 6.3.0 with Swiftly (Linux)
+      - name: Install Swift 6.4.0 with Swiftly (Linux)
         if: ${{ runner.os == 'Linux' }}
         shell: bash
         run: |
@@ -99,12 +99,12 @@ jobs:
           tar zxf swiftly-$(uname -m).tar.gz
           ./swiftly init --skip-install --assume-yes --quiet-shell-followup
           source ~/.local/share/swiftly/env.sh
-          swiftly install --assume-yes --use 6.3.0
+          swiftly install --assume-yes --use 6.4.0
 
           echo "Looking for Swift in toolchains directory..."
           ls -la "$HOME/.local/share/swiftly/toolchains/" || true
 
-          SWIFT_PATH=$(find "$HOME/.local/share/swiftly/toolchains/6.3.0" -name "swift" -type f 2>/dev/null | head -1)
+          SWIFT_PATH=$(find "$HOME/.local/share/swiftly/toolchains/6.4.0" -name "swift" -type f 2>/dev/null | head -1)
           if [ -n "$SWIFT_PATH" ]; then
             SWIFT_PATH=$(dirname "$SWIFT_PATH")
           else
@@ -126,9 +126,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Host OSS toolchain on macos-26 is 6.3.3; 6.3-RELEASE modules
+          # Host OSS toolchain on macos-26 is 6.4.0; 6.4-RELEASE modules
           # cannot be imported by that compiler.
-          printf 'y\n' | skip android sdk install --version 6.3.3 --swift-version 6.3.3
+          printf 'y\n' | skip android sdk install --version 6.4.0 --swift-version 6.4.0
 
       - name: Cache Swift packages
         uses: actions/cache@v4
@@ -150,4 +150,4 @@ jobs:
 
       - name: Skip Android build (macOS)
         if: ${{ runner.os == 'macOS' }}
-        run: skip android build --swift-version 6.3.3
+        run: skip android build --swift-version 6.4.0
