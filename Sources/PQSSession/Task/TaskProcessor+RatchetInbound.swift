@@ -1170,6 +1170,12 @@ extension MessagePipeline {
                 localOneTimePrivateKey = privateOneTimeKey
             } else if let storedOTK = props.ratchetOneTimePrivateKey, storedOTK.id == oneTimeKeyId {
                 localOneTimePrivateKey = storedOTK
+            } else if props.hasRatchetState {
+                // Established lane citing an id this device no longer holds. Keep the
+                // lane's own copy (if any) untouched and let the ratchet decide: a
+                // chain frame decrypts without the private half, only a handshake or
+                // epoch re-key fails fast.
+                localOneTimePrivateKey = props.ratchetOneTimePrivateKey
             } else {
                 if shouldEmitKeyPayloadLogs {
                     logger.log(level: .debug, message: """
