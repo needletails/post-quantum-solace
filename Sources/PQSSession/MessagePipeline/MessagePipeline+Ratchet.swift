@@ -1,5 +1,5 @@
 //
-//  TaskProcessor+Ratchet.swift
+//  MessagePipeline+Ratchet.swift
 //  post-quantum-solace
 //
 //  Created by Cole M on 2024-09-14.
@@ -145,7 +145,7 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
     /// the ratchet state from the pool via `fetchOneTimePrivateKey(_:)`. The
     /// private key is deleted only when the reverse handshake confirms — see
     /// `noteAcceptedInboundForDeferredOneTimeKeyConsumption` in
-    /// `TaskProcessor+RatchetInbound.swift`.
+    /// `MessagePipeline+RatchetInbound.swift`.
     ///
     /// ## Idempotency
     /// Bootstrap replays repeat this call for the same id. Only the first call

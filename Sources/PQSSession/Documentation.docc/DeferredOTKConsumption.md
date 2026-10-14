@@ -85,13 +85,13 @@ lane never re-keys are bounded by normal batch key rotation.
 
 Implementation points:
 
-- `TaskProcessor.updateOneTimeKey(remove:)` (`TaskProcessor+Ratchet.swift`)
+- `MessagePipeline.updateOneTimeKey(remove:)` (`MessagePipeline+Ratchet.swift`)
   handles the consumption *request*: prune the spent signed public key,
   mint + publish the replacement, keep the private half. Replay-idempotent.
   `loadKeys` also re-supplies a pool key when a reminted lane starts a
   sending handshake with a cleared state copy.
 - `noteAcceptedInboundForDeferredOneTimeKeyConsumption`
-  (`TaskProcessor+RatchetInbound.swift`) records and confirms pending
+  (`MessagePipeline+RatchetInbound.swift`) records and confirms pending
   consumptions. It runs inside `finalizeAcceptedInbound`, i.e. only for
   frames whose accepted-ledger write succeeded — a rolled-back decrypt can
   neither record nor confirm.

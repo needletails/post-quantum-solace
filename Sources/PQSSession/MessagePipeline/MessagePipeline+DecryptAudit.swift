@@ -1,5 +1,5 @@
 //
-//  TaskProcessor+DecryptAudit.swift
+//  MessagePipeline+DecryptAudit.swift
 //  post-quantum-solace
 //
 

@@ -1,5 +1,5 @@
 //
-//  TaskProcessor.swift
+//  MessagePipeline.swift
 //  post-quantum-solace
 //
 //  Created by Cole M on 2025-04-08.

@@ -1,5 +1,5 @@
 //
-//  TaskProcessor+RatchetRecovery.swift
+//  MessagePipeline+RatchetRecovery.swift
 //  post-quantum-solace
 //
 //  Created by Cole M on 2024-09-14.

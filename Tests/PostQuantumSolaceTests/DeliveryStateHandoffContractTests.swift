@@ -93,7 +93,7 @@ struct DeliveryStateHandoffContractTests {
     @Test("process does not treat coalesced jobNotFound as an unhandled delete")
     func processDoesNotDeleteOnCoalescedJobNotFound() throws {
         let source = try DeliveryStateHandoffSource.read(
-            "Sources/PQSSession/Task/TaskProcessor+Sequence.swift"
+            "Sources/PQSSession/MessagePipeline/MessagePipeline+Sequence.swift"
         )
         let processBody = try DeliveryStateHandoffSource.functionBody(
             named: "private func process(",

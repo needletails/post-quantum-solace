@@ -186,7 +186,7 @@ pass; bounded inactive retention.
 | --------------------------- | ----------------------------------------------- |
 | **Topology**                | Retry lands; sender has no MessageRecord        |
 | **Severity**                | Medium                                          |
-| **Behavioral test**         | `TaskProcessorSequenceTests` OOB unavailable    |
+| **Behavioral test**         | `MessagePipelineSequenceTests` OOB unavailable    |
 
 **Recovery.** Mark envelope unrecoverable via OOB unavailable notice;
 no receive-side ASR.

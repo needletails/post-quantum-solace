@@ -1,6 +1,6 @@
 # Message Pipeline
 
-The internal `actor` (`MessagePipeline`, formerly `TaskProcessor`) that owns
+The internal `actor` (`MessagePipeline`) that owns
 the SDK's cryptographic and message-processing work queues. It is not public
 API — ``PQSSession`` enqueues all heavy work here so that public API calls
 remain responsive and in-flight cryptographic work proceeds on a dedicated

@@ -45,7 +45,7 @@
 //  episode TTL expiry drains deferred resends
 //      Covered by SessionReestablishmentCoalescingTests episode TTL + aged pending resend.
 //  outbound user ciphertext is prioritized over control frames
-//      Covered by TaskProcessorSequenceTests urgent-before-background inbound.
+//      Covered by MessagePipelineSequenceTests urgent-before-background inbound.
 //  fresh session reset preserves at-most-once one-time prekeys
 //      Compile-time pin of resetSessionIdentityForFreshSession.
 //  out-of-band resend consolidates / requestMessageResend uses OOB /

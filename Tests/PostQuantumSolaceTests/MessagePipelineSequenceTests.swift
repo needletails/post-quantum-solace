@@ -1,5 +1,5 @@
 //
-//  TaskProcessorSequenceTests.swift
+//  MessagePipelineSequenceTests.swift
 //  post-quantum-solace
 //
 //  Created by Cole M on 2025-01-27.
@@ -25,7 +25,7 @@ import Testing
 // MARK: - Test Suite
 
 @Suite(.serialized)
-actor TaskProcessorSequenceTests {
+actor MessagePipelineSequenceTests {
     
     var session = PQSSession()
     let transport: _MockTransportDelegate
