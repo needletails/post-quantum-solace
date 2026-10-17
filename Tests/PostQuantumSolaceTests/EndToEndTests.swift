@@ -11615,6 +11615,7 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     }
 
     init(mockUserData: MockUserData, session: PQSSession, isSender: Bool) {
+        AppPasswordKDFTestOverride.iterations = 64
         self.mockUserData = mockUserData
         self.session = session
         self.isSender = isSender

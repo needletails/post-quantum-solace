@@ -606,8 +606,10 @@ actor MessagePipeline {
                 // recipients and silently no-op'ing OTK / friendship delivery.
             }
             
-            let isPersistable = await session.sessionDelegate?.shouldPersist(transportInfo: message.transportInfo) != false
-            if isPersistable && !sendOneTimeIdentities {
+            // Sibling fan-out is its own host decision: non-persisted controls such
+            // as edits and reactions must still reach the sender's linked devices.
+            let syncsToSiblings = await session.sessionDelegate?.shouldSyncToSiblings(transportInfo: message.transportInfo) != false
+            if syncsToSiblings && !sendOneTimeIdentities {
                 // Sibling sync must not block or fail the peer DM fan-out. A missing
                 // personal SessionIdentity (SESSIONIDENTITYNOTFOUND) is recovered
                 // best-effort after the peer ciphertext jobs are already queued.

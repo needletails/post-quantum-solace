@@ -62,6 +62,13 @@ public protocol MessagingPolicy: Sendable {
         transportInfo: Data?
     ) -> Bool
 
+    /// Whether a `.nickname` send is also encrypted to the sender's other linked
+    /// devices. Defaults to `shouldPersist(transportInfo:)`; override to sync
+    /// non-persisted controls (edits, reactions) without storing them as chat rows.
+    func shouldSyncToSiblings(
+        transportInfo: Data?
+    ) -> Bool
+
     func retrieveUserInfo(
         _ transportInfo: Data?
     ) async -> (secretName: String, deviceId: String)?
@@ -89,6 +96,12 @@ public protocol MessagingPolicy: Sendable {
     ) async -> Bool
 
     func shouldSendAutomaticDeliveryReceipts() async -> Bool
+}
+
+public extension MessagingPolicy {
+    func shouldSyncToSiblings(transportInfo: Data?) -> Bool {
+        shouldPersist(transportInfo: transportInfo)
+    }
 }
 
 /// Recovery, compromise, and identity-trust callbacks. Hosts must implement these.

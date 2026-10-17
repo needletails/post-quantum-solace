@@ -36,6 +36,7 @@ actor SessionIdentityTests {
     // MARK: - Mock Store
     
     final class MockSessionIdentityStore: PQSStore, PQSRecoveryStore, @unchecked Sendable {
+        init() { AppPasswordKDFTestOverride.iterations = 64 }
         enum MockError: Error {
             case forcedDelete
             case forcedUpdate

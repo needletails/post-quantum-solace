@@ -192,19 +192,9 @@ extension PQSSession {
         let symmetricKey = deriveAppSymmetricKey(passwordData: passwordData, salt: saltData)
 
         do {
-            // Decrypt the configuration data: current key first, then the legacy
-            // generation-1 key, in which case the blob is re-sealed below.
-            let opened = try await openSessionContextBlob(data, passwordData: passwordData, salt: saltData)
-            let sessionContext = opened.context
+            // Decrypt the configuration data
+            let sessionContext = try openSessionContextBlob(data, passwordData: passwordData, salt: saltData)
             await setAppPassword(appPassword)
-            if opened.needsRekey {
-                let encoded = try BinaryEncoder().encode(sessionContext)
-                guard let resealed = try crypto.encrypt(data: encoded, symmetricKey: symmetricKey) else {
-                    throw PQSError.sessionEncryptionError
-                }
-                try await cache.updateLocalSessionContext(resealed)
-                logger.log(level: .info, message: "Re-sealed session context under the generation-2 app key")
-            }
 
             // Diagnostic-only per-device identity check. Logs (does not throw) when the
             // local `signingPrivateKey` does not match this device's `signingPublicKey` entry in

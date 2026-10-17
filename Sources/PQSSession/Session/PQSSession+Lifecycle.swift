@@ -69,7 +69,10 @@ extension PQSSession {
             guard let saltData = try await cache?.fetchLocalDeviceSalt(keyData: passwordData) else { throw PQSError.saltError }
 
             guard let data = try await cache?.fetchLocalSessionContext() else { return false }
-            _ = try await openSessionContextBlob(data, passwordData: passwordData, salt: saltData)
+            let key = deriveAppSymmetricKey(passwordData: passwordData, salt: saltData, remember: false)
+            guard let plaintext = try crypto.decrypt(data: data, symmetricKey: key) else { return false }
+            _ = try BinaryDecoder().decode(SessionContext.self, from: plaintext)
+            rememberAppSymmetricKey(passwordData: passwordData, salt: saltData, key: key)
             // Only a password that opens the stored context may become the live
             // password: every later commit encrypts the context under it, and a
             // rejected guess here would otherwise re-key the blob out from under

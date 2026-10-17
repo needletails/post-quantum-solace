@@ -184,7 +184,7 @@ public actor PQSSession: SessionCacheSynchronizer {
     // module can access them; they are not part of the public API.
     var _sessionContext: SessionContext?
     var _appPassword = ""
-    /// Memoized generation-2 app key (see `PQSSession+AppKey.swift`).
+    /// Memoized app key (see `PQSSession+AppKey.swift`).
     var appSymmetricKeyCache: (password: Data, salt: Data, key: SymmetricKey)?
     /// See `withExclusiveSessionContextCommit`.
     var sessionContextCommitInProgress = false

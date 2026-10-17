@@ -608,6 +608,7 @@ actor SessionTests {
 // MARK: - Mock Classes
 
 actor MockCache: PQSStore, PQSRecoveryStore {
+    init() { AppPasswordKDFTestOverride.iterations = 64 }
     var localSessionData: Data = .init()
     let recoveryLedger = InMemoryRecoveryLedger()
     var storedMessages: [UUID: SessionModels.EncryptedMessage] = [:]

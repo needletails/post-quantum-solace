@@ -3,8 +3,6 @@
 //  post-quantum-solace
 //
 //  The app-password key must depend on the device salt and carry a work factor.
-//  Session contexts sealed under the old salt-less key still open and are
-//  re-sealed under the new key on unlock.
 //
 
 import BinaryCodable
@@ -31,8 +29,8 @@ struct AppKeyDerivationTests {
 }
 
 extension EndToEndTests {
-    @Test("a session context sealed under the legacy key unlocks and is re-sealed")
-    func legacyBlobUnlocksAndIsResealed() async throws {
+    @Test("a session context sealed under the salt-less pre-4.5 key is rejected")
+    func saltlessBlobIsRejected() async throws {
         defer { Task { await shutdownSessions() } }
         let aliceStore = createSenderStore()
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
@@ -44,21 +42,17 @@ extension EndToEndTests {
         let passwordData = Data(password.utf8)
         let salt = try await aliceStore.fetchLocalDeviceSalt(keyData: passwordData)
 
-        // Rewrite the stored blob the way a 4.0 client would have written it.
         let context = try #require(await _senderSession.sessionContext)
-        let legacyKey = await crypto.deriveStrictSymmetricKey(data: passwordData, salt: salt)
-        let legacyBlob = try #require(try crypto.encrypt(data: BinaryEncoder().encode(context), symmetricKey: legacyKey))
-        try await aliceStore.updateLocalSessionContext(legacyBlob)
+        let saltlessKey = await crypto.deriveStrictSymmetricKey(data: passwordData, salt: salt)
+        let blob = try #require(try crypto.encrypt(data: BinaryEncoder().encode(context), symmetricKey: saltlessKey))
+        try await aliceStore.updateLocalSessionContext(blob)
         await _senderSession.cache?.clearCache()
 
-        _senderSession = try await _senderSession.unlock(appPassword: password)
-
-        let stored = try await aliceStore.fetchLocalSessionContext()
-        let currentKey = try await _senderSession.getAppSymmetricKey()
-        #expect((try? crypto.decrypt(data: stored, symmetricKey: currentKey)) != nil,
-                "the blob must be re-sealed under the generation-2 key")
-        #expect((try? crypto.decrypt(data: stored, symmetricKey: legacyKey)) == nil,
-                "the legacy key must no longer open the stored blob")
-        #expect(await _senderSession.verifyAppPassword(password))
+        #expect(!(await _senderSession.verifyAppPassword(password)))
+        await #expect(throws: (any Error).self) {
+            _ = try await _senderSession.unlock(appPassword: password)
+        }
+        #expect(try await aliceStore.fetchLocalSessionContext() == blob,
+                "a rejected unlock must leave the stored blob untouched")
     }
 }
