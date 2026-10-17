@@ -54,6 +54,15 @@ public struct MessageRecord: Sendable {
 /// Typical host store: core CRUD plus recovery ledgers on one object.
 public typealias PQSPersistenceHost = PQSStore & PQSRecoveryStore
 
+public extension PQSStore {
+    /// Source-compatible default for 4.x hosts: delete then create. Not atomic;
+    /// see the requirement's documentation.
+    func replaceLocalSessionContext(_ data: Data) async throws {
+        try await deleteLocalSessionContext()
+        try await createLocalSessionContext(data)
+    }
+}
+
 /// Core session persistence. The atomic identity+job commit is required.
 public protocol PQSStore: Sendable {
     /// Creates a local device configuration with the provided data.
@@ -83,6 +92,14 @@ public protocol PQSStore: Sendable {
     /// Deletes the local device configuration.
     /// - Throws: An error if the operation fails, such as if the configuration does not exist or if there is a database error.
     func deleteLocalSessionContext() async throws
+
+    /// Replaces the stored local session context with `data` in one durable step.
+    ///
+    /// The session context holds every private key of the device. The default
+    /// implementation deletes and then creates, which leaves a window where a
+    /// crash loses the context entirely; hosts should override with a single
+    /// transaction (upsert) so a failed write leaves the previous blob in place.
+    func replaceLocalSessionContext(_ data: Data) async throws
 
     /// Creates a new session identity in the database.
     /// - Parameter session: The `SessionIdentity` object to be created.

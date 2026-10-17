@@ -245,6 +245,10 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
     /// The encrypted data associated with the job model.
     public var data: Data
 
+    /// Serializes `data` reads and writes; a job can be re-encrypted while a
+    /// retry is decrypting it (the other secure models lock the same way).
+    private let lock = NSLock()
+
     /// Coding keys with obfuscated names for enhanced security.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case id = "a"
@@ -470,7 +474,8 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
     /// - Throws: An error if decryption fails.
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         let crypto = NeedleTailCrypto()
-        guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
+        let snapshot = lock.withLock { data }
+        guard let decrypted = try crypto.decrypt(data: snapshot, symmetricKey: symmetricKey) else {
             throw PQSError.decryptionFailed
         }
         return try BinaryDecoder().decode(UnwrappedProps.self, from: decrypted)
@@ -488,7 +493,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
             throw PQSError.encryptionFailed
         }
-        self.data = encryptedData
+        lock.withLock { self.data = encryptedData }
         return try await decryptProps(symmetricKey: symmetricKey)
     }
 
@@ -502,14 +507,16 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         guard let props = await props(symmetricKey: symmetricKey) else {
             throw Errors.propsError
         }
-        return Job(
+        let model = Job(
             id: id,
             sequenceId: props.sequenceId,
             isBackgroundTask: props.isBackgroundTask,
             task: props.task,
             scheduledAt: props.scheduledAt,
             attempts: props.attempts
-        ) as! T
+        )
+        guard let typed = model as? T else { throw PQSError.propsError }
+        return typed
     }
 
     /// Private error types for internal use within the JobModel.

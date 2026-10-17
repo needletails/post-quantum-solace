@@ -81,10 +81,18 @@ public struct ControlEventEpisode: Sendable {
 public struct ProcessedControlEventKey: Hashable, Sendable {
     public let senderDeviceId: UUID
     public let kind: SessionReestablishmentKind
+    /// Device ids are client-chosen; scoping by account stops one peer from
+    /// shadowing another peer's (or a sibling's) control events with the same id.
+    public let senderSecretName: String
 
     public init(senderDeviceId: UUID, kind: SessionReestablishmentKind) {
+        self.init(senderDeviceId: senderDeviceId, kind: kind, senderSecretName: "")
+    }
+
+    public init(senderDeviceId: UUID, kind: SessionReestablishmentKind, senderSecretName: String) {
         self.senderDeviceId = senderDeviceId
         self.kind = kind
+        self.senderSecretName = senderSecretName
     }
 }
 
@@ -118,6 +126,62 @@ public enum ProcessedControlEventDecision: Sendable, Equatable {
 
 extension PQSSession {
 
+    // MARK: - Epoch arithmetic
+
+    /// Next epoch for a locally minted emission. Saturates at `UInt64.max`: the
+    /// counter can have been raised to the wire maximum by a response to a
+    /// peer-chosen epoch, and `+ 1` on it must never trap.
+    static func nextEmissionEpoch(currentCounter: UInt64?) -> UInt64 {
+        saturatingIncrement(currentCounter ?? 0)
+    }
+
+    /// Next epoch for a response to `requestEpoch`. Both inputs are untrusted:
+    /// the request epoch is decoded from the wire (clamped to
+    /// `SessionReestablishmentEnvelope.maximumWireEpoch`) and the counter may
+    /// already carry an earlier peer's maximum.
+    static func nextResponseEpoch(currentCounter: UInt64?, requestEpoch: UInt64) -> UInt64 {
+        max(
+            saturatingIncrement(currentCounter ?? 0),
+            saturatingIncrement(requestEpoch))
+    }
+
+    private static func saturatingIncrement(_ value: UInt64) -> UInt64 {
+        let (incremented, overflow) = value.addingReportingOverflow(1)
+        return overflow ? .max : incremented
+    }
+
+    /// Seeds the per-kind sender epoch counter. Tests use this because the
+    /// stored property cannot be mutated off the actor.
+    func seedSenderControlEpochCounter(_ epoch: UInt64, for kind: SessionReestablishmentKind) {
+        senderControlEpochCounters[kind] = epoch
+    }
+
+    // MARK: - Receiver-side control-plane rate limits
+
+    /// One `linkedDeviceRepair` rotation per sibling device per
+    /// `linkedDeviceRepairCooldownSeconds`. Records the attempt when it returns `true`.
+    func shouldHonorLinkedDeviceRepair(from siblingDeviceId: UUID) -> Bool {
+        let now = Date()
+        if let last = lastHonoredLinkedDeviceRepairAtBySibling[siblingDeviceId],
+           now.timeIntervalSince(last) < PQSSessionConstants.linkedDeviceRepairCooldownSeconds {
+            return false
+        }
+        lastHonoredLinkedDeviceRepairAtBySibling[siblingDeviceId] = now
+        return true
+    }
+
+    /// One inbound `refreshOneTimeKeys` replenish per peer per
+    /// `peerOneTimeRefreshRequestCooldown`. Records the attempt when it returns `true`.
+    func shouldHonorInboundOneTimeKeyRefresh(from secretName: String) -> Bool {
+        let now = Date()
+        if let last = lastHonoredInboundOneTimeKeyRefreshAtByPeer[secretName],
+           now.timeIntervalSince(last) < peerOneTimeRefreshRequestCooldown {
+            return false
+        }
+        lastHonoredInboundOneTimeKeyRefreshAtByPeer[secretName] = now
+        return true
+    }
+
     // MARK: - Sender-Side Coalescing
 
     /// Build a `SessionReestablishmentEnvelope` for `(kind, scope)` if the configured cooldown
@@ -150,7 +214,7 @@ extension PQSSession {
                 return nil
             }
             if now.timeIntervalSince(existing.firstEmittedAt) < episodeMaxLifetime {
-                let nextEpoch = (senderControlEpochCounters[kind] ?? 0) + 1
+                let nextEpoch = Self.nextEmissionEpoch(currentCounter: senderControlEpochCounters[kind])
                 senderControlEpochCounters[kind] = nextEpoch
                 existing.epoch = nextEpoch
                 existing.lastEmittedAt = now
@@ -174,7 +238,7 @@ extension PQSSession {
         }
 
         let intentId = UUID()
-        let nextEpoch = (senderControlEpochCounters[kind] ?? 0) + 1
+        let nextEpoch = Self.nextEmissionEpoch(currentCounter: senderControlEpochCounters[kind])
         senderControlEpochCounters[kind] = nextEpoch
         let episode = ControlEventEpisode(
             intentId: intentId,
@@ -262,9 +326,9 @@ extension PQSSession {
         respondingTo envelope: SessionReestablishmentEnvelope,
         targetDeviceId: UUID? = nil
     ) async throws -> Bool {
-        let nextEpoch = max(
-            (senderControlEpochCounters[kind] ?? 0) + 1,
-            envelope.epoch + 1)
+        let nextEpoch = Self.nextResponseEpoch(
+            currentCounter: senderControlEpochCounters[kind],
+            requestEpoch: envelope.epoch)
         senderControlEpochCounters[kind] = nextEpoch
         let response = SessionReestablishmentEnvelope(
             kind: kind,
@@ -287,10 +351,14 @@ extension PQSSession {
     /// higher-epoch re-emits of the same intent can still drive a fresh idempotent response.
     func recordReceivedSessionReestablishment(
         envelope: SessionReestablishmentEnvelope,
-        senderDeviceId: UUID
+        senderDeviceId: UUID,
+        senderSecretName: String = ""
     ) -> ProcessedControlEventDecision {
         pruneStaleProcessedEvents()
-        let key = ProcessedControlEventKey(senderDeviceId: senderDeviceId, kind: envelope.kind)
+        let key = ProcessedControlEventKey(
+            senderDeviceId: senderDeviceId,
+            kind: envelope.kind,
+            senderSecretName: senderSecretName)
         let now = Date()
 
         if let existing = processedControlEvents[key] {
@@ -319,9 +387,13 @@ extension PQSSession {
 
     func forgetReceivedSessionReestablishment(
         envelope: SessionReestablishmentEnvelope,
-        senderDeviceId: UUID
+        senderDeviceId: UUID,
+        senderSecretName: String = ""
     ) {
-        let key = ProcessedControlEventKey(senderDeviceId: senderDeviceId, kind: envelope.kind)
+        let key = ProcessedControlEventKey(
+            senderDeviceId: senderDeviceId,
+            kind: envelope.kind,
+            senderSecretName: senderSecretName)
         guard let existing = processedControlEvents[key] else { return }
 
         if envelope.epoch > 0, existing.lastProcessedEpoch == envelope.epoch {

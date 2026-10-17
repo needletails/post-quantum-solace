@@ -128,6 +128,14 @@ public protocol PQSTransport: Sendable {
 public protocol PQSKeyDirectory: Sendable {
     func findConfiguration(for secretName: String) async throws -> UserConfiguration
 
+    /// Live account lookup for the moments PQS has evidence the directory changed:
+    /// an inbound frame from a device id with no session row, or a verified device
+    /// without a lane on send. Hosts that cache `findConfiguration` must answer
+    /// this from the directory, never from the cache; a stale snapshot here makes
+    /// a just-linked device look retired and loses its first messages. The default
+    /// forwards to `findConfiguration`, which is already live for hosts without a cache.
+    func findConfigurationBypassingCache(for secretName: String) async throws -> UserConfiguration
+
     func publishUserConfiguration(_ configuration: UserConfiguration, recipient secretName: String, recipient identity: UUID) async throws
 
     func fetchOneTimeKeys(for secretName: String, deviceId: String) async throws -> OneTimeKeys
@@ -147,6 +155,14 @@ public protocol PQSKeyDirectory: Sendable {
         deviceId: String,
         rotated keys: RotatedPublicKeys
     ) async throws
+}
+
+public extension PQSKeyDirectory {
+    /// Source-compatible default for 4.x hosts. Hosts with a lookup cache must
+    /// override this to go to the directory.
+    func findConfigurationBypassingCache(for secretName: String) async throws -> UserConfiguration {
+        try await findConfiguration(for: secretName)
+    }
 }
 
 /// Authenticated out-of-band resend. Hosts must implement these; there is no silent no-op.

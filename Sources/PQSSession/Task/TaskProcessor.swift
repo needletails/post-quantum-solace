@@ -1141,12 +1141,14 @@ actor MessagePipeline {
         var activeMembers = Set<String>()
         for member in members {
             do {
-                let memberIdentities = try await session.refreshIdentities(secretName: member)
+                // Same device-coverage rules as a direct message: a member's device
+                // linked after the first lane existed must still get a lane.
+                let memberIdentities = try await session.sessionIdentitiesForChatFanout(secretName: member)
                 // Deleted accounts linger in channel `members` until roster repair.
-                // refreshIdentities returns no lanes for tombstoned accounts (graceful
-                // contract); exclude them from activeMembers too so recipients metadata
-                // does not carry ghost names. Members with empty lanes for any *other*
-                // reason (e.g. transient refresh failure) keep the legacy behavior.
+                // Tombstoned accounts yield no lanes; exclude them from activeMembers
+                // too so recipients metadata does not carry ghost names. Members with
+                // empty lanes for any *other* reason (e.g. transient refresh failure)
+                // keep the legacy behavior.
                 if memberIdentities.isEmpty,
                    await session.knownDeletedAccountSecretNames.contains(member) {
                     logger.log(
@@ -1162,6 +1164,17 @@ actor MessagePipeline {
                     level: .info,
                     message: "Skipping channel member with deleted account secretName=\(member)")
                 continue
+            } catch {
+                // Legacy graceful contract: one member's lookup failure (offline, no
+                // lanes yet) must not abort the channel send for everyone else.
+                logger.log(
+                    level: .warning,
+                    message: "Channel fan-out could not resolve lanes for member \(member): \(error)")
+                let fallback = try await session.refreshIdentities(secretName: member)
+                identities.formUnion(fallback)
+                if !fallback.isEmpty {
+                    activeMembers.insert(member)
+                }
             }
         }
         logger.log(level: .info, message: "Gathered \(identities.count) Channel Session Identities")

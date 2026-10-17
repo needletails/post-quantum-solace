@@ -204,7 +204,10 @@ extension MessagePipeline {
             peerDeviceId: pendingTransport.metadata.deviceId,
             session: session)
 
-        await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
+        await rememberRecentOutboundReplayIfNeeded(
+            outboundTask,
+            recipientDeviceId: pendingTransport.metadata.deviceId,
+            session: session)
 
         if outboundTask.isPersistedOutbound || pendingTransport.metadata.requiresServerAck {
             await registerUnackedServerAccept(
@@ -232,6 +235,7 @@ extension MessagePipeline {
 
     func rememberRecentOutboundReplayIfNeeded(
         _ outboundTask: OutboundTaskMessage,
+        recipientDeviceId: UUID,
         session: PQSSession,
         now: Date = Date()
     ) async {
@@ -240,21 +244,30 @@ extension MessagePipeline {
         recentOutboundReplayStore.remember(
             outboundTask.message,
             sharedId: outboundTask.sharedId,
+            recipientDeviceId: recipientDeviceId,
             now: now)
     }
 
     private func hasRecentOutboundReplay(
         sharedId: String,
+        recipientDeviceId: UUID,
         now: Date = Date()
     ) -> Bool {
-        recentOutboundReplayStore.contains(sharedId: sharedId, now: now)
+        recentOutboundReplayStore.contains(
+            sharedId: sharedId,
+            recipientDeviceId: recipientDeviceId,
+            now: now)
     }
 
     private func recentOutboundReplayMessage(
         sharedId: String,
+        recipientDeviceId: UUID,
         now: Date = Date()
     ) -> (message: CryptoMessage, replayCount: Int)? {
-        recentOutboundReplayStore.consume(sharedId: sharedId, now: now)
+        recentOutboundReplayStore.consume(
+            sharedId: sharedId,
+            recipientDeviceId: recipientDeviceId,
+            now: now)
     }
 
     /// Friendship packets must never be replayed from the recovery ring; peers
@@ -572,6 +585,9 @@ extension MessagePipeline {
             session: session,
             preferredDevice: senderDevice
         )
+        let localSecretName = await session.sessionContext?.sessionUser.secretName
+        let isSameAccountRequester =
+            localSecretName == requesterSecretName
         guard var identity = requestedIdentity ?? senderIdentity else {
             // No outbound lane to the requester yet: still resolve local
             // missing/unavailable without reminting or throwing.
@@ -583,7 +599,6 @@ extension MessagePipeline {
             for requestedEnvelopeMessageId in request.failedSharedMessageIds {
                 let messageRecord = await session.outboundDeviceSendRecord(
                     envelopeMessageId: requestedEnvelopeMessageId)
-                let logicalSharedId = messageRecord?.sharedId ?? requestedEnvelopeMessageId
                 if await session.isKnownUnavailableResend(
                     requestingDeviceId: request.requestingDeviceId,
                     sharedId: requestedEnvelopeMessageId)
@@ -591,7 +606,28 @@ extension MessagePipeline {
                     permanentlyUnavailableIds.append(requestedEnvelopeMessageId)
                     continue
                 }
-                if recentOutboundReplayMessage(sharedId: logicalSharedId) != nil {
+                // Plaintext is only ever probed through an envelope this device
+                // addressed to the requesting device.
+                guard OrphanResendOwnershipPolicy.requesterMayReplay(
+                    record: messageRecord,
+                    requesterSecretName: requesterSecretName,
+                    requestingDeviceId: request.requestingDeviceId),
+                      let logicalSharedId = messageRecord?.sharedId
+                else {
+                    if isSameAccountRequester, messageRecord == nil {
+                        // Sibling-observed NACK for an envelope another device sent.
+                        continue
+                    }
+                    permanentlyUnavailableIds.append(requestedEnvelopeMessageId)
+                    await session.markResendUnavailable(
+                        requestingDeviceId: request.requestingDeviceId,
+                        sharedId: requestedEnvelopeMessageId)
+                    audit(.recovery, "pqs.recovery.resendRefusedNotRecipient envelopeId=\(requestedEnvelopeMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) reason=\(messageRecord == nil ? "unknownEnvelope" : "notRecipient")")
+                    continue
+                }
+                if recentOutboundReplayMessage(
+                    sharedId: logicalSharedId,
+                    recipientDeviceId: request.requestingDeviceId) != nil {
                     continue
                 }
                 let foundMessage: EncryptedMessage?
@@ -630,9 +666,6 @@ extension MessagePipeline {
             identity: SessionIdentity,
             retransportCached: Bool
         )] = []
-        let localSecretName = await session.sessionContext?.sessionUser.secretName
-        let isSameAccountRequester =
-            localSecretName == requesterSecretName
         // Process escape-remint candidates first so a settled prove-fail
         // remints before sibling reuseRecoveryWave advances the old row.
         // Classify only — remint still happens in the per-id switch.
@@ -671,8 +704,6 @@ extension MessagePipeline {
             // whose durable content key remains the logical shared id.
             let requestedMessageRecord = await session.outboundDeviceSendRecord(
                 envelopeMessageId: failedEnvelopeMessageId)
-            let failedSharedMessageId =
-                requestedMessageRecord?.sharedId ?? failedEnvelopeMessageId
             // A previous lookup already proved this id unreplayable; skip the
             // DB pass and just re-notify the requester below.
             if await session.isKnownUnavailableResend(
@@ -683,15 +714,44 @@ extension MessagePipeline {
                 knownUnavailableCount += 1
                 continue
             }
+            // The plaintext key is the logical shared id, which the server sees
+            // on every packet. It is reached only through an envelope record this
+            // device wrote for the requesting device; a bare id or a record
+            // addressed elsewhere is refused before any store lookup.
+            guard OrphanResendOwnershipPolicy.requesterMayReplay(
+                record: requestedMessageRecord,
+                requesterSecretName: requesterSecretName,
+                requestingDeviceId: request.requestingDeviceId),
+                  let failedSharedMessageId = requestedMessageRecord?.sharedId
+            else {
+                if isSameAccountRequester, requestedMessageRecord == nil {
+                    // Sibling-observed NACK for an envelope another device sent:
+                    // defer without markUnavailable or remint.
+                    audit(.recovery, "pqs.recovery.orphanResendDeferredNotContentOwner sharedId=\(failedEnvelopeMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
+                    continue
+                }
+                let reason = requestedMessageRecord == nil ? "unknownEnvelope" : "notRecipient"
+                replayMissingCount += 1
+                unavailableIds.append(failedEnvelopeMessageId)
+                missingByReason[reason, default: 0] += 1
+                await session.markResendUnavailable(
+                    requestingDeviceId: request.requestingDeviceId,
+                    sharedId: failedEnvelopeMessageId)
+                audit(.recovery, "pqs.recovery.resendRefusedNotRecipient envelopeId=\(failedEnvelopeMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) reason=\(reason)")
+                continue
+            }
 
             let cryptoMessage: CryptoMessage
             // Recent non-persistent recovery controls are intentionally replayable
             // multiple times while a peer repairs; they are already bounded by
             // `recentOutboundReplayMaxReplays`, so they bypass the servicing cooldown.
             var servicedFromPersistedStore = false
-            let hasRecentReplay =
-                hasRecentOutboundReplay(sharedId: failedSharedMessageId)
-            if let replay = recentOutboundReplayMessage(sharedId: failedSharedMessageId) {
+            let hasRecentReplay = hasRecentOutboundReplay(
+                sharedId: failedSharedMessageId,
+                recipientDeviceId: request.requestingDeviceId)
+            if let replay = recentOutboundReplayMessage(
+                sharedId: failedSharedMessageId,
+                recipientDeviceId: request.requestingDeviceId) {
                 cryptoMessage = replay.message
                 logger.log(
                     level: .info,
@@ -1303,37 +1363,55 @@ extension MessagePipeline {
         }
     }
 
-    func removeKeys(session: PQSSession, x25519Id: String?, mlKEMId: String) async throws {
-        
-        guard let cache = await session.cache else { return }
-        let data = try await cache.fetchLocalSessionContext()
-        
-        // Decrypt the session context data using the app's symmetric key
-        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: session.getAppSymmetricKey()) else {
-            return
+    /// Inbound `synchronizeOneTimeKeys`: the initiator names the one-time keys
+    /// its bootstrap consumed. The ids inside the decrypted payload are
+    /// peer-supplied, so only ids that match the verified ratchet header are
+    /// acted on. Their published halves are retired (server + local list); the
+    /// private halves are left for deferred consumption, which deletes them
+    /// once the reverse handshake confirms.
+    func retireCitedOneTimeKeys(
+        session: PQSSession,
+        headerOneTimeKeyId: UUID?,
+        headerMLKEMOneTimeKeyId: UUID?,
+        claimed: SynchronizationKeyIdentities,
+        senderSecretName: String,
+        senderDeviceId: UUID
+    ) async throws {
+        let claimedX25519 = UUID(uuidString: claimed.recipientX25519Id)
+        let claimedMLKEM = UUID(uuidString: claimed.recipientMLKEMId)
+        let x25519Id = (headerOneTimeKeyId != nil && headerOneTimeKeyId == claimedX25519) ? headerOneTimeKeyId : nil
+        let mlKEMId = (headerMLKEMOneTimeKeyId != nil && headerMLKEMOneTimeKeyId == claimedMLKEM) ? headerMLKEMOneTimeKeyId : nil
+        if x25519Id == nil || mlKEMId == nil {
+            audit(.recovery, "pqs.otk.synchronizeIdsRejected sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) claimedX25519=\(claimed.recipientX25519Id) headerX25519=\(headerOneTimeKeyId?.uuidString ?? "nil") claimedMLKEM=\(claimed.recipientMLKEMId) headerMLKEM=\(headerMLKEMOneTimeKeyId?.uuidString ?? "nil")")
         }
-        
-        // Decode the session context from the decrypted data
-        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
-        
+        guard x25519Id != nil || mlKEMId != nil else { return }
+        guard let secretName = await session.sessionContext?.sessionUser.secretName else { return }
+
         if let x25519Id {
-            try await delegate?.deleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: x25519Id, type: .x25519)
+            try await delegate?.deleteOneTimeKeys(for: secretName, with: x25519Id.uuidString, type: .x25519)
         }
-        try await delegate?.deleteOneTimeKeys(for: sessionContext.sessionUser.secretName, with: mlKEMId, type: .mlKEM)
+        if let mlKEMId {
+            try await delegate?.deleteOneTimeKeys(for: secretName, with: mlKEMId.uuidString, type: .mlKEM)
+        }
         logger.log(level: .info, message: "Requested to Remove Remote Public Curve and MLKEM One Time Keys")
-        
-        sessionContext.activeUserConfiguration.signedOneTimePublicKeys.removeAll(where: { $0.id.uuidString == x25519Id })
-        sessionContext.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll(where: { $0.id.uuidString == mlKEMId })
-        sessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll(where: { $0.id.uuidString == x25519Id })
-        sessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll(where: { $0.id.uuidString == mlKEMId })
-        
-        await session.setSessionContext(sessionContext)
-        
-        let encodedData = try BinaryEncoder().encode(sessionContext)
-        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: session.getAppSymmetricKey()) else {
-            throw PQSError.sessionEncryptionError
+        _ = try await session.retirePublishedOneTimeKeys(x25519Id: x25519Id, mlKEMId: mlKEMId)
+    }
+
+    /// Outbound bookkeeping: this device chose to retire its own one-time keys
+    /// after a send (`needsRemoteDeletion`). Server deletes run first; the local
+    /// removal is one exclusive commit so a concurrent batch commit is never
+    /// rolled back by a stale snapshot.
+    func removeKeys(session: PQSSession, x25519Id: String?, mlKEMId: String) async throws {
+        guard let secretName = await session.sessionContext?.sessionUser.secretName else { return }
+        if let x25519Id {
+            try await delegate?.deleteOneTimeKeys(for: secretName, with: x25519Id, type: .x25519)
         }
-        try await cache.updateLocalSessionContext(encryptedConfig)
+        try await delegate?.deleteOneTimeKeys(for: secretName, with: mlKEMId, type: .mlKEM)
+        logger.log(level: .info, message: "Requested to Remove Remote Public Curve and MLKEM One Time Keys")
+
+        _ = try await session.removeOwnOneTimeKeys(
+            x25519Id: x25519Id.flatMap(UUID.init(uuidString:)),
+            mlKEMId: UUID(uuidString: mlKEMId))
         logger.log(level: .info, message: "Removed Local Curve and MLKEM One Time Keys")
     }
 

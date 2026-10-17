@@ -137,6 +137,13 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
     /// account-wide refresh controls.
     public let targetDeviceId: UUID?
 
+    /// Largest epoch accepted from the wire. A peer-chosen `UInt64.max` would
+    /// otherwise trap the receiver's `epoch + 1` response arithmetic before the
+    /// envelope is ledgered, so the spool redelivers it on every relaunch.
+    /// Decoding clamps rather than rejects so unpatched 4.x peers interoperate;
+    /// local emissions never approach this bound.
+    package static let maximumWireEpoch: UInt64 = 1 << 62
+
     public init(
         kind: SessionReestablishmentKind,
         intentId: UUID? = nil,
@@ -178,7 +185,9 @@ public struct SessionReestablishmentEnvelope: Sendable, Codable, Equatable {
         }
         self.kind = kind
         self.intentId = try container.decodeIfPresent(UUID.self, forKey: .intentId)
-        self.epoch = try container.decodeIfPresent(UInt64.self, forKey: .epoch) ?? 0
+        self.epoch = min(
+            try container.decodeIfPresent(UInt64.self, forKey: .epoch) ?? 0,
+            Self.maximumWireEpoch)
         self.emittedAt = try container.decodeIfPresent(Date.self, forKey: .emittedAt) ?? Date()
         self.isResponse = try container.decodeIfPresent(Bool.self, forKey: .isResponse) ?? false
         self.targetDeviceId = try container.decodeIfPresent(UUID.self, forKey: .targetDeviceId)

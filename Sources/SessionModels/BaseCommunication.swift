@@ -327,6 +327,12 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ///   ensure that the update was successful. The returned properties can be
     ///   used to verify that the update was applied correctly.
     public func updateProps(symmetricKey: SymmetricKey, props: Codable & Sendable) async throws -> UnwrappedProps? {
+        // The signature is kept for 4.x source compatibility; only `UnwrappedProps`
+        // can be stored here. Refuse before overwriting `data` so a wrong-type caller
+        // cannot corrupt the row.
+        guard props is UnwrappedProps else {
+            throw PQSError.propsError
+        }
         try lock.withLock { [weak self] in
             guard let self else { throw PQSError.encryptionFailed }
             let crypto = NeedleTailCrypto()
@@ -362,7 +368,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
         guard let props = await props(symmetricKey: symmetricKey) else {
             throw PQSError.propsError
         }
-        return Communication(
+        let model = Communication(
             id: id,
             sharedId: props.sharedId,
             messageCount: props.messageCount,
@@ -372,7 +378,11 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
             blockedMembers: props.blockedMembers,
             metadata: props.metadata,
             communicationType: props.communicationType
-        ) as! T
+        )
+        // Only `Communication` is produced here; a mismatched `T` is a caller bug,
+        // reported as an error instead of a trap.
+        guard let typed = model as? T else { throw PQSError.propsError }
+        return typed
     }
     
     public static func == (lhs: BaseCommunication, rhs: BaseCommunication) -> Bool {
@@ -436,8 +446,12 @@ public enum MessageRecipient: Codable, Sendable, Equatable {
             name
         case let .channel(name):
             name
-        default:
-            fatalError("Invalid Recipient Type \(self)")
+        case .personalMessage:
+            // Peers can address us with these cases; a public accessor must not
+            // take the process down. Same tag as `auditRecipientTag`.
+            "personal"
+        case .broadcast:
+            "broadcast"
         }
     }
 

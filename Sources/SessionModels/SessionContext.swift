@@ -41,6 +41,9 @@ public struct SessionContext: Codable & Sendable, Equatable {
         case hostLocalPolicyData = "f"
         /// Persisted schema version. Missing on schema-1 contexts (decode as 1).
         case schemaVersion = "g"
+        /// Account signing keys pinned for peers that have no Contact row. Optional;
+        /// skipped on the wire when nil so pre-existing blobs stay byte-identical.
+        case peerAccountSigningKeyPins = "h"
     }
 
     /// The session user associated with this context.
@@ -85,6 +88,12 @@ public struct SessionContext: Codable & Sendable, Equatable {
     /// On-disk schema version for this context. Schema-1 blobs omit the field.
     public var schemaVersion: Int
 
+    /// TOFU pins for peers that have no Contact row (channel members, pre-friendship
+    /// senders): peer secret name to account signing public key, recorded when the
+    /// first lane to that peer is minted. A Contact's pinned configuration takes
+    /// precedence when one exists. `nil` on contexts persisted before this field.
+    package var peerAccountSigningKeyPins: [String: Data]?
+
     /// Initializes a new instance of `SessionContext`.
     ///
     /// - Parameters:
@@ -124,6 +133,7 @@ public struct SessionContext: Codable & Sendable, Equatable {
         registrationState = try container.decode(RegistrationState.self, forKey: .registrationState)
         hostLocalPolicyData = try container.decodeIfPresent(Data.self, forKey: .hostLocalPolicyData)
         schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+        peerAccountSigningKeyPins = try container.decodeIfPresent([String: Data].self, forKey: .peerAccountSigningKeyPins)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -135,6 +145,9 @@ public struct SessionContext: Codable & Sendable, Equatable {
         try container.encode(registrationState, forKey: .registrationState)
         try container.encodeIfPresent(hostLocalPolicyData, forKey: .hostLocalPolicyData)
         try container.encode(schemaVersion, forKey: .schemaVersion)
+        if let peerAccountSigningKeyPins, !peerAccountSigningKeyPins.isEmpty {
+            try container.encode(peerAccountSigningKeyPins, forKey: .peerAccountSigningKeyPins)
+        }
     }
 
     /// Updates the session user with a new value.

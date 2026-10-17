@@ -132,4 +132,15 @@ public protocol RecoveryObserver: Sendable {
     func shouldSuppressInboundRecoveryFromSender(_ senderSecretName: String) async -> Bool
 
     func preferredOnlinePeerDeviceId(for secretName: String) async -> UUID?
+
+    /// The directory reports a per-device signing key for this master device that
+    /// differs from the one it holds, and no rotation of ours is pending persistence.
+    /// PQS no longer rotates the account key on its own in this state (a directory
+    /// could otherwise force identity-change prompts on every contact at will); the
+    /// host decides whether to call `rotateKeysOnPotentialCompromise()`.
+    func accountSigningKeyMismatchRequiresAttention() async
+}
+
+public extension RecoveryObserver {
+    func accountSigningKeyMismatchRequiresAttention() async {}
 }

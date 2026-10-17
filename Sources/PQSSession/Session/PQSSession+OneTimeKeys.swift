@@ -340,9 +340,7 @@ extension PQSSession {
 
     private func decodePersistedSessionContext(cache: SessionCache) async throws -> SessionContext {
         let data = try await cache.fetchLocalSessionContext()
-        guard let decrypted = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
-            throw PQSError.sessionDecryptionError
-        }
+        let decrypted = try await openSessionContextPlaintext(data)
         return try BinaryDecoder().decode(SessionContext.self, from: decrypted)
     }
 

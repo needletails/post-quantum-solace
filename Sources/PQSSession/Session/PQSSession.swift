@@ -184,6 +184,8 @@ public actor PQSSession: SessionCacheSynchronizer {
     // module can access them; they are not part of the public API.
     var _sessionContext: SessionContext?
     var _appPassword = ""
+    /// Memoized generation-2 app key (see `PQSSession+AppKey.swift`).
+    var appSymmetricKeyCache: (password: Data, salt: Data, key: SymmetricKey)?
     /// See `withExclusiveSessionContextCommit`.
     var sessionContextCommitInProgress = false
     var sessionContextCommitWaiters: [CheckedContinuation<Void, Never>] = []
@@ -505,6 +507,13 @@ public actor PQSSession: SessionCacheSynchronizer {
     var peerInboundFriendshipConfirmedPeers = Set<String>()
     var lastPeerOneTimeRefreshRequestAt: [String: Date] = [:]
     let peerOneTimeRefreshRequestCooldown: TimeInterval = 15
+    /// Receiver-side cooldowns for peer-triggered work (see `+ControlEventCoalescing`).
+    var lastHonoredInboundOneTimeKeyRefreshAtByPeer: [String: Date] = [:]
+    var lastHonoredLinkedDeviceRepairAtBySibling: [UUID: Date] = [:]
+    /// Set while `rotateKeysOnPotentialCompromise` has published new keys but not
+    /// yet persisted them; only then may a server-reported signing-key mismatch be
+    /// healed by rotating again without user involvement.
+    var accountRotationPublishedPendingPersist = false
     struct PeerReplenishWaiterKey: Hashable, Sendable {
         let secretName: String
         let deviceId: UUID
@@ -761,10 +770,59 @@ public actor PQSSession: SessionCacheSynchronizer {
     /// network configuration fetch on warm sends when local lanes already match.
     var lastVerifiedDeviceIdsBySecretName: [String: Set<UUID>] = [:]
 
+    /// Which directory lookup produced the memo entry for a secret name.
+    enum VerifiedDeviceIdsSource: Sendable, Equatable {
+        /// Answered by `findConfigurationBypassingCache`, or seeded as live.
+        case live
+        /// Answered by the host's normal `findConfiguration`, which may serve a
+        /// cached snapshot, or rehydrated from local lanes while offline.
+        case cachedOrUnknown
+    }
+
+    /// How a refresh should ask the directory for a configuration.
+    enum ConfigurationLookup: Sendable, Equatable {
+        case cached
+        case bypassCache
+    }
+
+    /// Source of the memo entry per secret name. A device missing from a memo
+    /// written from a possibly cached snapshot is a mint lag, not a retired install.
+    var lastVerifiedDeviceIdsSourceBySecretName: [String: VerifiedDeviceIdsSource] = [:]
+
+    /// When the memo entry was last written from a directory answer. Entries
+    /// rehydrated from local lanes while offline carry `.distantPast` so the first
+    /// online send consults the directory.
+    var lastVerifiedDeviceIdsRefreshedAtBySecretName: [String: Date] = [:]
+
+    /// Wall clock for time-based policy (memo TTL). Tests replace it instead of sleeping.
+    var now: @Sendable () -> Date = { Date() }
+
+    func setClock(_ clock: @escaping @Sendable () -> Date) {
+        now = clock
+    }
+
     /// Seeds the directory memo. Production writes it from identity refresh.
     /// Tests use this because the stored property cannot be mutated off the actor.
-    func setVerifiedDeviceIds(_ ids: Set<UUID>, for secretName: String) {
+    func setVerifiedDeviceIds(
+        _ ids: Set<UUID>,
+        for secretName: String,
+        source: VerifiedDeviceIdsSource = .live
+    ) {
         lastVerifiedDeviceIdsBySecretName[secretName] = ids
+        lastVerifiedDeviceIdsSourceBySecretName[secretName] = source
+        lastVerifiedDeviceIdsRefreshedAtBySecretName[secretName] = now()
+    }
+
+    /// Whether the warm memo for a peer is older than `verifiedDeviceMemoTTLSeconds`.
+    func verifiedDeviceMemoIsStale(for secretName: String) -> Bool {
+        guard let refreshedAt = lastVerifiedDeviceIdsRefreshedAtBySecretName[secretName] else {
+            return false
+        }
+        return now().timeIntervalSince(refreshedAt) > PQSSessionConstants.verifiedDeviceMemoTTLSeconds
+    }
+
+    func verifiedDeviceIdsSource(for secretName: String) -> VerifiedDeviceIdsSource {
+        lastVerifiedDeviceIdsSourceBySecretName[secretName] ?? .cachedOrUnknown
     }
 
     /// Accounts the transport definitively reported deleted (HTTP 404 / `userNotFound`).
@@ -926,6 +984,31 @@ public actor PQSSession: SessionCacheSynchronizer {
             }
             try await cache.updateLocalSessionContext(encryptedConfig)
             return updated
+        }
+    }
+
+    /// Like `commitLiveSessionContextMutation`, but `mutate` reports whether it
+    /// changed anything; an unchanged context is neither re-installed nor
+    /// persisted. Inbound bookkeeping runs on every frame and must not rewrite
+    /// the encrypted blob when there is nothing to record.
+    ///
+    /// - Returns: The context after mutation when a change was committed, `nil`
+    ///   when no session is active or nothing changed.
+    func commitLiveSessionContextMutationIfChanged(
+        _ mutate: (inout SessionContext) throws -> Bool
+    ) async throws -> SessionContext? {
+        try await withExclusiveSessionContextCommit {
+            guard var context = _sessionContext else { return nil }
+            guard try mutate(&context) else { return nil }
+            _sessionContext = context
+            guard let cache else { return context }
+            let encodedData = try BinaryEncoder().encode(context)
+            let symmetricKey = try await getAppSymmetricKey()
+            guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: symmetricKey) else {
+                throw PQSError.sessionEncryptionError
+            }
+            try await cache.updateLocalSessionContext(encryptedConfig)
+            return context
         }
     }
 
@@ -1184,8 +1267,7 @@ public actor PQSSession: SessionCacheSynchronizer {
 
     // Synchronizes the local configuration with the provided data
     func synchronizeLocalConfiguration(_ data: Data) async throws {
-        let symmetricKey = try await getAppSymmetricKey()
-        guard let decryptedData = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else { return }
+        let decryptedData = try await openSessionContextPlaintext(data)
         let context = try BinaryDecoder().decode(SessionContext.self, from: decryptedData)
         await setSessionContext(context)
     }

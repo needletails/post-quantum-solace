@@ -354,6 +354,10 @@ extension PQSSession {
             // Publish to server *before* persisting local keys. If publish fails, local state stays unchanged
             // and we avoid the INVALIDDEVICECONFIGURATION mismatch (server has old keys, local has new).
             logger.log(level: .debug, message: "Publishing rotated keys to server")
+            // Between publish and local persist, a server-reported signing-key
+            // mismatch is ours to heal by rotating again (see
+            // `recoverFromSigningKeyMismatch`). Outside this window it is not.
+            accountRotationPublishedPendingPersist = true
             let pskData = longTerm.signing.publicKey.rawRepresentation
             guard let rotatingDeviceSigned = allReSigned.first(where: { $0.id == sessionContext.sessionUser.deviceId }) else {
                 throw PQSError.invalidDeviceIdentity
@@ -413,7 +417,8 @@ extension PQSSession {
             }
             
             try await updateRotatedKeySessionContext(sessionContext: sessionContext)
-            
+            accountRotationPublishedPendingPersist = false
+
             // Full compromise rotation changes the account signing key. Replace this
             // device's one-time-key batches before any reestablishment/control messages
             // can make peers fetch keys that were signed by the old identity.
@@ -535,10 +540,7 @@ extension PQSSession {
                     }
                     let data = try await cache.fetchLocalSessionContext()
                     
-                    let symmetricKey = try await getAppSymmetricKey()
-                    guard let configurationData = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
-                        throw PQSError.sessionDecryptionError
-                    }
+                    let configurationData = try await openSessionContextPlaintext(data)
                     
                     var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
                     await sessionContext.sessionUser.deviceKeys.updateRotateKeysDate(Date())
@@ -748,7 +750,16 @@ extension PQSSession {
         logger.log(level: .warning, message: "Confirmed signing key divergence: local vs server device signing key differ")
         
         if serverDevice.isMasterDevice {
-            logger.log(level: .info, message: "Master device detected; re-rotating keys to re-establish signing key agreement")
+            guard accountRotationPublishedPendingPersist else {
+                // The directory disagrees with us and we did not just rotate. Rotating
+                // here on the directory's word would let it force an identity change
+                // (and a trust prompt on every contact) at will. Surface it instead.
+                logger.log(level: .error, message: "Server reports a different signing key for this master device and no rotation is pending; not rotating automatically")
+                auditSink.log(.recovery, "pqs.identity.serverSigningKeyMismatch action=hostAttention")
+                await sessionDelegate?.accountSigningKeyMismatchRequiresAttention()
+                return
+            }
+            logger.log(level: .info, message: "Master device detected with a rotation pending persist; re-rotating keys to re-establish signing key agreement")
             otkUploadCircuitOpen = false
             otkUploadCircuitOpenedAt = nil
             try await rotateKeysOnPotentialCompromise()
@@ -856,10 +867,7 @@ private extension PQSSession {
         
         let config = try await cache.fetchLocalSessionContext()
         
-        let symmetricKey = try await getAppSymmetricKey()
-        guard let configurationData = try crypto.decrypt(data: config, symmetricKey: symmetricKey) else {
-            throw PQSError.sessionDecryptionError
-        }
+        let configurationData = try await openSessionContextPlaintext(config)
         
         return try BinaryDecoder().decode(SessionContext.self, from: configurationData)
     }

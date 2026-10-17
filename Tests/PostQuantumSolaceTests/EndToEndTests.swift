@@ -11457,6 +11457,10 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
         continuation?.yield(finalReceived)
     }
     
+    /// Models a host lookup cache: when set, the normal `findConfiguration` serves
+    /// this snapshot instead of the live store. Cache-bypassing lookups ignore it.
+    var staleConfigurationBySecretName: [String: UserConfiguration] = [:]
+
     func findConfiguration(for secretName: String) async throws -> UserConfiguration {
         await findConfigurationTracker.record(secretName: secretName, deviceId: "", keyCount: 0)
         await beforeFindConfiguration?(secretName)
@@ -11469,6 +11473,15 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
                 throw findConfigurationError
             }
         }
+        if let stale = staleConfigurationBySecretName[secretName] {
+            return stale
+        }
+        return try await store.findConfiguration(for: secretName)
+    }
+
+    /// Live lookup: ignores the modeled cache snapshot.
+    func findConfigurationBypassingCache(for secretName: String) async throws -> UserConfiguration {
+        await findConfigurationTracker.record(secretName: secretName, deviceId: "bypass", keyCount: 0)
         return try await store.findConfiguration(for: secretName)
     }
     
@@ -11518,9 +11531,22 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     {
         try await store.batchDeleteOneTimeKeys(for: secretName, with: id, type: type)
     }
+    /// Optional suspension point before a single-key server delete (race tests).
+    var beforeDeleteOneTimeKeys: (@Sendable () async -> Void)?
+    private let deleteOneTimeKeyTracker = CallTracker()
+
+    /// Key ids this transport was asked to delete server-side, as `(secretName, id, kind)`.
+    var deletedOneTimeKeyIds: [(secretName: String, deviceId: String, keyCount: Int)] {
+        get async { await deleteOneTimeKeyTracker.calls }
+    }
+
     func deleteOneTimeKeys(for secretName: String, with id: String, type: SessionModels.KeyKind)
     async throws
     {
+        await deleteOneTimeKeyTracker.record(secretName: secretName, deviceId: id, keyCount: type == .x25519 ? 0 : 1)
+        if let beforeDeleteOneTimeKeys {
+            await beforeDeleteOneTimeKeys()
+        }
         try await store.deleteOneTimeKeys(for: secretName, with: id, type: type)
     }
     func createUploadPacket(
@@ -11580,16 +11606,28 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     func setLocalSalt(_ salt: String) async {
         localDeviceSalt = salt
     }
-    
+
+    /// When set, `createLocalSessionContext` throws instead of writing — models a
+    /// disk failure between the delete and create of a non-atomic replace.
+    var createLocalSessionContextError: Error?
+    func setCreateLocalSessionContextError(_ error: Error?) {
+        createLocalSessionContextError = error
+    }
+
     init(mockUserData: MockUserData, session: PQSSession, isSender: Bool) {
         self.mockUserData = mockUserData
         self.session = session
         self.isSender = isSender
     }
-    
+
     // MARK: - Used Methods
-    
-    func createLocalSessionContext(_ data: Data) async throws { sessionContext = data }
+
+    func createLocalSessionContext(_ data: Data) async throws {
+        if let createLocalSessionContextError {
+            throw createLocalSessionContextError
+        }
+        sessionContext = data
+    }
     func fetchLocalSessionContext() async throws -> Data {
         guard let context = sessionContext else {
             throw PQSError.databaseNotInitialized
@@ -11598,6 +11636,8 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     }
     func updateLocalSessionContext(_ data: Data) async throws { sessionContext = data }
     func deleteLocalSessionContext() async throws { sessionContext = nil }
+    /// Atomic replace, as a production store does in one transaction.
+    func replaceLocalSessionContext(_ data: Data) async throws { sessionContext = data }
     func fetchLocalDeviceSalt(keyData: Data) async throws -> Data {
         keyData + "salt".data(using: .utf8)!
     }

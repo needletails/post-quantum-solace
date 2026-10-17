@@ -115,8 +115,10 @@ extension MessagePipeline {
             return props.secretName == inboundTask.senderSecretName
                 && props.deviceId == inboundTask.senderDeviceId
         } ?? []
+        // The host store owns row uniqueness; a duplicate id must not trap inbound.
         let rollbackIdentityData = Dictionary(
-            uniqueKeysWithValues: rollbackPeerIdentities.map { ($0.id, $0.data) })
+            rollbackPeerIdentities.map { ($0.id, $0.data) },
+            uniquingKeysWith: { _, last in last })
         
         do {
             // Inbound decrypt: try the preferred/current session, then other
@@ -452,7 +454,8 @@ extension MessagePipeline {
                         // an offline mailbox before any expensive work or delegate dispatch.
                         let dedupDecision = await session.recordReceivedSessionReestablishment(
                             envelope: envelope,
-                            senderDeviceId: inboundTask.senderDeviceId)
+                            senderDeviceId: inboundTask.senderDeviceId,
+                            senderSecretName: inboundTask.senderSecretName)
 
                         switch dedupDecision {
                         case .skipDuplicate:
@@ -498,6 +501,13 @@ extension MessagePipeline {
                             shouldSendRefreshResponse = kind == .peerRefresh && !envelope.isResponse
                             break
                         case .rotateCurrentDevice:
+                            // One sibling must not be able to churn our keys (and every
+                            // contact's lanes) on every frame: honor one repair per
+                            // sibling per cooldown window.
+                            guard await session.shouldHonorLinkedDeviceRepair(from: inboundTask.senderDeviceId) else {
+                                logger.log(level: .info, message: "Linked-device repair from \(inboundTask.senderDeviceId) coalesced (cooldown)")
+                                break
+                            }
                             // Sync local activeUserConfiguration before checking signing-key
                             // agreement; the post-disposition refresh below cannot cover this
                             // because the check needs to run on fresh state.
@@ -586,7 +596,8 @@ extension MessagePipeline {
                                 } catch {
                                     await session.forgetReceivedSessionReestablishment(
                                         envelope: envelope,
-                                        senderDeviceId: inboundTask.senderDeviceId)
+                                        senderDeviceId: inboundTask.senderDeviceId,
+                                        senderSecretName: inboundTask.senderSecretName)
                                     logger.log(level: .warning, message: "Failed to emit peerRefresh response: \(error)")
                                 }
                             }
@@ -620,13 +631,28 @@ extension MessagePipeline {
                         }
                         
                     case .synchronizeOneTimeKeys(let info):
-                        try await removeKeys(
+                        // The payload ids are peer-supplied. Only the one-time keys
+                        // the verified ratchet header actually cites are retired, and
+                        // only their published halves: the private halves stay until
+                        // deferred consumption confirms the reverse handshake.
+                        try await retireCitedOneTimeKeys(
                             session: session,
-                            x25519Id: info.recipientX25519Id,
-                            mlKEMId: info.recipientMLKEMId)
+                            headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
+                            headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                            claimed: info,
+                            senderSecretName: inboundTask.senderSecretName,
+                            senderDeviceId: inboundTask.senderDeviceId)
                         canSaveMessage = false
                     case .refreshOneTimeKeys:
                         canSaveMessage = false
+                        // Any contact can ask; a flood must not cost a keygen + upload
+                        // per frame. Within the cooldown the pool is still fresh from the
+                        // previous replenish, so just acknowledge.
+                        guard await session.shouldHonorInboundOneTimeKeyRefresh(from: inboundTask.senderSecretName) else {
+                            logger.log(level: .info, message: "refreshOneTimeKeys from \(inboundTask.senderSecretName) coalesced (cooldown); acknowledging")
+                            try await session.ackPublishedOneTimeKeysReplenished(to: inboundTask.senderSecretName)
+                            break
+                        }
                         logger.log(
                             level: .info,
                             message: "Received refreshOneTimeKeys from \(inboundTask.senderSecretName); replenishing local published OTK batch")
@@ -652,7 +678,8 @@ extension MessagePipeline {
                     if let processedReestablishment {
                         await session.forgetReceivedSessionReestablishment(
                             envelope: processedReestablishment,
-                            senderDeviceId: inboundTask.senderDeviceId)
+                            senderDeviceId: inboundTask.senderDeviceId,
+                            senderSecretName: inboundTask.senderSecretName)
                     }
                     logger.log(level: .error, message: "Error handling transport event from \(inboundTask.senderSecretName): \(error)")
                     throw error
@@ -869,11 +896,17 @@ extension MessagePipeline {
             headerOneTimeKeyId: headerOneTimeKeyId,
             headerMLKEMOneTimeKeyId: headerMLKEMOneTimeKeyId,
             session: session)
-        preferredSessionIdentityIdByPeerDevice[
-            peerDeviceIdentityPreferenceKey(
-                secretName: inboundTask.senderSecretName,
-                deviceId: inboundTask.senderDeviceId)
-        ] = activated.id
+        // Only an active lane may become the outbound preference; a decrypt-only
+        // archive (promotion refused) must not capture general outbound.
+        let activatedIsActive = try await activated.props(symmetricKey: session.getDatabaseSymmetricKey())
+            .map { !$0.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) } ?? false
+        if activatedIsActive {
+            preferredSessionIdentityIdByPeerDevice[
+                peerDeviceIdentityPreferenceKey(
+                    secretName: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId)
+            ] = activated.id
+        }
         clearSurgicalControlEpisode(
             secretName: inboundTask.senderSecretName,
             deviceId: inboundTask.senderDeviceId)
@@ -929,79 +962,21 @@ extension MessagePipeline {
         session: PQSSession
     ) async {
         do {
-            guard var sessionContext = await session.sessionContext else { return }
-            var deviceKeys = sessionContext.sessionUser.deviceKeys
-            var mutated = false
-            var confirmed: [PendingOneTimeKeyConsumption] = []
-            // Only the X25519 `oneTimeKeyId` discriminates lanes here. In
-            // DRK 4.0.0 a live lane cites its bootstrap OTK id for its whole
-            // lifetime (the state OTK participates in every epoch re-key), so
-            // the deletion-confirming events are:
-            //   1. A committed frame on the same lane citing a *different* id —
-            //      the peer re-fetched our bundle and epoch re-keyed the lane,
-            //      so the superseded key can never be legitimately cited again.
-            //   2. A committed frame with no id — a lane established without an
-            //      OTK, and the forward-compatible trigger for a future DRK
-            //      that stops citing after the reverse handshake completes.
-            // `mlKEMOneTimeKeyId` mirrors non-optional lane state and is cited
-            // on every frame forever, so it never drives confirmation alone.
-            if let headerOneTimeKeyId {
-                let laneEntries = deviceKeys.removePendingOneTimeKeyConsumptions(for: laneId)
-                for entry in laneEntries {
-                    if entry.oneTimeKeyId == headerOneTimeKeyId {
-                        deviceKeys.recordPendingOneTimeKeyConsumption(entry)
-                    } else {
-                        confirmed.append(entry)
-                        mutated = true
-                    }
-                }
-                // Record only keys we can actually delete later. A bootstrap
-                // decrypted purely via archived-state fallback (pool already
-                // rotated) has nothing to defer.
-                let alreadyPending = (deviceKeys.pendingOneTimeKeyConsumptions ?? []).contains {
-                    $0.sessionIdentityId == laneId && $0.oneTimeKeyId == headerOneTimeKeyId
-                }
-                if !alreadyPending,
-                   deviceKeys.oneTimePrivateKeys.contains(where: { $0.id == headerOneTimeKeyId }) {
-                    // The cited MLKEM id is consumable only while it is a pool key —
-                    // the final (last-resort) MLKEM key is never consumed.
-                    let pendingMLKEMId = headerMLKEMOneTimeKeyId.flatMap { id in
-                        deviceKeys.mlKEMOneTimePrivateKeys.contains(where: { $0.id == id }) ? id : nil
-                    }
-                    deviceKeys.recordPendingOneTimeKeyConsumption(PendingOneTimeKeyConsumption(
-                        sessionIdentityId: laneId,
-                        oneTimeKeyId: headerOneTimeKeyId,
-                        mlKEMOneTimeKeyId: pendingMLKEMId))
-                    mutated = true
-                    audit(.recovery, "pqs.otk.consumptionPending lane=\(laneId.uuidString) otkId=\(headerOneTimeKeyId.uuidString) mlkemId=\(pendingMLKEMId?.uuidString ?? "nil")")
-                }
-            } else {
-                confirmed = deviceKeys.removePendingOneTimeKeyConsumptions(for: laneId)
-                mutated = !confirmed.isEmpty
+            // The ledger rules live in `DeviceKeys.applyCommittedInboundFrame`;
+            // they run inside the exclusive session-context commit so a
+            // concurrent one-time-key batch commit is never rolled back.
+            guard let outcome = try await session.commitDeferredOneTimeKeyConsumption(
+                laneId: laneId,
+                headerOneTimeKeyId: headerOneTimeKeyId,
+                headerMLKEMOneTimeKeyId: headerMLKEMOneTimeKeyId)
+            else { return }
+            if let recorded = outcome.recordedPending {
+                audit(.recovery, "pqs.otk.consumptionPending lane=\(laneId.uuidString) otkId=\(recorded.oneTimeKeyId?.uuidString ?? "nil") mlkemId=\(recorded.mlKEMOneTimeKeyId?.uuidString ?? "nil")")
             }
-
-            for entry in confirmed {
-                if let otkId = entry.oneTimeKeyId,
-                   !deviceKeys.isOneTimeKeyStillPending(otkId) {
-                    deviceKeys.oneTimePrivateKeys.removeAll { $0.id == otkId }
-                }
-                if let kemId = entry.mlKEMOneTimeKeyId,
-                   !deviceKeys.isMLKEMOneTimeKeyStillPending(kemId) {
-                    deviceKeys.mlKEMOneTimePrivateKeys.removeAll { $0.id == kemId }
-                }
+            for entry in outcome.confirmed {
                 let trigger = headerOneTimeKeyId == nil ? "reverseHandshake" : "laneRekey"
                 audit(.recovery, "pqs.otk.consumedAfterConfirmation trigger=\(trigger) lane=\(laneId.uuidString) otkId=\(entry.oneTimeKeyId?.uuidString ?? "nil") mlkemId=\(entry.mlKEMOneTimeKeyId?.uuidString ?? "nil")")
             }
-
-            guard mutated else { return }
-            sessionContext.sessionUser.deviceKeys = deviceKeys
-            sessionContext.updateSessionUser(sessionContext.sessionUser)
-            await session.setSessionContext(sessionContext)
-            let encodedData = try BinaryEncoder().encode(sessionContext)
-            guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: session.getAppSymmetricKey()) else {
-                throw PQSError.sessionEncryptionError
-            }
-            try await session.cache?.updateLocalSessionContext(encryptedConfig)
         } catch {
             logger.log(
                 level: .error,
@@ -1681,8 +1656,15 @@ extension MessagePipeline {
             symmetricKey: databaseSymmetricKey,
             preferredDevice: preferredDevice)
         
-        if sessionIdentity == nil { // SessionIdentity shouldn't be nil, but in case refresh never occured force it.
-            identities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
+        if sessionIdentity == nil {
+            // No row for this device id. That is evidence the directory changed
+            // (a just-linked device), so the refresh must bypass any host lookup
+            // cache: the memo it writes decides whether a still-missing row is a
+            // retired install or a mint lag.
+            identities = try await session.refreshIdentities(
+                secretName: inboundTask.senderSecretName,
+                forceRefresh: true,
+                lookup: .bypassCache)
             sessionIdentity = await bestSessionIdentity(
                 secretName: inboundTask.senderSecretName,
                 deviceId: inboundTask.senderDeviceId,
@@ -1712,7 +1694,12 @@ extension MessagePipeline {
         if try signedMessage.verifySignature(using: currentKey) {
             return try decode(signedMessage)
         } else {
-            // Signature verification failed with current key, likely due to key rotation
+            // Signature verification failed with current key, likely due to key rotation.
+            // The refresh runs under the peer pin and is throttled: a stream of garbage
+            // signatures must not cost one directory lookup each.
+            guard await session.shouldForceIdentityRefresh(secretName: inboundTask.senderSecretName) else {
+                throw PQSError.invalidSignature
+            }
             let refreshedIdentities = try await session.refreshIdentities(secretName: inboundTask.senderSecretName, forceRefresh: true)
             
             // Find the refreshed identity with updated keys
@@ -1732,23 +1719,11 @@ extension MessagePipeline {
             let refreshedKey = try Curve25519.Signing.PublicKey(rawRepresentation: refreshedProps.signingPublicKey)
             
             guard try signedMessage.verifySignature(using: refreshedKey) else {
-                let archivedIdentities = try await session.fetchArchivedSessionIdentities(
-                    secretName: inboundTask.senderSecretName,
-                    deviceId: inboundTask.senderDeviceId)
-                for archived in archivedIdentities {
-                    guard let archivedProps = await archived.props(symmetricKey: databaseSymmetricKey) else {
-                        continue
-                    }
-                    guard let archivedKey = try? Curve25519.Signing.PublicKey(rawRepresentation: archivedProps.signingPublicKey) else {
-                        continue
-                    }
-                    if try signedMessage.verifySignature(using: archivedKey) {
-                        logger.log(
-                            level: .info,
-                            message: "Verified inbound message from archived SessionIdentity for \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId))")
-                        return try decode(signedMessage, identity: archived)
-                    }
-                }
+                // No archived-key fallback. A per-device signing key only changes on
+                // compromise rotation, so a frame that verifies under a retired key
+                // is exactly the frame that rotation exists to reject; accepting it
+                // (and promoting its lane) would hand outbound back to the old keys.
+                audit(.recovery, "pqs.inbound.signatureRejected sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) reason=notCurrentDeviceKey")
                 throw PQSError.invalidSignature
             }
             

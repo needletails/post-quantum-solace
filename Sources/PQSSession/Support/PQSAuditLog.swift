@@ -11,8 +11,43 @@
 //  - When the fence is off, `log` / `configure` are no-ops (no string build, no I/O)
 //
 
+import Crypto
 import Foundation
 import NeedleTailLogger
+
+/// Redacts peer identifiers from audit lines before they reach disk. Secret names
+/// document themselves as "must not be logged"; the audit file still needs a
+/// stable per-peer token to correlate lines, so each value becomes `h:<8 hex>`.
+public enum PQSAuditRedaction {
+    /// `key=value` fields whose value is a secret name (or a comma list of them).
+    static let secretNameKeys: Set<String> = [
+        "sender", "peer", "requester", "requesterName", "recipientSecret",
+        "recipientSecretName", "secretName", "members", "senderSecretName", "recipient",
+    ]
+
+    public static func token(for secretName: String) -> String {
+        let digest = SHA256.hash(data: Data(secretName.utf8))
+        return "h:" + digest.prefix(4).map { String(format: "%02x", $0) }.joined()
+    }
+
+    public static func redact(_ line: String) -> String {
+        line.split(separator: " ", omittingEmptySubsequences: false).map { field -> String in
+            guard let equals = field.firstIndex(of: "=") else { return String(field) }
+            let key = String(field[field.startIndex..<equals])
+            guard secretNameKeys.contains(key) else { return String(field) }
+            let value = field[field.index(after: equals)...]
+            guard !value.isEmpty else { return String(field) }
+            let redacted = value.split(separator: ",").map { item -> String in
+                // `recipient=nickname:bob` style tags keep their kind prefix.
+                if let colon = item.firstIndex(of: ":"), item[item.startIndex..<colon].allSatisfy(\.isLetter) {
+                    return String(item[item.startIndex...colon]) + token(for: String(item[item.index(after: colon)...]))
+                }
+                return token(for: String(item))
+            }.joined(separator: ",")
+            return key + "=" + redacted
+        }.joined(separator: " ")
+    }
+}
 
 public enum PQSAuditLog {
     public enum Channel: String, Sendable, CaseIterable {
@@ -90,28 +125,35 @@ public struct FilePQSAuditSink: PQSAuditSink {
 
         guard enabled else { return }
 
-        let line = message()
-        let logger: NeedleTailLogger
-        if let existingLogger {
-            logger = existingLogger
-        } else {
-            storage.lock.lock()
-            defer { storage.lock.unlock() }
-            if let again = storage.fileLoggers[channel] {
-                logger = again
+        let line = PQSAuditRedaction.redact(message())
+        let storage = self.storage
+        // File I/O (and the first-use logger construction, which reads the existing
+        // file to count lines) runs off the caller: `log` is called from inside the
+        // session actor and the crypto executor.
+        Self.writeQueue.async {
+            let logger: NeedleTailLogger
+            if let existingLogger {
+                logger = existingLogger
             } else {
-                let created = NeedleTailLogger(
-                    channel.loggerLabel,
-                    maxLines: 5_000,
-                    maxLineLength: 512,
-                    writeToFile: true)
-                storage.fileLoggers[channel] = created
-                logger = created
+                storage.lock.lock()
+                defer { storage.lock.unlock() }
+                if let again = storage.fileLoggers[channel] {
+                    logger = again
+                } else {
+                    let created = NeedleTailLogger(
+                        channel.loggerLabel,
+                        maxLines: 5_000,
+                        maxLineLength: 512,
+                        writeToFile: true)
+                    storage.fileLoggers[channel] = created
+                    logger = created
+                }
             }
+            logger.log(level: level, message: Message(stringLiteral: line), displayIcons: false)
         }
-
-        logger.log(level: level, message: Message(stringLiteral: line), displayIcons: false)
     }
+
+    private static let writeQueue = DispatchQueue(label: "com.needletails.pqs.audit", qos: .utility)
 }
 
 extension PQSAuditLog {

@@ -170,8 +170,9 @@ extension PQSSession {
     /// - Returns: A `PQSSession` object representing the started session.
     /// - Throws: An error of type `PQSError` if the session start fails due to various reasons.
     public func unlock(appPassword: String) async throws -> PQSSession {
-        await setAppPassword(appPassword)
-        // Ensure the identity store is initialized
+        // The live password is replaced only after this password has decrypted
+        // the stored context (see below); a failed unlock on a live session must
+        // not re-key the next commit.
         guard let cache else {
             throw PQSError.databaseNotInitialized
         }
@@ -188,19 +189,22 @@ extension PQSSession {
         let saltData = try await cache.fetchLocalDeviceSalt(keyData: passwordData)
 
         // Derive the symmetric key from the password and salt - This is the AppSymmetricKey
-        let symmetricKey = await crypto.deriveStrictSymmetricKey(
-            data: passwordData,
-            salt: saltData
-        )
+        let symmetricKey = deriveAppSymmetricKey(passwordData: passwordData, salt: saltData)
 
         do {
-            // Decrypt the configuration data
-            guard let configurationData = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
-                throw PQSError.sessionDecryptionError
+            // Decrypt the configuration data: current key first, then the legacy
+            // generation-1 key, in which case the blob is re-sealed below.
+            let opened = try await openSessionContextBlob(data, passwordData: passwordData, salt: saltData)
+            let sessionContext = opened.context
+            await setAppPassword(appPassword)
+            if opened.needsRekey {
+                let encoded = try BinaryEncoder().encode(sessionContext)
+                guard let resealed = try crypto.encrypt(data: encoded, symmetricKey: symmetricKey) else {
+                    throw PQSError.sessionEncryptionError
+                }
+                try await cache.updateLocalSessionContext(resealed)
+                logger.log(level: .info, message: "Re-sealed session context under the generation-2 app key")
             }
-
-            // Decode the session context from the decrypted data
-            let sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
 
             // Diagnostic-only per-device identity check. Logs (does not throw) when the
             // local `signingPrivateKey` does not match this device's `signingPublicKey` entry in

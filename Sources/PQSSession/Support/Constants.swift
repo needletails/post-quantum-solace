@@ -122,6 +122,13 @@ public enum PQSSessionConstants: Sendable {
     /// Bound for in-memory outbound device-send ledger entries (`OutboundDeviceSendRecord`).
     public static let outboundDeviceSendRecordMaxCount = 2_000
 
+    /// How long the per-peer verified-device memo is trusted on the warm send path
+    /// before the directory is consulted again. Without a bound, a peer device
+    /// linked after the first lane existed received nothing until the process
+    /// restarted or that device happened to send first (bug report F1). Matches the
+    /// host lookup cache's maximum serve age so the two expire together.
+    package static let verifiedDeviceMemoTTLSeconds: TimeInterval = 300
+
     // MARK: - Session Reestablishment Coalescing
 
     /// Cooldown window during which repeated `peerRefresh` emissions to the same scope are suppressed.

@@ -1170,7 +1170,10 @@ extension MessagePipeline {
             peerDeviceId: props.deviceId,
             session: session)
 
-        await rememberRecentOutboundReplayIfNeeded(outboundTask, session: session)
+        await rememberRecentOutboundReplayIfNeeded(
+            outboundTask,
+            recipientDeviceId: props.deviceId,
+            session: session)
 
         if outboundTask.isPersistedOutbound || transportMetadata.requiresServerAck {
             await registerUnackedServerAccept(

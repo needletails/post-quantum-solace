@@ -202,12 +202,13 @@ struct OrphanOwnershipHealSourceTests {
     func inboundResendPeeksBeforeConsumingOneCredit() {
         var store = RecentOutboundReplayStore<String>(ttl: 600, limit: 256, maxReplays: 5)
         let now = Date(timeIntervalSince1970: 1_000)
-        store.remember("payload", sharedId: "control", now: now)
-        let firstPeek = store.contains(sharedId: "control", now: now)
-        let secondPeek = store.contains(sharedId: "control", now: now)
+        let device = UUID()
+        store.remember("payload", sharedId: "control", recipientDeviceId: device, now: now)
+        let firstPeek = store.contains(sharedId: "control", recipientDeviceId: device, now: now)
+        let secondPeek = store.contains(sharedId: "control", recipientDeviceId: device, now: now)
         #expect(firstPeek)
         #expect(secondPeek)
-        let replay = store.consume(sharedId: "control", now: now)
+        let replay = store.consume(sharedId: "control", recipientDeviceId: device, now: now)
         #expect(replay?.message == "payload")
     }
 }

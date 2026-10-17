@@ -227,6 +227,23 @@ public extension PQSSession {
         forceRefresh: Bool = false,
         sendOneTimeIdentities: Bool = false
     ) async throws -> [SessionIdentity] {
+        try await refreshIdentities(
+            secretName: secretName,
+            createIdentity: createIdentity,
+            forceRefresh: forceRefresh,
+            sendOneTimeIdentities: sendOneTimeIdentities,
+            lookup: .cached)
+    }
+
+    /// Internal variant that also chooses how the directory is consulted. Only
+    /// paths with evidence that the directory changed pass `.bypassCache`.
+    internal func refreshIdentities(
+        secretName: String,
+        createIdentity: Bool = true,
+        forceRefresh: Bool = false,
+        sendOneTimeIdentities: Bool = false,
+        lookup: ConfigurationLookup
+    ) async throws -> [SessionIdentity] {
         // Hide inactive snapshot identities from normal identity refresh flows.
         let existingIdentities = try await getSessionIdentities(with: secretName)
         logger.log(level: .info, message: "existingIdentities \(existingIdentities.count)")
@@ -267,6 +284,7 @@ public extension PQSSession {
                     createIdentity: createIdentity,
                     forceRefresh: forceRefresh,
                     sendOneTimeIdentities: sendOneTimeIdentities,
+                    lookup: lookup,
                     oneTime: syncKeys?.x25519Id,
                     oneTime: syncKeys?.mlKEMId)
                 
@@ -314,6 +332,8 @@ public extension PQSSession {
     internal func markAccountDeleted(secretName: String) {
         knownDeletedAccountSecretNames.insert(secretName)
         lastVerifiedDeviceIdsBySecretName.removeValue(forKey: secretName)
+        lastVerifiedDeviceIdsSourceBySecretName.removeValue(forKey: secretName)
+        lastVerifiedDeviceIdsRefreshedAtBySecretName.removeValue(forKey: secretName)
         logger.log(
             level: .info,
             message: "Marked account deleted (userNotFound); excluding from fan-out secretName=\(secretName)")
@@ -380,8 +400,14 @@ public extension PQSSession {
             return localActiveDeviceIds
         }
 
-        func fetchVerifiedIdsFromRemote() async throws -> Set<UUID> {
-            let configuration = try await transportDelegate.findConfiguration(for: secretName)
+        func fetchVerifiedIdsFromRemote(lookup: ConfigurationLookup = .cached) async throws -> Set<UUID> {
+            let configuration: UserConfiguration
+            switch lookup {
+            case .cached:
+                configuration = try await transportDelegate.findConfiguration(for: secretName)
+            case .bypassCache:
+                configuration = try await transportDelegate.findConfigurationBypassingCache(for: secretName)
+            }
             try validateUserConfigurationSignatures(configuration)
             let verifiedDevices = try verifiedDevicesWithUsableKeyMaterial(
                 in: configuration,
@@ -389,34 +415,49 @@ public extension PQSSession {
                 source: "remote")
             let ids = Set(verifiedDevices.map(\.deviceId))
             lastVerifiedDeviceIdsBySecretName[secretName] = ids
+            lastVerifiedDeviceIdsSourceBySecretName[secretName] =
+                lookup == .bypassCache ? .live : .cachedOrUnknown
+            lastVerifiedDeviceIdsRefreshedAtBySecretName[secretName] = now()
             return ids
         }
+
+        // The memo as it stood before this call touched it. The warm-lane decision
+        // below must not read a memo that `fetchVerifiedIdsFromRemote` has just
+        // written: a cold start that learned about a newly linked device would then
+        // count as warm and never lane it (bug report F1).
+        let memoBeforeFetch = lastVerifiedDeviceIdsBySecretName[secretName] ?? []
+        let memoIsStale = verifiedDeviceMemoIsStale(for: secretName)
 
         // Non-viable: never block compose on live config — local lanes are enough
         // to persist and park until `resumeJobQueue`.
         let offlineOutboundPersist = !isViable
         if offlineOutboundPersist,
-           lastVerifiedDeviceIdsBySecretName[secretName]?.isEmpty != false,
+           memoBeforeFetch.isEmpty,
            !localActiveDeviceIds.isEmpty {
             // The verified-id memo is intentionally in-memory, but active
             // SessionIdentity rows survive restart. Rehydrate the offline candidate
             // set from those established lanes so compose never needs HTTP offline.
+            // Stamped as already stale so the first online send asks the directory.
             lastVerifiedDeviceIdsBySecretName[secretName] = localActiveDeviceIds
+            lastVerifiedDeviceIdsSourceBySecretName[secretName] = .cachedOrUnknown
+            lastVerifiedDeviceIdsRefreshedAtBySecretName[secretName] = .distantPast
         }
 
         var verifiedIds: Set<UUID>
         var usedConfigurationLookupFallback = false
+        var fetchedThisCall = false
         if offlineOutboundPersist {
             verifiedIds = localLaneFallbackVerifiedIds()
             if verifiedIds.isEmpty {
                 throw PQSError.cannotFindUserConfiguration
             }
             usedConfigurationLookupFallback = true
-        } else if let cached = lastVerifiedDeviceIdsBySecretName[secretName], !cached.isEmpty {
-            verifiedIds = cached
+        } else if !memoBeforeFetch.isEmpty, !memoIsStale {
+            verifiedIds = memoBeforeFetch
         } else {
             do {
                 verifiedIds = try await fetchVerifiedIdsFromRemote()
+                fetchedThisCall = true
             } catch PQSError.userNotFound {
                 // Deleted accounts must not ride stale local SessionIdentity rows
                 // (channel roster ghosts like a removed `bob` still listed as members).
@@ -434,21 +475,22 @@ public extension PQSSession {
 
         let hasDevicesAbsentFromVerified = !localActiveDeviceIds.isSubset(of: verifiedIds)
         let missingVerifiedDevices = !verifiedIds.isSubset(of: localActiveDeviceIds)
-        // Warm baseline: local lanes + last verified snapshot already exist. Do not
-        // block compose on live findConfiguration — membership drift is reconciled
-        // on the next successful config fetch, not on every DM send (dogfood N1).
-        let hasWarmLocalLanes = !localActiveDeviceIds.isEmpty
-            && !(lastVerifiedDeviceIdsBySecretName[secretName] ?? []).isEmpty
+        // Warm baseline: local lanes + a verified snapshot that predates this call.
+        // Do not block compose on live findConfiguration for mere membership drift
+        // (dogfood N1) — except when a verified device has no lane at all: that
+        // device would otherwise receive nothing until it happened to send first.
+        let hasWarmLocalLanes = !localActiveDeviceIds.isEmpty && !memoBeforeFetch.isEmpty
         var forceRefresh = !offlineOutboundPersist
             && !usedConfigurationLookupFallback
-            && !hasWarmLocalLanes
-            && (existing.isEmpty
-                || hasDevicesAbsentFromVerified
-                || missingVerifiedDevices)
+            && (missingVerifiedDevices
+                || (!hasWarmLocalLanes && (existing.isEmpty || hasDevicesAbsentFromVerified)))
+        // A verified device without a lane is evidence the directory changed;
+        // answer it from the directory, not a host lookup cache.
+        let lookup: ConfigurationLookup = missingVerifiedDevices ? .bypassCache : .cached
 
-        if forceRefresh {
+        if forceRefresh, !fetchedThisCall {
             do {
-                verifiedIds = try await fetchVerifiedIdsFromRemote()
+                verifiedIds = try await fetchVerifiedIdsFromRemote(lookup: lookup)
             } catch {
                 // Keep local/cached membership; still encrypt to known lanes.
                 forceRefresh = false
@@ -467,7 +509,8 @@ public extension PQSSession {
             secretName: secretName,
             createIdentity: true,
             forceRefresh: forceRefresh,
-            sendOneTimeIdentities: false)
+            sendOneTimeIdentities: false,
+            lookup: lookup)
 
         var byDevice: [UUID: SessionIdentity] = [:]
         for deviceId in verifiedIds {
@@ -530,6 +573,14 @@ public extension PQSSession {
             }
         }
         let result = Array(byDevice.values)
+        let unlanedVerifiedDevices = verifiedIds.subtracting(byDevice.keys)
+        if !unlanedVerifiedDevices.isEmpty {
+            // A silent skip here is exactly how a linked device went dark; make it visible.
+            logger.log(
+                level: .warning,
+                message: "Chat fan-out could not lane \(unlanedVerifiedDevices.count) verified device(s) for \(secretName); copies to them are missing")
+            auditSink.log(.send, "pqs.send.fanoutMissingVerifiedDevices peer=\(secretName) missing=\(unlanedVerifiedDevices.count) laned=\(result.count) forceRefresh=\(forceRefresh)")
+        }
         logger.log(
             level: .info,
             message: "Chat fan-out resolved \(result.count) device lane(s) for \(secretName) forceRefresh=\(forceRefresh)")
@@ -1482,12 +1533,30 @@ public extension PQSSession {
             return proven
         }
 
-        if provenProps.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) {
-            return try await promoteArchivedSessionIdentityToActive(proven)
-        }
-
         guard let cache else {
             throw PQSError.databaseNotInitialized
+        }
+
+        if provenProps.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) {
+            // An archive may win decrypt for a delayed frame, but it only becomes the
+            // outbound lane again when it still carries the peer device's current
+            // identity keys. An archive left behind by a key rotation stays
+            // decrypt-only; promoting it would route our sends to retired keys.
+            let currentActive = try await cache.fetchSessionIdentities().asyncFirst { identity in
+                guard identity.id != proven.id,
+                      let props = await identity.props(symmetricKey: symmetricKey) else { return false }
+                return props.secretName == provenProps.secretName
+                    && props.deviceId == provenProps.deviceId
+                    && !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            }
+            if let currentActive,
+               let activeProps = await currentActive.props(symmetricKey: symmetricKey),
+               activeProps.signingPublicKey != provenProps.signingPublicKey
+                || activeProps.longTermPublicKey != provenProps.longTermPublicKey {
+                auditSink.log(.recovery, "pqs.recovery.archivePromotionRefused peer=\(provenProps.secretName) deviceId=\(provenProps.deviceId.uuidString) reason=identityKeysRetired")
+                return proven
+            }
+            return try await promoteArchivedSessionIdentityToActive(proven)
         }
         let allIdentities = try await cache.fetchSessionIdentities()
         var demotedSiblingCount = 0
@@ -1920,6 +1989,7 @@ public extension PQSSession {
         createIdentity: Bool = true,
         forceRefresh: Bool,
         sendOneTimeIdentities: Bool = false,
+        lookup: ConfigurationLookup = .cached,
         oneTime x25519Id: String?,
         oneTime mlKEMId: String?
     ) async throws -> [SessionIdentity] {
@@ -1947,11 +2017,30 @@ public extension PQSSession {
         
         if createIdentity, forceRefresh || sessionIdentities.isEmpty || !sessionIdentities.contains(secretName) {
 
-            // Get the user configuration for the recipient
-            var configuration = try await transportDelegate.findConfiguration(for: secretName)
+            // Get the user configuration for the recipient. A missing-row refresh
+            // has evidence the directory changed and must not be answered by a
+            // host lookup cache.
+            // A forced refresh is itself evidence that the current view is wrong
+            // (control event, rotation, missing row), so it always goes to the
+            // directory: a host lookup cache answering it is how bug report F2/F3
+            // turned a just-linked device into a "retired" one and pruned live lanes.
+            let lookup: ConfigurationLookup = forceRefresh ? .bypassCache : lookup
+            var configuration: UserConfiguration
+            switch lookup {
+            case .cached:
+                configuration = try await transportDelegate.findConfiguration(for: secretName)
+            case .bypassCache:
+                configuration = try await transportDelegate.findConfigurationBypassingCache(for: secretName)
+            }
             try validateUserConfigurationSignatures(configuration)
 
             if isSelfSecretName {
+                // TOFU pin on our own account key, on every self refresh. Forced
+                // refreshes also run the pinned adoption below, but a non-forced
+                // refresh used to mint sibling lanes straight from the fetched
+                // document: a directory serving a self-consistent configuration
+                // under its own key would get a lane and every personal fan-out copy.
+                try enforceSelfAccountSigningKeyPin(configuration)
                 // The local context is authoritative for own-account device *additions*:
                 // device linking signs the child locally before every remote read path
                 // observes it (transport lookup caches, read-after-publish races). Merge
@@ -1987,6 +2076,9 @@ public extension PQSSession {
                 secretName: secretName,
                 source: "remote")
             lastVerifiedDeviceIdsBySecretName[secretName] = Set(verifiedDevices.map(\.deviceId))
+            lastVerifiedDeviceIdsSourceBySecretName[secretName] =
+                lookup == .bypassCache ? .live : .cachedOrUnknown
+            lastVerifiedDeviceIdsRefreshedAtBySecretName[secretName] = now()
             var collected = [UserDeviceConfiguration]()
             var oneTimeNotifiedDeviceIds = Set<UUID>()
             // Create a set of existing device IDs from the existing identities for quick lookup
@@ -2228,6 +2320,26 @@ public extension PQSSession {
         }
     }
 
+    /// Rejects a fetched own-account configuration whose signing key differs from
+    /// the pinned one. Legitimate rotations update the pin first (compromise
+    /// rotation, reprovisioning bundle, `acknowledgeAccountIdentityChange`), so a
+    /// mismatch here is a directory serving someone else's key. A matching fetch
+    /// clears a previously raised mismatch gate, as `adoptVerifiedUserConfiguration` does.
+    private func enforceSelfAccountSigningKeyPin(_ configuration: UserConfiguration) throws {
+        guard let pinnedKey = _sessionContext?.activeUserConfiguration.signingPublicKey,
+              !pinnedKey.isEmpty
+        else { return }
+        if pinnedKey != configuration.signingPublicKey {
+            logger.log(
+                level: .error,
+                message: "[refreshSessionIdentities] own-account signing key changed without an authenticated rotation; refusing to mint lanes. pinnedPrefix=\(pinnedKey.prefix(8).map { String(format: "%02x", $0) }.joined()) incomingPrefix=\(configuration.signingPublicKey.prefix(8).map { String(format: "%02x", $0) }.joined())")
+            auditSink.log(.recovery, "pqs.identity.selfSigningKeyMismatch deviceCount=\(configuration.signedDevices.count)")
+            setAccountIdentityRequiresAcknowledgement(true)
+            throw PQSError.signingKeyOutOfSync
+        }
+        setAccountIdentityRequiresAcknowledgement(false)
+    }
+
     private func enforcePeerAccountSigningKeyPin(
         for secretName: String,
         configuration: UserConfiguration,
@@ -2265,6 +2377,40 @@ public extension PQSSession {
             logger.log(
                 level: .debug,
                 message: "Verified pinned peer account signing key for \(secretName)")
+            // The Contact is the host-acknowledged truth; keep the context pin in step
+            // so a later Contact removal does not reopen TOFU for this peer.
+            try await recordPeerAccountSigningKeyPin(configuration.signingPublicKey, for: secretName)
+            return
+        }
+
+        // No Contact row (channel member, pre-friendship sender): the first lane we
+        // minted pinned the account key in the session context. A directory serving
+        // a different key is an identity change the user has to acknowledge
+        // (creating or updating the Contact re-pins through the branch above).
+        let contextPin = _sessionContext?.peerAccountSigningKeyPins?[secretName]
+        if let contextPin, !contextPin.isEmpty {
+            guard contextPin == configuration.signingPublicKey else {
+                logger.log(
+                    level: .error,
+                    message: "[refreshSessionIdentities] account signing key for non-contact peer \(secretName) changed without acknowledgement; refusing to refresh")
+                auditSink.log(.recovery, "pqs.identity.peerSigningKeyMismatch peer=\(secretName) pinSource=sessionContext")
+                throw PQSError.peerSigningKeyOutOfSync
+            }
+            return
+        }
+        try await recordPeerAccountSigningKeyPin(configuration.signingPublicKey, for: secretName)
+    }
+
+    /// Persists a peer's account signing key as a TOFU pin in the session context.
+    /// No-op when the key is already pinned, so warm refreshes do not rewrite the blob.
+    private func recordPeerAccountSigningKeyPin(_ key: Data, for secretName: String) async throws {
+        guard !key.isEmpty else { return }
+        _ = try await commitLiveSessionContextMutationIfChanged { context in
+            guard context.peerAccountSigningKeyPins?[secretName] != key else { return false }
+            var pins = context.peerAccountSigningKeyPins ?? [:]
+            pins[secretName] = key
+            context.peerAccountSigningKeyPins = pins
+            return true
         }
     }
 

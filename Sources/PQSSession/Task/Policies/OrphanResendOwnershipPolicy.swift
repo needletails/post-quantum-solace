@@ -8,6 +8,7 @@
 //
 
 import Foundation
+import SessionModels
 
 /// Pure policy for whether this device may service a `requestMessageResend` id.
 public enum OrphanResendOwnershipPolicy: Sendable {
@@ -42,5 +43,19 @@ public enum OrphanResendOwnershipPolicy: Sendable {
             return .deferNotContentOwner
         }
         return .continueCrossAccountLookup
+    }
+
+    /// Whether the requesting device is the one the cited envelope was encrypted
+    /// for. A missing record means the id names no envelope this device sent, so
+    /// no plaintext lookup may happen on its behalf.
+    static func requesterMayReplay(
+        record: OutboundDeviceSendRecord?,
+        requesterSecretName: String,
+        requestingDeviceId: UUID
+    ) -> Bool {
+        guard let record else { return false }
+        return record.recipientDeviceId == requestingDeviceId
+            && SecretName(record.recipientSecretName).rawValue
+                == SecretName(requesterSecretName).rawValue
     }
 }

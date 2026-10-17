@@ -129,9 +129,13 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Parameter data: The new configuration data.
     /// - Throws: An error if the update fails.
     func updateLocalSessionContext(_ data: Data) async throws {
+        guard !data.isEmpty else {
+            throw CacheErrors.invalidData
+        }
+        // Durable write first, as one store-level replace. The warm copy and the
+        // live context must never claim a blob the store does not hold.
+        try await store.replaceLocalSessionContext(data)
         try await setLocalDeviceConfiguration(data)
-        try await store.deleteLocalSessionContext()
-        try await createLocalSessionContext(data)
     }
 
     /// Deletes the local device configuration and clears the cache.

@@ -147,7 +147,7 @@ actor SessionTests {
             await self.session.setAppPassword("123")
             let passwordData = await self.session.appPassword.data(using: .utf8)!
             let saltData = try await store.fetchLocalDeviceSalt(keyData: passwordData)
-            let symmetricKey = await self.crypto.deriveStrictSymmetricKey(data: passwordData, salt: saltData)
+            let symmetricKey = await self.session.deriveAppSymmetricKey(passwordData: passwordData, salt: saltData)
 
             let data = try BinaryEncoder().encode(context)
             let encryptedData = try self.crypto.encrypt(data: data, symmetricKey: symmetricKey)
@@ -238,7 +238,7 @@ actor SessionTests {
         await session.setAppPassword("test")
         let passwordData = await session.appPassword.data(using: .utf8)!
         let saltData = try await store.fetchLocalDeviceSalt(keyData: passwordData)
-        let symmetricKey = await crypto.deriveStrictSymmetricKey(data: passwordData, salt: saltData)
+        let symmetricKey = await session.deriveAppSymmetricKey(passwordData: passwordData, salt: saltData)
         let encryptedData = try crypto.encrypt(data: try BinaryEncoder().encode(context), symmetricKey: symmetricKey)
         try await store.createLocalSessionContext(encryptedData!)
         await session.setDatabaseDelegate(conformer: store)
@@ -271,8 +271,7 @@ actor SessionTests {
     func refreshOneTimeKeys_createsKeys_whenBelowThreshold() async throws {
         await #expect(throws: Never.self, "One-time key refresh should complete without throwing any errors when keys are below threshold") {
             let mockCache = MockCache()
-            let appSymmetricKey = await self.crypto.deriveStrictSymmetricKey(
-                data: "secret".data(using: .utf8)!,
+            let appSymmetricKey = await self.session.deriveAppSymmetricKey(passwordData: "secret".data(using: .utf8)!,
                 salt: Data()
             )
 
@@ -361,8 +360,7 @@ actor SessionTests {
     @Test
     func refreshOneTimeKeys_recoversMLKEMBatch_whenServerReturnsNoIdentities() async throws {
         let mockCache = MockCache()
-        let appSymmetricKey = await self.crypto.deriveStrictSymmetricKey(
-            data: "secret".data(using: .utf8)!,
+        let appSymmetricKey = await self.session.deriveAppSymmetricKey(passwordData: "secret".data(using: .utf8)!,
             salt: Data()
         )
 
@@ -423,8 +421,7 @@ actor SessionTests {
     @Test
     func concurrentCurveAndMLKEMReplenishmentPreservesBothPrivateBatches() async throws {
         let mockCache = MockCache()
-        let appSymmetricKey = await self.crypto.deriveStrictSymmetricKey(
-            data: "secret".data(using: .utf8)!,
+        let appSymmetricKey = await self.session.deriveAppSymmetricKey(passwordData: "secret".data(using: .utf8)!,
             salt: Data()
         )
 
@@ -493,8 +490,7 @@ actor SessionTests {
     @Test
     func refreshOneTimeKeys_doesNotPersistGeneratedX25519Keys_whenUploadFails() async throws {
         let mockCache = MockCache()
-        let appSymmetricKey = await self.crypto.deriveStrictSymmetricKey(
-            data: "secret".data(using: .utf8)!,
+        let appSymmetricKey = await self.session.deriveAppSymmetricKey(passwordData: "secret".data(using: .utf8)!,
             salt: Data()
         )
 
@@ -552,8 +548,7 @@ actor SessionTests {
     @Test
     func refreshOneTimeKeys_forceReplenish_topsUp_whenAboveLowWatermark() async throws {
         let mockCache = MockCache()
-        let appSymmetricKey = await self.crypto.deriveStrictSymmetricKey(
-            data: "secret".data(using: .utf8)!,
+        let appSymmetricKey = await self.session.deriveAppSymmetricKey(passwordData: "secret".data(using: .utf8)!,
             salt: Data()
         )
 
@@ -988,7 +983,7 @@ actor OTKSyncRaceTests {
         await session.setAppPassword("test")
         let passwordData = await session.appPassword.data(using: .utf8)!
         let saltData = try await store.fetchLocalDeviceSalt(keyData: passwordData)
-        let symmetricKey = await crypto.deriveStrictSymmetricKey(data: passwordData, salt: saltData)
+        let symmetricKey = await session.deriveAppSymmetricKey(passwordData: passwordData, salt: saltData)
 
         let data = try BinaryEncoder().encode(context)
         let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey)

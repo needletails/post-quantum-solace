@@ -203,9 +203,7 @@ extension PQSSession {
 
             // Retrieve salt and derive the symmetric key
             let saltData = try await cache.fetchLocalDeviceSalt(keyData: passwordData)
-            let symmetricKey = await crypto.deriveStrictSymmetricKey(
-                data: passwordData,
-                salt: saltData)
+            let symmetricKey = deriveAppSymmetricKey(passwordData: passwordData, salt: saltData)
 
             // Update the registration state to registered
             sessionContext.registrationState = .registered
@@ -613,9 +611,7 @@ extension PQSSession {
 
         guard let cache else { return }
         let data = try await cache.fetchLocalSessionContext()
-        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
-            throw PQSError.sessionDecryptionError
-        }
+        let configurationData = try await openSessionContextPlaintext(data)
 
         var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
 
@@ -697,9 +693,7 @@ extension PQSSession {
 
         guard let cache else { return }
         let data = try await cache.fetchLocalSessionContext()
-        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
-            throw PQSError.sessionDecryptionError
-        }
+        let configurationData = try await openSessionContextPlaintext(data)
 
         var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
 
@@ -800,9 +794,7 @@ extension PQSSession {
         guard let data = try await cache?.fetchLocalSessionContext() else { return }
 
         // Decrypt the session context data using the app's symmetric key
-        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
-            throw PQSError.sessionDecryptionError
-        }
+        let configurationData = try await openSessionContextPlaintext(data)
 
         // Decode the session context from the decrypted data
         var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
@@ -870,9 +862,7 @@ extension PQSSession {
         guard let data = try await cache?.fetchLocalSessionContext() else { return }
 
         // Decrypt the session context data using the app's symmetric key
-        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
-            throw PQSError.sessionDecryptionError
-        }
+        let configurationData = try await openSessionContextPlaintext(data)
 
         // Decode the session context from the decrypted data
         var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)

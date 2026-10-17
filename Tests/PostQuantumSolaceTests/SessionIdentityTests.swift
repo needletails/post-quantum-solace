@@ -367,7 +367,7 @@ actor SessionIdentityTests {
         
         let passwordData = await session.appPassword.data(using: .utf8)!
         let saltData = try await store.fetchLocalDeviceSalt(keyData: passwordData)
-        let symmetricKey = await crypto.deriveStrictSymmetricKey(data: passwordData, salt: saltData)
+        let symmetricKey = await session.deriveAppSymmetricKey(passwordData: passwordData, salt: saltData)
         
         let data = try BinaryEncoder().encode(sessionContext)
         let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey)

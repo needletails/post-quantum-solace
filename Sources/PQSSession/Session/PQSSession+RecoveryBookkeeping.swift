@@ -119,6 +119,7 @@ extension PQSSession {
         cleanupInboundFailurePolicy(now: now)
         let key = inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: messageId)
         inboundFailurePolicyUntil[key] = now.addingTimeInterval(inboundFailurePolicyTTL)
+        boundInboundFailurePolicyTable()
     }
 
     /// Marks an inbound tuple as terminally unrecoverable. Returns `true` only
@@ -258,6 +259,7 @@ extension PQSSession {
             failureClass: failureClass
         )
         inboundFailurePolicyUntil[key] = now.addingTimeInterval(inboundFailurePolicyTTL)
+        boundInboundFailurePolicyTable()
     }
 
     /// Records a distinct undecryptable inbound for this peer device and returns
@@ -335,6 +337,17 @@ extension PQSSession {
         lastAutomaticRotationAt = now
         pruneRecoveryTimestamps(&lastAutomaticRotationAtByPeer, ttl: automaticRotationPeerCooldown, now: now)
         lastAutomaticRotationAtByPeer[peerKey] = now
+    }
+
+    /// Count cap for the TTL-only failure-policy table: unique wire message ids are
+    /// attacker-chosen, so TTL alone does not bound memory under a flood.
+    func boundInboundFailurePolicyTable() {
+        let cap = PQSSessionConstants.recoveryTrackingMaxEntries * 8
+        guard inboundFailurePolicyUntil.count > cap else { return }
+        let overflow = inboundFailurePolicyUntil.count - cap
+        for key in inboundFailurePolicyUntil.sorted(by: { $0.value < $1.value }).prefix(overflow).map(\.key) {
+            inboundFailurePolicyUntil.removeValue(forKey: key)
+        }
     }
 
     /// Bounds an in-memory recovery bookkeeping map: drops entries whose cooldown/TTL
@@ -679,7 +692,8 @@ extension PQSSession {
         let verified = lastVerifiedDeviceIdsBySecretName[sender] ?? []
         if StaleInboundDevicePolicy.shouldDrop(
             senderDeviceId: deviceId,
-            verifiedDeviceIds: verified)
+            verifiedDeviceIds: verified,
+            source: verifiedDeviceIdsSource(for: sender))
         {
             await dropReplacedDeviceInbound(
                 sender: sender,
@@ -711,7 +725,8 @@ extension PQSSession {
         let verified = lastVerifiedDeviceIdsBySecretName[sender] ?? []
         if StaleInboundDevicePolicy.shouldDrop(
             senderDeviceId: deviceId,
-            verifiedDeviceIds: verified)
+            verifiedDeviceIds: verified,
+            source: verifiedDeviceIdsSource(for: sender))
         {
             await dropReplacedDeviceInbound(
                 sender: sender,

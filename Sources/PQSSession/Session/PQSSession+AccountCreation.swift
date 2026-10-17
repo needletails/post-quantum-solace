@@ -270,10 +270,7 @@ extension PQSSession {
         // Retrieve salt and derive symmetric key
         let saltData = try await cache.fetchLocalDeviceSalt(keyData: passwordData)
 
-        let appSymmetricKey = await crypto.deriveStrictSymmetricKey(
-            data: passwordData,
-            salt: saltData
-        )
+        let appSymmetricKey = deriveAppSymmetricKey(passwordData: passwordData, salt: saltData)
 
         let databaseEncryptionKey = try await getDatabaseSymmetricKey()
 

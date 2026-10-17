@@ -355,7 +355,7 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
         guard let props = await props(symmetricKey: symmetricKey) else {
             throw PQSError.propsError
         }
-        return EncryptedMessage.UnwrappedProps(
+        let model = EncryptedMessage.UnwrappedProps(
             id: id,
             base: props.base,
             sentDate: props.sentDate,
@@ -364,7 +364,9 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
             message: props.message,
             senderSecretName: props.senderSecretName,
             senderDeviceId: props.senderDeviceId
-        ) as! T
+        )
+        guard let typed = model as? T else { throw PQSError.propsError }
+        return typed
     }
 
     /// Compares two `EncryptedMessage` instances for equality.

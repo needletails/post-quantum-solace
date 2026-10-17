@@ -17,7 +17,8 @@ struct StaleInboundDevicePolicyTests {
         #expect(
             !StaleInboundDevicePolicy.shouldDrop(
                 senderDeviceId: UUID(),
-                verifiedDeviceIds: []))
+                verifiedDeviceIds: [],
+                source: .live))
     }
 
     @Test("member of the verified set does not drop")
@@ -26,15 +27,47 @@ struct StaleInboundDevicePolicyTests {
         #expect(
             !StaleInboundDevicePolicy.shouldDrop(
                 senderDeviceId: device,
-                verifiedDeviceIds: [device, UUID()]))
+                verifiedDeviceIds: [device, UUID()],
+                source: .live))
     }
 
-    @Test("non-member of a non-empty verified set drops")
+    @Test("non-member of a live non-empty verified set drops")
     func absentDeviceDrops() {
         #expect(
             StaleInboundDevicePolicy.shouldDrop(
                 senderDeviceId: UUID(),
-                verifiedDeviceIds: [UUID(), UUID()]))
+                verifiedDeviceIds: [UUID(), UUID()],
+                source: .live))
+    }
+
+    @Test("a memo from a possibly cached snapshot never drops")
+    func cachedSnapshotNeverDrops() {
+        #expect(
+            !StaleInboundDevicePolicy.shouldDrop(
+                senderDeviceId: UUID(),
+                verifiedDeviceIds: [UUID(), UUID()],
+                source: .cachedOrUnknown))
+    }
+
+    @Test("missing row with a cached-snapshot memo keeps the resend path")
+    func missingSessionRowWithCachedMemoDefers() async throws {
+        let session = PQSSession()
+        defer { Task { await session.shutdown() } }
+        let sender = "mm26"
+        let newDevice = UUID()
+        let envelope = UUID().uuidString
+        await session.setVerifiedDeviceIds([UUID(), UUID()], for: sender, source: .cachedOrUnknown)
+
+        await session.resolveInboundMissingSessionRow(
+            sender: sender,
+            deviceId: newDevice,
+            failedMessageId: envelope,
+            logicalSharedId: nil)
+
+        #expect(await session.hasPendingResendAfterReestablishment(
+            sender: sender, deviceId: newDevice, failedMessageId: envelope))
+        #expect(!(await session.isInboundFailureQuarantined(
+            sender: sender, deviceId: newDevice, messageId: envelope)))
     }
 
     @Test("no session row for a device absent from the memo does not NACK")

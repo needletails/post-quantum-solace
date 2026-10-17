@@ -49,10 +49,7 @@ extension PQSSession {
         // Retrieve salt and derive symmetric key
         guard let saltData = try await cache?.fetchLocalDeviceSalt(keyData: passwordData) else { throw PQSError.saltError }
 
-        return await crypto.deriveStrictSymmetricKey(
-            data: passwordData,
-            salt: saltData
-        )
+        return deriveAppSymmetricKey(passwordData: passwordData, salt: saltData)
     }
 
     /// Verifies an input password against stored session context.
@@ -71,16 +68,13 @@ extension PQSSession {
 
             guard let saltData = try await cache?.fetchLocalDeviceSalt(keyData: passwordData) else { throw PQSError.saltError }
 
-            let appEncryptionKey = await crypto.deriveStrictSymmetricKey(
-                data: passwordData,
-                salt: saltData
-            )
-
-            await setAppPassword(appPassword)
-
             guard let data = try await cache?.fetchLocalSessionContext() else { return false }
-            let box = try AES.GCM.SealedBox(combined: data)
-            _ = try AES.GCM.open(box, using: appEncryptionKey)
+            _ = try await openSessionContextBlob(data, passwordData: passwordData, salt: saltData)
+            // Only a password that opens the stored context may become the live
+            // password: every later commit encrypts the context under it, and a
+            // rejected guess here would otherwise re-key the blob out from under
+            // the real password.
+            await setAppPassword(appPassword)
             return true
         } catch {
             return false
@@ -104,12 +98,7 @@ extension PQSSession {
             throw PQSError.databaseNotInitialized
         }
 
-        let data = try await cache.fetchLocalSessionContext()
-        guard let configurationData = try await crypto.decrypt(data: data, symmetricKey: getAppSymmetricKey()) else {
-            throw PQSError.sessionDecryptionError
-        }
-        // Decode the session context from the decrypted data
-        let sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+        let sessionContext = try await openPersistedSessionContext()
         try await cache.deleteLocalDeviceSalt()
 
         guard let passwordData = newPassword.data(using: .utf8) else {
@@ -119,10 +108,7 @@ extension PQSSession {
         // Retrieve salt and derive symmetric key
         let saltData = try await cache.fetchLocalDeviceSalt(keyData: passwordData)
 
-        let symmetricKey = await crypto.deriveStrictSymmetricKey(
-            data: passwordData,
-            salt: saltData
-        )
+        let symmetricKey = deriveAppSymmetricKey(passwordData: passwordData, salt: saltData)
 
         let encodedData = try BinaryEncoder().encode(sessionContext)
         guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: symmetricKey) else {

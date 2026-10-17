@@ -444,7 +444,9 @@ extension MessagePipeline {
                 return .deferredToBack
             }
             deferredDelayedJobIds.remove(job.id)
-            let sleep = delayedUntil.timeIntervalSinceNow
+            // The due date may have passed during the awaits above; a negative
+            // interval would trap the UInt64 conversion.
+            let sleep = max(0, delayedUntil.timeIntervalSinceNow)
             do {
                 try await Task.sleep(nanoseconds: UInt64(sleep * 1_000_000_000))
             } catch {
@@ -1038,6 +1040,14 @@ extension MessagePipeline {
                     return .paused
                 }
                 await noteResendReplayDropped(sharedId: message.sharedId, reason: "unhandledError=\(error)")
+                // A persisted user message whose job is about to be deleted must fail
+                // visibly; a silent delete left the bubble in `.sending` forever.
+                if message.isPersistedOutbound {
+                    await markPersistedOutboundFailed(
+                        session: session,
+                        localMessageId: message.localId,
+                        reason: "unhandledError=\(error)")
+                }
             }
             
             // If we are throwing an error for some other reason... On stream we just delete the job

@@ -257,12 +257,14 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         guard let props = await props(symmetricKey: symmetricKey) else {
             throw Errors.propsError
         }
-        return Contact(
+        let model = Contact(
             id: id,
             secretName: props.secretName,
             configuration: props.configuration,
             metadata: props.metadata
-        ) as! T
+        )
+        guard let typed = model as? T else { throw PQSError.propsError }
+        return typed
     }
     
     /// Asynchronously updates the contact's metadata.

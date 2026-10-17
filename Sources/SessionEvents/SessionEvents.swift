@@ -93,9 +93,18 @@ func preferInboundFriendshipMetadata(
     if passed.myState == .pending && passed.theirState == .pending {
         return passed
     }
-    // Peer accepted us (including accept-after-delete and unblock-restore).
+    // Peer accepted us (including accept-after-delete and unblock-restore). The
+    // peer may only assert its own side of the relationship: our side is local
+    // truth. Acceptance completes a request we made; it cannot flip a rejection
+    // we recorded, and `ourState` is recomputed rather than taken from the wire.
     if passed.ourState == .accepted && stored.ourState != .accepted {
-        return passed
+        var merged = stored
+        merged.theirState = passed.theirState
+        if stored.myState == .requested || stored.myState == .accepted {
+            merged.myState = .accepted
+        }
+        merged.updateOurState()
+        return merged
     }
     // Peer (re-)requested us; idempotent when the prompt is already showing.
     if passed.theirState == .requested && stored.ourState != .accepted {
