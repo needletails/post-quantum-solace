@@ -88,12 +88,11 @@ extension MessagePipeline {
         // sends the same frame twice.
         try await feedJobDeduplicated(job, symmetricKey: symmetricKey)
 
-        // A prior writer failure owns the wake-up boundary. Keep newly persisted
-        // work queued until registration explicitly resumes the processor.
-        guard !isPausedUntilTransportReady else {
-            return
-        }
-
+        // A prior writer failure parks only the failed job (`transportParkedJobIds`),
+        // never the queue: inbound decrypt and other sends must keep flowing on a
+        // viable session, or one interrupted send reads as "the app stopped sending
+        // and receiving". When transport is genuinely down, the non-viable check
+        // above already kept this job durable without starting the processor.
         try await startProcessingIfNeeded(session)
     }
 
@@ -171,8 +170,11 @@ extension MessagePipeline {
 
         if let session {
             // `loadTasks(..., session:)` is the explicit event-driven resume path
-            // used after registration/writer readiness.
+            // used after registration/writer readiness. It is the one event that
+            // un-parks transport-failed jobs for another attempt.
             isPausedUntilTransportReady = false
+            transportParkedJobIds.removeAll()
+            resumeGeneration &+= 1
             try await startProcessingIfNeeded(session)
         }
     }
@@ -209,9 +211,13 @@ extension MessagePipeline {
     
     private func startProcessingIfNeeded(_ session: PQSSession) async throws {
         guard tryStart() else {
+            // Lost-wakeup fence: a resume or enqueue that lands while the loop is
+            // running must not be dropped — the running loop may be about to park
+            // and discard (gracefulShutdown) exactly the work this request loaded.
+            hasPendingStartRequest = true
             return
         }
-        
+
         let loopExit = try await Task {
             defer {
                 stop()
@@ -223,6 +229,16 @@ extension MessagePipeline {
                 throw error
             }
         }.value
+
+        // Consume a start request that arrived while the loop was running, no
+        // matter how the loop exited: the requester's work may have been wiped
+        // from the deque by a pausing job and only survives in cache.
+        if hasPendingStartRequest {
+            hasPendingStartRequest = false
+            guard await session.isViable else { return }
+            try await startProcessingIfNeeded(session)
+            return
+        }
 
         // A paused job stays durable but must wait for a concrete future event
         // (`enqueue`, `resumeJobQueue`, viability/writer readiness). Immediately
@@ -285,6 +301,12 @@ extension MessagePipeline {
                     return .drained
                 }
                 try await loadFromCache(cache: cache, symmetricKey: symmetricKey)
+                if await jobConsumer.deque.isEmpty {
+                    // Everything left in cache is parked for transport-ready;
+                    // nothing is runnable until the next explicit resume.
+                    await jobConsumer.gracefulShutdown()
+                    return .paused
+                }
             }
             
             for try await result in NeedleTailAsyncSequence(consumer: jobConsumer) {
@@ -297,6 +319,7 @@ extension MessagePipeline {
                         // exactly a reconnect drain racing an executing send.
                         inFlightJobIds.insert(job.id)
                         defer { inFlightJobIds.remove(job.id) }
+                        executingJobResumeGeneration = resumeGeneration
                         let outcome = try await process(
                             job,
                             cache: cache,
@@ -307,7 +330,14 @@ extension MessagePipeline {
                             await jobConsumer.gracefulShutdown()
                             return .paused
                         }
-                        if await jobConsumer.deque.isEmpty {
+                        if outcome == .outboundParkedAwaitingTransport {
+                            // The failed send stays durable and parked; keep
+                            // draining the inbound and outbound work behind it.
+                            if await jobConsumer.deque.isEmpty {
+                                await jobConsumer.gracefulShutdown()
+                                return .paused
+                            }
+                        } else if await jobConsumer.deque.isEmpty {
                             await jobConsumer.gracefulShutdown()
                             return .drained
                         }
@@ -368,7 +398,10 @@ extension MessagePipeline {
             }
         }
         let enqueuedJobIds = Set(await jobConsumer.deque.map { $0.item.id })
-        let skippedJobIds = enqueuedJobIds.union(inFlightJobIds)
+        // Parked jobs wait for the explicit resume (`loadTasks(session:)` clears
+        // the parked set before this reload); feeding them from a refill would
+        // tight-retry a send whose transport boundary already failed.
+        let skippedJobIds = enqueuedJobIds.union(inFlightJobIds).union(transportParkedJobIds)
         for job in try await cache.fetchJobs() where !skippedJobIds.contains(job.id) {
             try await jobConsumer.loadAndOrganizeTasks(job, symmetricKey: symmetricKey)
         }
@@ -411,6 +444,13 @@ extension MessagePipeline {
         symmetricKey: SymmetricKey
     ) async throws -> JobProcessingOutcome {
         
+        // A send whose prepared frame failed at the transport boundary stays
+        // parked until the next explicit resume. Skip it without stopping the
+        // drain: inbound decrypt and other sends keep flowing behind it.
+        if transportParkedJobIds.contains(job.id) {
+            return .outboundParkedAwaitingTransport
+        }
+
         guard let props = await job.props(symmetricKey: symmetricKey) else {
             try await cache.deleteJob(job)
             return .deleted
@@ -1033,11 +1073,26 @@ extension MessagePipeline {
                 // composed while going offline. Park it instead — the job stays in
                 // cache and the viability-transition drain replays it on reconnect,
                 // re-encrypting from scratch.
-                if !(await session.isViable) || isConnectionNonViableError(error) {
+                if !(await session.isViable) {
                     logger.log(
                         level: .info,
                         message: "pqs.outbound.parkedForViability sharedId=\(message.sharedId) recipient=\(message.message.recipient) error=\(error)")
                     return .paused
+                }
+                // Session viable, yet a leg this send needs failed (multipart writer
+                // not attached yet, a socket dying under one write). Park this job
+                // alone and count the attempt: a queue-wide pause here put the job back
+                // at the head of every later drain — retried on each new message with
+                // no cap, blocking what queued behind it. Reached whenever the frame is
+                // not remembered: after an app relaunch, or once its TTL evicted it.
+                if isConnectionNonViableError(error) {
+                    return try await deferPendingOutboundTransportRetry(
+                        job: job,
+                        props: props,
+                        cache: cache,
+                        session: session,
+                        symmetricKey: symmetricKey,
+                        error: error)
                 }
                 await noteResendReplayDropped(sharedId: message.sharedId, reason: "unhandledError=\(error)")
                 // A persisted user message whose job is about to be deleted must fail
@@ -1113,6 +1168,10 @@ extension MessagePipeline {
         /// Job is delayed and not yet due; it was re-queued at the back of the deque
         /// so ready jobs behind it can run first. It remains in cache.
         case deferredToBack
+        /// The send's prepared frame failed at the transport boundary. The job
+        /// stays in cache, parked until the next explicit resume; the drain
+        /// continues past it so one failed send never stalls the queue.
+        case outboundParkedAwaitingTransport
     }
     
     // MARK: - Errors
@@ -1633,7 +1692,41 @@ extension MessagePipeline {
         // writer-ready event. Timer requeues can race the recycled writer and duplicate
         // warning storms without adding a new recovery signal.
         updatedProps.delayedUntil = nil
+
+        // Bounded: retries only run at resume moments, which for media sends is
+        // exactly when the leg they need may not be up yet. Unbounded deferral
+        // livelocked the queue until the user deleted the message; past the cap
+        // the send fails visibly (Retry affordance) and the job is removed.
+        if updatedProps.attempts >= maxDeferredTransportRetryAttempts,
+           case .writeMessage(let outbound) = props.task.task {
+            pendingOutboundTransportBySharedId.removeValue(forKey: outbound.sharedId)
+            transportParkedJobIds.remove(job.id)
+            await noteResendReplayDropped(sharedId: outbound.sharedId, reason: "transportRetryAttemptsExhausted")
+            if outbound.isPersistedOutbound {
+                await markPersistedOutboundFailed(
+                    session: session,
+                    localMessageId: outbound.localId,
+                    reason: "transportRetryAttemptsExhausted")
+            }
+            logger.log(
+                level: .error,
+                message: "Deferred outbound transport retry exhausted after \(updatedProps.attempts) attempts; failing send sharedId=\(outbound.sharedId) error=\(error)")
+            do {
+                try await cache.deleteJob(job)
+            } catch SessionCache.CacheErrors.jobNotFound {
+                // Already removed by a concurrent path.
+            }
+            return .deleted
+        }
+
         isPausedUntilTransportReady = true
+        // A resume that landed mid-attempt already signalled transport-ready;
+        // parking would make this send wait for the next one. Leave it
+        // unparked so the pending-start restart retries it once (the attempt
+        // above still counts toward the cap).
+        if executingJobResumeGeneration == resumeGeneration {
+            transportParkedJobIds.insert(job.id)
+        }
         _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
         do {
             try await cache.updateJob(job)
@@ -1658,7 +1751,9 @@ extension MessagePipeline {
         if shouldLogOutboundTransportRetry(message: logMessage) {
             logger.log(level: .warning, message: .init(stringLiteral: logMessage))
         }
-        return .paused
+        // Park this job only; the drain continues past it so one failed send
+        // never blocks inbound decrypt or other queued sends.
+        return .outboundParkedAwaitingTransport
     }
 
     private func recoveryTransportSendFailureLog(
