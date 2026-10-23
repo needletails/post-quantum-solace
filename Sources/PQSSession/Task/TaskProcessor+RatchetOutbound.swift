@@ -276,13 +276,6 @@ extension MessagePipeline {
             return initialized[0].identity
         }
 
-        let previouslyRekeyed = candidates.filter { $0.props.previousRekey != nil }
-        if let newestRekey = previouslyRekeyed.max(by: { lhs, rhs in
-            (lhs.props.previousRekey ?? .distantPast) < (rhs.props.previousRekey ?? .distantPast)
-        }) {
-            return newestRekey.identity
-        }
-
         return bestCandidatePreservingStoreOrder(candidates)?.identity
     }
 
