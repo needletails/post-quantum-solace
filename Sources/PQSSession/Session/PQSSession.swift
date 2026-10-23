@@ -1015,6 +1015,26 @@ public actor PQSSession: SessionCacheSynchronizer {
         }
     }
 
+    /// Mutates the live session context and persists it under the session's
+    /// exclusive commit lock.
+    ///
+    /// Hosts that edit the context themselves (a re-signed device entry after a
+    /// child links, for example) must go through here rather than encrypting the
+    /// blob and writing it to the store directly: that write ran outside the lock
+    /// and could land a context that predates a commit the session made in the
+    /// meantime, losing it.
+    ///
+    /// - Parameter mutate: Edits the context in place; returns `true` when something
+    ///   changed. Returning `false` persists nothing.
+    /// - Returns: The committed context, or `nil` when no session is unlocked or
+    ///   `mutate` reported no change.
+    @discardableResult
+    public func commitSessionContextMutation(
+        _ mutate: @Sendable (inout SessionContext) throws -> Bool
+    ) async throws -> SessionContext? {
+        try await commitLiveSessionContextMutationIfChanged(mutate)
+    }
+
     /// Asynchronously retrieves the application password
     ///
     /// The application password is used to derive encryption keys for session data.
