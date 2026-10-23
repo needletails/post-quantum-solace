@@ -372,8 +372,7 @@ public actor PQSSession: SessionCacheSynchronizer {
             lifecyclePhase = .running
             let coordinator = SessionWorkCoordinator(
                 maxWorkers: PQSSessionConstants.sessionWorkMaxWorkers,
-                maxPending: PQSSessionConstants.sessionWorkMaxPending
-            )
+                maxPending: PQSSessionConstants.sessionWorkMaxPending)
             sessionWorkCoordinator = coordinator
             await coordinator.start()
         case .running, .shuttingDown, .shutDown:
@@ -887,11 +886,15 @@ public actor PQSSession: SessionCacheSynchronizer {
         case replacePublishedBatch
     }
     
+    /// Whether a device-key rotation is in flight. Session-scoped by nature: a
+    /// rotation republishes this device's keys for every peer and owns the flag
+    /// from start to finish. Per-lane key choice never reads it; a lane's keys
+    /// come from its own ratchet snapshot (see `loadKeys`).
     enum KeyLoadingState: Sendable {
-        case initial, rotating, complete
+        case rotating, complete
     }
     
-    var keyLoadingState: KeyLoadingState = .initial
+    var keyLoadingState: KeyLoadingState = .complete
     func setKeyLoadingState(_ newState: KeyLoadingState) {
         keyLoadingState = newState
     }
@@ -1282,10 +1285,25 @@ public actor PQSSession: SessionCacheSynchronizer {
     /// Sets the database delegate conforming to `PQSPersistenceHost`.
     /// - Parameter conformer: The conforming object to set as the identity store.
     func setDatabaseDelegate(conformer: (any PQSPersistenceHost)?) async {
-        if let conformer {
-            cache = SessionCache(store: conformer)
-            await cache?.setSynchronizer(self)
+        guard let conformer else { return }
+        // Re-attaching the store that already backs the live cache keeps that
+        // cache. Replacing it dropped the warm job and identity lists mid-send
+        // (`preparedCommitFailed error=jobNotFound`) and left two caches over one
+        // store free to diverge on ratchet state.
+        if let cache, await cache.isBacked(by: conformer) {
+            return
         }
+        cache = SessionCache(store: conformer)
+        await cache?.setSynchronizer(self)
+    }
+
+    /// Whether a persistence host is attached (a `SessionCache` exists).
+    public var isPersistenceHostAttached: Bool { cache != nil }
+
+    /// Test seam: identity of the live cache, so hosts can assert that
+    /// re-attaching their store did not replace it.
+    public var persistenceCacheIdentifier: ObjectIdentifier? {
+        cache.map { ObjectIdentifier($0) }
     }
 
     /// Attaches a persistence host so unlock and password checks can read salt and session context.

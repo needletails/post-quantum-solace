@@ -77,6 +77,12 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         self.store = store
     }
 
+    /// Whether `store` is the very object this cache writes through. Value-type
+    /// stores never compare equal, so they are always treated as new.
+    func isBacked(by store: any PQSPersistenceHost) -> Bool {
+        (self.store as AnyObject) === (store as AnyObject)
+    }
+
     // MARK: - Synchronizer Management
 
     func setSynchronizer(_ synchronizer: SessionCacheSynchronizer?) {
@@ -363,6 +369,17 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
             envelopeMessageId: envelopeMessageId)
     }
 
+    func fetchAcceptedEnvelope(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        frameFingerprint: Data
+    ) async throws -> AcceptedEnvelopeRecord? {
+        try await store.fetchAcceptedEnvelope(
+            senderSecretName: senderSecretName,
+            senderDeviceId: senderDeviceId,
+            frameFingerprint: frameFingerprint)
+    }
+
     func pruneAcceptedEnvelopes(olderThan: Date) async throws -> Int {
         try await store.pruneAcceptedEnvelopes(olderThan: olderThan)
     }
@@ -521,12 +538,29 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Parameter job: The job to be updated.
     /// - Throws: An error if the update fails.
     func updateJob(_ job: JobModel) async throws {
-        if let index = jobs.firstIndex(where: { $0.id == job.id }) {
-            try await store.updateJob(job) // Persist the updated job in the store
-            jobs[index] = job // Publish only after persistence succeeds
-        } else {
-            throw CacheErrors.jobNotFound // Handle the case where the job is not found in the cache
+        guard let index = try await jobIndex(for: job) else {
+            throw CacheErrors.jobNotFound
         }
+        try await store.updateJob(job) // Persist the updated job in the store
+        jobs[index] = job // Publish only after persistence succeeds
+    }
+
+    /// Index of `job` in the warm list, consulting the store on a miss.
+    ///
+    /// The warm list is a cache, not the source of truth. A host that re-attaches
+    /// its store builds a fresh `SessionCache` whose list is empty while the row is
+    /// still on disk; deciding `jobNotFound` from memory alone rolled the ratchet
+    /// back and skipped the send (dogfood 2026-10-19..21, 2,910 occurrences).
+    /// Rows found on disk are merged in rather than replacing the list, so a
+    /// `createJob` that appended during the await is not lost.
+    private func jobIndex(for job: JobModel) async throws -> Int? {
+        if let index = jobs.firstIndex(where: { $0.id == job.id }) {
+            return index
+        }
+        for stored in try await store.fetchJobs() where !jobs.contains(where: { $0.id == stored.id }) {
+            jobs.append(stored)
+        }
+        return jobs.firstIndex(where: { $0.id == job.id })
     }
 
     /// Publishes the encrypted ratchet checkpoint and prepared transport payload
@@ -550,7 +584,8 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         guard let identityIndex else {
             throw CacheErrors.sessionIdentityNotFound
         }
-        guard let jobIndex = jobs.firstIndex(where: { $0.id == job.id }) else {
+        // Same rule for the job row (see `jobIndex(for:)`).
+        guard let jobIndex = try await jobIndex(for: job) else {
             throw CacheErrors.jobNotFound
         }
         try await store.updateSessionIdentity(

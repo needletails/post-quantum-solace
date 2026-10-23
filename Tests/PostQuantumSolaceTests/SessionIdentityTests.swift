@@ -143,6 +143,16 @@ actor SessionIdentityTests {
                 senderDeviceId: senderDeviceId,
                 envelopeMessageId: envelopeMessageId)
         }
+        func fetchAcceptedEnvelope(
+            senderSecretName: String,
+            senderDeviceId: UUID,
+            frameFingerprint: Data
+        ) async throws -> AcceptedEnvelopeRecord? {
+            recoveryLedger.fetchAcceptedEnvelope(
+                senderSecretName: senderSecretName,
+                senderDeviceId: senderDeviceId,
+                frameFingerprint: frameFingerprint)
+        }
         func pruneAcceptedEnvelopes(olderThan date: Date) async throws -> Int {
             recoveryLedger.pruneAcceptedEnvelopes(olderThan: date)
         }
@@ -155,12 +165,16 @@ actor SessionIdentityTests {
             return (stream, nil)
         }
         func messageCount(sharedIdentifier _: UUID) async throws -> Int { 0 }
-        func readJobs() async throws -> [JobModel] { [] }
-        func fetchJobs() async throws -> [JobModel] { [] }
-        func createJob(_: JobModel) async throws {}
-        func updateJob(_: JobModel) async throws {}
-        func removeJob(_: JobModel) async throws {}
-        func deleteJob(_: JobModel) async throws {}
+        var jobs = [JobModel]()
+        func readJobs() async throws -> [JobModel] { jobs }
+        func fetchJobs() async throws -> [JobModel] { jobs }
+        func createJob(_ job: JobModel) async throws { jobs.append(job) }
+        func updateJob(_ job: JobModel) async throws {
+            jobs.removeAll(where: { $0.id == job.id })
+            jobs.append(job)
+        }
+        func removeJob(_ job: JobModel) async throws { jobs.removeAll(where: { $0.id == job.id }) }
+        func deleteJob(_ job: JobModel) async throws { jobs.removeAll(where: { $0.id == job.id }) }
         func findMediaJobs(for _: String, symmetricKey: SymmetricKey) async throws -> [DataPacket] { [] }
         func fetchMediaJobs(recipient _: String, symmetricKey: SymmetricKey) async throws -> [DataPacket] { [] }
         func findMediaJob(for _: String, symmetricKey: SymmetricKey) async throws -> DataPacket? { nil }
@@ -282,6 +296,63 @@ actor SessionIdentityTests {
             try await cache.commitPreparedOutbound(sessionIdentity: missing, job: job)
         }
         #expect(store.identities.count == 1)
+        await session.shutdown()
+    }
+
+    /// Dogfood 2026-10-19..21: `pqs.send.preparedCommitFailed error=jobNotFound`
+    /// 2,910 times across two devices, while 98% of those rows were transported on
+    /// a later reload. The job was on disk the whole time; only the warm list
+    /// missed it because the host re-attached its store mid-send. Jobs must fall
+    /// back to the store exactly like identities do.
+    @Test("commitPreparedOutbound reloads from the store when the memory list misses the job")
+    func testCommitPreparedOutboundReloadsJobFromStore() async throws {
+        let store = MockSessionIdentityStore()
+        let symmetricKey = SymmetricKey(size: .bits256)
+        let identity = SessionIdentity(id: UUID(), data: Data([0x01]))
+        store.identities.append(identity)
+        let job = try makeOutboundJob(recipient: identity, symmetricKey: symmetricKey)
+        // Persisted through one cache, committed through a fresh one over the same store.
+        try await SessionCache(store: store).createJob(job)
+        let cache = SessionCache(store: store)
+
+        let updated = SessionIdentity(id: identity.id, data: Data([0x02]))
+        try await cache.commitPreparedOutbound(sessionIdentity: updated, job: job)
+
+        #expect(try await cache.fetchJobs().contains(where: { $0.id == job.id }))
+        #expect(store.identities.first(where: { $0.id == identity.id })?.data == Data([0x02]))
+        await session.shutdown()
+    }
+
+    @Test("commitPreparedOutbound still throws when the job is absent from the store")
+    func testCommitPreparedOutboundThrowsWhenJobMissingEverywhere() async throws {
+        let store = MockSessionIdentityStore()
+        let cache = SessionCache(store: store)
+        let symmetricKey = SymmetricKey(size: .bits256)
+        let identity = SessionIdentity(id: UUID(), data: Data([0x01]))
+        try await cache.createSessionIdentity(identity)
+        let job = try makeOutboundJob(recipient: identity, symmetricKey: symmetricKey)
+
+        let updated = SessionIdentity(id: identity.id, data: Data([0x02]))
+        await #expect(throws: SessionCache.CacheErrors.jobNotFound) {
+            try await cache.commitPreparedOutbound(sessionIdentity: updated, job: job)
+        }
+        #expect(store.identities.first(where: { $0.id == identity.id })?.data == Data([0x01]),
+                "a refused commit must not publish the ratchet checkpoint")
+        await session.shutdown()
+    }
+
+    @Test("updateJob reloads from the store when the memory list misses the job")
+    func testUpdateJobReloadsFromStore() async throws {
+        let store = MockSessionIdentityStore()
+        let symmetricKey = SymmetricKey(size: .bits256)
+        let identity = SessionIdentity(id: UUID(), data: Data([0x01]))
+        let job = try makeOutboundJob(recipient: identity, symmetricKey: symmetricKey)
+        try await SessionCache(store: store).createJob(job)
+        let cache = SessionCache(store: store)
+
+        try await cache.updateJob(job)
+
+        #expect(try await cache.fetchJobs().contains(where: { $0.id == job.id }))
         await session.shutdown()
     }
 

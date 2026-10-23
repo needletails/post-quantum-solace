@@ -14,6 +14,7 @@
 //  post-quantum cryptographic session management capabilities.
 //
 
+import Crypto
 import DoubleRatchetKit
 import Foundation
 import NeedleTailCrypto
@@ -382,6 +383,13 @@ extension PQSSession {
     /// SHA256-ready raw fingerprint of an undecryptable inbound frame (signed payload).
     static func nackFrameFingerprint(for message: InboundTaskMessage) -> Data {
         message.message.signed?.data ?? Data(message.sharedMessageId.utf8)
+    }
+
+    /// Fixed-size digest of `nackFrameFingerprint` for the persisted accepted
+    /// ledger (`AcceptedEnvelopeRecord.frameFingerprint`), so a row never
+    /// carries the ciphertext itself.
+    static func frameFingerprintDigest(for message: InboundTaskMessage) -> Data {
+        Data(SHA256.hash(data: nackFrameFingerprint(for: message)))
     }
 
     /// Remember the frame fingerprint when a NACK is queued/submitted so rearm can
@@ -1140,52 +1148,61 @@ extension PQSSession {
         return nil
     }
 
+    /// Whether this sender device already had the frame accepted: by envelope id,
+    /// or, when `frameFingerprint` is given, by the signed payload under any
+    /// envelope id. The id rides outside the signature, so a redelivery can
+    /// arrive under a fresh one; the signed bytes cannot change.
     func hasAcceptedEnvelope(
         senderSecretName: String,
         senderDeviceId: UUID,
-        envelopeMessageId: String
+        envelopeMessageId: String,
+        frameFingerprint: Data? = nil
     ) async throws -> Bool {
         let key = AcceptedEnvelopeKey(
             senderSecretName: senderSecretName,
             senderDeviceId: senderDeviceId,
-            envelopeMessageId: envelopeMessageId)
+            envelopeMessageId: envelopeMessageId,
+            frameFingerprint: frameFingerprint)
         if AcceptedEnvelopeLedgerPolicy.shouldAckAndDrop(key: key, accepted: acceptedEnvelopeKeys) {
             return true
         }
         guard let cache else { throw PQSError.databaseNotInitialized }
-        if let stored = try await cache.fetchAcceptedEnvelope(
+        var stored = try await cache.fetchAcceptedEnvelope(
             senderSecretName: senderSecretName,
             senderDeviceId: senderDeviceId,
-            envelopeMessageId: envelopeMessageId
-        ) {
-            rememberAcceptedEnvelopeKey(stored.storageKey)
-            return true
+            envelopeMessageId: envelopeMessageId)
+        if stored == nil, let frameFingerprint {
+            // Hosts that do not persist the fingerprint answer nil here.
+            stored = try await cache.fetchAcceptedEnvelope(
+                senderSecretName: senderSecretName,
+                senderDeviceId: senderDeviceId,
+                frameFingerprint: frameFingerprint)
         }
-        return false
+        guard let stored else { return false }
+        rememberAcceptedEnvelope(stored)
+        return true
     }
 
-    func markEnvelopeAccepted(
-        senderSecretName: String,
-        senderDeviceId: UUID,
-        envelopeMessageId: String,
-        logicalSharedId: String
-    ) async throws {
+    /// Records `inboundTask` as accepted: its envelope id, logical id and the
+    /// digest of its signed payload.
+    func markEnvelopeAccepted(_ inboundTask: InboundTaskMessage) async throws {
         guard AcceptedEnvelopeLedgerPolicy.shouldMarkAccepted(
             decryptSucceeded: true,
             payloadDecoded: true,
             hostHandlingSucceeded: true
         ) else { return }
         let record = AcceptedEnvelopeRecord(
-            senderSecretName: senderSecretName,
-            senderDeviceId: senderDeviceId,
-            envelopeMessageId: envelopeMessageId,
-            logicalSharedId: logicalSharedId)
+            senderSecretName: inboundTask.senderSecretName,
+            senderDeviceId: inboundTask.senderDeviceId,
+            envelopeMessageId: inboundTask.sharedMessageId,
+            logicalSharedId: inboundTask.resolvedLogicalSharedId,
+            frameFingerprint: Self.frameFingerprintDigest(for: inboundTask))
         // Durability precedes the in-memory marker and transport ACK. If this
         // write fails, the caller must not delete the spool entry.
         guard let cache else { throw PQSError.databaseNotInitialized }
         try await cache.upsertAcceptedEnvelope(record)
-        rememberAcceptedEnvelopeKey(record.storageKey)
-        auditSink.log(.recovery, "pqs.recovery.envelopeAccepted sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) envelope=\(envelopeMessageId) logical=\(logicalSharedId)",
+        rememberAcceptedEnvelope(record)
+        auditSink.log(.recovery, "pqs.recovery.envelopeAccepted sender=\(record.senderSecretName) deviceId=\(record.senderDeviceId.uuidString) envelope=\(record.envelopeMessageId) logical=\(record.logicalSharedId)",
             level: .debug)
     }
 
@@ -1196,6 +1213,13 @@ extension PQSSession {
         }
         acceptedEnvelopeKeys.removeAll(keepingCapacity: true)
         acceptedEnvelopeKeyOrder.removeAll(keepingCapacity: true)
+    }
+
+    /// Warms every key a lookup may match the row by (envelope id, fingerprint).
+    private func rememberAcceptedEnvelope(_ record: AcceptedEnvelopeRecord) {
+        for key in record.lookupKeys {
+            rememberAcceptedEnvelopeKey(key)
+        }
     }
 
     private func rememberAcceptedEnvelopeKey(_ key: String) {

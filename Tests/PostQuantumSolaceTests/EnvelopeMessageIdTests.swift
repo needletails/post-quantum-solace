@@ -6,6 +6,7 @@
 //  envelope; resend replaces envelope while preserving logical sharedId.
 //
 
+import BinaryCodable
 import Foundation
 import Crypto
 import SessionModels
@@ -142,6 +143,142 @@ struct EnvelopeMessageIdTests {
             AcceptedEnvelopeLedgerPolicy.shouldAckAndDrop(
                 key: key,
                 accepted: [key.storageKey]))
+    }
+
+    @Test("accepted ledger row round-trips its optional frame fingerprint")
+    func acceptedRecordFingerprintRoundTrips() throws {
+        let device = UUID()
+        let acceptedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let fingerprint = Data(SHA256.hash(data: Data("signed frame bytes".utf8)))
+        let record = AcceptedEnvelopeRecord(
+            senderSecretName: "alice",
+            senderDeviceId: device,
+            envelopeMessageId: "env-1",
+            logicalSharedId: "logical-1",
+            acceptedAt: acceptedAt,
+            frameFingerprint: fingerprint)
+        let withoutFingerprint = AcceptedEnvelopeRecord(
+            senderSecretName: "alice",
+            senderDeviceId: device,
+            envelopeMessageId: "env-1",
+            logicalSharedId: "logical-1",
+            acceptedAt: acceptedAt)
+
+        for row in [record, withoutFingerprint] {
+            let binary = try BinaryDecoder().decode(
+                AcceptedEnvelopeRecord.self, from: BinaryEncoder().encode(row))
+            #expect(binary == row)
+            let json = try JSONDecoder().decode(
+                AcceptedEnvelopeRecord.self, from: JSONEncoder().encode(row))
+            #expect(json == row)
+        }
+
+        // The row identity stays the envelope key; the fingerprint only adds a lookup key.
+        #expect(record.storageKey == withoutFingerprint.storageKey)
+        #expect(record.lookupKeys.count == 2 && record.lookupKeys.first == record.storageKey)
+        #expect(withoutFingerprint.frameFingerprint == nil)
+        #expect(withoutFingerprint.lookupKeys == [withoutFingerprint.storageKey])
+    }
+
+    @Test("accepted ledger rows persisted before the fingerprint field decode with nil")
+    func acceptedRecordDecodesLegacyRowsWithoutFingerprint() throws {
+        /// The row as hosts persisted it before `frameFingerprint` existed. It
+        /// shares the production type's name so the binary codec's type header
+        /// matches, which is what a pre-field blob on disk looks like.
+        struct AcceptedEnvelopeRecord: Encodable {
+            let senderSecretName: String
+            let senderDeviceId: UUID
+            let envelopeMessageId: String
+            let logicalSharedId: String
+            let acceptedAt: Date
+        }
+        let device = UUID()
+        let acceptedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let legacy = AcceptedEnvelopeRecord(
+            senderSecretName: "alice",
+            senderDeviceId: device,
+            envelopeMessageId: "env-1",
+            logicalSharedId: "logical-1",
+            acceptedAt: acceptedAt)
+        let expected = SessionModels.AcceptedEnvelopeRecord(
+            senderSecretName: "alice",
+            senderDeviceId: device,
+            envelopeMessageId: "env-1",
+            logicalSharedId: "logical-1",
+            acceptedAt: acceptedAt)
+        #expect(expected.frameFingerprint == nil)
+
+        let binary = try BinaryDecoder().decode(
+            SessionModels.AcceptedEnvelopeRecord.self, from: BinaryEncoder().encode(legacy))
+        #expect(binary == expected)
+        let json = try JSONDecoder().decode(
+            SessionModels.AcceptedEnvelopeRecord.self, from: JSONEncoder().encode(legacy))
+        #expect(json == expected)
+        // Such a row can only ever be matched by its envelope id.
+        #expect(binary.lookupKeys == [binary.storageKey])
+    }
+
+    @Test("accepted drop matches a replayed signed payload under a fresh envelope id")
+    func acceptedDropMatchesFingerprintUnderFreshEnvelopeId() {
+        let device = UUID()
+        let fingerprint = Data([0xA1, 0xB2, 0xC3])
+        let accepted = AcceptedEnvelopeRecord(
+            senderSecretName: "alice",
+            senderDeviceId: device,
+            envelopeMessageId: "env-1",
+            logicalSharedId: "env-1",
+            frameFingerprint: fingerprint)
+        let markers = Set(accepted.lookupKeys)
+
+        // Same signed bytes, new transport id: a replay.
+        let replay = AcceptedEnvelopeKey(
+            senderSecretName: "alice",
+            senderDeviceId: device,
+            envelopeMessageId: "env-2",
+            frameFingerprint: fingerprint)
+        #expect(AcceptedEnvelopeLedgerPolicy.shouldAckAndDrop(key: replay, accepted: markers))
+        // The original envelope id still matches on its own.
+        #expect(
+            AcceptedEnvelopeLedgerPolicy.shouldAckAndDrop(
+                key: AcceptedEnvelopeKey(
+                    senderSecretName: "alice", senderDeviceId: device, envelopeMessageId: "env-1"),
+                accepted: markers))
+        // Without a fingerprint only the envelope id can match.
+        #expect(
+            !AcceptedEnvelopeLedgerPolicy.shouldAckAndDrop(
+                key: AcceptedEnvelopeKey(
+                    senderSecretName: "alice", senderDeviceId: device, envelopeMessageId: "env-2"),
+                accepted: markers))
+        // Different signed bytes under a new id are new material.
+        #expect(
+            !AcceptedEnvelopeLedgerPolicy.shouldAckAndDrop(
+                key: AcceptedEnvelopeKey(
+                    senderSecretName: "alice", senderDeviceId: device, envelopeMessageId: "env-2",
+                    frameFingerprint: Data([0x01])),
+                accepted: markers))
+        // Another device replaying the same bytes is independent (T16 scoping).
+        #expect(
+            !AcceptedEnvelopeLedgerPolicy.shouldAckAndDrop(
+                key: AcceptedEnvelopeKey(
+                    senderSecretName: "alice", senderDeviceId: UUID(), envelopeMessageId: "env-2",
+                    frameFingerprint: fingerprint),
+                accepted: markers))
+
+        // A legacy row (nil fingerprint) matches by envelope id only, even when the
+        // inbound frame offers its fingerprint.
+        let legacy = AcceptedEnvelopeRecord(
+            senderSecretName: "alice",
+            senderDeviceId: device,
+            envelopeMessageId: "env-1",
+            logicalSharedId: "env-1")
+        let legacyMarkers = Set(legacy.lookupKeys)
+        #expect(
+            AcceptedEnvelopeLedgerPolicy.shouldAckAndDrop(
+                key: AcceptedEnvelopeKey(
+                    senderSecretName: "alice", senderDeviceId: device, envelopeMessageId: "env-1",
+                    frameFingerprint: fingerprint),
+                accepted: legacyMarkers))
+        #expect(!AcceptedEnvelopeLedgerPolicy.shouldAckAndDrop(key: replay, accepted: legacyMarkers))
     }
 
     @Test("T17: archive tokens for distinct fingerprints are independent")

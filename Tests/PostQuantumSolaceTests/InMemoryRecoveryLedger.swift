@@ -60,6 +60,20 @@ final class InMemoryRecoveryLedger: @unchecked Sendable {
         }
     }
 
+    func fetchAcceptedEnvelope(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        frameFingerprint: Data
+    ) -> AcceptedEnvelopeRecord? {
+        lock.lock()
+        defer { lock.unlock() }
+        return acceptedEnvelopes.first {
+            $0.senderSecretName == senderSecretName
+                && $0.senderDeviceId == senderDeviceId
+                && $0.frameFingerprint == frameFingerprint
+        }
+    }
+
     func pruneAcceptedEnvelopes(olderThan date: Date) -> Int {
         lock.lock()
         defer { lock.unlock() }

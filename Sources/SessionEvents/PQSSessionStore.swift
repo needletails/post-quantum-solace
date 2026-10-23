@@ -303,5 +303,26 @@ public protocol PQSRecoveryStore: Sendable {
         envelopeMessageId: String
     ) async throws -> AcceptedEnvelopeRecord?
 
+    /// Lookup by the digest of the signed payload
+    /// (`AcceptedEnvelopeRecord.frameFingerprint`), so a redelivery that was
+    /// given a fresh envelope id is still recognised. Hosts whose schema does
+    /// not persist the field keep the default, which returns `nil` and leaves
+    /// the envelope-id match in place.
+    func fetchAcceptedEnvelope(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        frameFingerprint: Data
+    ) async throws -> AcceptedEnvelopeRecord?
+
     func pruneAcceptedEnvelopes(olderThan: Date) async throws -> Int
+}
+
+public extension PQSRecoveryStore {
+    func fetchAcceptedEnvelope(
+        senderSecretName _: String,
+        senderDeviceId _: UUID,
+        frameFingerprint _: Data
+    ) async throws -> AcceptedEnvelopeRecord? {
+        nil
+    }
 }

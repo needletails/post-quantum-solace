@@ -119,6 +119,7 @@ public protocol RecoveryObserver: Sendable {
         sharedMessageId: String
     ) async
 
+    /// Ends recovery if accepted
     func inboundCiphertextAccepted(sharedMessageId: String) async
 
     func inboundContentUnrecoverable(

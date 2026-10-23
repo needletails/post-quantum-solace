@@ -479,13 +479,16 @@ extension MessagePipeline {
         do {
             if let prepared = props.preparedOutbound,
                case .writeMessage(let outboundTask) = props.task.task {
+                // If we have a message that has been encrypted already but not sent... send it.
                 try await sendPreparedOutbound(
                     prepared,
                     outboundTask: outboundTask,
                     session: session)
             } else if let taskDelegate {
+                // Self implemented ratcheting
                 try await taskDelegate.performRatchet(task: props.task.task, session: session)
             } else {
+                // This is the initial step for outbound and inbound ratcheting
                 try await performRatchet(task: props.task.task, session: session)
             }
             

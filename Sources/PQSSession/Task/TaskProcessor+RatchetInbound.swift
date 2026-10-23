@@ -65,10 +65,15 @@ extension MessagePipeline {
     ) async throws {
         // T13: accepted-envelope ledger covers non-persisted successes (nudgeLocal).
         // Re-emit spool ACK; never re-enter ratchet / NACK / remint.
+        // The envelope id is transport metadata and a replay can carry a fresh
+        // one, so the ledger is also asked by the signed payload: an accepted
+        // frame must never reach lane selection again, where its still-valid
+        // PQXDH header could bootstrap a blank and demote the established lane.
         if try await session.hasAcceptedEnvelope(
             senderSecretName: inboundTask.senderSecretName,
             senderDeviceId: inboundTask.senderDeviceId,
-            envelopeMessageId: inboundTask.sharedMessageId
+            envelopeMessageId: inboundTask.sharedMessageId,
+            frameFingerprint: PQSSession.frameFingerprintDigest(for: inboundTask)
         ) {
             audit(.recovery, "pqs.recovery.redeliveryDropped reason=alreadyAccepted sharedId=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
             let acceptedSharedId = inboundTask.sharedMessageId
@@ -92,11 +97,7 @@ extension MessagePipeline {
                !Self.isReplaceableInboundRecoveryPlaceholder(existingProps)
             {
                 audit(.recovery, "pqs.recovery.redeliveryDropped reason=alreadyPersisted sharedId=\(inboundTask.sharedMessageId) logical=\(logicalLookupId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-                try await session.markEnvelopeAccepted(
-                    senderSecretName: inboundTask.senderSecretName,
-                    senderDeviceId: inboundTask.senderDeviceId,
-                    envelopeMessageId: inboundTask.sharedMessageId,
-                    logicalSharedId: logicalLookupId)
+                try await session.markEnvelopeAccepted(inboundTask)
                 let acceptedSharedId = inboundTask.sharedMessageId
                 let acceptedDelegate = await session.sessionDelegate
                 await session.scheduleTransportProtocolWork {
@@ -107,162 +108,139 @@ extension MessagePipeline {
         }
 
         let verificationResult = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
+        let inboundHeader = verificationResult.ratchetMessage.header
+        let frameFingerprint = PQSSession.nackFrameFingerprint(for: inboundTask)
         let rollbackSymmetricKey = try await session.getDatabaseSymmetricKey()
-        let rollbackPeerIdentities = try await session.cache?.fetchSessionIdentities().asyncFilter { identity in
-            guard let props = await identity.props(symmetricKey: rollbackSymmetricKey) else {
-                return false
-            }
-            return props.secretName == inboundTask.senderSecretName
-                && props.deviceId == inboundTask.senderDeviceId
-        } ?? []
+        var laneStats = InboundLaneSelectionStats(
+            sharedId: inboundTask.sharedMessageId,
+            pass: .activeFirst,
+            fingerprint: frameFingerprint)
+
+        // One store read and one props decrypt per row for the whole frame. The
+        // rollback set, the active/archived split, the blank dedupe and the header
+        // match all read from this list instead of re-decrypting per filter.
+        var peerLanes: [InboundLane] = []
+        for identity in try await session.cache?.fetchSessionIdentities() ?? [] {
+            laneStats.identityRowsScanned += 1
+            laneStats.propsDecrypts += 1
+            guard let props = await identity.props(symmetricKey: rollbackSymmetricKey),
+                  props.secretName == inboundTask.senderSecretName,
+                  props.deviceId == inboundTask.senderDeviceId
+            else { continue }
+            peerLanes.append(InboundLane(identity: identity, props: props, header: inboundHeader))
+        }
+        let rollbackPeerIdentities = peerLanes.map(\.identity)
+        let statefulRowExists = peerLanes.contains(where: \.hasRatchetState)
         // The host store owns row uniqueness; a duplicate id must not trap inbound.
         let rollbackIdentityData = Dictionary(
             rollbackPeerIdentities.map { ($0.id, $0.data) },
             uniquingKeysWith: { _, last in last })
         
+        // Everything up until this point delt with message recovery, meaning if a message was in a state of non recovery then we tried to recover that message stored in the SessionWorkCoordinator(via 2 different enqueue methods scheduleTransportProtocolWork and scheduleBackgroundWork messages use scheduleBackgroundWork via setConnectivity which reloads the job queue) ran on the background if we are a new message all of that recovery work is skipped and we start here.
         do {
             // Inbound decrypt: try the preferred/current session, then other
             // actives, then inactive sessions. Whichever decrypts becomes current
             // (activate = promote inactive / demote sibling actives).
             let preferredSessionIdentity = verificationResult.sessionIdentity
-            let preferredSessionIdentityDataBeforeAttempt = preferredSessionIdentity.data
-            var decryptionSessionIdentity = preferredSessionIdentity
-            var decryptedData: Data
-            do {
-                try await initializeRecipient(
-                    sessionIdentity: preferredSessionIdentity,
-                    session: session,
-                    ratchetMessage: verificationResult.ratchetMessage)
-                
-                decryptedData = try await ratchetManager.decrypt(
-                    verificationResult.ratchetMessage,
-                    sessionId: preferredSessionIdentity.id)
-            } catch {
-                let preferredError = error
-                try await restoreSessionIdentityData(
-                    preferredSessionIdentity,
-                    data: preferredSessionIdentityDataBeforeAttempt,
-                    session: session,
-                    reason: "preferred inbound decrypt failed before multi-session fallback")
-                let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
-                let activeIdentities = try await session.getSessionIdentities(
-                    with: inboundTask.senderSecretName)
-                let alternateActiveIdentities = await activeIdentities.asyncFilter { identity in
-                    guard identity.id != preferredSessionIdentity.id,
-                          let props = await identity.props(symmetricKey: databaseSymmetricKey)
-                    else {
-                        return false
-                    }
-                    return props.deviceId == inboundTask.senderDeviceId
+            let preferredLane: InboundLane
+            if let lane = peerLanes.first(where: { $0.identity.id == preferredSessionIdentity.id }) {
+                preferredLane = lane
+            } else {
+                laneStats.propsDecrypts += 1
+                guard let props = await preferredSessionIdentity.props(symmetricKey: rollbackSymmetricKey) else {
+                    throw DoubleRatchetKit.CryptoError.propsError
                 }
+                preferredLane = InboundLane(identity: preferredSessionIdentity, props: props, header: inboundHeader)
+            }
+            var decryptionSessionIdentity = preferredSessionIdentity
+            // Per-candidate failure classes for the rollback audit and terminal
+            // error. Without this the try-all loop swallows every alternate.
+            var attemptFailures: [(label: String, error: Error)] = []
+
+            var decryptedData: Data
+            if let data = await attemptInboundDecrypt(
+                preferredLane, kind: "preferred", frame: verificationResult, fingerprint: frameFingerprint,
+                statefulRowExists: statefulRowExists, session: session, stats: &laneStats, failures: &attemptFailures)
+            {
+                decryptedData = data
+            } else {
+                let preferredError = attemptFailures[0].error
                 // Inbound try-all: stateful Active → Archives → state-less Active.
                 // Blank PQXDH runs only on state-less rows already in (or ensured into)
                 // the device record — not a gated post-failure matching mint.
                 //
+                // Within each tier, lanes whose stored remote keys match the frame
+                // header go first (stable), so the common case decrypts on the first
+                // or second attempt. Tiers never reorder against each other.
+                //
                 // activeFirstInboundPass: try actives + state-less first. Archive walk is
                 // deferred to a `.background` job via deferArchivedInboundFallback so
                 // fresher `.urgent` ciphertext is not HOL-blocked on the single consumer.
-                let statefulAlternates = await alternateActiveIdentities.asyncFilter { identity in
-                    (await identity.props(symmetricKey: databaseSymmetricKey))?.hasRatchetState == true
-                }
-                let stateLessAlternates = await alternateActiveIdentities.asyncFilter { identity in
-                    (await identity.props(symmetricKey: databaseSymmetricKey))?.hasRatchetState != true
-                }
-                let archivedIdentities = try await session.fetchArchivedSessionIdentities(
-                    secretName: inboundTask.senderSecretName,
-                    deviceId: inboundTask.senderDeviceId)
+                let alternates = peerLanes.filter { !$0.isArchived && $0.identity.id != preferredSessionIdentity.id }
+                let statefulAlternates = InboundLaneSelectionPolicy.orderedByHeaderMatch(
+                    alternates.filter(\.hasRatchetState), rank: \.headerMatch.rank)
+                let stateLessAlternates = InboundLaneSelectionPolicy.orderedByHeaderMatch(
+                    alternates.filter { !$0.hasRatchetState }, rank: \.headerMatch.rank)
+                // Archives newest-first (sessionContextId desc), then header match.
+                let archivedLanes = InboundLaneSelectionPolicy.orderedByHeaderMatch(
+                    peerLanes.filter(\.isArchived).sorted { $0.props.sessionContextId > $1.props.sessionContextId },
+                    rank: \.headerMatch.rank)
+                let archivedBlanks = archivedLanes.filter { !$0.hasRatchetState }
+                // Active-first never walks full archives, but blankForHeaderExists
+                // counts archived blanks. Include the single header-matched archived
+                // blank in the active pass so demoted blanks are not invisible until
+                // a (possibly exhausted) archive defer.
+                let headerMatchedArchivedBlank = archivedBlanks.first(where: \.matchesHeaderKeys)
+
                 let archiveToken = ArchivedInboundFallbackToken(
                     senderSecretName: inboundTask.senderSecretName,
                     senderDeviceId: inboundTask.senderDeviceId,
                     envelopeMessageId: inboundTask.sharedMessageId,
-                    fingerprint: PQSSession.nackFrameFingerprint(for: inboundTask))
+                    fingerprint: frameFingerprint)
                 let includeArchivedFallback =
                     archivedInboundFallbackPasses.contains(archiveToken.storageKey)
                     || archivedInboundFallbackPasses.contains(inboundTask.sharedMessageId)
                 if includeArchivedFallback {
                     archivedInboundFallbackPasses.remove(archiveToken.storageKey)
                     archivedInboundFallbackPasses.remove(inboundTask.sharedMessageId)
+                    laneStats.pass = .archived
                 }
                 // Mark exhausted when this pass actually walks archives (success or
                 // total failure). Prevents re-defer on the same ciphertext.
                 let shouldMarkArchivePassExhausted = includeArchivedFallback
 
                 var fallbackData: Data?
-                // Per-candidate failure classes for the rollback audit and terminal
-                // error. Without this the try-all loop swallows every alternate.
-                var attemptFailures: [(label: String, error: Error)] = [
-                    ("preferred:\(preferredSessionIdentity.id.uuidString.prefix(8))", preferredError)
-                ]
-
-                func tryDecryptCandidates(
-                    _ candidates: [(identity: SessionIdentity, kind: String)]
-                ) async {
-                    for candidate in candidates {
-                        let fallbackIdentity = candidate.identity
-                        let fallbackDataBeforeAttempt = fallbackIdentity.data
-                        do {
-                            try await initializeRecipient(
-                                sessionIdentity: fallbackIdentity,
-                                session: session,
-                                ratchetMessage: verificationResult.ratchetMessage)
-
-                            let data = try await ratchetManager.decrypt(
-                                verificationResult.ratchetMessage,
-                                sessionId: fallbackIdentity.id)
-                            logger.log(
-                                level: .info,
-                                message: "\(candidate.kind) identity fallback succeeded for \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId))")
-                            decryptionSessionIdentity = fallbackIdentity
-                            fallbackData = data
-                            return
-                        } catch {
-                            attemptFailures.append((
-                                "\(candidate.kind):\(fallbackIdentity.id.uuidString.prefix(8))",
-                                error))
-                            try? await restoreSessionIdentityData(
-                                fallbackIdentity,
-                                data: fallbackDataBeforeAttempt,
-                                session: session,
-                                reason: "inbound identity fallback attempt failed")
-                        }
-                    }
-                }
-
-                let inboundHeader = verificationResult.ratchetMessage.header
-                let archivedBlanks = await archivedIdentities.asyncFilter { identity in
-                    (await identity.props(symmetricKey: databaseSymmetricKey))?.hasRatchetState != true
-                }
-                // Active-first never walks full archives, but blankForHeaderExists
-                // counts archived blanks. Include the single header-matched archived
-                // blank in the active pass so demoted blanks are not invisible until
-                // a (possibly exhausted) archive defer.
-                let headerMatchedArchivedBlank = await archivedBlanks.asyncFirst(where: { identity in
-                    guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else {
-                        return false
-                    }
-                    return props.longTermPublicKey == inboundHeader.remoteLongTermPublicKey
-                        && props.oneTimePublicKey?.id == inboundHeader.remoteOneTimePublicKey?.id
-                })
-
+                let candidates: [(lane: InboundLane, kind: String)]
                 if includeArchivedFallback {
                     // Background pass: archives only (actives already failed).
-                    await tryDecryptCandidates(
-                        archivedIdentities.map { (identity: $0, kind: "archived") })
+                    candidates = archivedLanes.map { (lane: $0, kind: "archived") }
                 } else {
                     // activeFirstInboundPass — decryptInboundActiveOnly candidates,
                     // plus header-matched archived blank when policy allows.
                     var activeFirstCandidates =
-                        statefulAlternates.map { (identity: $0, kind: "active") }
-                        + stateLessAlternates.map { (identity: $0, kind: "stateLess") }
+                        statefulAlternates.map { (lane: $0, kind: "active") }
+                        + stateLessAlternates.map { (lane: $0, kind: "stateLess") }
                     if let matched = headerMatchedArchivedBlank,
                        InboundInitiatingSlotPolicy.shouldTryArchivedHeaderMatchBeforeEnsureSkip(
                            blankForHeaderExists: true,
                            matchedIsArchived: true,
                            includeArchivedFallback: false)
                     {
-                        activeFirstCandidates.append((identity: matched, kind: "archivedHeaderMatch"))
+                        activeFirstCandidates.append((lane: matched, kind: "archivedHeaderMatch"))
                     }
-                    await tryDecryptCandidates(activeFirstCandidates)
+                    candidates = activeFirstCandidates
+                }
+                for candidate in candidates {
+                    guard let data = await attemptInboundDecrypt(
+                        candidate.lane, kind: candidate.kind, frame: verificationResult, fingerprint: frameFingerprint,
+                        statefulRowExists: statefulRowExists, session: session, stats: &laneStats, failures: &attemptFailures)
+                    else { continue }
+                    logger.log(
+                        level: .info,
+                        message: "\(candidate.kind) identity fallback succeeded for \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId))")
+                    decryptionSessionIdentity = candidate.lane.identity
+                    fallbackData = data
+                    break
                 }
 
                 // Every existing row failed. The receiver must always be able to
@@ -274,78 +252,57 @@ extension MessagePipeline {
                 // header already exists (it just failed in try-all above), a fresh
                 // one would fail identically, so redelivered copies don't mint storms.
                 if fallbackData == nil, !includeArchivedFallback {
-                    if let preferredProps = await preferredSessionIdentity.props(
-                        symmetricKey: databaseSymmetricKey)
+                    let preferredProps = preferredLane.props
+                    var blankRows = stateLessAlternates
+                    if !preferredProps.hasRatchetState {
+                        blankRows.append(preferredLane)
+                    }
+                    // Archived blanks count too: a prior ensured blank demoted by a
+                    // sibling's activation is still in the try-all set above, so a
+                    // fresh mint for the same header would fail identically. Without
+                    // this, every activate-then-fail cycle mints a new blank whose
+                    // archival evicts a real stateful snapshot at the retention cap.
+                    blankRows.append(contentsOf: archivedBlanks)
+                    let blankForHeaderExists = blankRows.contains(where: \.matchesHeaderKeys)
+                    if !InboundInitiatingSlotPolicy.shouldEnsureInboundBlank(
+                        blankForHeaderExists: blankForHeaderExists)
                     {
-                        let header = inboundHeader
-                        var blankRows = stateLessAlternates
-                        if !preferredProps.hasRatchetState {
-                            blankRows.append(preferredSessionIdentity)
-                        }
-                        // Archived blanks count too: a prior ensured blank demoted by a
-                        // sibling's activation is still in the try-all set above, so a
-                        // fresh mint for the same header would fail identically. Without
-                        // this, every activate-then-fail cycle mints a new blank whose
-                        // archival evicts a real stateful snapshot at the retention cap.
-                        blankRows.append(contentsOf: archivedBlanks)
-                        let blankForHeaderExists = await blankRows.asyncFirst(where: { identity in
-                            guard let props = await identity.props(symmetricKey: databaseSymmetricKey) else {
-                                return false
-                            }
-                            return props.longTermPublicKey == header.remoteLongTermPublicKey
-                                && props.oneTimePublicKey?.id == header.remoteOneTimePublicKey?.id
-                        }) != nil
-                        if !InboundInitiatingSlotPolicy.shouldEnsureInboundBlank(
-                            blankForHeaderExists: blankForHeaderExists)
-                        {
-                            audit(.recovery, "pqs.recovery.inboundInitiatingSlotEnsureSkipped reason=blankForHeaderExists peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-                        } else {
-                            do {
-                                let ensured = try await session.ensureInboundInitiatingSessionIdentity(
-                                    secretName: inboundTask.senderSecretName,
-                                    deviceId: inboundTask.senderDeviceId,
-                                    longTermPublicKey: header.remoteLongTermPublicKey,
-                                    signingPublicKey: preferredProps.signingPublicKey,
-                                    oneTimePublicKey: header.remoteOneTimePublicKey,
-                                    mlKEMPublicKey: header.remoteMLKEMPublicKey,
-                                    deviceNameHint: preferredProps.deviceName)
-                                audit(.recovery, "pqs.recovery.inboundInitiatingSlotEnsured peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) sessionId=\(ensured.id.uuidString)")
-                                let ensuredDataBeforeAttempt = ensured.data
-                                do {
-                                    try await initializeRecipient(
-                                        sessionIdentity: ensured,
-                                        session: session,
-                                        ratchetMessage: verificationResult.ratchetMessage)
-                                    let data = try await ratchetManager.decrypt(
-                                        verificationResult.ratchetMessage,
-                                        sessionId: ensured.id)
-                                    logger.log(
-                                        level: .info,
-                                        message: "stateLess identity fallback succeeded for \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId))")
-                                    decryptionSessionIdentity = ensured
-                                    fallbackData = data
-                                } catch {
-                                    attemptFailures.append((
-                                        "ensured:\(ensured.id.uuidString.prefix(8))",
-                                        error))
-                                    try? await restoreSessionIdentityData(
-                                        ensured,
-                                        data: ensuredDataBeforeAttempt,
-                                        session: session,
-                                        reason: "inbound identity fallback attempt failed")
-                                }
-                            } catch {
+                        audit(.recovery, "pqs.recovery.inboundInitiatingSlotEnsureSkipped reason=blankForHeaderExists peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                    } else {
+                        do {
+                            let ensured = try await session.ensureInboundInitiatingSessionIdentity(
+                                secretName: inboundTask.senderSecretName,
+                                deviceId: inboundTask.senderDeviceId,
+                                longTermPublicKey: inboundHeader.remoteLongTermPublicKey,
+                                signingPublicKey: preferredProps.signingPublicKey,
+                                oneTimePublicKey: inboundHeader.remoteOneTimePublicKey,
+                                mlKEMPublicKey: inboundHeader.remoteMLKEMPublicKey,
+                                deviceNameHint: preferredProps.deviceName)
+                            audit(.recovery, "pqs.recovery.inboundInitiatingSlotEnsured peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) sessionId=\(ensured.id.uuidString)")
+                            laneStats.identityRowsScanned += 1
+                            laneStats.propsDecrypts += 1
+                            if let ensuredProps = await ensured.props(symmetricKey: rollbackSymmetricKey),
+                               let data = await attemptInboundDecrypt(
+                                   InboundLane(identity: ensured, props: ensuredProps, header: inboundHeader),
+                                   kind: "ensured", frame: verificationResult, fingerprint: frameFingerprint,
+                                   statefulRowExists: statefulRowExists, session: session, stats: &laneStats, failures: &attemptFailures)
+                            {
                                 logger.log(
-                                    level: .warning,
-                                    message: "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) error=\(error)")
-                                audit(.recovery, "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) error=\(error)")
+                                    level: .info,
+                                    message: "stateLess identity fallback succeeded for \(inboundTask.senderSecretName) (\(inboundTask.senderDeviceId))")
+                                decryptionSessionIdentity = ensured
+                                fallbackData = data
                             }
+                        } catch {
+                            logger.log(
+                                level: .warning,
+                                message: "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) error=\(error)")
+                            audit(.recovery, "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) error=\(error)")
                         }
                     }
                 }
 
                 guard let data = fallbackData else {
-                    let frameFingerprint = PQSSession.nackFrameFingerprint(for: inboundTask)
                     if shouldMarkArchivePassExhausted {
                         markArchivedInboundFallbackExhausted(
                             sharedId: inboundTask.sharedMessageId,
@@ -355,18 +312,15 @@ extension MessagePipeline {
                     }
                     // Active-first miss with archives remaining: defer archive try-all
                     // to a background job so urgent inbound can proceed.
-                    if !includeArchivedFallback, !archivedIdentities.isEmpty {
+                    if !includeArchivedFallback, !archivedLanes.isEmpty {
                         await deferArchivedInboundFallback(
                             inboundTask: inboundTask,
                             session: session)
                     }
-                    // Inbound decrypt: no session decrypted — discard mutations and abort.
-                    try await restoreSessionIdentityData(
-                        preferredSessionIdentity,
-                        data: preferredSessionIdentityDataBeforeAttempt,
-                        session: session,
-                        reason: "active and archived inbound decrypt attempts failed")
-                    audit(.recovery, "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) attempts=[\(attemptFailures.map { "\($0.label):\($0.error)" }.joined(separator: "; "))]")
+                    // Inbound decrypt: no session decrypted. Every failed lane was
+                    // already rolled back by `attemptInboundDecrypt`; nothing else was mutated.
+                    recordInboundLaneSelectionStats(laneStats)
+                    audit(.recovery, "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) attempts=[\(attemptFailures.map { "\($0.label):\($0.error)" }.joined(separator: "; "))] negativeCacheSkips=\(laneStats.negativeCacheSkips)")
                     // Do NOT write the failed try-first id into the preference map here.
                     // Dogfood 2026-07-25: that armed preferredFailedInTryAll on every
                     // poison redelivery → demoteProveFailedActive walked unique session
@@ -381,10 +335,14 @@ extension MessagePipeline {
                         sharedId: inboundTask.sharedMessageId,
                         sender: inboundTask.senderSecretName,
                         deviceId: inboundTask.senderDeviceId,
-                        fingerprint: PQSSession.nackFrameFingerprint(for: inboundTask))
+                        fingerprint: frameFingerprint)
                 }
                 decryptedData = data
             }
+            // The winning lane's ratchet advanced: its recorded rejections are stale.
+            inboundNegativeDecryptCache.invalidate(laneId: decryptionSessionIdentity.id)
+            laneStats.winningLaneId = decryptionSessionIdentity.id
+            recordInboundLaneSelectionStats(laneStats)
 
             // Strict mode clears the state copy of the OTK after authenticated
             // decrypt, but DRK 4.0.0 lanes embed and re-use that key in every
@@ -884,11 +842,7 @@ extension MessagePipeline {
         // Do not publish preference / clear recovery state until the durable
         // accepted ledger write succeeds. The outer catch restores identity
         // inventory if persistence fails.
-        try await session.markEnvelopeAccepted(
-            senderSecretName: inboundTask.senderSecretName,
-            senderDeviceId: inboundTask.senderDeviceId,
-            envelopeMessageId: inboundTask.sharedMessageId,
-            logicalSharedId: inboundTask.resolvedLogicalSharedId)
+        try await session.markEnvelopeAccepted(inboundTask)
         // Deferred OTK consumption is driven only by committed frames, so a
         // rolled-back decrypt can neither record nor confirm a consumption.
         await noteAcceptedInboundForDeferredOneTimeKeyConsumption(
@@ -1063,6 +1017,107 @@ extension MessagePipeline {
         }
     }
 
+    /// Appends per-frame lane-selection accounting (DEBUG test seam, bounded).
+    func recordInboundLaneSelectionStats(_ stats: InboundLaneSelectionStats) {
+#if DEBUG
+        inboundLaneSelectionStatsLog.append(stats)
+        if inboundLaneSelectionStatsLog.count > 256 {
+            inboundLaneSelectionStatsLog.removeFirst(inboundLaneSelectionStatsLog.count - 256)
+        }
+#endif
+    }
+
+    /// The one attempt path for every inbound candidate. A lane that already
+    /// rejected this ciphertext under the same ratchet state is skipped with its
+    /// recorded failure; a fresh failure is recorded and rolled back only if the
+    /// attempt changed the row (the ratchet manager's lane is always evicted).
+    /// A state-less row that bootstraps mid-session is refused and rolled back
+    /// to blank (`InboundLaneSelectionPolicy.blankMayBecomeLane`); the frame then
+    /// takes the resend path as `decryptionFailed`, which the sender answers on
+    /// a lane this device can open.
+    private func attemptInboundDecrypt(
+        _ lane: InboundLane,
+        kind: String,
+        frame: VerificationResult,
+        fingerprint: Data,
+        statefulRowExists: Bool,
+        session: PQSSession,
+        stats: inout InboundLaneSelectionStats,
+        failures: inout [(label: String, error: Error)]
+    ) async -> Data? {
+        let laneId = lane.identity.id
+        let dataBeforeAttempt = lane.identity.data
+        let stateToken = lane.ratchetStateToken
+        let label = "\(kind):\(laneId.uuidString.prefix(8))"
+        if let cached = inboundNegativeDecryptCache.cachedFailure(
+            laneId: laneId, fingerprint: fingerprint, laneState: stateToken)
+        {
+            failures.append((label, cached))
+            stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .skippedNegativeCache, failure: "\(cached)"))
+            return nil
+        }
+        do {
+            try await initializeRecipient(
+                sessionIdentity: lane.identity,
+                props: lane.props,
+                session: session,
+                ratchetMessage: frame.ratchetMessage)
+            let data = try await ratchetManager.decrypt(frame.ratchetMessage, sessionId: laneId)
+            if !lane.hasRatchetState {
+                let receivedMessagesCount = try await ratchetManager.sessionStatus(sessionId: laneId).receivedMessagesCount
+                guard InboundLaneSelectionPolicy.blankMayBecomeLane(
+                    receivedMessagesCount: receivedMessagesCount, statefulRowExists: statefulRowExists)
+                else {
+                    audit(.recovery, "pqs.recovery.blankBootstrapRefused reason=midSessionFrame messageNumber=\(receivedMessagesCount - 1) lane=\(laneId.uuidString) kind=\(kind)")
+                    throw RatchetError.decryptionFailed
+                }
+            }
+            stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .decrypted))
+            return data
+        } catch {
+            failures.append((label, error))
+            stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .failed, failure: "\(error)"))
+            inboundNegativeDecryptCache.recordFailure(
+                laneId: laneId, fingerprint: fingerprint, laneState: stateToken, error: error)
+            if await rollBackFailedAttempt(
+                lane.identity,
+                dataBeforeAttempt: dataBeforeAttempt,
+                session: session,
+                reason: "inbound \(kind) decrypt attempt failed")
+            {
+                stats.restoreStoreWrites += 1
+            } else {
+                stats.restoresSkippedUnchanged += 1
+            }
+            return nil
+        }
+    }
+
+    /// Rolls back a failed decrypt attempt. The ratchet manager's in-memory lane is
+    /// always evicted; the row is written back only when the attempt changed its
+    /// bytes. Returns whether a store write ran. Store errors are logged, as the
+    /// fallback loop always treated them.
+    func rollBackFailedAttempt(
+        _ identity: SessionIdentity,
+        dataBeforeAttempt: Data,
+        session: PQSSession,
+        reason: String
+    ) async -> Bool {
+        guard InboundLaneSelectionPolicy.shouldRestoreIdentityData(
+            before: dataBeforeAttempt, after: identity.data)
+        else {
+            await ratchetManager.discardCachedLane(identity.id)
+            return false
+        }
+        do {
+            try await restoreSessionIdentityData(identity, data: dataBeforeAttempt, session: session, reason: reason)
+            return true
+        } catch {
+            logger.log(level: .warning, message: "Failed restoring SessionIdentity after \(reason): \(error)")
+            return true
+        }
+    }
+
     func restoreSessionIdentityData(
         _ identity: SessionIdentity,
         data: Data,
@@ -1121,6 +1176,7 @@ extension MessagePipeline {
     ///           cryptographic errors, or invalid state.
     private func initializeRecipient(
         sessionIdentity: SessionIdentity,
+        props frameProps: SessionIdentity.UnwrappedProps? = nil,
         session: PQSSession,
         ratchetMessage: RatchetMessage
     ) async throws {
@@ -1133,7 +1189,12 @@ extension MessagePipeline {
         
         var localOneTimePrivateKey: X25519PrivateKey?
         var localMLKEMPrivateKey: MLKEMPrivateKey
-        guard let props = await sessionIdentity.props(symmetricKey: databaseSymmetricKey) else {
+        // Lane selection already decrypted this row's props for the frame.
+        var resolvedProps = frameProps
+        if resolvedProps == nil {
+            resolvedProps = await sessionIdentity.props(symmetricKey: databaseSymmetricKey)
+        }
+        guard let props = resolvedProps else {
             throw DoubleRatchetKit.CryptoError.propsError
         }
         

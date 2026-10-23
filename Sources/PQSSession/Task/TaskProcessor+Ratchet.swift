@@ -323,12 +323,11 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
         session: PQSSession,
         sessionIdentityId: UUID
     ) async throws -> LoadedKeysResult {
-        /// What are our requirements? We need to ensure that the proper keys are loaded for local and remote
-        /// What are our scenarios?
-        /// 1. Initial write -  No State
-        /// 2. Rotating - State Reset and archived, essentially a new initial write
-        /// 3. Has state
-        /// 4. Has state - Rotated keys, but didn't clear state (Maintenance?)
+        /// Loads the key material for one outbound encrypt on one lane.
+        /// - No ratchet state: a handshake from the pool keys.
+        /// - Ratchet state: the keys in the lane's own snapshot.
+        /// - Routine ML-KEM rotation due: this lane re-keys with the new final key
+        ///   (skipped while a device-key rotation is in flight; it re-keys itself).
         
         var localOneTimePrivateKey: X25519PrivateKey?
         var localMLKEMPrivateKey: MLKEMPrivateKey
@@ -338,50 +337,29 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
         var needsRemoteDeletion = false
         var effectiveSessionContext = sessionContext
         
-        switch await session.keyLoadingState {
-        case .initial:
-            if let privateOneTimeKey = effectiveSessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last {
-                localOneTimePrivateKey = privateOneTimeKey
-            }
-
-            if let mlKEMOneTimePrivateKey = effectiveSessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last {
-                localMLKEMPrivateKey = mlKEMOneTimePrivateKey
-            } else {
-                localMLKEMPrivateKey = effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
-            }
-        case .rotating:
-            // `keyLoadingState` is session-scoped, but ratchet state is recipient-scoped.
-            // In multi-recipient sends (e.g. channels), we may have `.rotating`/`.complete` while
-            // a particular recipient has no established ratchet state yet. Treat missing state as
-            // an initial handshake for that recipient instead of failing the whole job.
-            if props.hasRatchetState {
-                localOneTimePrivateKey = props.ratchetOneTimePrivateKey
-                localMLKEMPrivateKey = props.ratchetMLKEMPrivateKey
-                    ?? effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
-            } else {
-                localOneTimePrivateKey = effectiveSessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last
-                localMLKEMPrivateKey = effectiveSessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last
+        // Local keys are recipient-scoped: an established lane keeps the keys in its
+        // ratchet snapshot, a lane without state starts a handshake from the pool.
+        // `keyLoadingState` is session-scoped (the process's first send, a rotation)
+        // and says nothing about this lane. Handing an established lane fresh pool
+        // keys reads to the ratchet as a local key change and fires an epoch
+        // re-key the peer only mirrors in order: every frame they sent before
+        // seeing it fails on this lane (the responder's first reply, or the first
+        // send after a relaunch, with the peer's traffic crossing it).
+        if props.hasRatchetState {
+            localOneTimePrivateKey = props.ratchetOneTimePrivateKey
+            localMLKEMPrivateKey = props.ratchetMLKEMPrivateKey
                 ?? effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
-            }
-        case .complete:
-            if props.hasRatchetState {
-                localOneTimePrivateKey = props.ratchetOneTimePrivateKey
-                localMLKEMPrivateKey = props.ratchetMLKEMPrivateKey
-                    ?? effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
-            } else {
-                localOneTimePrivateKey = effectiveSessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last
-                localMLKEMPrivateKey = effectiveSessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last
+        } else {
+            localOneTimePrivateKey = effectiveSessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last
+            localMLKEMPrivateKey = effectiveSessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last
                 ?? effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
-            }
         }
         
         switch await session.keyLoadingState {
-        case .initial, .rotating:
+        case .rotating:
             remoteLongTermPublicKey = props.longTermPublicKey
             remoteMLKEMPublicKey = props.mlKEMPublicKey
             remoteOneTimePublicKey = props.oneTimePublicKey
-            
-            await session.setKeyLoadingState(.complete)
         case .complete:
             if try await session.rotateMLKEMKeysIfNeeded() && !needsRemoteDeletion {
                 if let refreshedContext = await session.sessionContext {

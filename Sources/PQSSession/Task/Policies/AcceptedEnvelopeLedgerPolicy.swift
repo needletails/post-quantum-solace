@@ -7,33 +7,56 @@
 //
 
 import Foundation
+import SessionModels
 
 /// Composite key for a successfully accepted inbound envelope.
 public struct AcceptedEnvelopeKey: Hashable, Sendable, Codable {
     public let senderSecretName: String
     public let senderDeviceId: UUID
     public let envelopeMessageId: String
+    /// Digest of the frame's signed payload when the caller has the frame
+    /// (see `AcceptedEnvelopeRecord.frameFingerprint`); nil for id-only lookups.
+    public let frameFingerprint: Data?
 
-    public init(senderSecretName: String, senderDeviceId: UUID, envelopeMessageId: String) {
+    public init(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        envelopeMessageId: String,
+        frameFingerprint: Data? = nil
+    ) {
         self.senderSecretName = senderSecretName
         self.senderDeviceId = senderDeviceId
         self.envelopeMessageId = envelopeMessageId
+        self.frameFingerprint = frameFingerprint
     }
 
     public var storageKey: String {
         "\(senderSecretName)|\(senderDeviceId.uuidString)|\(envelopeMessageId)"
     }
+
+    public var fingerprintStorageKey: String? {
+        frameFingerprint.map {
+            AcceptedEnvelopeRecord.fingerprintStorageKey(
+                senderSecretName: senderSecretName,
+                senderDeviceId: senderDeviceId,
+                frameFingerprint: $0)
+        }
+    }
 }
 
 /// Pure policy for accepted-envelope ledger decisions.
 public enum AcceptedEnvelopeLedgerPolicy: Sendable {
-    /// Drop before ratchet when the exact sender/device/envelope was accepted.
+    /// Drop before ratchet when this sender/device already had the envelope id
+    /// accepted, or the same signed payload under any envelope id. A key without
+    /// a fingerprint, and a row persisted without one, match by envelope id only.
     public static func shouldAckAndDrop(
         key: AcceptedEnvelopeKey,
         accepted: Set<String>
     ) -> Bool {
         guard !key.senderSecretName.isEmpty, !key.envelopeMessageId.isEmpty else { return false }
-        return accepted.contains(key.storageKey)
+        if accepted.contains(key.storageKey) { return true }
+        guard let fingerprintKey = key.fingerprintStorageKey else { return false }
+        return accepted.contains(fingerprintKey)
     }
 
     /// Only successful decrypt + decode + host handling may mark accepted.

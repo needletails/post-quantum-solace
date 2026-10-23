@@ -709,6 +709,16 @@ actor MockCache: PQSStore, PQSRecoveryStore {
             senderDeviceId: senderDeviceId,
             envelopeMessageId: envelopeMessageId)
     }
+    func fetchAcceptedEnvelope(
+        senderSecretName: String,
+        senderDeviceId: UUID,
+        frameFingerprint: Data
+    ) async throws -> AcceptedEnvelopeRecord? {
+        recoveryLedger.fetchAcceptedEnvelope(
+            senderSecretName: senderSecretName,
+            senderDeviceId: senderDeviceId,
+            frameFingerprint: frameFingerprint)
+    }
     func pruneAcceptedEnvelopes(olderThan date: Date) async throws -> Int {
         recoveryLedger.pruneAcceptedEnvelopes(olderThan: date)
     }

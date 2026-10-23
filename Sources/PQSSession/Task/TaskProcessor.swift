@@ -177,6 +177,17 @@ actor MessagePipeline {
     /// Maps exhausted token → peer episode key (`secretName|deviceId`).
     var archivedInboundFallbackExhaustedPeerKey: [String: String] = [:]
 
+    /// Negative decrypt cache: `(lane id, frame fingerprint)` → failure, gated on
+    /// the lane's row bytes. A redelivered copy of the same ciphertext skips
+    /// lanes that already rejected it under unchanged ratchet state.
+    var inboundNegativeDecryptCache = InboundNegativeDecryptCache(
+        maxEntries: PQSSessionConstants.recoveryTrackingMaxEntries)
+
+#if DEBUG
+    /// Per-frame lane-selection accounting, newest last (test seam; bounded).
+    var inboundLaneSelectionStatsLog: [InboundLaneSelectionStats] = []
+#endif
+
     /// Delegate responsible for transport-level session communication.
     /// Handles the actual sending and receiving of encrypted messages over the network.
     var delegate: (any PQSNetworkHost)?
