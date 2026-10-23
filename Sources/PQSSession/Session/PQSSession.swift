@@ -683,6 +683,10 @@ public actor PQSSession: SessionCacheSynchronizer {
     /// (late orphan replay) still recovers normally — this ledger is only
     /// consulted on failure. Key format: "<sender>|<deviceUUID>|<sharedId>".
     var terminalInboundOutcomeAt: [String: Date] = [:]
+    /// Pending resends settled by an accepted replay, by inbound tuple. A sender's
+    /// "unavailable" answer that lands after the replay must not write the content
+    /// off (dogfood 2026-10-24: recovered messages shown as failed).
+    var settledInboundResendAt: [String: Date] = [:]
 
     struct PendingResendAfterReestablishment: Sendable, Equatable {
         let senderName: String

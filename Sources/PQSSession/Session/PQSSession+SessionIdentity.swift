@@ -2471,7 +2471,7 @@ public extension PQSSession {
     /// - Throws: `PQSError.invalidSignature` when the configuration is not internally
     ///   consistent, `PQSError.cannotFindContact` when the peer is not a Contact.
     @discardableResult
-    public func acknowledgePeerAccountIdentityChange(
+    func acknowledgePeerAccountIdentityChange(
         secretName: String,
         proposedConfiguration: UserConfiguration
     ) async throws -> ContactModel {
@@ -2510,6 +2510,22 @@ public extension PQSSession {
             message: "[acknowledgePeerAccountIdentityChange] user-acknowledged peer account signing key change for \(secretName) newPrefix=\(proposedConfiguration.signingPublicKey.prefix(8).map { String(format: "%02x", $0) }.joined())")
         auditSink.log(.recovery, "pqs.identity.peerAccountIdentityAcknowledged peer=\(secretName)")
         _ = try await refreshIdentities(secretName: secretName, forceRefresh: true)
+        // Signal's null message after a session reset: a control frame on the fresh
+        // lane makes every peer device build its own new lane now, not when the user
+        // next types. Without it the peer keeps sending on the ratchet we just
+        // dropped and nothing from it decrypts until our first send (dogfood
+        // 2026-10-24 07:11).
+        do {
+            _ = try await emitSessionReestablishment(
+                kind: .peerRefresh,
+                recipient: .nickname(secretName),
+                scope: .peer(secretName: secretName),
+                forceReemit: true)
+        } catch {
+            logger.log(
+                level: .warning,
+                message: "[acknowledgePeerAccountIdentityChange] lane-rebuild frame to \(secretName) not sent; the peer rebuilds on our next send instead: \(error)")
+        }
         return updated
     }
 

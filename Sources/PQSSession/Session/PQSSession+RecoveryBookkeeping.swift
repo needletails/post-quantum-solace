@@ -123,6 +123,22 @@ extension PQSSession {
         return now.timeIntervalSince(markedAt) < PQSSessionConstants.terminalInboundOutcomeTTLSeconds
     }
 
+    func rememberInboundResendSettled(sender: String, deviceId: UUID, sharedId: String, now: Date = Date()) {
+        pruneRecoveryTimestamps(
+            &settledInboundResendAt,
+            ttl: PQSSessionConstants.terminalInboundOutcomeTTLSeconds,
+            now: now)
+        settledInboundResendAt[inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: sharedId)] = now
+    }
+
+    /// True when a replay already settled this tuple's resend request, so a late
+    /// "unavailable" answer from the sender is stale.
+    func wasInboundResendSettled(sender: String, deviceId: UUID, sharedId: String, now: Date = Date()) -> Bool {
+        let key = inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: sharedId)
+        guard let settledAt = settledInboundResendAt[key] else { return false }
+        return now.timeIntervalSince(settledAt) < PQSSessionConstants.terminalInboundOutcomeTTLSeconds
+    }
+
     /// Clears the terminal mark after content is recovered (late replay landed).
     func clearInboundTerminalOutcome(sender: String, deviceId: UUID, sharedId: String) {
         let key = inboundFailureQuarantineKey(sender: sender, deviceId: deviceId, messageId: sharedId)
@@ -1296,6 +1312,7 @@ extension PQSSession {
             let settledEnvelope = pending.failedSharedMessageId
             settledIds.append(settledEnvelope)
             clearInboundTerminalOutcome(sender: sender, deviceId: deviceId, sharedId: settledEnvelope)
+            rememberInboundResendSettled(sender: sender, deviceId: deviceId, sharedId: settledEnvelope, now: now)
             let priorFailureClasses = takeInboundFailureClasses(
                 sender: sender,
                 deviceId: deviceId,

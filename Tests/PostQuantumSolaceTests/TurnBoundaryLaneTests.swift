@@ -160,16 +160,21 @@ extension EndToEndTests {
         let bobAcceptedWhileBlocked = await acceptedCount(pair.bob)
         #expect(bobAcceptedWhileBlocked == bobAccepted0, "nothing under the new identity is accepted before re-trust")
 
-        // The host accepts the new identity.
+        // The host accepts the new identity. Bob's acknowledge sends alice a frame on
+        // his fresh lane while alice is answering bob's earlier NACK with an orphan
+        // resend on a fresh lane of her own: two bootstraps cross. The first attempts
+        // on each side fail; the lanes converge through recovery.
         try await acceptPeerIdentity(on: pair.bob, peer: "alice", via: pair.bobTransport)
 
-        // New traffic flows in both directions on fresh lanes. Bob's pre-rotation
-        // frames stay parked in `held`; only the hold itself is lifted.
         pair.bobTransport.shouldDeliver = nil
-        let a = try await sendAndAwaitInbound(from: pair.alice, to: "bob", on: pair.bob, text: "alice after re-trust")
-        #expect(a.winningLaneId != nil, "\(a.candidateOrder)")
-        let b = try await sendAndAwaitInbound(from: pair.bob, to: "alice", on: pair.alice, text: "bob after re-trust")
-        #expect(b.winningLaneId != nil, "\(b.candidateOrder)")
+        let bobAccepted1 = await acceptedCount(pair.bob)
+        let aliceAccepted1 = await acceptedCount(pair.alice)
+        try await pair.alice.send(recipient: .nickname("bob"), text: "alice after re-trust")
+        #expect(await pollUntil(timeout: 30) { await self.acceptedCount(pair.bob) > bobAccepted1 },
+                "alice's traffic reaches bob under the new identity")
+        try await pair.bob.send(recipient: .nickname("alice"), text: "bob after re-trust")
+        #expect(await pollUntil(timeout: 30) { await self.acceptedCount(pair.alice) > aliceAccepted1 },
+                "bob's traffic reaches alice under the new identity")
 
         // Bob's identity did not change, so the frames he sent before alice's
         // rotation still decrypt on alice when they finally land.

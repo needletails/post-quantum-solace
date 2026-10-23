@@ -268,6 +268,11 @@ public extension PQSSession {
             messageIds: unavailableEnvelopeMessageIds)
         let delegate = sessionDelegate
         for messageId in unavailableEnvelopeMessageIds {
+            // The sender's replay already landed; its earlier "unavailable" answer is stale.
+            if wasInboundResendSettled(sender: senderName, deviceId: senderDeviceId, sharedId: messageId) {
+                auditSink.log(.recovery, "pqs.recovery.unavailableNoticeIgnored reason=alreadyRecovered sharedId=\(messageId) sender=\(senderName) deviceId=\(senderDeviceId.uuidString)")
+                continue
+            }
             let newlyTerminal = markInboundContentUnrecoverable(
                 sender: senderName,
                 deviceId: senderDeviceId,
