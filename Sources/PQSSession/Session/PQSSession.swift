@@ -257,7 +257,6 @@ public actor PQSSession: SessionCacheSynchronizer {
             message: entry.pending.message,
             metadata: newMetadata,
             sessionIdentityId: entry.pending.sessionIdentityId,
-            needsRemoteDeletion: entry.pending.needsRemoteDeletion,
             x25519OneTimeKeyId: entry.pending.x25519OneTimeKeyId,
             mlKEMOneTimeKeyId: entry.pending.mlKEMOneTimeKeyId,
             createdAt: Date()
@@ -524,19 +523,6 @@ public actor PQSSession: SessionCacheSynchronizer {
     var peerOneTimeReplenishAcknowledgedPeers = Set<String>()
     let peerOneTimeReplenishWaitTimeout: TimeInterval = 4
     var addingContactData: Data?
-    /// Last successful automatic key-rotation attempt by inbound peer key.
-    /// Key format: "<secretName>|<deviceUUID>".
-    var lastAutomaticRotationAtByPeer: [String: Date] = [:]
-    
-    /// Global timestamp for the last successful automatic key-rotation attempt.
-    /// Helps cap account-wide churn when many peers fail at once.
-    var lastAutomaticRotationAt: Date?
-    
-    /// Cooldown window for automatic rotation attempts per peer.
-    let automaticRotationPeerCooldown: TimeInterval = 60
-    
-    /// Cooldown window for automatic rotation attempts globally.
-    let automaticRotationGlobalCooldown: TimeInterval = 20
 
     enum ReconciliationFlow: String, Sendable {
         case inbound

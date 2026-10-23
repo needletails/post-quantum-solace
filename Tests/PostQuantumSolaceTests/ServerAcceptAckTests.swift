@@ -54,7 +54,6 @@ struct ServerAcceptAckTests {
                 transportEvent: nil,
                 requiresServerAck: true),
             sessionIdentityId: UUID(),
-            needsRemoteDeletion: false,
             x25519OneTimeKeyId: nil,
             mlKEMOneTimeKeyId: "mlkem",
             createdAt: Date())

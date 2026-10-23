@@ -1073,7 +1073,6 @@ extension MessagePipeline {
                 transportEvent: transportMetadata.transportEvent,
                 requiresServerAck: transportMetadata.requiresServerAck,
                 sessionIdentityId: sessionIdentity.id,
-                needsRemoteDeletion: results.needsRemoteDeletion,
                 x25519OneTimeKeyId: results.localOneTimePrivateKey?.id.uuidString,
                 mlKEMOneTimeKeyId: results.localMLKEMPrivateKey.id.uuidString)
             jobProps.preparedOutbound = prepared
@@ -1107,7 +1106,6 @@ extension MessagePipeline {
                 message: signedMessage,
                 metadata: transportMetadata,
                 sessionIdentityId: sessionIdentity.id,
-                needsRemoteDeletion: results.needsRemoteDeletion,
                 x25519OneTimeKeyId: results.localOneTimePrivateKey?.id.uuidString,
                 mlKEMOneTimeKeyId: results.localMLKEMPrivateKey.id.uuidString)
         }
@@ -1155,7 +1153,6 @@ extension MessagePipeline {
                 message: signedMessage,
                 metadata: transportMetadata,
                 sessionIdentityId: sessionIdentity.id,
-                needsRemoteDeletion: false,
                 x25519OneTimeKeyId: nil,
                 mlKEMOneTimeKeyId: results.localMLKEMPrivateKey.id.uuidString)
         }
@@ -1181,8 +1178,7 @@ extension MessagePipeline {
                     message: signedMessage,
                     metadata: transportMetadata,
                     sessionIdentityId: sessionIdentity.id,
-                    needsRemoteDeletion: results.needsRemoteDeletion,
-                    x25519OneTimeKeyId: results.localOneTimePrivateKey?.id.uuidString,
+                        x25519OneTimeKeyId: results.localOneTimePrivateKey?.id.uuidString,
                     mlKEMOneTimeKeyId: results.localMLKEMPrivateKey.id.uuidString,
                     createdAt: Date()),
                 localId: outboundTask.localId,
@@ -1191,14 +1187,6 @@ extension MessagePipeline {
                 session: session)
         }
         // Ephemeral / control traffic without accept-ack: no local delivery row to advance.
-        
-        // Perform remote key deletion only after a successful send
-        if results.needsRemoteDeletion {
-            try await removeKeys(
-                session: session,
-                x25519Id: results.localOneTimePrivateKey?.id.uuidString,
-                mlKEMId: results.localMLKEMPrivateKey.id.uuidString)
-        }
     }
 
     func completeResponderPeerRefreshIfNeeded(

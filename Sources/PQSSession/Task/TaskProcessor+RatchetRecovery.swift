@@ -73,7 +73,6 @@ extension MessagePipeline {
         message: SignedRatchetMessage,
         metadata: SignedRatchetMessageMetadata,
         sessionIdentityId: UUID,
-        needsRemoteDeletion: Bool,
         x25519OneTimeKeyId: String?,
         mlKEMOneTimeKeyId: String,
         now: Date = Date()
@@ -83,7 +82,6 @@ extension MessagePipeline {
             message: message,
             metadata: metadata,
             sessionIdentityId: sessionIdentityId,
-            needsRemoteDeletion: needsRemoteDeletion,
             x25519OneTimeKeyId: x25519OneTimeKeyId,
             mlKEMOneTimeKeyId: mlKEMOneTimeKeyId,
             createdAt: now)
@@ -121,7 +119,6 @@ extension MessagePipeline {
         message: SignedRatchetMessage,
         metadata: SignedRatchetMessageMetadata,
         sessionIdentityId: UUID,
-        needsRemoteDeletion: Bool,
         x25519OneTimeKeyId: String?,
         mlKEMOneTimeKeyId: String,
         now: Date = Date()
@@ -132,7 +129,6 @@ extension MessagePipeline {
             message: message,
             metadata: metadata,
             sessionIdentityId: sessionIdentityId,
-            needsRemoteDeletion: needsRemoteDeletion,
             x25519OneTimeKeyId: x25519OneTimeKeyId,
             mlKEMOneTimeKeyId: mlKEMOneTimeKeyId,
             createdAt: now)
@@ -165,7 +161,6 @@ extension MessagePipeline {
             message: prepared.signedMessage,
             metadata: metadata,
             sessionIdentityId: prepared.sessionIdentityId,
-            needsRemoteDeletion: prepared.needsRemoteDeletion,
             x25519OneTimeKeyId: prepared.x25519OneTimeKeyId,
             mlKEMOneTimeKeyId: prepared.mlKEMOneTimeKeyId,
             createdAt: prepared.createdAt)
@@ -216,13 +211,6 @@ extension MessagePipeline {
                 sharedId: outboundTask.sharedId,
                 isPersistedOutbound: outboundTask.isPersistedOutbound,
                 session: session)
-        }
-
-        if pendingTransport.needsRemoteDeletion {
-            try await removeKeys(
-                session: session,
-                x25519Id: pendingTransport.x25519OneTimeKeyId,
-                mlKEMId: pendingTransport.mlKEMOneTimeKeyId)
         }
     }
 
@@ -1395,24 +1383,6 @@ extension MessagePipeline {
         }
         logger.log(level: .info, message: "Requested to Remove Remote Public Curve and MLKEM One Time Keys")
         _ = try await session.retirePublishedOneTimeKeys(x25519Id: x25519Id, mlKEMId: mlKEMId)
-    }
-
-    /// Outbound bookkeeping: this device chose to retire its own one-time keys
-    /// after a send (`needsRemoteDeletion`). Server deletes run first; the local
-    /// removal is one exclusive commit so a concurrent batch commit is never
-    /// rolled back by a stale snapshot.
-    func removeKeys(session: PQSSession, x25519Id: String?, mlKEMId: String) async throws {
-        guard let secretName = await session.sessionContext?.sessionUser.secretName else { return }
-        if let x25519Id {
-            try await delegate?.deleteOneTimeKeys(for: secretName, with: x25519Id, type: .x25519)
-        }
-        try await delegate?.deleteOneTimeKeys(for: secretName, with: mlKEMId, type: .mlKEM)
-        logger.log(level: .info, message: "Requested to Remove Remote Public Curve and MLKEM One Time Keys")
-
-        _ = try await session.removeOwnOneTimeKeys(
-            x25519Id: x25519Id.flatMap(UUID.init(uuidString:)),
-            mlKEMId: UUID(uuidString: mlKEMId))
-        logger.log(level: .info, message: "Removed Local Curve and MLKEM One Time Keys")
     }
 
     /// Drains deferred NACK entries for idle-sender / episode-end paths.

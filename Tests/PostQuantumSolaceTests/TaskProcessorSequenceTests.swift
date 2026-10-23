@@ -3109,37 +3109,6 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
-    @Test("Automatic rotation tracking is pruned and capped")
-    func testAutomaticRotationTrackingIsBounded() async {
-        let deviceId = UUID()
-        let now = Date()
-
-        for index in 0..<10 {
-            await session.markAutomaticRotationAttempt(
-                sender: "stale\(index)",
-                deviceId: deviceId,
-                now: now.addingTimeInterval(-3600))
-        }
-        await session.markAutomaticRotationAttempt(
-            sender: "fresh",
-            deviceId: deviceId,
-            now: now)
-        #expect(
-            await session.lastAutomaticRotationAtByPeer.count == 1,
-            "Stale rotation entries must be pruned on insert")
-
-        for index in 0..<(PQSSessionConstants.recoveryTrackingMaxEntries + 100) {
-            await session.markAutomaticRotationAttempt(
-                sender: "flood\(index)",
-                deviceId: deviceId,
-                now: now)
-        }
-        #expect(
-            await session.lastAutomaticRotationAtByPeer.count <= PQSSessionConstants.recoveryTrackingMaxEntries,
-            "Rotation tracking must be capped")
-        await session.shutdown()
-    }
-
     @Test("Pending resend-after-reestablishment tracking is capped")
     func testPendingResendTrackingIsCapped() async {
         let deviceId = UUID()

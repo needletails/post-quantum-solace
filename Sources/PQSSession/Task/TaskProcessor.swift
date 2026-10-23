@@ -251,7 +251,6 @@ actor MessagePipeline {
         let message: SignedRatchetMessage
         let metadata: SignedRatchetMessageMetadata
         let sessionIdentityId: UUID
-        let needsRemoteDeletion: Bool
         let x25519OneTimeKeyId: String?
         let mlKEMOneTimeKeyId: String
         let createdAt: Date

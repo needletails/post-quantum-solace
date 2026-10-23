@@ -349,6 +349,9 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
         /// Whether the transport should request a server acceptance acknowledgment.
         public let requiresServerAck: Bool
         public let sessionIdentityId: UUID
+        /// Legacy. Routine ML-KEM rotation once retired this device's pool keys after
+        /// the send that re-keyed a lane; rotation no longer touches established lanes,
+        /// so nothing sets or reads this. Kept so persisted jobs keep decoding.
         public let needsRemoteDeletion: Bool
         public let x25519OneTimeKeyId: String?
         public let mlKEMOneTimeKeyId: String
@@ -365,7 +368,7 @@ public final class JobModel: SecureModelProtocol, Codable, @unchecked Sendable {
             transportEvent: TransportEvent?,
             requiresServerAck: Bool = false,
             sessionIdentityId: UUID,
-            needsRemoteDeletion: Bool,
+            needsRemoteDeletion: Bool = false,
             x25519OneTimeKeyId: String?,
             mlKEMOneTimeKeyId: String,
             createdAt: Date = Date()

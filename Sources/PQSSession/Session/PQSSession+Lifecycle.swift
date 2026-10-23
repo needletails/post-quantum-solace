@@ -373,8 +373,6 @@ extension PQSSession {
         otkUploadCircuitOpen = false
         otkUploadCircuitOpenedAt = nil
         lastReconciliationAtByPeer.removeAll()
-        lastAutomaticRotationAtByPeer.removeAll()
-        lastAutomaticRotationAt = nil
         lifecyclePhase = .shutDown
     }
 

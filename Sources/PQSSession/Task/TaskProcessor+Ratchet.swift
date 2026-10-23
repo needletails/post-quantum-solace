@@ -314,7 +314,6 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
         var remoteLongTermPublicKey: Data
         var remoteOneTimePublicKey: X25519PublicKey?
         var remoteMLKEMPublicKey: MLKEMPublicKey
-        var needsRemoteDeletion = false
     }
     
     func loadKeys(
@@ -326,15 +325,14 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
         /// Loads the key material for one outbound encrypt on one lane.
         /// - No ratchet state: a handshake from the pool keys.
         /// - Ratchet state: the keys in the lane's own snapshot.
-        /// - Routine ML-KEM rotation due: this lane re-keys with the new final key
-        ///   (skipped while a device-key rotation is in flight; it re-keys itself).
+        /// - Routine ML-KEM rotation due: the published bundle and the pool move on;
+        ///   an established lane keeps its snapshot keys.
         
         var localOneTimePrivateKey: X25519PrivateKey?
         var localMLKEMPrivateKey: MLKEMPrivateKey
         var remoteLongTermPublicKey: Data
         var remoteOneTimePublicKey: X25519PublicKey?
         var remoteMLKEMPublicKey: MLKEMPublicKey
-        var needsRemoteDeletion = false
         var effectiveSessionContext = sessionContext
         
         // Local keys are recipient-scoped: an established lane keeps the keys in its
@@ -355,41 +353,24 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
                 ?? effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
         }
         
-        switch await session.keyLoadingState {
-        case .rotating:
-            remoteLongTermPublicKey = props.longTermPublicKey
-            remoteMLKEMPublicKey = props.mlKEMPublicKey
-            remoteOneTimePublicKey = props.oneTimePublicKey
-        case .complete:
-            if try await session.rotateMLKEMKeysIfNeeded() && !needsRemoteDeletion {
-                if let refreshedContext = await session.sessionContext {
-                    effectiveSessionContext = refreshedContext
-                }
-                guard props.hasRatchetState else {
-                    // No prior ratchet state for this recipient yet; skip rotate-on-complete path.
-                    remoteLongTermPublicKey = props.longTermPublicKey
-                    remoteOneTimePublicKey = props.oneTimePublicKey
-                    remoteMLKEMPublicKey = props.mlKEMPublicKey
-                    return LoadedKeysResult(
-                        localOneTimePrivateKey: localOneTimePrivateKey,
-                        localMLKEMPrivateKey: localMLKEMPrivateKey,
-                        remoteLongTermPublicKey: remoteLongTermPublicKey,
-                        remoteOneTimePublicKey: remoteOneTimePublicKey,
-                        remoteMLKEMPublicKey: remoteMLKEMPublicKey,
-                        needsRemoteDeletion: false
-                    )
-                }
-                needsRemoteDeletion = true
-                localOneTimePrivateKey = props.ratchetOneTimePrivateKey
-                if let privateMLKEMOneTimeKey = effectiveSessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last {
-                    localMLKEMPrivateKey = privateMLKEMOneTimeKey
-                } else {
-                    localMLKEMPrivateKey = effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
-                }
-            }
-            remoteLongTermPublicKey = props.longTermPublicKey
-            remoteOneTimePublicKey = props.oneTimePublicKey
-            remoteMLKEMPublicKey = props.mlKEMPublicKey
+        remoteLongTermPublicKey = props.longTermPublicKey
+        remoteOneTimePublicKey = props.oneTimePublicKey
+        remoteMLKEMPublicKey = props.mlKEMPublicKey
+
+        // Routine ML-KEM rotation is Signal's signed-prekey rotation: it moves the
+        // published bundle and the pool for lanes that have not started yet and
+        // never touches an established lane. Re-keying an established lane here
+        // was a spontaneous epoch the peer could only mirror in order; frames
+        // already in flight, or a peer rotating at the same moment, diverged the
+        // chains. A device-key rotation in flight (`.rotating`) owns the context
+        // and re-keys lanes through reestablishment, so routine rotation waits.
+        if await session.keyLoadingState == .complete,
+           try await session.rotateMLKEMKeysIfNeeded(),
+           !props.hasRatchetState,
+           let refreshedContext = await session.sessionContext {
+            effectiveSessionContext = refreshedContext
+            localMLKEMPrivateKey = refreshedContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last
+                ?? refreshedContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
         }
         
         // Strict encrypt throws if a sending handshake still wants a remote OTK
@@ -426,8 +407,7 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
             localMLKEMPrivateKey: localMLKEMPrivateKey,
             remoteLongTermPublicKey: remoteLongTermPublicKey,
             remoteOneTimePublicKey: remoteOneTimePublicKey,
-            remoteMLKEMPublicKey: remoteMLKEMPublicKey,
-            needsRemoteDeletion: needsRemoteDeletion)
+            remoteMLKEMPublicKey: remoteMLKEMPublicKey)
     }
     
 }

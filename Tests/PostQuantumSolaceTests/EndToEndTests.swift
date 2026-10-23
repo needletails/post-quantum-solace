@@ -470,7 +470,7 @@ actor EndToEndTests {
     /// SDK can reestablish with the sender and request resend without rotating local identity keys.
     /// In tests, we typically want receive loops to keep running while reestablishment converges.
     @discardableResult
-    private func receiveIgnoringRecoverableErrors(
+    func receiveIgnoringRecoverableErrors(
         _ session: PQSSession,
         received: ReceivedMessage
     ) async throws -> Bool {
@@ -5206,10 +5206,10 @@ actor EndToEndTests {
         #expect(bobReceivedCount >= 1, "Bob should have received at least the sessionReestablishment message. Actual: \(bobReceivedCount)")
     }
     
-    @Test("NeedsRemoteDeletion Not Always True After Rotation")
-    func testNeedsRemoteDeletionNotAlwaysTrue() async throws {
-        // This test verifies that needsRemoteDeletion is not always true after key rotation.
-        // After the first send following rotation, needsRemoteDeletion should be false for subsequent sends.
+    @Test("Messages after a compromise rotation all reach the peer")
+    func testMessagesAfterCompromiseRotationReachPeer() async throws {
+        // A compromise rotation changes this device's identity keys; every send after
+        // it must still decrypt on the peer once the reestablishment has been processed.
         
         var aliceTask: Task<Void, Never>?
         var bobTask: Task<Void, Never>?
@@ -5276,8 +5276,6 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .milliseconds(300))
         
         // Step 3: Alice sends multiple messages after rotation
-        // The first send should trigger needsRemoteDeletion = true
-        // Subsequent sends should have needsRemoteDeletion = false (rotatingKeys was reset)
         try await _senderSession.send(recipient: .nickname("bob"), text: "message 1 after rotation")
         try await Task.sleep(until: .now + .milliseconds(200))
         
@@ -5305,7 +5303,6 @@ actor EndToEndTests {
         try await Task.sleep(until: .now + .milliseconds(500))
         
         // Verify all messages were received successfully
-        // If needsRemoteDeletion was always true, there might be issues with key deletion
         #expect(bobReceivedCount >= 3, "Bob should have received all 3 post-rotation messages. Actual: \(bobReceivedCount)")
     }
     
@@ -10009,7 +10006,7 @@ actor EndToEndTests {
     }
     
     /// Polls `condition` until it holds or `timeout` elapses. Returns the final evaluation.
-    private func pollUntil(
+    func pollUntil(
         timeout: TimeInterval,
         _ condition: @Sendable () async -> Bool
     ) async -> Bool {

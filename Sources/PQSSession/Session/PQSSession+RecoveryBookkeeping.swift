@@ -25,25 +25,11 @@ import SessionModels
 /// Inbound-failure classification, quarantine, resend-request throttling,
 /// reestablishment episodes, and accepted-envelope/send-record ledgers.
 extension PQSSession {
-    /// Builds a stable key for peer-scoped automatic rotation throttling.
+    /// Stable "<secretName>|<deviceUUID>" key for peer-device scoped recovery bookkeeping.
     func automaticRotationPeerKey(sender: String, deviceId: UUID) -> String {
         "\(sender)|\(deviceId.uuidString)"
     }
     
-    enum InboundFailureDisposition: Sendable, Equatable {
-        case dropAndIgnore
-        case reconcileThenRequestResend
-        case rotateAndRequestResend
-        case rotate
-    }
-
-    enum InboundFailureKind: Sendable, Equatable {
-        case securityViolation
-        case sessionRepairNeeded
-        case payloadRepairNeeded
-        case dropOrQuarantine
-    }
-
     enum PeerIdentityRefreshImpact: Sendable, Equatable {
         case noSessionImpact
         case resendRecommended
@@ -53,31 +39,6 @@ extension PQSSession {
     struct PeerIdentityRefreshAssessment: Sendable {
         let identities: [SessionIdentity]
         let impact: PeerIdentityRefreshImpact
-    }
-    
-    struct InboundFailureClassification: Sendable {
-        let failureClass: String
-        let disposition: InboundFailureDisposition
-        let kind: InboundFailureKind
-
-        init(
-            failureClass: String,
-            disposition: InboundFailureDisposition,
-            kind: InboundFailureKind? = nil
-        ) {
-            self.failureClass = failureClass
-            self.disposition = disposition
-            self.kind = kind ?? {
-                switch disposition {
-                case .dropAndIgnore:
-                    return .dropOrQuarantine
-                case .reconcileThenRequestResend:
-                    return .sessionRepairNeeded
-                case .rotateAndRequestResend, .rotate:
-                    return .securityViolation
-                }
-            }()
-        }
     }
     
     /// Builds a stable key for inbound failure policy.
@@ -320,26 +281,6 @@ extension PQSSession {
         return matches.map { String($0.dropFirst(prefix.count)) }
     }
     
-    /// Returns whether automatic key rotation is currently allowed for this peer.
-    func canAttemptAutomaticRotation(sender: String, deviceId: UUID, now: Date = Date()) -> Bool {
-        let peerKey = automaticRotationPeerKey(sender: sender, deviceId: deviceId)
-        if let lastGlobal = lastAutomaticRotationAt, now.timeIntervalSince(lastGlobal) < automaticRotationGlobalCooldown {
-            return false
-        }
-        if let lastPeer = lastAutomaticRotationAtByPeer[peerKey], now.timeIntervalSince(lastPeer) < automaticRotationPeerCooldown {
-            return false
-        }
-        return true
-    }
-    
-    /// Records a successful automatic rotation attempt for cooldown gating.
-    func markAutomaticRotationAttempt(sender: String, deviceId: UUID, now: Date = Date()) {
-        let peerKey = automaticRotationPeerKey(sender: sender, deviceId: deviceId)
-        lastAutomaticRotationAt = now
-        pruneRecoveryTimestamps(&lastAutomaticRotationAtByPeer, ttl: automaticRotationPeerCooldown, now: now)
-        lastAutomaticRotationAtByPeer[peerKey] = now
-    }
-
     /// Count cap for the TTL-only failure-policy table: unique wire message ids are
     /// attacker-chosen, so TTL alone does not bound memory under a flood.
     func boundInboundFailurePolicyTable() {
