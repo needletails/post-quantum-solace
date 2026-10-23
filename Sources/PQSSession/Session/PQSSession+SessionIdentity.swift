@@ -2457,6 +2457,62 @@ public extension PQSSession {
 
     /// Fetches the remote peer configuration and refuses recovery emit when the
     /// advertised signing key no longer matches the locally pinned contact.
+    /// The user accepted a peer's new account signing key (reported through
+    /// `peerAccountIdentityChanged`). Re-pins the Contact and the session-context pin to
+    /// `proposedConfiguration`, drops every lane for that peer (frames sealed under the
+    /// old identity stay refused), and refreshes identities from the directory so fresh
+    /// lanes are minted under the new key.
+    ///
+    /// This has to run inside the session: a host that rewrote the Contact in its own
+    /// store left the warm contact list on the old pin, and the forced refresh that
+    /// followed threw `peerSigningKeyOutOfSync` at the user who had just accepted
+    /// (dogfood 2026-10-23).
+    ///
+    /// - Throws: `PQSError.invalidSignature` when the configuration is not internally
+    ///   consistent, `PQSError.cannotFindContact` when the peer is not a Contact.
+    @discardableResult
+    public func acknowledgePeerAccountIdentityChange(
+        secretName: String,
+        proposedConfiguration: UserConfiguration
+    ) async throws -> ContactModel {
+        try validateUserConfigurationSignatures(proposedConfiguration)
+        guard let cache else {
+            throw PQSError.databaseNotInitialized
+        }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        var found: (contact: ContactModel, props: ContactModel.UnwrappedProps)?
+        for contact in try await cache.fetchContacts() {
+            if let props = await contact.props(symmetricKey: symmetricKey), props.secretName == secretName {
+                found = (contact, props)
+                break
+            }
+        }
+        guard let found else {
+            throw PQSError.cannotFindContact
+        }
+        let updated = try ContactModel(
+            id: found.contact.id,
+            props: .init(
+                secretName: secretName,
+                configuration: proposedConfiguration,
+                metadata: found.props.metadata),
+            symmetricKey: symmetricKey)
+        try await cache.updateContact(updated)
+        for identity in try await cache.fetchSessionIdentities() {
+            guard let props = await identity.props(symmetricKey: symmetricKey),
+                  props.secretName == secretName else { continue }
+            try await cache.deleteSessionIdentity(identity.id)
+        }
+        clearPeerTransientState(secretName: secretName)
+        try await recordPeerAccountSigningKeyPin(proposedConfiguration.signingPublicKey, for: secretName)
+        logger.log(
+            level: .error,
+            message: "[acknowledgePeerAccountIdentityChange] user-acknowledged peer account signing key change for \(secretName) newPrefix=\(proposedConfiguration.signingPublicKey.prefix(8).map { String(format: "%02x", $0) }.joined())")
+        auditSink.log(.recovery, "pqs.identity.peerAccountIdentityAcknowledged peer=\(secretName)")
+        _ = try await refreshIdentities(secretName: secretName, forceRefresh: true)
+        return updated
+    }
+
     internal func validatePeerAccountSigningKeyAgainstRemote(secretName: String) async throws {
         guard let transportDelegate else {
             throw PQSError.transportNotInitialized

@@ -123,27 +123,10 @@ extension EndToEndTests {
         await pair.finish()
     }
 
-    /// What nudge-kit does when the user accepts a peer's new account identity
-    /// (`NudgeSession.acknowledgePeerAccountIdentityChange`): re-pin the contact's
-    /// configuration, drop every lane for that peer, and refresh identities.
+    /// What the host does when the user accepts a peer's new account identity.
     private func acceptPeerIdentity(on session: PQSSession, peer: String, via transport: _MockTransportDelegate) async throws {
-        let cache = try #require(await session.cache)
-        let key = try await session.getDatabaseSymmetricKey()
         let proposed = try await transport.findConfigurationBypassingCache(for: peer)
-        var found: (ContactModel, ContactModel.UnwrappedProps)?
-        for contact in try await cache.fetchContacts() {
-            if let p = await contact.props(symmetricKey: key), p.secretName == peer { found = (contact, p); break }
-        }
-        let (contact, props) = try #require(found)
-        try await cache.updateContact(ContactModel(
-            id: contact.id,
-            props: .init(secretName: peer, configuration: proposed, metadata: props.metadata),
-            symmetricKey: key))
-        for identity in try await cache.fetchSessionIdentities() {
-            guard let p = await identity.props(symmetricKey: key), p.secretName == peer else { continue }
-            try await cache.deleteSessionIdentity(identity.id)
-        }
-        _ = try await session.refreshIdentities(secretName: peer, forceRefresh: true)
+        _ = try await session.acknowledgePeerAccountIdentityChange(secretName: peer, proposedConfiguration: proposed)
     }
 
     @Test("a compromise rotation with frames in flight is trust-blocked until the host re-trusts, then converges")

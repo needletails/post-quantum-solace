@@ -20,6 +20,8 @@ extension EndToEndTests {
         let bobDeviceId: UUID
         let aliceTransport: _MockTransportDelegate
         let bobTransport: _MockTransportDelegate
+        let aliceStore: MockIdentityStore
+        let bobStore: MockIdentityStore
         let aliceTask: Task<Void, Never>
         let bobTask: Task<Void, Never>
         /// Reestablishment control frames seen on either transport.
@@ -70,8 +72,10 @@ extension EndToEndTests {
         }
         let sd = SessionDelegate(session: _senderSession, outboundUnrecoverableProbe: aliceUnrecoverableProbe)
         let rsd = SessionDelegate(session: _recipientSession, peerIdentityTrustProbe: bobTrustProbe)
-        try await createSenderSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
-        try await createRecipientSession(store: createRecipientStore(), transport: bobTransport, sessionDelegate: rsd)
+        let aliceStore = createSenderStore()
+        let bobStore = createRecipientStore()
+        try await createSenderSession(store: aliceStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: bobStore, transport: bobTransport, sessionDelegate: rsd)
         let alice = _senderSession
         let bob = _recipientSession
         let controls = ControlCounter()
@@ -97,6 +101,7 @@ extension EndToEndTests {
             alice: alice, bob: bob,
             aliceDeviceId: aliceDeviceId, bobDeviceId: bobDeviceId,
             aliceTransport: aliceTransport, bobTransport: bobTransport,
+            aliceStore: aliceStore, bobStore: bobStore,
             aliceTask: aliceTask, bobTask: bobTask,
             controls: controls)
     }
