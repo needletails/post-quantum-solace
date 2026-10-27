@@ -12427,19 +12427,27 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
         keyData + "salt".data(using: .utf8)!
     }
     func deleteLocalDeviceSalt() async throws {}
+    /// A SQL store hands out a new `SessionIdentity` instance per fetch and keeps its own
+    /// bytes on write, so a row cached by one process never changes under another. The
+    /// default shares instances, which hides stale-cache bugs; opt in to model the real store.
+    var detachesRows = false
+    func setDetachesRows(_ enabled: Bool) { detachesRows = enabled }
+    private func row(_ session: SessionIdentity) -> SessionIdentity {
+        detachesRows ? SessionIdentity(id: session.id, data: session.data) : session
+    }
     func fetchSessionIdentities() async throws -> [DoubleRatchetKit.SessionIdentity] {
-        identities
+        identities.map(row)
     }
     /// Store-write spy: every identity row update that reached this store.
     var updateSessionIdentityCallCount = 0
     func updateSessionIdentity(_ session: DoubleRatchetKit.SessionIdentity) async throws {
         updateSessionIdentityCallCount += 1
         identities.removeAll(where: { $0.id == session.id })
-        identities.append(session)
+        identities.append(row(session))
     }
     
     func createSessionIdentity(_ session: SessionIdentity) async throws {
-        identities.append(session)
+        identities.append(row(session))
     }
     func fetchLocalDeviceSalt() async throws -> String {
         guard let salt = localDeviceSalt else { throw PQSError.saltError }
