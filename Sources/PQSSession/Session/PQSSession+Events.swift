@@ -823,4 +823,14 @@ extension PQSSession: ContactService {
             )
         }
     }
+
+    /// Deletes a communication from the store and the in-memory cache together.
+    ///
+    /// Deleting on the persistence host directly leaves the cache holding the model, so
+    /// ``conversation(for:)`` keeps returning a conversation the store no longer has.
+    /// - Throws: `PQSError.databaseNotInitialized` before the cache exists, or the store's error.
+    public func deleteCommunication(_ communication: BaseCommunication) async throws {
+        guard let cache else { throw PQSError.databaseNotInitialized }
+        try await cache.deleteCommunication(communication)
+    }
 }
