@@ -1641,6 +1641,7 @@ public extension PQSSession {
     /// Demote a specific prove-failed active (initialized or state-less) so it cannot
     /// win `bestSessionIdentity` / preferred selection. Used after inbound try-all
     /// failure and sender orphan remint when MessageRecord named a dead lane.
+    /// Keeps the device's last initialized active: a receiver never forks the lane.
     @discardableResult
     internal func demoteProveFailedActive(
         sessionId: UUID,
@@ -1673,6 +1674,28 @@ public extension PQSSession {
             sessionId: identity.id
         ) {
             return false
+        }
+        // With no other initialized active for this device, demoting would leave
+        // outbound a blank to initiate on: a one-time key burned and a second
+        // session the peer must now track (dogfood 2026-10-27). The pin is already
+        // cleared; the peer's next initiating frame activates its replacement and
+        // demotes this row then.
+        if props.hasRatchetState {
+            var otherInitializedActive = false
+            for other in allIdentities where other.id != identity.id {
+                guard let otherProps = await other.props(symmetricKey: symmetricKey),
+                      otherProps.secretName == secretName,
+                      otherProps.deviceId == deviceId,
+                      !otherProps.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix),
+                      otherProps.hasRatchetState
+                else { continue }
+                otherInitializedActive = true
+                break
+            }
+            if !otherInitializedActive {
+                auditSink.log(.recovery, "pqs.recovery.proveFailedActiveDemoteSkipped reason=lastInitializedLane peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(sessionId.uuidString)")
+                return false
+            }
         }
         let demoted = try await demoteActiveSessionIdentityToInactive(identity)
         if demoted {

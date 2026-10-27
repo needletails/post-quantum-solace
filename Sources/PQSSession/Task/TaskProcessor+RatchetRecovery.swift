@@ -586,7 +586,7 @@ extension MessagePipeline {
             let symmetricKeyForLookup = try? await session.getDatabaseSymmetricKey()
             for requestedEnvelopeMessageId in request.failedSharedMessageIds {
                 let messageRecord = await session.outboundDeviceSendRecord(
-                    envelopeMessageId: requestedEnvelopeMessageId)
+                    citedId: requestedEnvelopeMessageId, requestingDeviceId: request.requestingDeviceId)
                 if await session.isKnownUnavailableResend(
                     requestingDeviceId: request.requestingDeviceId,
                     sharedId: requestedEnvelopeMessageId)
@@ -666,7 +666,7 @@ extension MessagePipeline {
             var remainder: [String] = []
             for candidateId in request.failedSharedMessageIds {
                 let candidateRecord = await session.outboundDeviceSendRecord(
-                    envelopeMessageId: candidateId)
+                    citedId: candidateId, requestingDeviceId: request.requestingDeviceId)
                 let candidateLogicalId = candidateRecord?.sharedId ?? candidateId
                 let candidateKey = orphanResendServiceKey(
                     requestingDeviceId: request.requestingDeviceId,
@@ -688,10 +688,11 @@ extension MessagePipeline {
         }
         for failedEnvelopeMessageId in orderedFailedSharedMessageIds {
             // Strict §4.1 retry requests identify the failed encrypted
-            // envelope. Resolve its MessageRecord before looking up plaintext,
-            // whose durable content key remains the logical shared id.
+            // envelope; a host re-arm cites its logical id. Resolve the
+            // MessageRecord before looking up plaintext, whose durable content
+            // key remains the logical shared id.
             let requestedMessageRecord = await session.outboundDeviceSendRecord(
-                envelopeMessageId: failedEnvelopeMessageId)
+                citedId: failedEnvelopeMessageId, requestingDeviceId: request.requestingDeviceId)
             // A previous lookup already proved this id unreplayable; skip the
             // DB pass and just re-notify the requester below.
             if await session.isKnownUnavailableResend(
@@ -793,7 +794,7 @@ extension MessagePipeline {
                             requestingDeviceId: request.requestingDeviceId,
                             sharedId: failedSharedMessageId)
                         let messageRecord = await session.outboundDeviceSendRecord(
-                            envelopeMessageId: failedEnvelopeMessageId)
+                            citedId: failedEnvelopeMessageId, requestingDeviceId: request.requestingDeviceId)
                         let recoverySessionId = await session.orphanResendRecoverySessionId(
                             secretName: requesterSecretName,
                             deviceId: request.requestingDeviceId)
@@ -907,7 +908,7 @@ extension MessagePipeline {
             var replayIdentity = identity
             var retransportCached = false
             let messageRecord = await session.outboundDeviceSendRecord(
-                envelopeMessageId: failedEnvelopeMessageId)
+                citedId: failedEnvelopeMessageId, requestingDeviceId: request.requestingDeviceId)
             let recoverySessionId = await session.orphanResendRecoverySessionId(
                 secretName: requesterSecretName,
                 deviceId: request.requestingDeviceId)
@@ -1293,7 +1294,7 @@ extension MessagePipeline {
             for envelopeMessageId in unavailableIds {
                 let sharedId =
                     await session.outboundDeviceSendRecord(
-                        envelopeMessageId: envelopeMessageId)?.sharedId
+                        citedId: envelopeMessageId, requestingDeviceId: request.requestingDeviceId)?.sharedId
                     ?? envelopeMessageId
                 await sessionDelegate.outboundMessageUnrecoverable(
                     sharedMessageId: sharedId,

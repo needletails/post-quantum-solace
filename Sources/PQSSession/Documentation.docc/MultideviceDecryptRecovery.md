@@ -40,7 +40,7 @@ sender orphan-resend.
 | Activate inactive session only on decrypt success | §3.4 | `activateSessionIdentityAfterInboundDecrypt` | S16 |
 | Discard all state changes on decrypt failure | §3.4 | Snapshot rollback | S16 |
 | Retry request is unencrypted | §4.1 | `PQSRecoveryTransport.sendOutOfBandResendRequest` | S1, S7, S13 |
-| Retry cites unique MessageID of failed envelope | §4.1 | `failedEnvelopeMessageIds` | S11–S13 |
+| Retry cites the failed envelope's MessageID; a host re-arm cites its logical id, resolved only through the record addressed to the requesting device | §4.1 | `outboundDeviceSendRecord(citedId:requestingDeviceId:)` | S11–S13, `ResendServicingAuthorizationTests` |
 | MessageRecord per (device, envelope), new ID on resend | §4.1 | `OutboundDeviceSendRecord` envelope index | S11, S12 |
 | Replay settles the failed envelope's deferred NACK by logical id | §4.1 | `settlePendingResendsForAcceptedInbound` | S12a |
 | Remint only when active SessionID matches MessageRecord | §4.1 | `OrphanResendRemintPolicy` | S15 |

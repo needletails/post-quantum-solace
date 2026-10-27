@@ -1105,6 +1105,20 @@ extension PQSSession {
         return nil
     }
 
+    /// Resolves the id a resend request cites to the envelope record it names for
+    /// the requesting device: by envelope id (§4.1), else by logical shared id — a
+    /// host re-arm from the placeholder ledger cites the logical id (S12a). Either
+    /// way the record must be one this device addressed to that device.
+    func outboundDeviceSendRecord(
+        citedId: String,
+        requestingDeviceId: UUID
+    ) async -> OutboundDeviceSendRecord? {
+        if let record = await outboundDeviceSendRecord(envelopeMessageId: citedId) {
+            return record
+        }
+        return await outboundDeviceSendRecord(sharedId: citedId, recipientDeviceId: requestingDeviceId)
+    }
+
     /// Whether this sender device already had the frame accepted: by envelope id,
     /// or, when `frameFingerprint` is given, by the signed payload under any
     /// envelope id. The id rides outside the signature, so a redelivery can
