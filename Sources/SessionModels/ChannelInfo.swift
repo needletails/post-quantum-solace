@@ -24,6 +24,7 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         case botMemberWelcome
         case botOperatorWelcome
         case botIdleHint
+        case title
     }
 
     /// Display name / handle for the channel (e.g. `"design"`).
@@ -42,6 +43,10 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
     public let botMemberWelcome: String?
     public let botOperatorWelcome: String?
     public let botIdleHint: String?
+    /// Human title the creator gave the channel (e.g. `"Family"`); `name` is the
+    /// `#slug_<uuid>` wire identifier. Synchronized to every member; `nil` on channels
+    /// created before titles were shared.
+    public let title: String?
 
     public init(
         name: String,
@@ -51,7 +56,8 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         enabledBotNames: [String]? = nil,
         botMemberWelcome: String? = nil,
         botOperatorWelcome: String? = nil,
-        botIdleHint: String? = nil
+        botIdleHint: String? = nil,
+        title: String? = nil
     ) {
         self.name = name
         self.administrator = administrator
@@ -61,6 +67,7 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         self.botMemberWelcome = botMemberWelcome
         self.botOperatorWelcome = botOperatorWelcome
         self.botIdleHint = botIdleHint
+        self.title = title
     }
 
     public init(from decoder: Decoder) throws {
@@ -73,6 +80,7 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         botMemberWelcome = try container.decodeIfPresent(String.self, forKey: .botMemberWelcome)
         botOperatorWelcome = try container.decodeIfPresent(String.self, forKey: .botOperatorWelcome)
         botIdleHint = try container.decodeIfPresent(String.self, forKey: .botIdleHint)
+        title = try container.decodeIfPresent(String.self, forKey: .title)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -92,6 +100,9 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         }
         if let botIdleHint {
             try container.encode(botIdleHint, forKey: .botIdleHint)
+        }
+        if let title {
+            try container.encode(title, forKey: .title)
         }
     }
 }

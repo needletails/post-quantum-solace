@@ -379,6 +379,7 @@ public extension PQSSession {
         administrator: String,
         members: Set<String>,
         operators: Set<String>,
+        title: String? = nil,
         welcomeMessage: String? = nil,
         transportInfo: Data? = nil,
         shouldSynchronize: Bool = true
@@ -392,7 +393,8 @@ public extension PQSSession {
             name: channelName,
             administrator: administrator,
             members: members,
-            operators: operators)
+            operators: operators,
+            title: title)
         
         let metadata = try BinaryEncoder().encode(info)
         
@@ -449,6 +451,7 @@ public extension PQSSession {
         administrator: String,
         members: Set<String>,
         operators: Set<String>,
+        title: String? = nil,
         shouldSynchronize: Bool
     ) async throws {
         guard let cache else {
@@ -459,6 +462,7 @@ public extension PQSSession {
             administrator: administrator,
             members: members,
             operators: operators,
+            title: title,
             symmetricKey: getDatabaseSymmetricKey(),
             session: self,
             cache: cache,

@@ -966,6 +966,7 @@ actor MessagePipeline {
         administrator: String,
         members: Set<String>,
         operators: Set<String>,
+        title: String? = nil,
         symmetricKey: SymmetricKey,
         session: PQSSession,
         cache: SessionCache,
@@ -995,7 +996,8 @@ actor MessagePipeline {
             enabledBotNames: existingInfo?.enabledBotNames,
             botMemberWelcome: existingInfo?.botMemberWelcome,
             botOperatorWelcome: existingInfo?.botOperatorWelcome,
-            botIdleHint: existingInfo?.botIdleHint)
+            botIdleHint: existingInfo?.botIdleHint,
+            title: title ?? existingInfo?.title)
         let wireMetadata = try BinaryEncoder().encode(wireInfo)
         let localMetadata = try BinaryEncoder().encode(
             ChannelStoredMetadata(core: wireInfo, overlay: existingStored?.overlay))
