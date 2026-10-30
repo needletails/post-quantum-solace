@@ -161,7 +161,10 @@ public actor PQSSession: SessionCacheSynchronizer {
     public init(_ ratchetConfiguration: RatchetConfiguration? = nil) {
         self.ratchetConfiguration = ratchetConfiguration
         self.auditSink = FilePQSAuditSink()
-        messagePipeline = MessagePipeline(logger: logger, ratchetConfiguration: ratchetConfiguration)
+        messagePipeline = MessagePipeline(
+            logger: logger,
+            ratchetConfiguration: ratchetConfiguration,
+            auditSink: auditSink)
     }
 
     /// Host construction path. Wires transport, store, and receiver before any session work.
@@ -171,7 +174,10 @@ public actor PQSSession: SessionCacheSynchronizer {
     ) async {
         self.ratchetConfiguration = ratchetConfiguration
         self.auditSink = configuration.auditSink
-        messagePipeline = MessagePipeline(logger: logger, ratchetConfiguration: ratchetConfiguration)
+        messagePipeline = MessagePipeline(
+            logger: logger,
+            ratchetConfiguration: ratchetConfiguration,
+            auditSink: auditSink)
         await setTransportDelegate(conformer: configuration.transport)
         await setDatabaseDelegate(conformer: configuration.store)
         setReceiverDelegate(conformer: configuration.observer)
@@ -397,7 +403,8 @@ public actor PQSSession: SessionCacheSynchronizer {
 
         let replacement = MessagePipeline(
             logger: logger,
-            ratchetConfiguration: ratchetConfiguration)
+            ratchetConfiguration: ratchetConfiguration,
+            auditSink: auditSink)
         await replacement.setDelegate(transportDelegate)
         messagePipeline = replacement
         sessionWorkCoordinator = nil

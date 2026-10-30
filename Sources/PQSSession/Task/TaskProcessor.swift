@@ -105,13 +105,16 @@ actor MessagePipeline {
     /// This is set by the session manager and contains the current cryptographic context.
     var session: PQSSession?
 
+    /// The owning session's audit sink, bound at construction so lines written
+    /// before the first ratchet call sets ``session`` still reach the audit files.
+    let auditSink: any PQSAuditSink
+
     func audit(
         _ channel: PQSAuditLog.Channel,
         _ message: @autoclosure () -> String,
-        level: Level = .warning,
-        on session: PQSSession? = nil
+        level: Level = .warning
     ) {
-        (session ?? self.session)?.auditSink.log(channel, message(), level: level)
+        auditSink.log(channel, message(), level: level)
     }
 
     /// Handles cryptographic operations (e.g. encryption/decryption).
@@ -392,11 +395,18 @@ actor MessagePipeline {
     /// ready to handle message processing tasks. The ratchet manager and job consumer
     /// are configured to use the cryptographic executor for serialized operations.
     ///
-    /// - Parameter logger: Custom logger instance, defaults to a basic logger.
-    ///   The logger is used for debugging, telemetry, and audit trails.
+    /// - Parameters:
+    ///   - logger: Custom logger instance, defaults to a basic logger.
+    ///     The logger is used for debugging, telemetry, and audit trails.
+    ///   - auditSink: The owning session's audit sink. Defaults to a new file-backed sink.
     /// - Note: The processor is not ready for use until a session is set and the delegate is configured.
-    init(logger: NeedleTailLogger = NeedleTailLogger(), ratchetConfiguration: RatchetConfiguration? = nil) {
+    init(
+        logger: NeedleTailLogger = NeedleTailLogger(),
+        ratchetConfiguration: RatchetConfiguration? = nil,
+        auditSink: any PQSAuditSink = FilePQSAuditSink()
+    ) {
         self.logger = logger
+        self.auditSink = auditSink
         ratchetManager = MessageRatchet(
             executor: cryptoExecutor,
             logger: logger,

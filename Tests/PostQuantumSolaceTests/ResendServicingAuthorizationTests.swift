@@ -31,6 +31,29 @@ actor SentEnvelopeLog {
     }
 }
 
+/// Keeps every audit line so a test can assert what reached the injected sink.
+final class RecordingAuditSink: PQSAuditSink, @unchecked Sendable {
+    private let lock = NSLock()
+    private var lines: [String] = []
+
+    var isEnabled: Bool { true }
+
+    func configure(isEnabled: Bool) {}
+
+    func log(_ channel: PQSAuditLog.Channel, _ message: @autoclosure () -> String, level: Level) {
+        let line = message()
+        lock.lock()
+        defer { lock.unlock() }
+        lines.append(line)
+    }
+
+    func contains(_ fragment: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return lines.contains { $0.contains(fragment) }
+    }
+}
+
 extension EndToEndTests {
     private func setUpAliceBobWithAliceChild() async throws -> (
         aliceTransport: _MockTransportDelegate,
@@ -64,6 +87,31 @@ extension EndToEndTests {
         let bobDeviceId = try #require(
             await _recipientSession.sessionContext?.sessionUser.deviceId)
         return (aliceTransport, bobDeviceId, sMockUserData.ssn, rMockUserData.rsn)
+    }
+
+    @Test("a fresh pipeline audits the first resend request")
+    func freshPipelineAuditsFirstResendRequest() async throws {
+        defer { Task { await shutdownSessions() } }
+        let sink = RecordingAuditSink()
+        let aliceStore = createSenderStore()
+        _senderSession = await PQSSession(configuration: SessionConfiguration(
+            transport: _MockTransportDelegate(session: _senderSession, store: store),
+            store: aliceStore,
+            observer: senderReceiver,
+            auditSink: sink))
+        try await createSenderSession(
+            store: aliceStore,
+            transport: _MockTransportDelegate(session: _senderSession, store: store),
+            sessionDelegate: SessionDelegate(session: _senderSession))
+
+        // A relaunched sender services a resend request before any ratchet work.
+        #expect(await _senderSession.messagePipeline.session == nil)
+        try await _senderSession.handleOutOfBandResendRequest(
+            from: rMockUserData.rsn,
+            deviceId: UUID(),
+            failedSharedMessageIds: ["fresh-process-\(UUID().uuidString)"])
+
+        #expect(sink.contains("pqs.recovery.resendRequestReceived"))
     }
 
     @Test("resend servicing refuses an envelope addressed to another account")
