@@ -268,18 +268,6 @@ actor MessagePipeline {
         limit: 256,
         maxReplays: 5)
 
-    /// Last `messageResendUnavailable` notice emitted per requester device, so repeats
-    /// re-send the same notice sharedId instead of minting a new UUID storm.
-    struct RecentUnavailableNotice: Sendable {
-        let sharedId: String
-        let message: CryptoMessage
-        let unavailableIds: Set<String>
-        let createdAt: Date
-    }
-    var recentUnavailableNoticeByRequesterDevice: [String: RecentUnavailableNotice] = [:]
-    let recentUnavailableNoticeTTL: TimeInterval = 60 * 10
-    let recentUnavailableNoticeLimit = 64
-
     /// Signed ratchet frames whose encryption succeeded but whose transport send has not.
     /// Retrying these frames avoids advancing the outbound ratchet a second time for the same
     /// logical message, which is especially important for first messages in a session.

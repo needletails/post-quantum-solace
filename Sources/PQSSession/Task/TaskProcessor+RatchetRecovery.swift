@@ -372,17 +372,14 @@ extension MessagePipeline {
     }
 
     /// Tells the requesting device that these ids have no replay source anywhere so it
-    /// stops re-requesting them. Delivered on the requester device's existing active
-    /// lane — an unanswerable retry request must never reset session state. An
-    /// initiating row is minted only when no active session exists for that device.
+    /// stops re-requesting them. The notice is out of band: it uses no lane and mints
+    /// none, so an unanswerable retry request never resets session state.
     /// Send failures park the notice and re-emit on the next viability restore;
     /// the requester-side attempt cap still bounds the loop if that flush is lost.
     private func emitResendUnavailableNotice(
-        to fallbackIdentity: SessionIdentity,
         requesterName: String,
         requesterDeviceId: UUID,
         unavailableIds: [String],
-        laneHealActive: Bool,
         session: PQSSession
     ) async {
         guard !unavailableIds.isEmpty else { return }
@@ -404,126 +401,7 @@ extension MessagePipeline {
         logger.log(
             level: .info,
             message: "pqs.recovery.resendUnavailableSentOutOfBand requester=\(requesterName) unavailableCount=\(unavailableIds.count) ids=\(unavailableIds.joined(separator: ","))")
-        if laneHealActive {
-            // A remint (or a live prior heal mark) already owns the lane
-            // toward this requester; the old NoRemint audit would read as
-            // a contradiction right after resendUnavailableLaneReminted.
-            audit(.recovery, "pqs.recovery.resendUnavailableAfterLaneHeal requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(fallbackIdentity.id.uuidString) unavailableCount=\(unavailableIds.count)")
-        } else {
-            audit(.recovery, "pqs.recovery.resendUnavailableSameAccountNoRemint requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(fallbackIdentity.id.uuidString) unavailableCount=\(unavailableIds.count)")
-        }
-    }
-
-    /// Reports whether a heal lane toward the requester is live after a resend
-    /// wave this owner could not service at all (every id terminally unavailable —
-    /// typically ephemeral control/sync frames with no plaintext to replay).
-    ///
-    /// Such a wave mints nothing. A NACK says the requester could not decrypt a
-    /// frame; it is not proof that this lane is diverged. Dogfood 2026-10-28:
-    /// the requester's NACKs came from its own blank refusals, from one-time
-    /// keys it had lost, and from NACKs it sent before its archive pass ran, and
-    /// the remint each one triggered archived the lane the requester was
-    /// mid-sentence on, consumed one of its one-time keys and provoked the next
-    /// NACK (17 remints in 71 minutes between two devices). Lane heal belongs to
-    /// the content ladder, where a replay re-encrypted on the current lane and
-    /// NACKed again is the proof (`performOrphanEscapeRemint`), and to the
-    /// requester's `peerRefresh` on `missingOneTimeKey`.
-    ///
-    /// - Returns: `true` when a live state-less initiating mark (a prior heal not
-    ///   yet used for traffic) already covers the requester; `false` otherwise.
-    @discardableResult
-    private func healOutboundLaneAfterUnservicableResendWave(
-        requesterName: String,
-        requesterDeviceId: UUID,
-        queuedReplayCount: Int,
-        coalescedReplayCount: Int,
-        unavailableCount: Int,
-        symmetricKey: SymmetricKey,
-        session: PQSSession
-    ) async -> Bool {
-        var stateLessMarkIsLive = false
-        var liveMarkId: UUID?
-        if let markedId = await session.orphanResendInitiatingSessionId(
-            secretName: requesterName,
-            deviceId: requesterDeviceId),
-            let identities = try? await session.cache?.fetchSessionIdentities(),
-            let marked = identities.first(where: { $0.id == markedId }),
-            let markedProps = await marked.props(symmetricKey: symmetricKey),
-            markedProps.secretName == requesterName,
-            markedProps.deviceId == requesterDeviceId,
-            !markedProps.deviceName.hasPrefix(
-                PQSSessionConstants.inactiveSessionDeviceNamePrefix),
-            !markedProps.hasRatchetState
-        {
-            stateLessMarkIsLive = true
-            liveMarkId = markedId
-        }
-
-        let decision = UnservicableResendLaneHealPolicy.decision(
-            queuedReplayCount: queuedReplayCount,
-            coalescedReplayCount: coalescedReplayCount,
-            unavailableCount: unavailableCount,
-            stateLessInitiatingMarkIsLive: stateLessMarkIsLive)
-        switch decision {
-        case .noHealNeeded, .remintLane:
-            return false
-        case .reuseExistingStateLessMark:
-            audit(.recovery, "pqs.recovery.resendUnavailableLaneHealSkipped reason=stateLessMarkLive requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(liveMarkId?.uuidString ?? "nil")")
-            return true
-        }
-    }
-
-    /// Delivery identity for unavailable NACKs. A retry request we cannot service
-    /// must never tear down session state (discard, don't reset): deliver the notice
-    /// on the requester device's existing active lane. Mint an initiating row only
-    /// when that peer device has no active session at all — with no actives the
-    /// reset demotes nothing (`laneReset ... demotedActive=0`). Never stamp a
-    /// preferred lane here; general outbound must not be captured by a NACK row.
-    private func resolveResendUnavailableDeliveryIdentity(
-        fallback: SessionIdentity,
-        requesterName: String,
-        requesterDeviceId: UUID,
-        session: PQSSession
-    ) async -> SessionIdentity {
-        do {
-            let symmetricKey = try await session.getDatabaseSymmetricKey()
-            let identities = try await session.cache?.fetchSessionIdentities() ?? []
-            let preferredDevice = await currentDeviceConfiguration(
-                secretName: requesterName,
-                deviceId: requesterDeviceId,
-                session: session)
-            if let active = await outboundSessionIdentity(
-                secretName: requesterName,
-                deviceId: requesterDeviceId,
-                in: identities,
-                symmetricKey: symmetricKey,
-                session: session,
-                preferredDevice: preferredDevice
-            ) {
-                audit(.recovery, "pqs.recovery.resendUnavailableUsingActive requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(active.id.uuidString)")
-                return active
-            }
-            let identity = try await session.resetSessionIdentityForFreshSession(
-                secretName: requesterName,
-                deviceId: requesterDeviceId,
-                sendOneTimeIdentities: false,
-                reason: "resendUnavailable")
-            audit(.recovery, "pqs.recovery.resendUnavailableInitiating requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) newSessionId=\(identity.id.uuidString)")
-            return identity
-        } catch {
-            logger.log(
-                level: .warning,
-                message: "pqs.recovery.resendUnavailableInitiatingFailed requester=\(requesterName) deviceId=\(requesterDeviceId) error=\(error)")
-            audit(.recovery, "pqs.recovery.resendUnavailableInitiatingFailed requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) error=\(error)")
-            return fallback
-        }
-    }
-
-    private func cleanupRecentUnavailableNotices(now: Date = Date()) {
-        let cutoff = now.addingTimeInterval(-recentUnavailableNoticeTTL)
-        recentUnavailableNoticeByRequesterDevice = recentUnavailableNoticeByRequesterDevice.filter {
-            $0.value.createdAt > cutoff
-        }
+        audit(.recovery, "pqs.recovery.resendUnavailableNoRemint requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) unavailableCount=\(unavailableIds.count)")
     }
 
     /// §4.1 sender-side servicing for authenticated OOB retry ingress.
@@ -1240,13 +1118,18 @@ extension MessagePipeline {
         } else {
             // Terminal for the requested content: we have nothing to
             // replay. The messageResendUnavailable notice below tells the
-            // requester to stop asking. Content the sender never persisted
-            // is unrecoverable by design; the lane itself is healed by
-            // `healOutboundLaneAfterUnservicableResendWave` below so *new*
-            // messages flow — only the original frames stay lost. Audit
-            // which ids hit this so production logs show whether they were
-            // ephemeral/control frames (expected) or persisted chat (a
-            // replay-lookup bug).
+            // requester to stop asking; content the sender never persisted
+            // is unrecoverable by design. An all-terminal wave answers with
+            // that notice and changes no lane: a NACK says the requester
+            // could not decrypt a frame, not that this lane diverged
+            // (dogfood 2026-10-28: minting here archived the lane the
+            // requester was reading and spent one of its one-time keys, 17
+            // remints in 71 minutes). Lane heal belongs to the content
+            // ladder, where a replay NACKed again is the proof
+            // (`performOrphanEscapeRemint`), and to the requester's
+            // `peerRefresh` on `missingOneTimeKey`. Audit which ids hit this
+            // so production logs show whether they were ephemeral/control
+            // frames (expected) or persisted chat (a replay-lookup bug).
             let reasonsSummary = missingByReason
                 .sorted { $0.key < $1.key }
                 .map { "\($0.key):\($0.value)" }
@@ -1257,31 +1140,10 @@ extension MessagePipeline {
             audit(.recovery, "pqs.recovery.resendReplayFailed reason=noReplayableMessages requester=\(requesterSecretName) requesterDeviceId=\(requesterWireDeviceId.uuidString) requestedCount=\(request.failedSharedMessageIds.count) reasons=\(reasonsSummary) sharedIds=\(request.failedSharedMessageIds.joined(separator: ","))")
         }
 
-        // Lane heal for a fully unservicable wave: the requester's NACK proved
-        // our outbound ratchet is diverged, and with zero queued replays no
-        // msg0 goes out to re-prove it. Without this, new outbound traffic
-        // keeps riding the dead lane and every future frame fails the same
-        // way (dogfood: personal lane failing 15:33→21:24 after
-        // ownerMissingPlaintext-only waves). Bounded by the state-less
-        // initiating mark — see UnservicableResendLaneHealPolicy.
-        var laneHealActive = false
-        if replayQueuedCount == 0, !unavailableIds.isEmpty {
-            laneHealActive = await healOutboundLaneAfterUnservicableResendWave(
-                requesterName: requesterSecretName,
-                requesterDeviceId: request.requestingDeviceId,
-                queuedReplayCount: replayQueuedCount,
-                coalescedReplayCount: replayCoalescedCount,
-                unavailableCount: unavailableIds.count,
-                symmetricKey: symmetricKey,
-                session: session)
-        }
-
         await emitResendUnavailableNotice(
-            to: identity,
             requesterName: requesterSecretName,
             requesterDeviceId: request.requestingDeviceId,
             unavailableIds: unavailableIds,
-            laneHealActive: laneHealActive,
             session: session)
         // Local honesty: if we told the peer these ids are gone, any
         // matching outbound rows on this device must not keep a

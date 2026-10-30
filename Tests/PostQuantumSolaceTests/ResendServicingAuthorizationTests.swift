@@ -282,4 +282,50 @@ extension EndToEndTests {
         #expect(result.queuedIds == [bobEnvelope.messageId])
         #expect(result.permanentlyUnavailableIds.isEmpty)
     }
+
+    /// Dogfood 2026-10-28: a NACK for an ephemeral frame the owner never persisted
+    /// reminted the lane, which archived the row the requester was reading and spent
+    /// one of its one-time keys. Such a wave now answers with the notice and no more.
+    @Test("an all-unavailable wave changes no lane")
+    func allUnavailableWaveChangesNoLane() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(aliceAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+
+        let log = SentEnvelopeLog()
+        pair.aliceTransport.duringSendMessage = { received in await log.record(received) }
+
+        let sharedId = "ephemeral-\(UUID().uuidString)"
+        try await pair.alice.send(
+            recipient: .nickname("bob"),
+            text: "never persisted",
+            sharedIdOverride: sharedId,
+            shouldPersistOverride: false)
+        await pair.alice.waitForOutboundJobDrain()
+        let envelope = try #require(await log.first { $0.logicalMessageId == sharedId })
+
+        let laneBefore = try #require(
+            await rows(on: pair.alice, peer: "bob", deviceId: pair.bobDeviceId).first)
+        let keyFetchesBefore = sink.lines(containing: "consumedOTK=true").count
+
+        let result = try await pair.alice.handleOutOfBandResendRequest(
+            from: "bob",
+            deviceId: pair.bobDeviceId,
+            failedSharedMessageIds: [envelope.messageId])
+        await pair.alice.waitForOutboundJobDrain()
+
+        #expect(result.queuedIds.isEmpty)
+        #expect(result.permanentlyUnavailableIds == [envelope.messageId])
+        #expect(sink.contains("pqs.recovery.resendUnavailableNoRemint"))
+
+        // The next frame out stays on the lane the wave left alone.
+        _ = try await sendAndAwaitInbound(from: pair.alice, to: "bob", on: pair.bob, text: "same lane")
+        expectSameLane(
+            try await rows(on: pair.alice, peer: "bob", deviceId: pair.bobDeviceId),
+            laneBefore,
+            "after the wave")
+        #expect(sink.lines(containing: "consumedOTK=true").count == keyFetchesBefore)
+        await pair.finish()
+    }
 }
