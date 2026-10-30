@@ -144,66 +144,6 @@ extension TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
-    @Test("a confirmation says which private halves it deleted, keeping one another lane has pending")
-    func confirmationNamesTheDeletedPrivateHalves() async throws {
-        let sink = try await startAuditedSession()
-        var context = try #require(await session.sessionContext)
-        let otkId = try #require(context.sessionUser.deviceKeys.oneTimePrivateKeys.first?.id)
-        let mlkemId = try #require(context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.first?.id)
-        let confirmingLane = UUID()
-        let siblingLane = UUID()
-        context.sessionUser.deviceKeys.recordPendingOneTimeKeyConsumption(PendingOneTimeKeyConsumption(
-            sessionIdentityId: confirmingLane, oneTimeKeyId: otkId, mlKEMOneTimeKeyId: mlkemId))
-        context.sessionUser.deviceKeys.recordPendingOneTimeKeyConsumption(PendingOneTimeKeyConsumption(
-            sessionIdentityId: siblingLane, oneTimeKeyId: otkId, mlKEMOneTimeKeyId: nil))
-        await session.setSessionContext(context)
-        let task = try makeTestInboundTaskMessage(
-            senderSecretName: "bob", senderDeviceId: UUID(), sharedMessageId: "confirmed_1")
-
-        func confirm(_ lane: UUID) async {
-            await session.messagePipeline.noteAcceptedInboundForDeferredOneTimeKeyConsumption(
-                inboundTask: task,
-                laneId: lane,
-                headerOneTimeKeyId: nil,
-                headerMLKEMOneTimeKeyId: nil,
-                session: session)
-        }
-        func confirmationLine(_ lane: UUID) throws -> String {
-            try #require(sink.lines(containing: "pqs.otk.consumedAfterConfirmation trigger=reverseHandshake lane=\(lane.uuidString)").first)
-        }
-
-        await confirm(confirmingLane)
-        #expect(try confirmationLine(confirmingLane).contains("privateDeleted=mlkem"))
-        #expect(await session.sessionContext?.sessionUser.deviceKeys.oneTimePrivateKeys.contains { $0.id == otkId } == true)
-
-        await confirm(siblingLane)
-        #expect(try confirmationLine(siblingLane).contains("privateDeleted=otk"))
-        #expect(await session.sessionContext?.sessionUser.deviceKeys.oneTimePrivateKeys.contains { $0.id == otkId } == false)
-        await session.shutdown()
-    }
-
-    @Test("a confirmation that found nothing left to delete says none")
-    func confirmationOfAKeyTheDeviceNoLongerHoldsSaysNone() async throws {
-        let sink = try await startAuditedSession()
-        var context = try #require(await session.sessionContext)
-        let lane = UUID()
-        context.sessionUser.deviceKeys.recordPendingOneTimeKeyConsumption(PendingOneTimeKeyConsumption(
-            sessionIdentityId: lane, oneTimeKeyId: UUID(), mlKEMOneTimeKeyId: UUID()))
-        await session.setSessionContext(context)
-
-        await session.messagePipeline.noteAcceptedInboundForDeferredOneTimeKeyConsumption(
-            inboundTask: try makeTestInboundTaskMessage(
-                senderSecretName: "bob", senderDeviceId: UUID(), sharedMessageId: "confirmed_2"),
-            laneId: lane,
-            headerOneTimeKeyId: nil,
-            headerMLKEMOneTimeKeyId: nil,
-            session: session)
-
-        #expect(sink.contains("pqs.otk.consumedAfterConfirmation trigger=reverseHandshake lane=\(lane.uuidString)"))
-        #expect(sink.contains("privateDeleted=none"))
-        await session.shutdown()
-    }
-
     @Test("a recovery cancelled during replacement audits that no peerRefresh follows")
     func cancelledRecoveryReplacementIsAudited() async throws {
         let sink = try await startAuditedSession()

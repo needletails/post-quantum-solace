@@ -15,20 +15,9 @@ import SessionModels
 extension DeviceKeys {
     /// What a committed inbound frame did to the deferred-consumption ledger.
     struct CommittedInboundFrameOutcome: Sendable {
-        /// An entry the lane proved it no longer needs, and which private halves
-        /// that removed. A half stays while another lane has it pending.
-        struct Confirmation: Sendable {
-            let entry: PendingOneTimeKeyConsumption
-            let deletedOneTimeKey: Bool
-            let deletedMLKEMKey: Bool
-
-            var privateDeleted: String {
-                let deleted = [deletedOneTimeKey ? "otk" : nil, deletedMLKEMKey ? "mlkem" : nil].compactMap { $0 }
-                return deleted.isEmpty ? "none" : deleted.joined(separator: ",")
-            }
-        }
-
-        var confirmed: [Confirmation] = []
+        /// Entries whose private halves were deleted because the lane proved it
+        /// no longer needs them.
+        var confirmed: [PendingOneTimeKeyConsumption] = []
         /// Newly recorded pending consumption for this frame's bootstrap keys.
         var recordedPending: PendingOneTimeKeyConsumption?
         var mutated = false
@@ -53,7 +42,6 @@ extension DeviceKeys {
         headerMLKEMOneTimeKeyId: UUID?
     ) -> CommittedInboundFrameOutcome {
         var outcome = CommittedInboundFrameOutcome()
-        var confirmedEntries: [PendingOneTimeKeyConsumption] = []
 
         if let headerOneTimeKeyId {
             let laneEntries = removePendingOneTimeKeyConsumptions(for: laneId)
@@ -61,7 +49,7 @@ extension DeviceKeys {
                 if entry.oneTimeKeyId == headerOneTimeKeyId {
                     recordPendingOneTimeKeyConsumption(entry)
                 } else {
-                    confirmedEntries.append(entry)
+                    outcome.confirmed.append(entry)
                     outcome.mutated = true
                 }
             }
@@ -87,13 +75,11 @@ extension DeviceKeys {
                 outcome.mutated = true
             }
         } else {
-            confirmedEntries = removePendingOneTimeKeyConsumptions(for: laneId)
-            outcome.mutated = !confirmedEntries.isEmpty
+            outcome.confirmed = removePendingOneTimeKeyConsumptions(for: laneId)
+            outcome.mutated = !outcome.confirmed.isEmpty
         }
 
-        for entry in confirmedEntries {
-            let heldOneTimeKeys = oneTimePrivateKeys.count
-            let heldMLKEMKeys = mlKEMOneTimePrivateKeys.count
+        for entry in outcome.confirmed {
             if let otkId = entry.oneTimeKeyId,
                !isOneTimeKeyStillPending(otkId) {
                 oneTimePrivateKeys.removeAll { $0.id == otkId }
@@ -102,10 +88,6 @@ extension DeviceKeys {
                !isMLKEMOneTimeKeyStillPending(kemId) {
                 mlKEMOneTimePrivateKeys.removeAll { $0.id == kemId }
             }
-            outcome.confirmed.append(CommittedInboundFrameOutcome.Confirmation(
-                entry: entry,
-                deletedOneTimeKey: oneTimePrivateKeys.count != heldOneTimeKeys,
-                deletedMLKEMKey: mlKEMOneTimePrivateKeys.count != heldMLKEMKeys))
         }
         return outcome
     }

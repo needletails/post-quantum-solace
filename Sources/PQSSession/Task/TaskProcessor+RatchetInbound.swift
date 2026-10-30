@@ -879,7 +879,6 @@ extension MessagePipeline {
         // Deferred OTK consumption is driven only by committed frames, so a
         // rolled-back decrypt can neither record nor confirm a consumption.
         await noteAcceptedInboundForDeferredOneTimeKeyConsumption(
-            inboundTask: inboundTask,
             laneId: activated.id,
             headerOneTimeKeyId: headerOneTimeKeyId,
             headerMLKEMOneTimeKeyId: headerMLKEMOneTimeKeyId,
@@ -943,8 +942,7 @@ extension MessagePipeline {
         }
     }
 
-    func noteAcceptedInboundForDeferredOneTimeKeyConsumption(
-        inboundTask: InboundTaskMessage,
+    private func noteAcceptedInboundForDeferredOneTimeKeyConsumption(
         laneId: UUID,
         headerOneTimeKeyId: UUID?,
         headerMLKEMOneTimeKeyId: UUID?,
@@ -960,12 +958,11 @@ extension MessagePipeline {
                 headerMLKEMOneTimeKeyId: headerMLKEMOneTimeKeyId)
             else { return }
             if let recorded = outcome.recordedPending {
-                audit(.recovery, "pqs.otk.consumptionPending lane=\(laneId.uuidString) peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) otkId=\(recorded.oneTimeKeyId?.uuidString ?? "nil") mlkemId=\(recorded.mlKEMOneTimeKeyId?.uuidString ?? "nil")")
+                audit(.recovery, "pqs.otk.consumptionPending lane=\(laneId.uuidString) otkId=\(recorded.oneTimeKeyId?.uuidString ?? "nil") mlkemId=\(recorded.mlKEMOneTimeKeyId?.uuidString ?? "nil")")
             }
-            for confirmation in outcome.confirmed {
-                let entry = confirmation.entry
+            for entry in outcome.confirmed {
                 let trigger = headerOneTimeKeyId == nil ? "reverseHandshake" : "laneRekey"
-                audit(.recovery, "pqs.otk.consumedAfterConfirmation trigger=\(trigger) lane=\(laneId.uuidString) otkId=\(entry.oneTimeKeyId?.uuidString ?? "nil") mlkemId=\(entry.mlKEMOneTimeKeyId?.uuidString ?? "nil") privateDeleted=\(confirmation.privateDeleted)")
+                audit(.recovery, "pqs.otk.consumedAfterConfirmation trigger=\(trigger) lane=\(laneId.uuidString) otkId=\(entry.oneTimeKeyId?.uuidString ?? "nil") mlkemId=\(entry.mlKEMOneTimeKeyId?.uuidString ?? "nil")")
             }
         } catch {
             logger.log(
