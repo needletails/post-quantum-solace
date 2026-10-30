@@ -28,7 +28,8 @@ let package = Package(
         .default(enabledTraits: ["PQSAuditLog"]),
     ],
     dependencies: [
-//        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "4.1.2"),
+        // BRANCH ONLY, fix/child-decrypt-recovery: before merging, restore the URL requirement with the DRK release containing ea867db.
+//        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "<that release>"),
         .package(path: "../double-ratchet-kit"),
         .package(url: "https://github.com/needletails/binary-codable.git", "1.1.1"..<"2.0.0"),
         .package(url: "https://github.com/needletails/needletail-logger.git", from: "3.2.1"),
