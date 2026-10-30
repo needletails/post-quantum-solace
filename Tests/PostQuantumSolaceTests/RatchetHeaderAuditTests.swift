@@ -201,6 +201,20 @@ extension EndToEndTests {
         await pair.finish()
     }
 
+    @Test("a transport line naming every key fits one line of the audit file")
+    func deviceTransportOkFitsOneAuditFileLine() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(aliceAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        let sharedId = UUID().uuidString
+
+        _ = try await heldInitiatingFrame(pair, sharedId: sharedId)
+
+        let line = try #require(sink.lines(containing: "pqs.send.deviceTransportOk sharedId=\(sharedId)").first)
+        #expect(PQSAuditRedaction.redact(line).count <= FilePQSAuditSink.maxLineLength)
+        await pair.finish()
+    }
+
     @Test("a replayed pending frame logs the same transport line, decoded from the frame")
     func pendingTransportNamesHeaderKeys() async throws {
         let sink = RecordingAuditSink()
@@ -347,6 +361,9 @@ extension EndToEndTests {
         let rollback = try #require(sink.lines(containing: "pqs.recovery.laneRolledBack").first)
         #expect(rollback.contains("hdrEpoch=\(epochHex(frames[3].header))"))
         #expect(rollback.contains(fields))
+        // A long attempt list may wrap; everything ahead of it must not.
+        let attempts = try #require(rollback.range(of: " attempts="))
+        #expect(PQSAuditRedaction.redact(String(rollback[..<attempts.lowerBound])).count <= FilePQSAuditSink.maxLineLength)
         let failure = try #require(sink.lines(containing: "pqs.decryptFailure").first)
         #expect(failure.contains("hdrEpoch=\(epochHex(frames[3].header))"))
         #expect(failure.contains(fields))

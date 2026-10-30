@@ -84,6 +84,11 @@ public struct FilePQSAuditSink: PQSAuditSink {
 
     private let storage: Storage
 
+    /// The logger splits a longer line on spaces, and a continuation has no timestamp or
+    /// event name, so a field past the wrap stops matching a grep for its line. This
+    /// stays above the widest line one frame writes, not counting `attempts=`.
+    static let maxLineLength = 1024
+
 #if DEBUG || PQS_AUDIT_LOG
     private static let isCompileTimeEnabled = true
 #else
@@ -143,7 +148,7 @@ public struct FilePQSAuditSink: PQSAuditSink {
                     let created = NeedleTailLogger(
                         channel.loggerLabel,
                         maxLines: 5_000,
-                        maxLineLength: 512,
+                        maxLineLength: Self.maxLineLength,
                         writeToFile: true)
                     storage.fileLoggers[channel] = created
                     logger = created
