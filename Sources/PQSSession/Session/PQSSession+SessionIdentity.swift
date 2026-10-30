@@ -1989,12 +1989,9 @@ public extension PQSSession {
             message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities) demotePrior=\(demotePriorActives)")
         // Lane teardown in the same audit file as the decrypt failures: a proven
         // inbound lane failing right after one of these entries identifies the
-        // caller that clobbered it.
-        if demotePriorActives {
-            auditSink.log(.recovery, "pqs.recovery.laneReset outcome=reset reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
-        } else {
-            auditSink.log(.recovery, "pqs.recovery.laneReset outcome=surgicalControlInsert reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
-        }
+        // caller that clobbered it. `bound*` are the peer's keys this lane was handed.
+        let outcome = demotePriorActives ? "reset" : "surgicalControlInsert"
+        auditSink.log(.recovery, "pqs.recovery.laneReset outcome=\(outcome) reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities) boundOtk=\(x25519?.id.uuidString ?? "nil") boundMlkem=\(mlKEM.id.uuidString)")
 
         return identity
     }

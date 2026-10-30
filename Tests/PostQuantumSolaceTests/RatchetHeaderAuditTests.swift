@@ -184,6 +184,38 @@ extension EndToEndTests {
         await pair.finish()
     }
 
+    @Test("a lane reset names the keys it bound, which the lane's first frame then cites")
+    func laneResetNamesTheBoundKeys() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(aliceAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+
+        let (_, header) = try await heldInitiatingFrame(pair, sharedId: "audit-bound-\(UUID().uuidString)")
+
+        let line = try #require(sink.lines(containing: "pqs.recovery.laneReset outcome=reset").last)
+        #expect(line.contains("boundOtk=\(try #require(header.oneTimeKeyId).uuidString)"))
+        #expect(line.contains("boundMlkem=\(try #require(header.mlKEMOneTimeKeyId).uuidString)"))
+        await pair.finish()
+    }
+
+    @Test("a recorded consumption names the peer whose bootstrap spent the key")
+    func consumptionPendingNamesThePeer() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        let (frame, header) = try await heldInitiatingFrame(pair, sharedId: "audit-pending-\(UUID().uuidString)")
+        let citedOTK = try #require(header.oneTimeKeyId).uuidString
+
+        pair.aliceTransport.continuation?.yield(frame)
+
+        #expect(await pollUntil(timeout: 20) {
+            sink.lines(containing: "pqs.otk.consumptionPending").contains { $0.contains(citedOTK) }
+        })
+        let line = try #require(sink.lines(containing: "pqs.otk.consumptionPending").first { $0.contains(citedOTK) })
+        #expect(line.contains("peer=alice deviceId=\(pair.aliceDeviceId.uuidString)"))
+        await pair.finish()
+    }
+
     @Test("a frame citing keys this device lost names them on the rollback and failure lines")
     func failedDecryptNamesTheCitedKeysAndWhichLookupMissed() async throws {
         let sink = RecordingAuditSink()
