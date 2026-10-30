@@ -232,25 +232,38 @@ extension EndToEndTests {
 
     @Test("a frame only an archived lane can decrypt is not NACKed before the archive pass has run")
     func archivePassRunsBeforeAnyResendRequest() async throws {
-        let pair = try await connectedPair()
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
         defer { Task { await shutdownSessions() } }
         try await settleLanes(pair)
         let archivedRow = try await archiveBobsLaneBehindABlank(pair)
 
         // Alice's new keys open a new epoch, so no row holds the frame by its epoch
-        // and only the archived row can mirror the re-key.
-        try await pair.alice.rotateCurrentDeviceKeys()
+        // and only the archived row can mirror the re-key. Her rotation's peerRefresh
+        // stays home: it would take the archive pass and leave this frame a holder.
         let sharedId = "archived-\(UUID().uuidString)"
+        let captured = HeldFrames()
+        pair.aliceTransport.shouldDeliver = { received in
+            if received.logicalMessageId == sharedId { await captured.hold(received) }
+            return received.isContentMessage
+        }
+        try await pair.alice.rotateCurrentDeviceKeys()
         try await pair.alice.send(recipient: .nickname("bob"), text: "still on the old lane", sharedIdOverride: sharedId)
 
         #expect(await persisted(pair.bob, sharedId), "the archived lane decrypts the frame in the background pass")
-        #expect(await pair.bob.messagePipeline.inboundLaneSelectionStatsLog.contains {
+        let frame = try #require(await captured.take().first)
+        #expect(await laneSelections(on: pair.bob, sharedId: frame.messageId).contains {
             $0.pass == .archived && $0.winningLaneId == archivedRow
         }, "the archive pass, not the active-first pass, decrypted it")
         #expect(await pair.bobTransport.outOfBandResendRequestCount == 0,
                 "no resend request may leave before the archive pass has had its say")
         #expect(await pair.bob.resendRequestSubmissionCount(
             sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: sharedId) == 0)
+
+        // The active-first miss reached no failure handler: the pass owned the outcome.
+        let trail = sink.lines(containing: frame.messageId)
+        #expect(trail.contains { $0.contains("pqs.recovery.inboundDeferredToArchivePass") }, "\(trail)")
+        #expect(!trail.contains { $0.contains("pqs.decryptFailure") }, "\(trail)")
         await pair.finish()
     }
 
