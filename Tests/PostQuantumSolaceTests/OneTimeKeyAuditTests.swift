@@ -90,6 +90,26 @@ extension TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    @Test("a failed upload's error field carries the code, never the request URL")
+    func failedUploadErrorOmitsTheRequestURL() async throws {
+        let sink = try await startAuditedSession()
+        // The key routes carry the account's secret name, and URLSession puts the
+        // whole URL in the error's userInfo.
+        let url = "https://server.example/api/auth/one-time-keys/a/alice_secretname/\(UUID().uuidString)"
+        await transport.setOTKUploadFailCount(1, error: URLError(.timedOut, userInfo: [
+            NSURLErrorFailingURLStringErrorKey: url,
+            NSURLErrorFailingURLErrorKey: try #require(URL(string: url)),
+        ]))
+
+        _ = await session.refreshOneTimeKeysTask(policy: .replacePublishedBatch)
+
+        let line = try #require(sink.lines(containing: "pqs.otk.batchReplaceFailed kind=x25519 stage=upload").first)
+        #expect(!line.contains("alice_secretname"))
+        #expect(!line.contains("https://"))
+        #expect(line.contains("error=NSURLErrorDomain:-1001"))
+        await session.shutdown()
+    }
+
     @Test("an open circuit audits the skip for each kind")
     func openCircuitAuditsSkip() async throws {
         let sink = try await startAuditedSession()
@@ -107,7 +127,7 @@ extension TaskProcessorSequenceTests {
         let sink = try await startAuditedSession()
         await session.messagePipeline.setTaskDelegate(
             MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey))
-        await transport.setOTKUploadFailCount(2, error: .sessionEncryptionError)
+        await transport.setOTKUploadFailCount(2, error: PQSError.sessionEncryptionError)
 
         try await session.messagePipeline.enqueue(
             EncryptableTask(task: .streamMessage(try makeTestInboundTaskMessage(

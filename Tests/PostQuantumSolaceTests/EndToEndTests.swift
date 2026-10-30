@@ -12038,7 +12038,7 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     /// If set, OTK curve uploads will throw on the first N calls then succeed.
     /// Thread-safe via OTKErrorInjector actor.
     private let otkErrorInjector = OTKErrorInjector()
-    func setOTKUploadFailCount(_ count: Int, error: PQSError = .oneTimeKeyUploadFailed) async {
+    func setOTKUploadFailCount(_ count: Int, error: any Error = PQSError.oneTimeKeyUploadFailed) async {
         await otkErrorInjector.configure(failCount: count, error: error)
     }
     var otkUploadAttemptCount: Int {
@@ -12347,10 +12347,10 @@ private actor RotationTracker {
 
 private actor OTKErrorInjector {
     private var remainingFailures: Int = 0
-    private var error: PQSError = .oneTimeKeyUploadFailed
+    private var error: any Error = PQSError.oneTimeKeyUploadFailed
     private(set) var attemptCount: Int = 0
     
-    func configure(failCount: Int, error: PQSError) {
+    func configure(failCount: Int, error: any Error) {
         remainingFailures = failCount
         self.error = error
         attemptCount = 0

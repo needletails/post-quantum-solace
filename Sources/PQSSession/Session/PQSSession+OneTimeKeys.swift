@@ -377,7 +377,9 @@ extension PQSSession {
     }
 
     /// Runs one stage of a batch swap and audits its failure. The refresh tasks retry the
-    /// whole swap, so every failed attempt leaves its own line.
+    /// whole swap, so every failed attempt leaves its own line. The line names the error
+    /// by domain and code: a `URLError`'s description carries the failing URL, and the key
+    /// routes hold this account's secret name.
     private func auditingBatchStage<Value>(
         _ stage: String,
         kind: KeyKind,
@@ -386,7 +388,8 @@ extension PQSSession {
         do {
             return try await work()
         } catch {
-            auditSink.log(.recovery, "pqs.otk.batchReplaceFailed kind=\(kind) stage=\(stage) error=\(error)")
+            let failure = error as NSError
+            auditSink.log(.recovery, "pqs.otk.batchReplaceFailed kind=\(kind) stage=\(stage) error=\(failure.domain):\(failure.code)")
             throw error
         }
     }
