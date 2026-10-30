@@ -15,11 +15,6 @@ import Testing
 
 @testable import PQSSession
 
-/// How an audit line renders a header's epoch: the digest's first 8 bytes.
-private func epochHex(_ header: EncryptedHeader) -> String {
-    header.ratchetEpochDigest.prefix(8).map { String(format: "%02x", $0) }.joined()
-}
-
 @Suite
 struct RatchetHeaderAuditTests {
     private let citedOTK = UUID()
@@ -41,20 +36,20 @@ struct RatchetHeaderAuditTests {
 
     @Test("send fields separate the recipient's cited keys from the sender's embedded keys")
     func sendFieldsNameEachRole() throws {
-        let frameHeader = try header(citesOTK: citedOTK, citesMLKEM: citedMLKEM, embedsOTK: embeddedOTK)
-        #expect(RatchetHeaderAudit(frameHeader).sendFields == "citesOtk=\(citedOTK.uuidString) citesMlkem=\(citedMLKEM.uuidString) embedsOtk=\(embeddedOTK.uuidString) embedsMlkem=\(embeddedMLKEM.uuidString) epoch=\(epochHex(frameHeader))")
+        let audit = RatchetHeaderAudit(try header(citesOTK: citedOTK, citesMLKEM: citedMLKEM, embedsOTK: embeddedOTK))
+        #expect(audit.sendFields == "citesOtk=\(citedOTK.uuidString) citesMlkem=\(citedMLKEM.uuidString) embedsOtk=\(embeddedOTK.uuidString) embedsMlkem=\(embeddedMLKEM.uuidString)")
     }
 
     @Test("inbound fields carry the hdr prefix, and an absent key reads nil")
     func inboundFieldsNameEachRole() throws {
-        let frameHeader = try header(citesOTK: nil, citesMLKEM: citedMLKEM, embedsOTK: nil)
-        #expect(RatchetHeaderAudit(frameHeader).inboundFields == "hdrCitesOtk=nil hdrCitesMlkem=\(citedMLKEM.uuidString) hdrEmbedsOtk=nil hdrEmbedsMlkem=\(embeddedMLKEM.uuidString) hdrEpoch=\(epochHex(frameHeader))")
+        let audit = RatchetHeaderAudit(try header(citesOTK: nil, citesMLKEM: citedMLKEM, embedsOTK: nil))
+        #expect(audit.inboundFields == "hdrCitesOtk=nil hdrCitesMlkem=\(citedMLKEM.uuidString) hdrEmbedsOtk=nil hdrEmbedsMlkem=\(embeddedMLKEM.uuidString)")
     }
 
     @Test("failure fields say the header was not verified")
     func unverifiedFieldsAreLabelled() throws {
-        let frameHeader = try header(citesOTK: citedOTK, citesMLKEM: citedMLKEM, embedsOTK: embeddedOTK)
-        #expect(RatchetHeaderAudit(frameHeader).unverifiedCitedFields == "hdrCitesOtk=\(citedOTK.uuidString) hdrCitesMlkem=\(citedMLKEM.uuidString) hdrEpoch=\(epochHex(frameHeader)) hdrUnverified=true")
+        let audit = RatchetHeaderAudit(try header(citesOTK: citedOTK, citesMLKEM: citedMLKEM, embedsOTK: embeddedOTK))
+        #expect(audit.unverifiedCitedFields == "hdrCitesOtk=\(citedOTK.uuidString) hdrCitesMlkem=\(citedMLKEM.uuidString) hdrUnverified=true")
     }
 
     @Test("a signed frame decodes to its header ids, and a frame without one decodes to nil")
@@ -116,73 +111,11 @@ extension EndToEndTests {
         return (frame, try BinaryDecoder().decode(RatchetMessage.self, from: signed.data).header)
     }
 
-    /// Alice encrypts `count` frames on the live lane and all of them are held in transit.
-    private func heldFrames(
-        _ pair: ConnectedPair,
-        count: Int
-    ) async throws -> [(frame: ReceivedMessage, header: EncryptedHeader)] {
-        try await settleLanes(pair)
-        let held = HeldFrames()
-        pair.aliceTransport.shouldDeliver = { received in
-            guard received.recipient == "bob", received.isContentMessage else { return true }
-            await held.hold(received)
-            return false
-        }
-        for index in 0..<count {
-            try await pair.alice.send(
-                recipient: .nickname("bob"),
-                text: "held \(index)",
-                sharedIdOverride: "audit-held-\(index)-\(UUID().uuidString)")
-        }
-        #expect(await pollUntil(timeout: 20) { await held.count == count })
-        pair.aliceTransport.shouldDeliver = nil
-        return try await held.take().map { frame in
-            let signed = try #require(frame.message.signed)
-            return (frame, try BinaryDecoder().decode(RatchetMessage.self, from: signed.data).header)
-        }
-    }
-
-    /// Bob's row holding `header`'s epoch for alice's device.
-    private func epochHolder(
-        _ pair: ConnectedPair,
-        header: EncryptedHeader
-    ) async throws -> (id: UUID, props: SessionIdentity.UnwrappedProps)? {
-        let cache = try #require(await pair.bob.cache)
-        let key = try await pair.bob.getDatabaseSymmetricKey()
-        for identity in try await cache.fetchSessionIdentities() {
-            guard let props = await identity.props(symmetricKey: key),
-                  props.secretName == "alice",
-                  props.deviceId == pair.aliceDeviceId,
-                  props.ratchetEpochDigest == header.ratchetEpochDigest
-            else { continue }
-            return (identity.id, props)
-        }
-        return nil
-    }
-
-    /// `frame` with its body garbled and re-signed by alice: it passes verification and
-    /// its header names the live epoch, but no row can open it.
-    private func undecryptable(_ frame: ReceivedMessage, _ pair: ConnectedPair) async throws -> ReceivedMessage {
-        let signed = try #require(frame.message.signed)
-        let message = try BinaryDecoder().decode(RatchetMessage.self, from: signed.data)
-        let garbled = RatchetMessage(header: message.header, ciphertext: Data(repeating: 0, count: message.ciphertext.count))
-        return ReceivedMessage(
-            message: try await pair.alice.messagePipeline.signRatchetMessage(message: garbled, session: pair.alice),
-            sender: frame.sender,
-            recipient: frame.recipient,
-            deviceId: frame.deviceId,
-            recipientDeviceId: frame.recipientDeviceId,
-            messageId: frame.messageId,
-            logicalMessageId: frame.logicalMessageId,
-            transportEvent: frame.transportEvent)
-    }
-
     private func expectSendFields(_ line: String, _ header: EncryptedHeader) throws {
         #expect(line.contains("citesOtk=\(try #require(header.oneTimeKeyId).uuidString)"))
         #expect(line.contains("citesMlkem=\(try #require(header.mlKEMOneTimeKeyId).uuidString)"))
         #expect(line.contains("embedsOtk=\(try #require(header.remoteOneTimePublicKey?.id).uuidString)"))
         #expect(line.contains("embedsMlkem=\(header.remoteMLKEMPublicKey.id.uuidString)"))
-        #expect(line.contains("epoch=\(epochHex(header))"))
     }
 
     @Test("a transported frame's audit line names the keys its header cites and embeds")
@@ -197,7 +130,6 @@ extension EndToEndTests {
         let lines = sink.lines(containing: "pqs.send.deviceTransportOk sharedId=\(sharedId)")
         #expect(lines.count == 1)
         try expectSendFields(try #require(lines.first), header)
-        #expect(try #require(lines.first).contains("sentCount=1"))
         await pair.finish()
     }
 
@@ -261,7 +193,6 @@ extension EndToEndTests {
         #expect(line.contains("envelopeMessageId=audit-envelope"))
         #expect(line.contains("sessionIdentityId=\(identityId.uuidString)"))
         #expect(line.contains("pending=true"))
-        #expect(line.contains("sentCount=nil"))
         try expectSendFields(line, header)
         pair.aliceTransport.shouldDeliver = nil
         await pair.finish()
@@ -326,83 +257,13 @@ extension EndToEndTests {
         #expect(rollback.contains("hdrCitesMlkem=\(citedMLKEM.uuidString)"))
         #expect(rollback.contains("hdrEmbedsMlkem=\(header.remoteMLKEMPublicKey.id.uuidString)"))
         #expect(rollback.contains("otkHeld=none mlkemHeld=none"))
-        #expect(rollback.contains("hdrEpoch=\(epochHex(header))"))
-        #expect(rollback.contains("epochHolder=none"))
-        let failure = try #require(sink.lines(containing: "pqs.decryptFailure").first)
-        #expect(failure.contains("hdrCitesOtk=\(citedOTK.uuidString)"))
-        #expect(failure.contains("hdrCitesMlkem=\(citedMLKEM.uuidString)"))
-        #expect(failure.contains("hdrEpoch=\(epochHex(header))"))
-        #expect(failure.contains("epochHolder=none"))
-        #expect(failure.contains("hdrUnverified=true"))
-        await pair.finish()
-    }
-
-    @Test("a frame failing on the lane that holds its epoch names that lane and its stash")
-    func failedDecryptNamesTheEpochHolder() async throws {
-        let sink = RecordingAuditSink()
-        let pair = try await connectedPair(bobAuditSink: sink)
-        defer { Task { await shutdownSessions() } }
-        let frames = try await heldFrames(pair, count: 4)
-
-        // Frame 1 never arrives, so the holder stashes its header key.
-        pair.aliceTransport.continuation?.yield(frames[0].frame)
-        pair.aliceTransport.continuation?.yield(frames[2].frame)
-        #expect(await pollUntil(timeout: 20) {
-            (try? await self.epochHolder(pair, header: frames[2].header))?.props.ratchetSkippedHeaderCount == 1
-        })
-        let holder = try #require(try await epochHolder(pair, header: frames[3].header))
-
-        pair.aliceTransport.continuation?.yield(try await undecryptable(frames[3].frame, pair))
-
-        #expect(await pollUntil(timeout: 20) {
-            sink.contains("pqs.recovery.laneRolledBack") && sink.contains("pqs.decryptFailure")
-        })
-        let fields = "epochHolder=\(holder.id.uuidString) holderReceived=\(holder.props.ratchetReceivedMessagesCount) holderSkippedHeaders=1 holderCount=1"
-        let rollback = try #require(sink.lines(containing: "pqs.recovery.laneRolledBack").first)
-        #expect(rollback.contains("hdrEpoch=\(epochHex(frames[3].header))"))
-        #expect(rollback.contains(fields))
         // A long attempt list may wrap; everything ahead of it must not.
         let attempts = try #require(rollback.range(of: " attempts="))
         #expect(PQSAuditRedaction.redact(String(rollback[..<attempts.lowerBound])).count <= FilePQSAuditSink.maxLineLength)
         let failure = try #require(sink.lines(containing: "pqs.decryptFailure").first)
-        #expect(failure.contains("hdrEpoch=\(epochHex(frames[3].header))"))
-        #expect(failure.contains(fields))
-
-        // A later failure that never reached the lanes does not inherit this frame's holder.
-        await pair.bob.messagePipeline.auditInboundDecryptFailure(
-            message: InboundTaskMessage(
-                message: frames[1].frame.message,
-                senderSecretName: "alice",
-                senderDeviceId: pair.aliceDeviceId,
-                sharedMessageId: "audit-never-attempted",
-                logicalSharedId: "audit-never-attempted"),
-            failureClass: "test.neverAttempted")
-        let unattempted = try #require(sink.lines(containing: "failureClass=test.neverAttempted").first)
-        #expect(unattempted.contains("epochHolder=notAttempted"))
-        await pair.finish()
-    }
-
-    @Test("clones sharing an epoch report the most advanced row and how many hold it")
-    func epochHolderPicksTheMostAdvancedClone() async throws {
-        let sink = RecordingAuditSink()
-        let pair = try await connectedPair(bobAuditSink: sink)
-        defer { Task { await shutdownSessions() } }
-        let frames = try await heldFrames(pair, count: 2)
-        let persisted = sink.lines(containing: "pqs.recv.persisted").count
-
-        pair.aliceTransport.continuation?.yield(frames[0].frame)
-        #expect(await pollUntil(timeout: 20) { sink.lines(containing: "pqs.recv.persisted").count == persisted + 1 })
-        let behind = try #require(try await epochHolder(pair, header: frames[0].header)).props
-        pair.aliceTransport.continuation?.yield(frames[1].frame)
-        #expect(await pollUntil(timeout: 20) { sink.lines(containing: "pqs.recv.persisted").count == persisted + 2 })
-        let ahead = try #require(try await epochHolder(pair, header: frames[1].header)).props
-
-        let audit = RatchetHeaderAudit(frames[1].header)
-        let behindId = UUID()
-        let aheadId = UUID()
-        #expect(audit.epochHolderFields(rows: [(aheadId, ahead), (behindId, behind)])
-            == "epochHolder=\(aheadId.uuidString) holderReceived=\(behind.ratchetReceivedMessagesCount + 1) holderSkippedHeaders=0 holderCount=2")
-        #expect(audit.epochHolderFields(rows: []) == "epochHolder=none")
+        #expect(failure.contains("hdrCitesOtk=\(citedOTK.uuidString)"))
+        #expect(failure.contains("hdrCitesMlkem=\(citedMLKEM.uuidString)"))
+        #expect(failure.contains("hdrUnverified=true"))
         await pair.finish()
     }
 }

@@ -16,14 +16,12 @@ struct RatchetHeaderAudit: Equatable {
     let citesMLKEMKeyId: UUID?
     let embedsOneTimeKeyId: UUID?
     let embedsMLKEMKeyId: UUID
-    let epochDigest: Data
 
     init(_ header: EncryptedHeader) {
         citesOneTimeKeyId = header.oneTimeKeyId
         citesMLKEMKeyId = header.mlKEMOneTimeKeyId
         embedsOneTimeKeyId = header.remoteOneTimePublicKey?.id
         embedsMLKEMKeyId = header.remoteMLKEMPublicKey.id
-        epochDigest = header.ratchetEpochDigest
     }
 
     /// Reads the header of a frame that has not been verified; a caller that logs
@@ -35,33 +33,16 @@ struct RatchetHeaderAudit: Equatable {
         self.init(message.header)
     }
 
-    /// Eight bytes of the epoch digest: enough to link a lane's frames across log lines.
-    private var auditEpoch: String {
-        epochDigest.prefix(8).map { String(format: "%02x", $0) }.joined()
-    }
-
     var sendFields: String {
-        "citesOtk=\(citesOneTimeKeyId.auditId) citesMlkem=\(citesMLKEMKeyId.auditId) embedsOtk=\(embedsOneTimeKeyId.auditId) embedsMlkem=\(embedsMLKEMKeyId.uuidString) epoch=\(auditEpoch)"
+        "citesOtk=\(citesOneTimeKeyId.auditId) citesMlkem=\(citesMLKEMKeyId.auditId) embedsOtk=\(embedsOneTimeKeyId.auditId) embedsMlkem=\(embedsMLKEMKeyId.uuidString)"
     }
 
     var inboundFields: String {
-        "hdrCitesOtk=\(citesOneTimeKeyId.auditId) hdrCitesMlkem=\(citesMLKEMKeyId.auditId) hdrEmbedsOtk=\(embedsOneTimeKeyId.auditId) hdrEmbedsMlkem=\(embedsMLKEMKeyId.uuidString) hdrEpoch=\(auditEpoch)"
+        "hdrCitesOtk=\(citesOneTimeKeyId.auditId) hdrCitesMlkem=\(citesMLKEMKeyId.auditId) hdrEmbedsOtk=\(embedsOneTimeKeyId.auditId) hdrEmbedsMlkem=\(embedsMLKEMKeyId.uuidString)"
     }
 
     var unverifiedCitedFields: String {
-        "hdrCitesOtk=\(citesOneTimeKeyId.auditId) hdrCitesMlkem=\(citesMLKEMKeyId.auditId) hdrEpoch=\(auditEpoch) hdrUnverified=true"
-    }
-
-    /// The row that owns this frame's epoch and the state it failed from, including the
-    /// header stash a legacy row carries. Clones share an epoch, so this reports the most
-    /// advanced one and how many hold it. `none` means no row's current epoch matches,
-    /// which a sender-driven re-key can cause while a row could still open the frame.
-    func epochHolderFields(rows: [(id: UUID, props: SessionIdentity.UnwrappedProps)]) -> String {
-        let holders = rows.filter { $0.props.ratchetEpochDigest == epochDigest }
-        guard let holder = holders.max(by: { $0.props.ratchetReceivedMessagesCount < $1.props.ratchetReceivedMessagesCount }) else {
-            return "epochHolder=none"
-        }
-        return "epochHolder=\(holder.id.uuidString) holderReceived=\(holder.props.ratchetReceivedMessagesCount) holderSkippedHeaders=\(holder.props.ratchetSkippedHeaderCount) holderCount=\(holders.count)"
+        "hdrCitesOtk=\(citesOneTimeKeyId.auditId) hdrCitesMlkem=\(citesMLKEMKeyId.auditId) hdrUnverified=true"
     }
 
     /// Where this device holds the cited keys, so a failure says which lookup missed

@@ -105,11 +105,6 @@ actor MessagePipeline {
     /// This is set by the session manager and contains the current cryptographic context.
     var session: PQSSession?
 
-    /// Who held the epoch of the frame that last failed every lane. `pqs.decryptFailure`
-    /// is raised from the job's catch sites, which have no lanes in hand and must not
-    /// suspend or scan the store for a log field.
-    var rolledBackEpochHolder: (sharedId: String, fields: String)?
-
     /// The owning session's audit sink, bound at construction so lines written
     /// before the first ratchet call sets ``session`` still reach the audit files.
     let auditSink: any PQSAuditSink

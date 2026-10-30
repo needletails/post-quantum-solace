@@ -997,7 +997,6 @@ extension MessagePipeline {
         }
         let signedMessage: SignedRatchetMessage
         let sentHeader: EncryptedHeader
-        var sentCount: Int?
         do {
             try await ratchetManager.initiateSession(
                 sessionIdentity: sessionIdentity,
@@ -1022,9 +1021,6 @@ extension MessagePipeline {
                 plainText: encodedData,
                 sessionId: sessionIdentity.id)
             sentHeader = ratchetedMessage.header
-            if auditSink.isEnabled {
-                sentCount = await sessionIdentity.props(symmetricKey: databaseSymmetricKey)?.ratchetSentMessagesCount
-            }
             signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
         } catch {
             atomicOutboundPreparationIdentityIds.remove(sessionIdentity.id)
@@ -1148,7 +1144,6 @@ extension MessagePipeline {
             recipientDeviceId: props.deviceId,
             sessionIdentityId: sessionIdentity.id,
             pending: false,
-            sentCount: sentCount,
             header: RatchetHeaderAudit(sentHeader))
         
         if isOrphanReplay {
