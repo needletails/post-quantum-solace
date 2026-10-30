@@ -8,9 +8,8 @@
 //  accuracy is fine; these helpers cut the per-frame cost without changing
 //  which lane wins:
 //
-//  - header-match ordering *within* a tier (preferred, stateful actives,
-//    state-less actives, archives), so the common case decrypts on attempt one
-//    or two;
+//  - header-match ordering *within* a tier (stateful preferred, stateful actives,
+//    archives, state-less rows), so the common case decrypts on attempt one or two;
 //  - a bounded negative cache keyed by (lane id, frame fingerprint) and gated
 //    on the lane's row bytes, so a redelivered copy of the same ciphertext skips
 //    lanes that already rejected it under the same ratchet state;
@@ -56,7 +55,7 @@ enum InboundLaneSelectionPolicy: Sendable {
 
     /// Stable partition: higher rank first, original order preserved among
     /// equal ranks. Callers apply this *within* a tier only, never across the
-    /// preferred → stateful → state-less → archived precedence.
+    /// stateful preferred → stateful → archived → state-less precedence.
     static func orderedByHeaderMatch<T>(_ candidates: [T], rank: (T) -> Int) -> [T] {
         candidates
             .enumerated()
@@ -74,6 +73,25 @@ enum InboundLaneSelectionPolicy: Sendable {
         before != after
     }
 
+    /// Whether a state-less row that just bootstrapped from a frame's header may
+    /// become the lane. A header carries PQXDH material until the sender has
+    /// processed a reply, so a blank can decrypt any frame of that initial chain,
+    /// including one a row of the same epoch already consumed, and it could not
+    /// open the sender's next turn. It may take over only from holders of the epoch
+    /// that all rejected this frame and all sit behind it on the same chain: those
+    /// failed on a frame they never consumed. Received counts restart with each
+    /// chain, so a holder on another chain compares as nothing and refuses.
+    static func blankMayBecomeLane(
+        receivedMessagesCount: Int,
+        remoteRatchetPublicKey: Data?,
+        holders: [(rejectedFrame: Bool, receivedMessagesCount: Int, remoteRatchetPublicKey: Data?)]
+    ) -> Bool {
+        holders.allSatisfy { holder in
+            holder.rejectedFrame
+                && holder.remoteRatchetPublicKey == remoteRatchetPublicKey
+                && receivedMessagesCount > holder.receivedMessagesCount
+        }
+    }
 
     /// What decides whether a frame can decrypt on a lane: whether a ratchet
     /// snapshot exists, how far its receiving side advanced, and the local and
@@ -170,6 +188,10 @@ struct InboundLane: Sendable {
     let identity: SessionIdentity
     let props: SessionIdentity.UnwrappedProps
     let headerMatch: InboundLaneSelectionPolicy.HeaderMatch
+    /// This row's snapshot is on the frame's epoch. A sender-driven re-key replaces a
+    /// row's epoch while the peer's in-flight frames still carry the old one, so
+    /// `false` does not prove the row cannot open the frame.
+    let holdsFrameEpoch: Bool
 
     init(identity: SessionIdentity, props: SessionIdentity.UnwrappedProps, header: EncryptedHeader) {
         self.identity = identity
@@ -181,6 +203,7 @@ struct InboundLane: Sendable {
             headerLongTermPublicKey: header.remoteLongTermPublicKey,
             headerOneTimeKeyId: header.remoteOneTimePublicKey?.id,
             headerMLKEMKeyId: header.remoteMLKEMPublicKey.id)
+        holdsFrameEpoch = props.ratchetEpochDigest == header.ratchetEpochDigest
     }
 
     var isArchived: Bool {

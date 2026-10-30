@@ -13,6 +13,7 @@ import Foundation
 import Testing
 @testable import PQSSession
 @testable import SessionModels
+import DoubleRatchetKit
 
 extension EndToEndTests {
     private func persisted(_ session: PQSSession, _ sharedId: String, timeout: TimeInterval = 20) async -> Bool {
@@ -24,6 +25,112 @@ extension EndToEndTests {
     private func identity(on session: PQSSession, id: UUID) async throws -> SessionIdentity {
         let cache = try #require(await session.cache)
         return try #require(try await cache.fetchSessionIdentities().first { $0.id == id })
+    }
+
+    private func lanePropsOnBob(_ pair: ConnectedPair, id: UUID) async -> SessionIdentity.UnwrappedProps? {
+        guard let row = try? await identity(on: pair.bob, id: id),
+              let key = try? await pair.bob.getDatabaseSymmetricKey()
+        else { return nil }
+        return await row.props(symmetricKey: key)
+    }
+
+    private func laneSelections(on session: PQSSession, sharedId: String) async -> [InboundLaneSelectionStats] {
+        await session.messagePipeline.inboundLaneSelectionStatsLog.filter { $0.sharedId == sharedId }
+    }
+
+    /// Alice opens a fresh lane toward bob and bob takes `count` of its initial-chain
+    /// frames on one row. Returns that row and the frames as they crossed the wire.
+    private func openInitialChain(
+        _ pair: ConnectedPair,
+        frames count: Int
+    ) async throws -> (holder: UUID, frames: [ReceivedMessage]) {
+        _ = try await pair.alice.resetSessionIdentityForFreshSession(
+            secretName: "bob",
+            deviceId: pair.bobDeviceId,
+            sendOneTimeIdentities: true,
+            reason: "test")
+        let captured = HeldFrames()
+        pair.aliceTransport.transformOutgoing = { received in
+            if received.recipient == "bob", received.isContentMessage { await captured.hold(received) }
+            return received
+        }
+        var holder: UUID?
+        for index in 0..<count {
+            holder = try await sendAndAwaitInbound(
+                from: pair.alice, to: "bob", on: pair.bob, text: "initial chain \(index)").winningLaneId
+        }
+        pair.aliceTransport.transformOutgoing = nil
+        return (try #require(holder), await captured.take())
+    }
+
+    @Test("a state-less preferred row waits for the archived row that holds the frame's epoch")
+    func stateLessPreferredRowYieldsToTheArchivedHolder() async throws {
+        let pair = try await connectedPair()
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        let lane = try await openInitialChain(pair, frames: 2)
+
+        // Master 12:43:52Z: a laneReset archived the row holding frames 0-8 and left a
+        // lone state-less row, which every later frame reached first as preferred.
+        _ = try await pair.bob.demoteActiveSessionIdentityToInactive(try await identity(on: pair.bob, id: lane.holder))
+        _ = try await pair.bob.resetSessionIdentityForFreshSession(
+            secretName: "alice",
+            deviceId: pair.aliceDeviceId,
+            sendOneTimeIdentities: false,
+            reason: "test",
+            demotePriorActives: false)
+        let blank = try #require(try await rows(on: pair.bob, peer: "alice", deviceId: pair.aliceDeviceId).first { !$0.archived })
+
+        let next = try await sendAndAwaitInbound(from: pair.alice, to: "bob", on: pair.bob, text: "next on the initial chain")
+        #expect(next.pass == .activeFirst && next.winningLaneId == lane.holder, "\(next.candidateOrder)")
+        #expect(!next.attemptedLaneIds.contains(blank.id), "the holder decrypted it first: \(next.candidateOrder)")
+
+        // The holder keeps its ratchet, so the lane survives a turn in each direction.
+        let reply = try await sendAndAwaitInbound(from: pair.bob, to: "alice", on: pair.alice, text: "reply")
+        #expect(reply.winningLaneId != nil, "\(reply.candidateOrder)")
+        let after = try await sendAndAwaitInbound(from: pair.alice, to: "bob", on: pair.bob, text: "after the reply")
+        #expect(after.winningLaneId == lane.holder, "\(after.candidateOrder)")
+        await pair.finish()
+    }
+
+    @Test("a replay of an initial-chain frame adopts no blank after the holder took a turn")
+    func replayOfAConsumedInitialChainFrameAfterATurnAdoptsNoBlank() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        let lane = try await openInitialChain(pair, frames: 3)
+        let chainBefore = try #require(await lanePropsOnBob(pair, id: lane.holder)).ratchetRemotePublicKey
+
+        _ = try await sendAndAwaitInbound(from: pair.bob, to: "alice", on: pair.alice, text: "reply")
+        let turn = try await sendAndAwaitInbound(from: pair.alice, to: "bob", on: pair.bob, text: "alice's next turn")
+        #expect(turn.winningLaneId == lane.holder, "\(turn.candidateOrder)")
+        let holderProps = try #require(await lanePropsOnBob(pair, id: lane.holder))
+        #expect(holderProps.ratchetRemotePublicKey != chainBefore, "the holder moved to a new receiving chain")
+        #expect(holderProps.ratchetReceivedMessagesCount < 3, "the per-chain count restarted")
+
+        // A replay the ledger no longer knows, under a fresh envelope id, of a frame the
+        // holder consumed. The blank's count now exceeds the holder's restarted count.
+        await pair.bob.pruneAcceptedEnvelopes(now: Date().addingTimeInterval(pair.bob.acceptedEnvelopeRetention + 60))
+        let replayId = "replay-\(UUID().uuidString)"
+        let replayed = lane.frames[2]
+        try await pair.bob.receiveMessage(
+            message: replayed.message,
+            sender: replayed.sender,
+            deviceId: replayed.deviceId,
+            messageId: replayId,
+            logicalMessageId: nil)
+
+        #expect(await pollUntil(timeout: 20) {
+            await self.laneSelections(on: pair.bob, sharedId: replayId).contains { $0.pass == .archived || $0.winningLaneId != nil }
+        })
+        let selections = await laneSelections(on: pair.bob, sharedId: replayId)
+        #expect(selections.allSatisfy { $0.winningLaneId == nil }, "\(selections.map(\.candidateOrder))")
+        #expect(sink.contains("pqs.recovery.blankBootstrapRefused reason=replayOfConsumedFrame"), "the blank decrypted it and was refused")
+        #expect(try await rows(on: pair.bob, peer: "alice", deviceId: pair.aliceDeviceId).filter { !$0.archived }.map(\.id) == [lane.holder],
+                "the established row stays the one active row")
+        #expect(try await pair.bob.cache?.fetchMessageIfExists(sharedId: replayId) == nil, "no second chat row")
+        await pair.finish()
     }
 
     @Test("a frame only an archived lane can decrypt is not NACKed before the archive pass has run")
@@ -43,6 +150,9 @@ extension EndToEndTests {
             reason: "test",
             demotePriorActives: false)
 
+        // Alice's new keys open a new epoch, so no row holds the frame by its epoch
+        // and only the archived row can mirror the re-key.
+        try await pair.alice.rotateCurrentDeviceKeys()
         let sharedId = "archived-\(UUID().uuidString)"
         try await pair.alice.send(recipient: .nickname("bob"), text: "still on the old lane", sharedIdOverride: sharedId)
 

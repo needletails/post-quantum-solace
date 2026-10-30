@@ -10723,8 +10723,9 @@ actor EndToEndTests {
         }
         let tokensBeforeFirst = try await ratchetTokens()
         
-        // Delivery 1: every row is walked once (active-first pass, then the deferred
-        // archive pass, which no longer re-tries the preferred row it just rejected).
+        // Delivery 1: every row is walked once. The archived rows are snapshots of one
+        // lane, so they all hold the frame's epoch and run in the active-first pass;
+        // the deferred archive pass re-tries none of the rows that pass rejected.
         let writesBeforeFirst = await recipientStore.updateSessionIdentityCallCount
         await deliver(frame.messageId)
         #expect(await pollUntil(timeout: 30) { await bothPassesRecorded(frame.messageId) },
@@ -10740,7 +10741,7 @@ actor EndToEndTests {
         #expect(Set(firstAttemptedLanes).count == firstAttemptedLanes.count, "a lane is attempted at most once per frame")
         #expect(laneIds.isSubset(of: Set(firstAttemptedLanes)), "every existing row for the device is tried once")
         #expect(firstAttempts == laneIds.count + 1, "every row once plus the ensured blank: \(first.map(\.candidateOrder))")
-        #expect(firstSkips == 1, "the archive pass skips the preferred row the active-first pass already rejected")
+        #expect(firstSkips == laneIds.count, "the archive pass skips every row the active-first pass already rejected")
         #expect(firstSkippedUnchanged >= 1, "the ensured blank fails before touching its row, so it is not written back")
         for entry in first {
             #expect(

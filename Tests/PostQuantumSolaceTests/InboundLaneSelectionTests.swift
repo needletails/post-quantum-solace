@@ -79,6 +79,29 @@ struct InboundLaneSelectionTests {
         #expect(ordered == items)
     }
 
+    // MARK: - Blank adoption
+
+    @Test("a blank takes over only from holders that all rejected the frame and sit behind it on its chain")
+    func blankIsJudgedAgainstEveryHolder() {
+        let chain = Data(repeating: 0xA1, count: 32)
+        let otherChain = Data(repeating: 0xB2, count: 32)
+        func mayAdopt(
+            _ holders: [(rejectedFrame: Bool, receivedMessagesCount: Int, remoteRatchetPublicKey: Data?)]
+        ) -> Bool {
+            InboundLaneSelectionPolicy.blankMayBecomeLane(
+                receivedMessagesCount: 6, remoteRatchetPublicKey: chain, holders: holders)
+        }
+        #expect(mayAdopt([]), "no row holds the epoch")
+        #expect(mayAdopt([(true, 3, chain), (true, 5, chain)]), "both holders failed on a frame past them")
+
+        // Two holders: a clone that lags must not hide the row that consumed the frame.
+        #expect(!mayAdopt([(true, 3, chain), (true, 9, chain)]), "the second holder consumed this frame")
+        #expect(!mayAdopt([(true, 9, chain), (true, 3, chain)]), "whichever order the rows came in")
+        #expect(!mayAdopt([(true, 3, chain), (false, 3, chain)]), "a holder that was never tried may still open it")
+        #expect(!mayAdopt([(true, 3, chain), (true, 1, otherChain)]), "a count on another chain proves nothing")
+        #expect(!mayAdopt([(true, 6, chain)]), "a count equal to the blank's means the frame was consumed")
+    }
+
     // MARK: - Restore gate
 
     @Test("restore only when the row bytes changed during the attempt")

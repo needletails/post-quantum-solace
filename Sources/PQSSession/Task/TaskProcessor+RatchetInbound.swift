@@ -153,9 +153,10 @@ extension MessagePipeline {
         
         // Everything up until this point delt with message recovery, meaning if a message was in a state of non recovery then we tried to recover that message stored in the SessionWorkCoordinator(via 2 different enqueue methods scheduleTransportProtocolWork and scheduleBackgroundWork messages use scheduleBackgroundWork via setConnectivity which reloads the job queue) ran on the background if we are a new message all of that recovery work is skipped and we start here.
         do {
-            // Inbound decrypt: try the preferred/current session, then other
-            // actives, then inactive sessions. Whichever decrypts becomes current
-            // (activate = promote inactive / demote sibling actives).
+            // Inbound decrypt: try the preferred/current session if it has state,
+            // then other actives, inactive sessions, then state-less rows. Whichever
+            // decrypts becomes current (activate = promote inactive / demote sibling
+            // actives).
             let preferredSessionIdentity = verificationResult.sessionIdentity
             let preferredLane: InboundLane
             if let lane = peerLanes.first(where: { $0.identity.id == preferredSessionIdentity.id }) {
@@ -170,17 +171,18 @@ extension MessagePipeline {
             var decryptionSessionIdentity = preferredSessionIdentity
             // Per-candidate failure classes for the rollback audit and terminal
             // error. Without this the try-all loop swallows every alternate.
-            var attemptFailures: [(label: String, error: Error, stateLess: Bool)] = []
+            var attemptFailures: [(laneId: UUID, label: String, error: Error, stateLess: Bool)] = []
+            let frameEpochHolders = (peerLanes + [preferredLane]).filter(\.holdsFrameEpoch)
 
             var decryptedData: Data
-            if let data = await attemptInboundDecrypt(
+            if preferredLane.hasRatchetState, let data = await attemptInboundDecrypt(
                 preferredLane, kind: "preferred", frame: verificationResult, fingerprint: frameFingerprint,
-                session: session, stats: &laneStats, failures: &attemptFailures)
+                frameEpochHolders: frameEpochHolders, session: session, stats: &laneStats, failures: &attemptFailures)
             {
                 decryptedData = data
             } else {
-                let preferredError = attemptFailures[0].error
-                // Inbound try-all: stateful Active → Archives → state-less Active.
+                // Inbound try-all: stateful Active → archived rows that belong to the
+                // frame → state-less rows, the preferred one included → ensured blank.
                 // Blank PQXDH runs only on state-less rows already in (or ensured into)
                 // the device record — not a gated post-failure matching mint.
                 //
@@ -188,7 +190,8 @@ extension MessagePipeline {
                 // header go first (stable), so the common case decrypts on the first
                 // or second attempt. Tiers never reorder against each other.
                 //
-                // activeFirstInboundPass: try actives + state-less first. Archive walk is
+                // activeFirstInboundPass: try actives, the archived rows holding the
+                // frame's epoch and state-less rows first. The full archive walk is
                 // deferred to a `.background` job via deferArchivedInboundFallback so
                 // fresher `.urgent` ciphertext is not HOL-blocked on the single consumer.
                 let alternates = peerLanes.filter { !$0.isArchived && $0.identity.id != preferredSessionIdentity.id }
@@ -201,6 +204,7 @@ extension MessagePipeline {
                     peerLanes.filter(\.isArchived).sorted { $0.props.sessionContextId > $1.props.sessionContextId },
                     rank: \.headerMatch.rank)
                 let archivedBlanks = archivedLanes.filter { !$0.hasRatchetState }
+                let stateLessPreferred = preferredLane.hasRatchetState ? [] : [(lane: preferredLane, kind: "preferred")]
                 // Active-first never walks full archives, but blankForHeaderExists
                 // counts archived blanks. Include the single header-matched archived
                 // blank in the active pass so demoted blanks are not invisible until
@@ -227,14 +231,18 @@ extension MessagePipeline {
                 var fallbackData: Data?
                 let candidates: [(lane: InboundLane, kind: String)]
                 if includeArchivedFallback {
-                    // Background pass: archives only (actives already failed).
-                    candidates = archivedLanes.map { (lane: $0, kind: "archived") }
+                    // Background pass: archives only (actives already failed), and
+                    // every stateful row before a blank can be judged against it.
+                    candidates = (archivedLanes.filter(\.hasRatchetState) + archivedBlanks)
+                        .map { (lane: $0, kind: "archived") } + stateLessPreferred
                 } else {
                     // activeFirstInboundPass — decryptInboundActiveOnly candidates,
-                    // plus header-matched archived blank when policy allows.
+                    // the archived rows that belong to this frame (holders of its epoch,
+                    // then the header-matched archived blank when policy allows), then
+                    // state-less rows.
                     var activeFirstCandidates =
                         statefulAlternates.map { (lane: $0, kind: "active") }
-                        + stateLessAlternates.map { (lane: $0, kind: "stateLess") }
+                        + archivedLanes.filter(\.holdsFrameEpoch).map { (lane: $0, kind: "archivedHolder") }
                     if let matched = headerMatchedArchivedBlank,
                        InboundInitiatingSlotPolicy.shouldTryArchivedHeaderMatchBeforeEnsureSkip(
                            blankForHeaderExists: true,
@@ -244,11 +252,13 @@ extension MessagePipeline {
                         activeFirstCandidates.append((lane: matched, kind: "archivedHeaderMatch"))
                     }
                     candidates = activeFirstCandidates
+                        + stateLessPreferred
+                        + stateLessAlternates.map { (lane: $0, kind: "stateLess") }
                 }
                 for candidate in candidates {
                     guard let data = await attemptInboundDecrypt(
                         candidate.lane, kind: candidate.kind, frame: verificationResult, fingerprint: frameFingerprint,
-                        session: session, stats: &laneStats, failures: &attemptFailures)
+                        frameEpochHolders: frameEpochHolders, session: session, stats: &laneStats, failures: &attemptFailures)
                     else { continue }
                     logger.log(
                         level: .info,
@@ -300,7 +310,7 @@ extension MessagePipeline {
                                let data = await attemptInboundDecrypt(
                                    InboundLane(identity: ensured, props: ensuredProps, header: inboundHeader),
                                    kind: "ensured", frame: verificationResult, fingerprint: frameFingerprint,
-                                   session: session, stats: &laneStats, failures: &attemptFailures)
+                                   frameEpochHolders: frameEpochHolders, session: session, stats: &laneStats, failures: &attemptFailures)
                             {
                                 logger.log(
                                     level: .info,
@@ -358,9 +368,10 @@ extension MessagePipeline {
                             && ((headerOneTimeKeyId != nil && lane.props.ratchetOneTimePrivateKey?.id == headerOneTimeKeyId)
                                 || (headerMLKEMKeyId != nil && lane.props.ratchetMLKEMPrivateKey?.id == headerMLKEMKeyId))
                     }
+                    let preferredId = preferredSessionIdentity.id
                     throw InboundRecoveryStormPolicy.terminalTryAllError(
-                        preferred: preferredError,
-                        alternates: attemptFailures.dropFirst().map(\.error),
+                        preferred: attemptFailures.first { $0.laneId == preferredId }?.error ?? RatchetError.decryptionFailed,
+                        alternates: attemptFailures.filter { $0.laneId != preferredId }.map(\.error),
                         stateLess: frameKeysPinnedByALane ? [] : attemptFailures.filter(\.stateLess).map(\.error))
                 }
                 if shouldMarkArchivePassExhausted {
@@ -1072,21 +1083,24 @@ extension MessagePipeline {
     /// rejected this ciphertext under the same ratchet state is skipped with its
     /// recorded failure; a fresh failure is recorded and rolled back only if the
     /// attempt changed the row (the ratchet manager's lane is always evicted).
-    /// A state-less row is tried only after every stateful row failed, and a
-    /// frame it decrypts is authentic under keys derived from the frame's own
-    /// header and this device's keys: it becomes the lane whatever the frame's
-    /// position in the sender's chain, with the skipped keys stashed for the
-    /// frames before it. Refusing it past the first frame kept authenticated
-    /// content from the user and NACKed a lane that worked (dogfood 2026-10-28:
-    /// 105 refusals across three devices, a channel message held 59 minutes).
+    /// A frame a state-less row decrypts is authentic under keys derived from the
+    /// frame's own header and this device's keys, so with no row holding the
+    /// frame's epoch it becomes the lane whatever the frame's position in the
+    /// sender's chain, with the skipped keys stashed for the frames before it.
+    /// Refusing it past the first frame kept authenticated content from the user
+    /// and NACKed a lane that worked (dogfood 2026-10-28: 105 refusals across three
+    /// devices, a channel message held 59 minutes). With a holder it must also
+    /// pass `InboundLaneSelectionPolicy.blankMayBecomeLane`; refused, it rolls back
+    /// to blank and the frame takes the resend path as `decryptionFailed`.
     private func attemptInboundDecrypt(
         _ lane: InboundLane,
         kind: String,
         frame: VerificationResult,
         fingerprint: Data,
+        frameEpochHolders: [InboundLane],
         session: PQSSession,
         stats: inout InboundLaneSelectionStats,
-        failures: inout [(label: String, error: Error, stateLess: Bool)]
+        failures: inout [(laneId: UUID, label: String, error: Error, stateLess: Bool)]
     ) async -> Data? {
         let laneId = lane.identity.id
         let dataBeforeAttempt = lane.identity.data
@@ -1095,7 +1109,7 @@ extension MessagePipeline {
         if let cached = inboundNegativeDecryptCache.cachedFailure(
             laneId: laneId, fingerprint: fingerprint, laneState: stateToken)
         {
-            failures.append((label, cached, !lane.hasRatchetState))
+            failures.append((laneId, label, cached, !lane.hasRatchetState))
             stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .skippedNegativeCache, failure: "\(cached)"))
             return nil
         }
@@ -1106,10 +1120,27 @@ extension MessagePipeline {
                 session: session,
                 ratchetMessage: frame.ratchetMessage)
             let data = try await ratchetManager.decrypt(frame.ratchetMessage, sessionId: laneId)
+            if !lane.hasRatchetState {
+                let status = try await ratchetManager.sessionStatus(sessionId: laneId)
+                guard InboundLaneSelectionPolicy.blankMayBecomeLane(
+                    receivedMessagesCount: status.receivedMessagesCount,
+                    remoteRatchetPublicKey: status.remoteRatchetPublicKey,
+                    holders: frameEpochHolders.map { holder in
+                        // Every failed attempt lands in the cache, whichever pass made it.
+                        (rejectedFrame: inboundNegativeDecryptCache.cachedFailure(
+                            laneId: holder.identity.id, fingerprint: fingerprint, laneState: holder.ratchetStateToken) != nil,
+                         receivedMessagesCount: holder.props.ratchetReceivedMessagesCount,
+                         remoteRatchetPublicKey: holder.props.ratchetRemotePublicKey)
+                    })
+                else {
+                    audit(.recovery, "pqs.recovery.blankBootstrapRefused reason=replayOfConsumedFrame messageNumber=\(status.receivedMessagesCount - 1) lane=\(laneId.uuidString) kind=\(kind)")
+                    throw RatchetError.decryptionFailed
+                }
+            }
             stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .decrypted))
             return data
         } catch {
-            failures.append((label, error, !lane.hasRatchetState))
+            failures.append((laneId, label, error, !lane.hasRatchetState))
             stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .failed, failure: "\(error)"))
             inboundNegativeDecryptCache.recordFailure(
                 laneId: laneId, fingerprint: fingerprint, laneState: stateToken, error: error)
