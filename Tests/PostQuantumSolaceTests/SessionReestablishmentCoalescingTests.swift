@@ -1473,6 +1473,7 @@ struct RecordingEpisodeEndDelegate: MessagingPolicy, RecoveryObserver {
     func editMessage(recipient: MessageRecipient, metadata: Data) async throws {}
     func shouldPersist(transportInfo: Data?) -> Bool { true }
     func shouldReplayNonPersistentOutbound(transportInfo: Data?) -> Bool { false }
+    func isInboundRecoveryPlaceholder(transportInfo: Data?) -> Bool { false }
     func retrieveUserInfo(_ transportInfo: Data?) async -> (secretName: String, deviceId: String)? { nil }
     func updateCryptoMessageMetadata(
         _ message: CryptoMessage,

@@ -3981,6 +3981,7 @@ actor EndToEndTests {
                     text: "",
                     metadata: Data(),
                     recipient: .nickname("carol"),
+                    transportInfo: SessionDelegate.recoveryPlaceholderMarker,
                     sentDate: Date(),
                     destructionTime: nil),
                 senderSecretName: "alice",
@@ -11327,6 +11328,11 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
     {}
     func shouldPersist(transportInfo _: Data?) -> Bool { true }
     func shouldReplayNonPersistentOutbound(transportInfo _: Data?) -> Bool { false }
+    /// A seeded row's `transportInfo` when it stands for a host's recovery placeholder.
+    static let recoveryPlaceholderMarker = Data("inboundRecoveryPlaceholder".utf8)
+    func isInboundRecoveryPlaceholder(transportInfo: Data?) -> Bool {
+        transportInfo == Self.recoveryPlaceholderMarker
+    }
     func retrieveUserInfo(_: Data?) async -> (secretName: String, deviceId: String)? {
         forcedRetrieveUserInfo
     }

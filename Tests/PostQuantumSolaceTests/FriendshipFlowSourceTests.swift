@@ -256,7 +256,6 @@ struct FriendshipFlowSourceTests {
         _ = InboundRecoveryStormPolicy.terminalTryAllError
         _ = ExplicitOutboundRecipientPinPolicy.shouldHonorExplicitRecipient
         _ = OrphanReplayRearmPolicy.shouldRearm
-        _ = MessagePipeline.isReplaceableInboundRecoveryPlaceholder
         _ = MessagePipeline.inboundConversationType
     }
 

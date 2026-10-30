@@ -224,6 +224,7 @@ private actor RecordingHostDelegate: MessagingPolicy, RecoveryObserver {
     func editMessage(recipient _: MessageRecipient, metadata _: Data) async throws {}
     nonisolated func shouldPersist(transportInfo _: Data?) -> Bool { true }
     nonisolated func shouldReplayNonPersistentOutbound(transportInfo _: Data?) -> Bool { false }
+    nonisolated func isInboundRecoveryPlaceholder(transportInfo _: Data?) -> Bool { false }
     func retrieveUserInfo(_: Data?) async -> (secretName: String, deviceId: String)? { nil }
     nonisolated func updateCryptoMessageMetadata(_ message: CryptoMessage, sharedMessageId _: String) -> CryptoMessage { message }
     func updateEncryptableMessageMetadata(_ message: EncryptedMessage, transportInfo _: Data?, identity _: SessionIdentity, recipient _: MessageRecipient) async -> EncryptedMessage { message }

@@ -79,6 +79,8 @@ extension MessagePipeline {
         // one, so the ledger is also asked by the signed payload: an accepted
         // frame must never reach lane selection again, where its still-valid
         // PQXDH header could bootstrap a blank and demote the established lane.
+        // The ledger knows these bytes, not the chat row they name, so a resend
+        // pending for the logical id stays for the drain to settle.
         if try await session.hasAcceptedEnvelope(
             senderSecretName: inboundTask.senderSecretName,
             senderDeviceId: inboundTask.senderDeviceId,
@@ -86,51 +88,8 @@ extension MessagePipeline {
             frameFingerprint: PQSSession.frameFingerprintDigest(for: inboundTask)
         ) {
             audit(.recovery, "pqs.recovery.redeliveryDropped reason=alreadyAccepted sharedId=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-            await session.settlePendingResendsForAcceptedInbound(
-                sender: inboundTask.senderSecretName,
-                deviceId: inboundTask.senderDeviceId,
-                envelopeMessageId: inboundTask.sharedMessageId,
-                logicalSharedId: inboundTask.resolvedLogicalSharedId)
-            let acceptedSharedId = inboundTask.sharedMessageId
-            let acceptedDelegate = await session.sessionDelegate
-            await session.scheduleTransportProtocolWork {
-                await acceptedDelegate?.inboundCiphertextAccepted(sharedMessageId: acceptedSharedId)
-            }
+            await acknowledgeAcceptedInbound(inboundTask, session: session)
             return
-        }
-
-        // Redelivery ingress guard: offline queues redeliver un-ACKed frames on
-        // every reconnect. Lookup by logical id (chat row) with sender-device match.
-        // Waiting/failed recovery placeholders must NOT short-circuit — orphan
-        // resend heals by decrypting into that same sharedId.
-        let logicalLookupId = inboundTask.resolvedLogicalSharedId
-        if let existing = try await session.cache?.fetchMessageIfExists(sharedId: logicalLookupId) {
-            let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
-            if let existingProps = await existing.props(symmetricKey: databaseSymmetricKey),
-               existingProps.senderSecretName == inboundTask.senderSecretName,
-               existingProps.senderDeviceId == inboundTask.senderDeviceId,
-               !Self.isReplaceableInboundRecoveryPlaceholder(existingProps)
-            {
-                audit(.recovery, "pqs.recovery.redeliveryDropped reason=alreadyPersisted sharedId=\(inboundTask.sharedMessageId) logical=\(logicalLookupId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-                // The content is here, so every NACK still pending for it is answered,
-                // whichever envelope carried this copy: a sender resend arrives under a
-                // new envelope id, and a host re-arm is keyed by the chat row's logical
-                // id. Left pending, the id was re-NACKed at every drain boundary until
-                // the cap wrote it off and told the author "failed" (dogfood 2026-10-28,
-                // C653BE44 on the master).
-                await session.settlePendingResendsForAcceptedInbound(
-                    sender: inboundTask.senderSecretName,
-                    deviceId: inboundTask.senderDeviceId,
-                    envelopeMessageId: inboundTask.sharedMessageId,
-                    logicalSharedId: logicalLookupId)
-                try await session.markEnvelopeAccepted(inboundTask)
-                let acceptedSharedId = inboundTask.sharedMessageId
-                let acceptedDelegate = await session.sessionDelegate
-                await session.scheduleTransportProtocolWork {
-                    await acceptedDelegate?.inboundCiphertextAccepted(sharedMessageId: acceptedSharedId)
-                }
-                return
-            }
         }
 
         let verificationResult = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
@@ -160,6 +119,9 @@ extension MessagePipeline {
             rollbackPeerIdentities.map { ($0.id, $0.data) },
             uniquingKeysWith: { _, last in last })
         
+        // Set when no lane can open this frame and no pass is left to try.
+        var decryptFailedTerminally = false
+
         // Everything up until this point delt with message recovery, meaning if a message was in a state of non recovery then we tried to recover that message stored in the SessionWorkCoordinator(via 2 different enqueue methods scheduleTransportProtocolWork and scheduleBackgroundWork messages use scheduleBackgroundWork via setConnectivity which reloads the job queue) ran on the background if we are a new message all of that recovery work is skipped and we start here.
         do {
             // Inbound decrypt: try the preferred/current session if it has state,
@@ -366,6 +328,7 @@ extension MessagePipeline {
                     // poison redelivery → demoteProveFailedActive walked unique session
                     // ids (nudge primary: 92 demotes / 4k blankForHeader skips against
                     // linked). Preference stays success-only; demote remains rearm-gated.
+                    decryptFailedTerminally = true
                     throw InboundRecoveryStormPolicy.terminalTryAllError(attempts: attemptFailures)
                 }
                 if shouldMarkArchivePassExhausted {
@@ -410,16 +373,20 @@ extension MessagePipeline {
                 throw PQSError.sessionDecryptionError
             }
 
+            // A copy of content this device holds has done its work on the ratchet. The
+            // host saw the message when it landed, so it must not run a second time.
+            let contentHeld = try await holdsInboundContent(inboundTask, session: session)
             var canSaveMessage = true
             
-            if let sessionDelegate = await session.sessionDelegate {
+            if !contentHeld, let sessionDelegate = await session.sessionDelegate {
                 canSaveMessage = await sessionDelegate.processMessage(
                     decodedMessage,
                     senderSecretName: inboundTask.senderSecretName,
                     senderDeviceId: inboundTask.senderDeviceId)
             }
 
-            if let transportInfo = decodedMessage.transportInfo,
+            if !contentHeld,
+               let transportInfo = decodedMessage.transportInfo,
                let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo) {
                 var processedReestablishment: SessionReestablishmentEnvelope?
                 do {
@@ -684,18 +651,29 @@ extension MessagePipeline {
 
             var didAcceptInbound = false
             if canSaveMessage {
-                /// Now we can handle the message
-                try await handleDecodedMessage(
-                    decodedMessage,
-                    inboundTask: inboundTask,
-                    session: session,
-                    sessionIdentity: decryptionSessionIdentity)
+                if contentHeld {
+                    audit(.recovery, "pqs.recovery.duplicateInboundPersistSkipped envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                } else {
+                    /// Now we can handle the message
+                    try await handleDecodedMessage(
+                        decodedMessage,
+                        inboundTask: inboundTask,
+                        session: session,
+                        sessionIdentity: decryptionSessionIdentity)
+                }
+                // A held copy can be stale: the row that opened it may be one the sender
+                // has left, so it takes no lane back. A state-less row is different, the
+                // frame just bootstrapped it and the sender is on that lane.
+                let bootstrappedLane = !(peerLanes + [preferredLane]).contains {
+                    $0.identity.id == decryptionSessionIdentity.id && $0.hasRatchetState
+                }
                 decryptionSessionIdentity = try await finalizeAcceptedInbound(
                     decryptionSessionIdentity,
                     inboundTask: inboundTask,
                     session: session,
                     headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
                     headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                    activateLane: !contentHeld || bootstrappedLane,
                     acknowledgeTransport: false)
                 didAcceptInbound = true
             } else if await shouldAcceptWithoutChatRow(decodedMessage, session: session) {
@@ -839,6 +817,25 @@ extension MessagePipeline {
                 await session.invalidateSessionIdentityCache(
                     secretName: inboundTask.senderSecretName)
             }
+            // No lane opens this copy, but the content is here, so the sender owes
+            // nothing: every NACK still pending for it is answered, whichever envelope
+            // carried this copy. A sender resend arrives under a new envelope id, and a
+            // host re-arm is keyed by the chat row's logical id. Left pending, the id was
+            // re-NACKed at every drain boundary until the cap wrote it off and told the
+            // author "failed" (dogfood 2026-10-28, C653BE44 on the master). Only a
+            // terminal decrypt failure lands here: a queued pass still owns the frame,
+            // and a failure after a decrypt must stay retryable.
+            if decryptFailedTerminally, (try? await holdsInboundContent(inboundTask, session: session)) == true {
+                audit(.recovery, "pqs.recovery.redeliveryDropped reason=alreadyPersisted sharedId=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                try await session.markEnvelopeAccepted(inboundTask)
+                await session.settlePendingResendsForAcceptedInbound(
+                    sender: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId,
+                    envelopeMessageId: inboundTask.sharedMessageId,
+                    logicalSharedId: inboundTask.resolvedLogicalSharedId)
+                await acknowledgeAcceptedInbound(inboundTask, session: session)
+                return
+            }
 #if DEBUG
             logger.log(
                 level: .debug,
@@ -846,6 +843,25 @@ extension MessagePipeline {
 #endif
             throw error
         }
+    }
+
+    /// Whether this device already holds the content `inboundTask` carries: a chat row
+    /// for its logical id from this sender tuple that the host does not call a recovery
+    /// placeholder. It is asked after decrypt, never in place of it: the id is
+    /// unauthenticated wire metadata, and a frame dropped before the ratchet leaves a
+    /// header gap and throws away a resend opening a new lane. With no delegate the row
+    /// is not known to be content, so nothing is dropped on its account.
+    private func holdsInboundContent(
+        _ inboundTask: InboundTaskMessage,
+        session: PQSSession
+    ) async throws -> Bool {
+        guard let existing = try await session.cache?.fetchMessageIfExists(sharedId: inboundTask.resolvedLogicalSharedId),
+              let props = await existing.props(symmetricKey: try await session.getDatabaseSymmetricKey()),
+              props.senderSecretName == inboundTask.senderSecretName,
+              props.senderDeviceId == inboundTask.senderDeviceId
+        else { return false }
+        return await session.sessionDelegate?.isInboundRecoveryPlaceholder(
+            transportInfo: props.message.transportInfo) == false
     }
 
     /// True when decrypt succeeded but no chat row is expected — TransportEvent
@@ -873,10 +889,12 @@ extension MessagePipeline {
         session: PQSSession,
         headerOneTimeKeyId: UUID?,
         headerMLKEMOneTimeKeyId: UUID?,
+        activateLane: Bool = true,
         acknowledgeTransport: Bool = true
     ) async throws -> SessionIdentity {
-        let activated = try await session.activateSessionIdentityAfterInboundDecrypt(
-            decryptionSessionIdentity)
+        let activated = activateLane
+            ? try await session.activateSessionIdentityAfterInboundDecrypt(decryptionSessionIdentity)
+            : decryptionSessionIdentity
         // Do not publish preference / clear recovery state until the durable
         // accepted ledger write succeeds. The outer catch restores identity
         // inventory if persistence fails.
@@ -1448,48 +1466,42 @@ extension MessagePipeline {
             sender: inboundTask.senderSecretName,
             mySecretName: mySecretName)
 
-        // Duplicate-persist guard: the same logical message can decrypt twice
-        // (an orphan replay landing after the original, or a redelivery racing
-        // the ingress guard). One sharedId from one sender tuple is one chat
-        // row — persisting again would mint a second row with a fresh UUID and
-        // notify the host twice. The sender-tuple match keeps this from ever
-        // colliding with a *different* sender's frame or with our own outbound
-        // record for the same conversation.
-        // Recovery placeholders (waiting/failed) are replaced in place on heal.
+        // Held content stopped in `handleStreamMessage`, so a row here for this logical
+        // id and sender tuple is not known to be content: it is a recovery placeholder,
+        // or no delegate was there to say. One sharedId from one sender tuple is one chat
+        // row, so the frame replaces it in place on heal: inserting would mint a second
+        // row with a fresh UUID. The sender-tuple match keeps this from ever colliding
+        // with a *different* sender's frame or with our own outbound record for the same
+        // conversation.
         if let existing = try await cache.fetchMessageIfExists(
             sharedId: inboundTask.resolvedLogicalSharedId),
            let existingProps = await existing.props(symmetricKey: databaseSymmetricKey),
            existingProps.senderSecretName == inboundTask.senderSecretName,
            existingProps.senderDeviceId == inboundTask.senderDeviceId
         {
-            if Self.isReplaceableInboundRecoveryPlaceholder(existingProps) {
-                let target = try? await conversation(
-                    cache: cache,
-                    communicationType: conversationType,
-                    session: session)
-                if target?.id == existing.communicationId {
-                    var healedProps = existingProps
-                    healedProps.message = decodedMessage
-                    healedProps.deliveryState = .received
-                    let healed = try await existing.updateMessage(
-                        with: healedProps,
-                        symmetricKey: databaseSymmetricKey)
-                    try await cache.updateMessage(healed, symmetricKey: databaseSymmetricKey)
-                    audit(.recovery, "pqs.recovery.placeholderHealed envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-                    await session.receiverDelegate?.createdMessage(healed)
-                    await sendAutomaticDeliveredReceiptIfNeeded(
-                        session: session,
-                        inboundTask: inboundTask,
-                        sharedId: healed.sharedId,
-                        conversationRecipient: decodedMessage.recipient)
-                    return
-                }
-                try await cache.deleteMessage(existing)
-                audit(.recovery, "pqs.recovery.placeholderRefiled envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-            } else {
-                audit(.recovery, "pqs.recovery.duplicateInboundPersistSkipped envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+            let target = try? await conversation(
+                cache: cache,
+                communicationType: conversationType,
+                session: session)
+            if target?.id == existing.communicationId {
+                var healedProps = existingProps
+                healedProps.message = decodedMessage
+                healedProps.deliveryState = .received
+                let healed = try await existing.updateMessage(
+                    with: healedProps,
+                    symmetricKey: databaseSymmetricKey)
+                try await cache.updateMessage(healed, symmetricKey: databaseSymmetricKey)
+                audit(.recovery, "pqs.recovery.placeholderHealed envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                await session.receiverDelegate?.createdMessage(healed)
+                await sendAutomaticDeliveredReceiptIfNeeded(
+                    session: session,
+                    inboundTask: inboundTask,
+                    sharedId: healed.sharedId,
+                    conversationRecipient: decodedMessage.recipient)
                 return
             }
+            try await cache.deleteMessage(existing)
+            audit(.recovery, "pqs.recovery.placeholderRefiled envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
         }
         
         switch decodedMessage.recipient {
@@ -1713,19 +1725,6 @@ extension MessagePipeline {
     ) -> MessageRecipient {
         guard case .nickname(let peer) = recipient else { return recipient }
         return .nickname(sender == mySecretName ? peer : sender)
-    }
-
-    /// Host-inserted inbound recovery placeholders use `.waitingDelivery` / `.failed` until
-    /// an orphan resend decrypts into the same logical sharedId.
-    static func isReplaceableInboundRecoveryPlaceholder(
-        _ props: EncryptedMessage.UnwrappedProps
-    ) -> Bool {
-        switch props.deliveryState {
-        case .waitingDelivery, .failed:
-            return true
-        default:
-            return false
-        }
     }
 
     /// Verifies and decrypts an encrypted message received in an inbound task.

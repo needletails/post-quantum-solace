@@ -6,19 +6,28 @@
 //  child lost one channel message and received another 59 minutes late): the
 //  archive pass runs before any resend request leaves, an initiating frame
 //  opens its lane whatever its position in the sender's chain, and a copy of
-//  content this device already holds settles the resend requests pending for it.
+//  content this device already holds decrypts first, then settles the resend
+//  requests pending for it. A recovery placeholder is not content, whatever
+//  its delivery state.
 //
 
 import Foundation
 import Testing
 @testable import PQSSession
 @testable import SessionModels
-import DoubleRatchetKit
+@testable import DoubleRatchetKit
 
 extension MessagePipeline {
     /// A pass queued for `token` whose job has not run.
     fileprivate func queueArchivePass(_ token: ArchivedInboundFallbackToken) {
         archivedInboundFallbackPasses[token.storageKey] = []
+    }
+}
+
+extension PQSSession {
+    /// Context present, delegates absent, as `fetchLocalSessionContext` documents.
+    fileprivate func clearSessionDelegate() {
+        sessionDelegate = nil
     }
 }
 
@@ -43,6 +52,72 @@ extension EndToEndTests {
 
     private func laneSelections(on session: PQSSession, sharedId: String) async -> [InboundLaneSelectionStats] {
         await session.messagePipeline.inboundLaneSelectionStatsLog.filter { $0.sharedId == sharedId }
+    }
+
+    /// Writes a chat row on bob for `sharedId`, as alice's device sent it. A recovery
+    /// placeholder carries the marker the test delegate recognises.
+    private func seedChatRowOnBob(
+        _ pair: ConnectedPair,
+        sharedId: String,
+        text: String,
+        deliveryState: DeliveryState,
+        transportInfo: Data? = nil
+    ) async throws {
+        let key = try await pair.bob.getDatabaseSymmetricKey()
+        let communication = try await pair.bob.conversation(for: .nickname("alice"))
+        let messageId = UUID()
+        let row = try EncryptedMessage(
+            id: messageId,
+            communicationId: communication.id,
+            sessionContextId: await pair.bob.sessionContext?.sessionContextId ?? 0,
+            sharedId: sharedId,
+            sequenceNumber: 1,
+            props: EncryptedMessage.UnwrappedProps(
+                id: messageId,
+                base: communication,
+                sentDate: Date(),
+                receiveDate: Date(),
+                deliveryState: deliveryState,
+                message: CryptoMessage(
+                    text: text,
+                    metadata: Data(),
+                    recipient: .nickname("bob"),
+                    transportInfo: transportInfo,
+                    sentDate: Date(),
+                    destructionTime: nil),
+                senderSecretName: "alice",
+                senderDeviceId: pair.aliceDeviceId),
+            symmetricKey: key)
+        try await pair.bob.cache?.createMessage(row, symmetricKey: key)
+    }
+
+    private func chatRowOnBob(_ pair: ConnectedPair, _ sharedId: String) async -> EncryptedMessage.UnwrappedProps? {
+        guard let row = try? await pair.bob.cache?.fetchMessageIfExists(sharedId: sharedId),
+              let key = try? await pair.bob.getDatabaseSymmetricKey()
+        else { return nil }
+        return await row.props(symmetricKey: key)
+    }
+
+    private func accepted(_ pair: ConnectedPair, envelope: String) async -> Bool {
+        (try? await pair.bob.hasAcceptedEnvelope(
+            senderSecretName: "alice",
+            senderDeviceId: pair.aliceDeviceId,
+            envelopeMessageId: envelope)) == true
+    }
+
+    /// Bob's ledger forgets everything, so `frame` redelivered under a fresh envelope
+    /// id reaches the lanes and fails there: its keys are spent. `logical` names the
+    /// chat row the copy claims.
+    private func replayConsumedFrame(_ pair: ConnectedPair, _ frame: ReceivedMessage, logical: String) async throws -> String {
+        await pair.bob.pruneAcceptedEnvelopes(now: Date().addingTimeInterval(pair.bob.acceptedEnvelopeRetention + 60))
+        let replayId = "replay-\(UUID().uuidString)"
+        try await pair.bob.receiveMessage(
+            message: frame.message,
+            sender: frame.sender,
+            deviceId: frame.deviceId,
+            messageId: replayId,
+            logicalMessageId: logical)
+        return replayId
     }
 
     /// Alice opens a fresh lane toward bob and bob takes `count` of its initial-chain
@@ -368,22 +443,16 @@ extension EndToEndTests {
         await pair.finish()
     }
 
-    @Test("a copy of content this device already holds settles the resend requests pending for it")
+    @Test("a re-encrypted copy of content this device already holds settles the resend requests pending for it")
     func duplicateOfPersistedContentSettlesPendingResend() async throws {
-        let pair = try await connectedPair()
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
         defer { Task { await shutdownSessions() } }
         try await settleLanes(pair)
 
         let sharedId = "held-\(UUID().uuidString)"
-        let captured = HeldFrames()
-        pair.aliceTransport.transformOutgoing = { received in
-            if received.logicalMessageId == sharedId { await captured.hold(received) }
-            return received
-        }
         try await pair.alice.send(recipient: .nickname("bob"), text: "content", sharedIdOverride: sharedId)
         #expect(await persisted(pair.bob, sharedId))
-        pair.aliceTransport.transformOutgoing = nil
-        let original = try #require(await captured.take().first)
 
         // A host re-arm (a relaunch with a stale placeholder ledger) left a NACK
         // pending for content bob already has, as the master's did for C653BE44.
@@ -396,20 +465,297 @@ extension EndToEndTests {
         #expect(await pair.bob.hasPendingResendAfterReestablishment(
             sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: sharedId))
 
-        // The sender answers with the same frame under a fresh envelope id.
+        // The sender answers with a new frame for the same logical id.
+        try await pair.alice.send(recipient: .nickname("bob"), text: "content", sharedIdOverride: sharedId)
+        #expect(await pollUntil(timeout: 20) {
+            await !pair.bob.hasPendingResendAfterReestablishment(
+                sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: sharedId)
+        }, "the copy is held content and settles the pending resend")
+        #expect(await pair.bobStore.getAllMessages().filter { $0.sharedId == sharedId }.count == 1)
+        #expect(sink.lines(containing: "pqs.recovery.duplicateInboundPersistSkipped").filter { $0.contains(sharedId) }.count == 1,
+                "the copy decrypted before held content decided")
+        await pair.finish()
+    }
+
+    @Test("a same-bytes redelivery under a fresh envelope id leaves the pending resend for the drain")
+    func sameBytesRedeliveryLeavesThePendingResendForTheDrain() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+
+        let sharedId = "accepted-\(UUID().uuidString)"
+        let captured = HeldFrames()
+        pair.aliceTransport.transformOutgoing = { received in
+            if received.logicalMessageId == sharedId { await captured.hold(received) }
+            return received
+        }
+        try await pair.alice.send(recipient: .nickname("bob"), text: "content", sharedIdOverride: sharedId)
+        #expect(await persisted(pair.bob, sharedId))
+        pair.aliceTransport.transformOutgoing = nil
+        let original = try #require(await captured.take().first)
+        await pair.bob.deferPeerResendUntilReestablished(
+            sender: "alice",
+            deviceId: pair.aliceDeviceId,
+            failedMessageId: sharedId,
+            failureClass: "hostRearm",
+            notifyDelegate: false)
+
+        // The ledger knows these bytes. It proves nothing about the row they name: the
+        // child's false `recovered` came from a placeholder with an accepted record.
+        let redeliveredId = UUID().uuidString
         pair.aliceTransport.continuation?.yield(ReceivedMessage(
             message: original.message,
             sender: original.sender,
             recipient: original.recipient,
             deviceId: original.deviceId,
             recipientDeviceId: original.recipientDeviceId,
-            messageId: UUID().uuidString,
+            messageId: redeliveredId,
             logicalMessageId: sharedId,
             transportEvent: original.transportEvent))
         #expect(await pollUntil(timeout: 20) {
-            await !pair.bob.hasPendingResendAfterReestablishment(
-                sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: sharedId)
-        }, "the duplicate is dropped as already held and settles the pending resend")
+            sink.lines(containing: "pqs.recovery.redeliveryDropped reason=alreadyAccepted").contains { $0.contains(redeliveredId) }
+        })
+        #expect(await pair.bob.hasPendingResendAfterReestablishment(
+            sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: sharedId))
+        await pair.finish()
+    }
+
+    @Test("a placeholder a read receipt moved to .read is healed by the resend")
+    func placeholderMovedToReadIsHealedByTheResend() async throws {
+        let pair = try await connectedPair()
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+
+        // Child 02:11:09Z: 8B2FF9BC's placeholder had taken an own-device read, so the
+        // guard read it as content and dropped the replay before it could decrypt.
+        let sharedId = "placeholder-\(UUID().uuidString)"
+        try await seedChatRowOnBob(
+            pair, sharedId: sharedId, text: "", deliveryState: .read,
+            transportInfo: SessionDelegate.recoveryPlaceholderMarker)
+        try await pair.alice.send(recipient: .nickname("bob"), text: "the content", sharedIdOverride: sharedId)
+
+        #expect(await pollUntil(timeout: 20) { await self.chatRowOnBob(pair, sharedId)?.message.text == "the content" })
+        #expect(await chatRowOnBob(pair, sharedId)?.deliveryState == .received)
+        #expect(await pair.bobStore.getAllMessages().filter { $0.sharedId == sharedId }.count == 1)
+        await pair.finish()
+    }
+
+    @Test("a content row in .failed is not replaced by a redelivered copy")
+    func contentRowInFailedIsNotReplaced() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+
+        let sharedId = "content-\(UUID().uuidString)"
+        try await seedChatRowOnBob(pair, sharedId: sharedId, text: "the content", deliveryState: .failed("peer"))
+        try await pair.alice.send(recipient: .nickname("bob"), text: "another body", sharedIdOverride: sharedId)
+
+        #expect(await pollUntil(timeout: 20) {
+            sink.lines(containing: "pqs.recovery.envelopeAccepted").contains { $0.contains(sharedId) }
+        })
+        let row = await chatRowOnBob(pair, sharedId)
+        #expect(row?.message.text == "the content")
+        #expect(row?.deliveryState == .failed("peer"))
+        await pair.finish()
+    }
+
+    @Test("a resend that opens a re-minted lane bootstraps it when the content is held")
+    func resendOpeningARemintedLaneBootstrapsItWhenContentIsHeld() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        let established = try #require(try await rows(on: pair.bob, peer: "alice", deviceId: pair.aliceDeviceId).first { !$0.archived })
+
+        let sharedId = "held-\(UUID().uuidString)"
+        try await pair.alice.send(recipient: .nickname("bob"), text: "content", sharedIdOverride: sharedId)
+        #expect(await persisted(pair.bob, sharedId))
+
+        // Master 23:49:49Z: the sender's resend was the first frame on her new lane, 3A834CBE.
+        _ = try await pair.alice.resetSessionIdentityForFreshSession(
+            secretName: "bob",
+            deviceId: pair.bobDeviceId,
+            sendOneTimeIdentities: true,
+            reason: "test")
+        try await pair.alice.send(recipient: .nickname("bob"), text: "content", sharedIdOverride: sharedId)
+        #expect(await pollUntil(timeout: 20) {
+            sink.lines(containing: "pqs.recovery.envelopeAccepted").filter { $0.contains(sharedId) }.count == 2
+        }, "the resend decrypted and was accepted")
+        let active = try await rows(on: pair.bob, peer: "alice", deviceId: pair.aliceDeviceId).filter { !$0.archived }.map(\.id)
+        #expect(active.count == 1 && active != [established.id], "the state-less row the resend bootstrapped is the lane: \(active)")
+
+        let next = "next-\(UUID().uuidString)"
+        try await pair.alice.send(recipient: .nickname("bob"), text: "next on the new lane", sharedIdOverride: next)
+        #expect(await persisted(pair.bob, next))
+        #expect(await lanePropsOnBob(pair, id: try #require(active.first))?.state?.skippedHeaderMessages.count == 0)
+        #expect(await pair.bobStore.getAllMessages().filter { $0.sharedId == sharedId }.count == 1)
+        #expect(await pair.bobTransport.outOfBandResendRequestCount == 0)
+        await pair.finish()
+    }
+
+    @Test("resends of held content leave no header gap on the lane")
+    func resendsOfHeldContentLeaveNoHeaderGap() async throws {
+        let pair = try await connectedPair()
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+
+        // Master 12:43:56Z: frames 23 and 24 were resends of held content. Dropped
+        // before the ratchet, they left the gap that killed 2824A981.
+        for index in 23...24 {
+            let sharedId = "frame-\(index)-\(UUID().uuidString)"
+            try await seedChatRowOnBob(pair, sharedId: sharedId, text: "held", deliveryState: .received)
+            try await pair.alice.send(recipient: .nickname("bob"), text: "held", sharedIdOverride: sharedId)
+        }
+        let next = "frame-25-\(UUID().uuidString)"
+        try await pair.alice.send(recipient: .nickname("bob"), text: "the next frame", sharedIdOverride: next)
+        #expect(await persisted(pair.bob, next))
+
+        let active = try #require(try await rows(on: pair.bob, peer: "alice", deviceId: pair.aliceDeviceId).first { !$0.archived })
+        #expect(await lanePropsOnBob(pair, id: active.id)?.state?.skippedHeaderMessages.count == 0)
+        await pair.finish()
+    }
+
+    @Test("a held copy that fails signature verification is not swallowed as a duplicate")
+    func heldCopyFailingSignatureVerificationIsNotSwallowed() async throws {
+        let pair = try await connectedPair()
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+
+        let sharedId = "held-\(UUID().uuidString)"
+        try await seedChatRowOnBob(pair, sharedId: sharedId, text: "the content", deliveryState: .received)
+        let forged = HeldFrames()
+        pair.aliceTransport.transformOutgoing = { received in
+            guard received.logicalMessageId == sharedId, let signed = received.message.signed else { return received }
+            let frame = ReceivedMessage(
+                message: try SignedRatchetMessage(
+                    message: try BinaryDecoder().decode(RatchetMessage.self, from: signed.data),
+                    signingPrivateKey: Curve25519.Signing.PrivateKey().rawRepresentation),
+                sender: received.sender,
+                recipient: received.recipient,
+                deviceId: received.deviceId,
+                recipientDeviceId: received.recipientDeviceId,
+                messageId: received.messageId,
+                logicalMessageId: received.logicalMessageId,
+                transportEvent: received.transportEvent)
+            await forged.hold(frame)
+            return frame
+        }
+        try await pair.alice.send(recipient: .nickname("bob"), text: "another body", sharedIdOverride: sharedId)
+
+        #expect(await pollUntil(timeout: 20) { await pair.bobTransport.outOfBandResendRequestCount > 0 },
+                "the signature failure takes its own path")
+        pair.aliceTransport.transformOutgoing = nil
+        let frame = try #require(await forged.take().first)
+        #expect(await !accepted(pair, envelope: frame.messageId), "an unverified frame never reaches the ledger")
+        #expect(await chatRowOnBob(pair, sharedId)?.message.text == "the content")
+        await pair.finish()
+    }
+
+    @Test("a held copy on an archived lane leaves the active lane unchanged")
+    func heldCopyOnAnArchivedLaneLeavesTheActiveLaneUnchanged() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        let archived = try #require(try await rows(on: pair.bob, peer: "alice", deviceId: pair.aliceDeviceId).first { !$0.archived })
+
+        // A copy held back on the lane bob is about to leave.
+        let sharedId = "held-\(UUID().uuidString)"
+        let delayed = HeldFrames()
+        pair.aliceTransport.shouldDeliver = { received in
+            guard received.logicalMessageId == sharedId else { return true }
+            await delayed.hold(received)
+            return false
+        }
+        try await pair.alice.send(recipient: .nickname("bob"), text: "a stale copy", sharedIdOverride: sharedId)
+        #expect(await pollUntil(timeout: 20) { await delayed.count == 1 })
+        pair.aliceTransport.shouldDeliver = nil
+        let frame = try #require(await delayed.take().first)
+        try await seedChatRowOnBob(pair, sharedId: sharedId, text: "the content", deliveryState: .received)
+
+        // The sender moved to a new lane, and bob with her.
+        let fresh = try await openInitialChain(pair, frames: 1)
+        #expect(try await rows(on: pair.bob, peer: "alice", deviceId: pair.aliceDeviceId).filter { !$0.archived }.map(\.id) == [fresh.holder])
+
+        pair.aliceTransport.continuation?.yield(frame)
+
+        #expect(await pollUntil(timeout: 20) {
+            sink.lines(containing: "pqs.recovery.envelopeAccepted").contains { $0.contains(sharedId) }
+        })
+        let selections = await laneSelections(on: pair.bob, sharedId: frame.messageId)
+        #expect(selections.last?.winningLaneId == archived.id, "\(selections.map(\.candidateOrder))")
+        #expect(try await rows(on: pair.bob, peer: "alice", deviceId: pair.aliceDeviceId).filter { !$0.archived }.map(\.id) == [fresh.holder],
+                "a stale copy must not take the lane the sender moved to")
+        await pair.finish()
+    }
+
+    @Test("a held copy no lane can open waits for the archive pass, then drops without a resend request")
+    func heldCopyNoLaneCanOpenDropsAfterTheArchivePass() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        let frame = try await openInitialChain(pair, frames: 2).frames[1]
+        try await pair.bob.createInactiveSessionSnapshot(for: "alice", policy: .archive)
+
+        let replayId = try await replayConsumedFrame(pair, frame, logical: try #require(frame.logicalMessageId))
+
+        #expect(await pollUntil(timeout: 30) { sink.contains("pqs.recovery.redeliveryDropped reason=alreadyPersisted") })
+        let selections = await laneSelections(on: pair.bob, sharedId: replayId)
+        #expect(selections.map(\.pass) == [.activeFirst, .archived], "\(selections.map(\.candidateOrder))")
+        #expect(await accepted(pair, envelope: replayId))
+        #expect(await pair.bobTransport.outOfBandResendRequestCount == 0, "the content is here")
+        await pair.finish()
+    }
+
+    @Test("with no delegate a row is not known to be content, so a failed copy is not dropped")
+    func failedCopyWithNoDelegateIsNotDropped() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        let frame = try await openInitialChain(pair, frames: 2).frames[1]
+        await pair.bob.clearSessionDelegate()
+
+        let replayId = try await replayConsumedFrame(pair, frame, logical: try #require(frame.logicalMessageId))
+
+        #expect(await pollUntil(timeout: 30) {
+            sink.lines(containing: "pqs.decryptFailure").contains { $0.contains(replayId) }
+        }, "the frame took the failure path")
+        #expect(await !accepted(pair, envelope: replayId))
+        #expect(!sink.contains("pqs.recovery.redeliveryDropped reason=alreadyPersisted"))
+        await pair.finish()
+    }
+
+    @Test("a copy that cannot decrypt leaves a placeholder's resend request and accepts nothing")
+    func undecryptableCopyLeavesAPlaceholdersResendRequest() async throws {
+        let pair = try await connectedPair()
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        let frame = try await openInitialChain(pair, frames: 2).frames[1]
+
+        let sharedId = "placeholder-\(UUID().uuidString)"
+        try await seedChatRowOnBob(
+            pair, sharedId: sharedId, text: "", deliveryState: .read,
+            transportInfo: SessionDelegate.recoveryPlaceholderMarker)
+        await pair.bob.deferPeerResendUntilReestablished(
+            sender: "alice",
+            deviceId: pair.aliceDeviceId,
+            failedMessageId: sharedId,
+            failureClass: "hostRearm",
+            notifyDelegate: false)
+
+        // A2D7E1C8 and 6AB795EB on the child: replays failing on the lane they cite.
+        let replayId = try await replayConsumedFrame(pair, frame, logical: sharedId)
+
+        #expect(await pollUntil(timeout: 30) { await pair.bobTransport.outOfBandResendRequestCount > 0 },
+                "the failed copy asks the sender")
+        #expect(await !accepted(pair, envelope: replayId))
+        #expect(await pair.bob.hasPendingResendAfterReestablishment(
+            sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: sharedId))
+        #expect(await chatRowOnBob(pair, sharedId) != nil)
         await pair.finish()
     }
 }
