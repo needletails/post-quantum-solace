@@ -60,8 +60,26 @@ extension EndToEndTests {
 
     func connectedPair(
         bobTrustProbe: PeerIdentityTrustProbe? = nil,
-        aliceUnrecoverableProbe: OutboundUnrecoverableProbe? = nil
+        aliceUnrecoverableProbe: OutboundUnrecoverableProbe? = nil,
+        aliceAuditSink: (any PQSAuditSink)? = nil,
+        bobAuditSink: (any PQSAuditSink)? = nil
     ) async throws -> ConnectedPair {
+        if let aliceAuditSink {
+            _senderSession = await PQSSession(configuration: SessionConfiguration(
+                transport: _MockTransportDelegate(session: _senderSession, store: store),
+                store: createSenderStore(),
+                observer: senderReceiver,
+                auditSink: aliceAuditSink))
+            senderReceiver = ReceiverDelegate(session: _senderSession)
+        }
+        if let bobAuditSink {
+            _recipientSession = await PQSSession(configuration: SessionConfiguration(
+                transport: _MockTransportDelegate(session: _recipientSession, store: store),
+                store: createRecipientStore(),
+                observer: recipientReceiver,
+                auditSink: bobAuditSink))
+            recipientReceiver = ReceiverDelegate(session: _recipientSession)
+        }
         let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
         let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
         let aliceStream = AsyncStream<ReceivedMessage> { continuation in
@@ -72,8 +90,8 @@ extension EndToEndTests {
         }
         let sd = SessionDelegate(session: _senderSession, outboundUnrecoverableProbe: aliceUnrecoverableProbe)
         let rsd = SessionDelegate(session: _recipientSession, peerIdentityTrustProbe: bobTrustProbe)
-        let aliceStore = createSenderStore()
-        let bobStore = createRecipientStore()
+        let aliceStore = MockIdentityStore(mockUserData: sMockUserData, session: _senderSession, isSender: true)
+        let bobStore = MockIdentityStore(mockUserData: rMockUserData, session: _recipientSession, isSender: false)
         try await createSenderSession(store: aliceStore, transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientSession(store: bobStore, transport: bobTransport, sessionDelegate: rsd)
         let alice = _senderSession

@@ -336,7 +336,9 @@ extension MessagePipeline {
                     // Inbound decrypt: no session decrypted. Every failed lane was
                     // already rolled back by `attemptInboundDecrypt`; nothing else was mutated.
                     recordInboundLaneSelectionStats(laneStats)
-                    audit(.recovery, "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) attempts=[\(attemptFailures.map { "\($0.label):\($0.error)" }.joined(separator: "; "))] negativeCacheSkips=\(laneStats.negativeCacheSkips)")
+                    let headerAudit = RatchetHeaderAudit(inboundHeader)
+                    let deviceKeys = await session.sessionContext?.sessionUser.deviceKeys
+                    audit(.recovery, "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) \(headerAudit.inboundFields) \(deviceKeys.map { headerAudit.heldFields(deviceKeys: $0, rows: peerLanes.map(\.props) + [preferredLane.props]) } ?? "otkHeld=unknown mlkemHeld=unknown") attempts=[\(attemptFailures.map { "\($0.label):\($0.error)" }.joined(separator: "; "))] negativeCacheSkips=\(laneStats.negativeCacheSkips)")
                     // The queued pass owns this frame's outcome; see `InboundDecryptDeferral`.
                     if archivePassQueued {
                         throw InboundDecryptDeferral.archivePassQueued

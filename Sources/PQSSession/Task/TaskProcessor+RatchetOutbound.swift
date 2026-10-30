@@ -996,6 +996,7 @@ extension MessagePipeline {
             atomicOutboundPreparationIdentityIds.insert(sessionIdentity.id)
         }
         let signedMessage: SignedRatchetMessage
+        let sentHeader: EncryptedHeader
         do {
             try await ratchetManager.initiateSession(
                 sessionIdentity: sessionIdentity,
@@ -1019,6 +1020,7 @@ extension MessagePipeline {
             let ratchetedMessage = try await ratchetManager.encrypt(
                 plainText: encodedData,
                 sessionId: sessionIdentity.id)
+            sentHeader = ratchetedMessage.header
             signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
         } catch {
             atomicOutboundPreparationIdentityIds.remove(sessionIdentity.id)
@@ -1135,8 +1137,14 @@ extension MessagePipeline {
 
         try await transportDelegate.sendMessage(signedMessage, metadata: transportMetadata)
         
-        audit(.send, "pqs.send.deviceTransportOk sharedId=\(outboundTask.sharedId) envelopeMessageId=\(envelopeMessageId) recipientSecret=\(props.secretName) recipientDeviceId=\(props.deviceId.uuidString) sessionIdentityId=\(sessionIdentity.id.uuidString) recipient=\(outboundTask.message.recipient.auditRecipientTag) persisted=\(outboundTask.isPersistedOutbound)",
-            level: .info)
+        auditDeviceTransportOk(
+            outboundTask: outboundTask,
+            envelopeMessageId: envelopeMessageId,
+            recipientSecretName: props.secretName,
+            recipientDeviceId: props.deviceId,
+            sessionIdentityId: sessionIdentity.id,
+            pending: false,
+            header: RatchetHeaderAudit(sentHeader))
         
         if isOrphanReplay {
             audit(.recovery, "pqs.recovery.messageRecordSessionId=\(sessionIdentity.id.uuidString) sharedId=\(outboundTask.sharedId) recipientDeviceId=\(props.deviceId.uuidString)")

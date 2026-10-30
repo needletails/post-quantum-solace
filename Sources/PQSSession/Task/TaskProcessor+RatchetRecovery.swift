@@ -170,6 +170,22 @@ extension MessagePipeline {
             session: session)
     }
 
+    /// One line per frame handed to the transport, naming the keys its header binds
+    /// so a failing frame can be matched to its send. `header` runs only when the
+    /// sink is enabled: a pending frame has to decode its own message to get there.
+    func auditDeviceTransportOk(
+        outboundTask: OutboundTaskMessage,
+        envelopeMessageId: String,
+        recipientSecretName: String,
+        recipientDeviceId: UUID,
+        sessionIdentityId: UUID,
+        pending: Bool,
+        header: @autoclosure () -> RatchetHeaderAudit?
+    ) {
+        audit(.send, "pqs.send.deviceTransportOk sharedId=\(outboundTask.sharedId) envelopeMessageId=\(envelopeMessageId) recipientSecret=\(recipientSecretName) recipientDeviceId=\(recipientDeviceId.uuidString) sessionIdentityId=\(sessionIdentityId.uuidString) recipient=\(outboundTask.message.recipient.auditRecipientTag) persisted=\(outboundTask.isPersistedOutbound) pending=\(pending) \(header()?.sendFields ?? "citesOtk=unreadable")",
+            level: .info)
+    }
+
     func sendPendingOutboundTransport(
         _ pendingTransport: PendingOutboundTransport,
         outboundTask: OutboundTaskMessage,
@@ -188,6 +204,14 @@ extension MessagePipeline {
         try await session.transportDelegate?.sendMessage(
             pendingTransport.message,
             metadata: pendingTransport.metadata)
+        auditDeviceTransportOk(
+            outboundTask: outboundTask,
+            envelopeMessageId: pendingTransport.metadata.envelopeMessageId,
+            recipientSecretName: pendingTransport.metadata.secretName,
+            recipientDeviceId: pendingTransport.metadata.deviceId,
+            sessionIdentityId: pendingTransport.sessionIdentityId,
+            pending: true,
+            header: RatchetHeaderAudit(signedMessage: pendingTransport.message))
         logRecoveryTransportSendSuccess(
             pendingTransport.metadata.transportEvent,
             sharedId: outboundTask.sharedId)
