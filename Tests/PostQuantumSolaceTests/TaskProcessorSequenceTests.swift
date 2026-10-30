@@ -3725,7 +3725,7 @@ actor TaskProcessorSequenceTests {
             destructionTime: nil)
     }
 
-    private func makeTestInboundTaskMessage(
+    func makeTestInboundTaskMessage(
         senderSecretName: String,
         senderDeviceId: UUID,
         sharedMessageId: String
@@ -3798,7 +3798,7 @@ actor TaskProcessorSequenceTests {
         }
     }
 
-    private func waitUntil(
+    func waitUntil(
         timeout: TimeInterval = 3,
         _ condition: @escaping @Sendable () async -> Bool
     ) async throws -> Bool {
@@ -4100,7 +4100,7 @@ final class MockTaskDelegateWithAlwaysOutboundError: TaskSequenceDelegate, @unch
     }
 }
 
-private actor OTKUploadPause {
+actor OTKUploadPause {
     private var didPause = false
     private var isReleased = false
     private var invocations = 0

@@ -52,6 +52,12 @@ final class RecordingAuditSink: PQSAuditSink, @unchecked Sendable {
         defer { lock.unlock() }
         return lines.contains { $0.contains(fragment) }
     }
+
+    func lines(containing fragment: String) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return lines.filter { $0.contains(fragment) }
+    }
 }
 
 extension EndToEndTests {

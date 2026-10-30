@@ -822,7 +822,10 @@ extension MessagePipeline {
                     // instead of racing delete/upload cycles against the same
                     // server config row (HTTP 409 "concurrent user update").
                     let batchesReplaced = await session.replacePublishedOneTimeKeyBatchesForRecovery()
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled else {
+                        auditSink.log(.recovery, "pqs.recovery.otkBatchReplacementCancelled failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) sharedId=\(sharedMessageId) batchesReplaced=\(batchesReplaced) proceeding=noPeerRefresh")
+                        return
+                    }
                     if !batchesReplaced {
                         // Non-terminal: replacement throws before any local mutation
                         // and retained privates keep every previously published key
@@ -831,9 +834,7 @@ extension MessagePipeline {
                         // re-encrypt — aborting here strands the episode open with no
                         // heal path (subsequent failures coalesce instead of
                         // re-emitting) until TTL expiry.
-                        logger.log(
-                            level: .warning,
-                            message: "pqs.recovery.otkBatchReplacementIncomplete failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId) sharedId=\(sharedMessageId) proceeding=peerRefresh")
+                        auditSink.log(.recovery, "pqs.recovery.otkBatchReplacementIncomplete failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) sharedId=\(sharedMessageId) proceeding=peerRefresh")
                     }
 
                     // Bilateral one-time-key churn is symmetric: the peer failing on
