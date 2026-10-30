@@ -63,6 +63,16 @@ extension MessagePipeline {
         inboundTask: InboundTaskMessage,
         session: PQSSession
     ) async throws {
+        // A waiting token makes this job the frame's archive pass. It is spent before
+        // any exit: a frame dropped below never reaches the pass, and the evidence the
+        // token carries must not outlive the job.
+        let frameFingerprint = PQSSession.nackFrameFingerprint(for: inboundTask)
+        let carriedFailures = archivedInboundFallbackPasses.removeValue(forKey: ArchivedInboundFallbackToken(
+            senderSecretName: inboundTask.senderSecretName,
+            senderDeviceId: inboundTask.senderDeviceId,
+            envelopeMessageId: inboundTask.sharedMessageId,
+            fingerprint: frameFingerprint).storageKey)
+
         // T13: accepted-envelope ledger covers non-persisted successes (nudgeLocal).
         // Re-emit spool ACK; never re-enter ratchet / NACK / remint.
         // The envelope id is transport metadata and a replay can carry a fresh
@@ -125,7 +135,6 @@ extension MessagePipeline {
 
         let verificationResult = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
         let inboundHeader = verificationResult.ratchetMessage.header
-        let frameFingerprint = PQSSession.nackFrameFingerprint(for: inboundTask)
         let rollbackSymmetricKey = try await session.getDatabaseSymmetricKey()
         var laneStats = InboundLaneSelectionStats(
             sharedId: inboundTask.sharedMessageId,
@@ -171,7 +180,7 @@ extension MessagePipeline {
             var decryptionSessionIdentity = preferredSessionIdentity
             // Per-candidate failure classes for the rollback audit and terminal
             // error. Without this the try-all loop swallows every alternate.
-            var attemptFailures: [(laneId: UUID, label: String, error: Error, stateLess: Bool)] = []
+            var attemptFailures: [InboundAttemptFailure] = []
             let frameEpochHolders = (peerLanes + [preferredLane]).filter(\.holdsFrameEpoch)
 
             var decryptedData: Data
@@ -211,14 +220,8 @@ extension MessagePipeline {
                 // a (possibly exhausted) archive defer.
                 let headerMatchedArchivedBlank = archivedBlanks.first(where: \.matchesHeaderKeys)
 
-                let archiveToken = ArchivedInboundFallbackToken(
-                    senderSecretName: inboundTask.senderSecretName,
-                    senderDeviceId: inboundTask.senderDeviceId,
-                    envelopeMessageId: inboundTask.sharedMessageId,
-                    fingerprint: frameFingerprint)
-                let includeArchivedFallback = archivedInboundFallbackPasses.contains(archiveToken.storageKey)
+                let includeArchivedFallback = carriedFailures != nil
                 if includeArchivedFallback {
-                    archivedInboundFallbackPasses.remove(archiveToken.storageKey)
                     laneStats.pass = .archived
                 }
                 // Mark exhausted when this pass actually walks archives (success or
@@ -338,7 +341,15 @@ extension MessagePipeline {
                     if !includeArchivedFallback, !archivedLanes.isEmpty {
                         archivePassQueued = await deferArchivedInboundFallback(
                             inboundTask: inboundTask,
+                            failures: attemptFailures,
                             session: session)
+                    }
+                    // The pass cannot learn again what active-first learned (the ensured
+                    // blank left with that job), so its verdicts join the pass's. A lane
+                    // tried in both passes speaks once, with the newer verdict.
+                    if let carriedFailures {
+                        let retriedLanes = Set(attemptFailures.map(\.laneId))
+                        attemptFailures += carriedFailures.filter { !retriedLanes.contains($0.laneId) }
                     }
                     // Inbound decrypt: no session decrypted. Every failed lane was
                     // already rolled back by `attemptInboundDecrypt`; nothing else was mutated.
@@ -355,21 +366,7 @@ extension MessagePipeline {
                     // poison redelivery → demoteProveFailedActive walked unique session
                     // ids (nudge primary: 92 demotes / 4k blankForHeader skips against
                     // linked). Preference stays success-only; demote remains rearm-gated.
-                    //
-                    // A state-less row's error is about this frame only when no row for
-                    // the device pinned the header's keys (see `terminalTryAllError`).
-                    let headerOneTimeKeyId = inboundHeader.oneTimeKeyId
-                    let headerMLKEMKeyId = inboundHeader.mlKEMOneTimeKeyId
-                    let frameKeysPinnedByALane = (peerLanes + [preferredLane]).contains { lane in
-                        lane.hasRatchetState
-                            && ((headerOneTimeKeyId != nil && lane.props.ratchetOneTimePrivateKey?.id == headerOneTimeKeyId)
-                                || (headerMLKEMKeyId != nil && lane.props.ratchetMLKEMPrivateKey?.id == headerMLKEMKeyId))
-                    }
-                    let preferredId = preferredSessionIdentity.id
-                    throw InboundRecoveryStormPolicy.terminalTryAllError(
-                        preferred: attemptFailures.first { $0.laneId == preferredId }?.error ?? RatchetError.decryptionFailed,
-                        alternates: attemptFailures.filter { $0.laneId != preferredId }.map(\.error),
-                        stateLess: frameKeysPinnedByALane ? [] : attemptFailures.filter(\.stateLess).map(\.error))
+                    throw InboundRecoveryStormPolicy.terminalTryAllError(attempts: attemptFailures)
                 }
                 if shouldMarkArchivePassExhausted {
                     markArchivedInboundFallbackExhausted(
@@ -993,13 +990,15 @@ extension MessagePipeline {
     /// Enqueues a `.background` re-process of `inboundTask` that includes archived
     /// SessionIdentity rows. Pass ownership is tokenized by
     /// `(sender, device, envelope, fingerprint)` so a fresh orphan fingerprint
-    /// cannot consume an older archive-only pass (T17).
+    /// cannot consume an older archive-only pass (T17). The token carries `failures`,
+    /// this pass's verdicts, to the pass that decides the frame's class.
     ///
     /// - Returns: `true` when this call queued the pass, which then owns this
     ///   ciphertext's outcome. `false` when the pass already ran for this token or
     ///   the enqueue failed; the caller's failure then stands as the frame's outcome.
     private func deferArchivedInboundFallback(
         inboundTask: InboundTaskMessage,
+        failures: [InboundAttemptFailure],
         session: PQSSession
     ) async -> Bool {
         let sharedId = inboundTask.sharedMessageId
@@ -1015,7 +1014,7 @@ extension MessagePipeline {
         ) else {
             return false
         }
-        archivedInboundFallbackPasses.insert(token.storageKey)
+        archivedInboundFallbackPasses[token.storageKey] = failures
         audit(.recovery, "pqs.recovery.deferArchivedInboundFallback sharedId=\(sharedId) token=\(token.storageKey.prefix(64)) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
         do {
             try await enqueue(
@@ -1025,7 +1024,7 @@ extension MessagePipeline {
                 session: session)
             return true
         } catch {
-            archivedInboundFallbackPasses.remove(token.storageKey)
+            archivedInboundFallbackPasses.removeValue(forKey: token.storageKey)
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.deferArchivedInboundFallbackFailed sharedId=\(sharedId) error=\(error)")
@@ -1048,7 +1047,6 @@ extension MessagePipeline {
             current: archivedInboundFallbackExhausted,
             token: token)
         archivedInboundFallbackExhaustedPeerKey[token.storageKey] = token.peerKey
-        archivedInboundFallbackPasses.remove(token.storageKey)
     }
 
     func clearArchivedInboundFallbackExhausted(sender: String, deviceId: UUID) {
@@ -1092,16 +1090,25 @@ extension MessagePipeline {
         frameEpochHolders: [InboundLane],
         session: PQSSession,
         stats: inout InboundLaneSelectionStats,
-        failures: inout [(laneId: UUID, label: String, error: Error, stateLess: Bool)]
+        failures: inout [InboundAttemptFailure]
     ) async -> Data? {
         let laneId = lane.identity.id
         let dataBeforeAttempt = lane.identity.data
         let stateToken = lane.ratchetStateToken
         let label = "\(kind):\(laneId.uuidString.prefix(8))"
+        let failure = { (error: Error) in
+            InboundAttemptFailure(
+                laneId: laneId,
+                label: label,
+                error: error,
+                stateLess: !lane.hasRatchetState,
+                holdsFrameEpoch: lane.holdsFrameEpoch,
+                isPreferred: laneId == frame.sessionIdentity.id)
+        }
         if let cached = inboundNegativeDecryptCache.cachedFailure(
             laneId: laneId, fingerprint: fingerprint, laneState: stateToken)
         {
-            failures.append((laneId, label, cached, !lane.hasRatchetState))
+            failures.append(failure(cached))
             stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .skippedNegativeCache, failure: "\(cached)"))
             return nil
         }
@@ -1132,7 +1139,7 @@ extension MessagePipeline {
             stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .decrypted))
             return data
         } catch {
-            failures.append((laneId, label, error, !lane.hasRatchetState))
+            failures.append(failure(error))
             stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .failed, failure: "\(error)"))
             inboundNegativeDecryptCache.recordFailure(
                 laneId: laneId, fingerprint: fingerprint, laneState: stateToken, error: error)

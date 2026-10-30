@@ -74,33 +74,49 @@ public enum InboundRecoveryStormPolicy: Sendable {
         a.storageKey != b.storageKey
     }
 
-    /// Terminal error for a failed try-all.
+    /// Terminal error for a failed try-all, decided by who holds the frame's epoch.
     ///
-    /// A state-less row's failure is about this frame: PQXDH ran from the frame's
-    /// own header, so `missingOneTimeKey` there means the header cites a one-time
-    /// key this device does not hold, and only a fresh batch (and the peer's
-    /// refresh) heals it. The caller passes those errors in `stateLess` only when
-    /// no row for the device pinned the header's keys; a row that did is the lane
-    /// the frame belongs to, and its failure is a chain desync the sender heals
-    /// by resending. A stateful lane's `maxSkippedHeadersExceeded` says nothing
-    /// about the frame: DRK throws it after failing to match the header under
-    /// any of that lane's header keys, without authenticating anything (dogfood
-    /// 2026-10-28, child C7420C75 02:10:08Z: the class hid the blank's
-    /// `missingOneTimeKey`, and recovery NACKed for ninety seconds before it
-    /// replaced the batch).
+    /// A stateful row on the frame's epoch is the lane the frame belongs to, so its
+    /// failure is the class: a chain desync the sender heals by resending, whatever
+    /// the other rows said (dogfood 2026-10-28: 23:41:41Z and 01:23:16Z replaced the
+    /// batch for a desync the holder failed AEAD on).
     ///
-    /// Otherwise the preferred lane's error stands, except that an alternate's
-    /// `maxSkippedHeadersExceeded` is surfaced over the preferred session's
-    /// `expiredKey`, the resend-owning class.
-    static func terminalTryAllError(preferred: Error, alternates: [Error], stateLess: [Error] = []) -> Error {
-        if stateLess.contains(where: { ($0 as? RatchetError) == .missingOneTimeKey }) {
+    /// With no holder, a state-less row's `missingOneTimeKey` names the class: PQXDH
+    /// ran from the frame's own header, so the header cites a one-time key this
+    /// device does not hold, and only a fresh batch (and the peer's refresh) heals
+    /// it. No other failure on such a row proves anything about the frame's keys. A
+    /// stateful lane's `maxSkippedHeadersExceeded` says nothing about the frame: DRK
+    /// throws it after failing to match the header under any of that lane's header
+    /// keys, without authenticating anything (child C7420C75 02:10:08Z: the class hid
+    /// the blank's `missingOneTimeKey`, and recovery NACKed for ninety seconds before
+    /// it replaced the batch).
+    ///
+    /// Otherwise the preferred lane's error stands. Whichever row's error is chosen,
+    /// another lane's `maxSkippedHeadersExceeded` is surfaced over its `expiredKey`,
+    /// the resend-owning class.
+    static func terminalTryAllError(attempts: [InboundAttemptFailure]) -> Error {
+        let holder = attempts.first { $0.holdsFrameEpoch && !$0.stateLess }
+        if holder == nil,
+           attempts.contains(where: { $0.stateLess && ($0.error as? RatchetError) == .missingOneTimeKey })
+        {
             return RatchetError.missingOneTimeKey
         }
-        guard (preferred as? RatchetError) == .expiredKey,
-              alternates.contains(where: { ($0 as? RatchetError) == .maxSkippedHeadersExceeded })
-        else { return preferred }
+        guard let owner = holder ?? attempts.first(where: \.isPreferred) else { return RatchetError.decryptionFailed }
+        guard (owner.error as? RatchetError) == .expiredKey,
+              attempts.contains(where: { $0.laneId != owner.laneId && ($0.error as? RatchetError) == .maxSkippedHeadersExceeded })
+        else { return owner.error }
         return RatchetError.maxSkippedHeadersExceeded
     }
+}
+
+/// One lane's failure on a frame, for the rollback audit and the terminal class.
+struct InboundAttemptFailure: Sendable {
+    let laneId: UUID
+    let label: String
+    let error: Error
+    let stateLess: Bool
+    let holdsFrameEpoch: Bool
+    let isPreferred: Bool
 }
 
 /// The active-first pass missed and queued the archive pass for the frame. The

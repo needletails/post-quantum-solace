@@ -15,6 +15,13 @@ import Testing
 @testable import SessionModels
 import DoubleRatchetKit
 
+extension MessagePipeline {
+    /// A pass queued for `token` whose job has not run.
+    fileprivate func queueArchivePass(_ token: ArchivedInboundFallbackToken) {
+        archivedInboundFallbackPasses[token.storageKey] = []
+    }
+}
+
 extension EndToEndTests {
     private func persisted(_ session: PQSSession, _ sharedId: String, timeout: TimeInterval = 20) async -> Bool {
         await pollUntil(timeout: timeout) {
@@ -172,8 +179,8 @@ extension EndToEndTests {
         await pair.finish()
     }
 
-    @Test("a frame no row can decrypt asks for one resend, and only after the archive pass failed")
-    func archivePassFailureSendsExactlyOneResendRequest() async throws {
+    @Test("a blank's missingOneTimeKey decides the class after the archive pass, where the blank is gone")
+    func blankMissingOneTimeKeyDecidesTheClassAfterTheArchivePass() async throws {
         let sink = RecordingAuditSink()
         let pair = try await connectedPair(bobAuditSink: sink)
         defer { Task { await shutdownSessions() } }
@@ -181,8 +188,7 @@ extension EndToEndTests {
         try await pair.bob.createInactiveSessionSnapshot(for: "alice", policy: .archive)
 
         // Alice's fresh lane cites a one-time key bob has lost, so no row of his and
-        // no blank can open the frame, and the archive pass has nothing to find. The
-        // hold stays on, so her answer to the request cannot draw a second one.
+        // no blank can open the frame, and the archive pass has nothing to find.
         _ = try await pair.alice.resetSessionIdentityForFreshSession(
             secretName: "bob",
             deviceId: pair.bobDeviceId,
@@ -201,13 +207,21 @@ extension EndToEndTests {
         #expect(try await pair.bob.removeOwnOneTimeKeys(x25519Id: try #require(header.oneTimeKeyId), mlKEMId: nil))
         pair.aliceTransport.continuation?.yield(frame)
 
+        // Child 02:10:08Z: the stateful rows said maxSkipped and the ensured blank said
+        // missingOneTimeKey, then the blank went with the active-first job. Its verdict
+        // has to survive into the pass, or recovery NACKs a lane that cannot open.
         let sharedId = frame.messageId
-        #expect(await pollUntil(timeout: 30) { await pair.bobTransport.outOfBandResendRequestCount > 0 },
-                "the failed archive pass asks the sender")
-        #expect(await pair.bobTransport.outOfBandResendRequestCount == 1)
-        #expect(await pair.bob.resendRequestSubmissionCount(
-            sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: sharedId) == 1)
+        #expect(await pollUntil(timeout: 30) { sink.contains("action=replaceOTKBatchThenPeerRefresh") },
+                "\(sink.lines(containing: sharedId))")
+        #expect(await pair.bobTransport.outOfBandResendRequestCount == 0, "a resend cannot open this lane")
         #expect(await laneSelections(on: pair.bob, sharedId: sharedId).map(\.pass) == [.activeFirst, .archived])
+
+        // The pass's rollback line shows both passes' verdicts, each lane once.
+        let rollbacks = sink.lines(containing: "pqs.recovery.laneRolledBack")
+        #expect(rollbacks.count == 2, "\(rollbacks)")
+        let merged = try #require(rollbacks.last)
+        #expect(merged.contains("ensured:"), "\(merged)")
+        #expect(merged.components(separatedBy: "preferred:").count == 2, "\(merged)")
 
         // The active-first miss reached no failure handler: the deferral comes first
         // and the only failure outcome the frame gets is the archive pass's.
@@ -216,6 +230,72 @@ extension EndToEndTests {
         let failures = trail.indices.filter { trail[$0].contains("pqs.decryptFailure") }
         #expect(failures.count == 1, "\(trail)")
         #expect(failures.allSatisfy { deferred < $0 }, "\(trail)")
+        await pair.finish()
+    }
+
+    @Test("a frame on the holder's lane keeps the holder's class when another row is preferred, and asks one resend after the pass")
+    func frameOnHoldersLaneKeepsTheHoldersClassWhenAnotherRowIsPreferred() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        let lane = try await openInitialChain(pair, frames: 2)
+        let frame = lane.frames[1]
+        let header = try BinaryDecoder().decode(RatchetMessage.self, from: try #require(frame.message.signed).data).header
+        #expect(try await pair.bob.removeOwnOneTimeKeys(x25519Id: try #require(header.oneTimeKeyId), mlKEMId: nil))
+
+        // Master 23:20:46Z: the row for a fresh lane has just become preferred, and the
+        // frames still arriving belong to the row it archived.
+        let fresh = try await openInitialChain(pair, frames: 1)
+        #expect(fresh.holder != lane.holder)
+        pair.aliceTransport.shouldDeliver = { received in
+            !(received.recipient == "bob" && received.isContentMessage)
+        }
+
+        // A replay the ledger no longer knows, which the holder rejects.
+        await pair.bob.pruneAcceptedEnvelopes(now: Date().addingTimeInterval(pair.bob.acceptedEnvelopeRetention + 60))
+        let replayId = "replay-\(UUID().uuidString)"
+        try await pair.bob.receiveMessage(
+            message: frame.message,
+            sender: frame.sender,
+            deviceId: frame.deviceId,
+            messageId: replayId,
+            logicalMessageId: nil)
+
+        #expect(await pollUntil(timeout: 30) { await pair.bobTransport.outOfBandResendRequestCount > 0 },
+                "the failed archive pass asks the sender")
+        #expect(await pair.bobTransport.outOfBandResendRequestCount == 1)
+        #expect(await pair.bob.resendRequestSubmissionCount(
+            sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: replayId) == 1)
+        let selections = await laneSelections(on: pair.bob, sharedId: replayId)
+        #expect(selections.map(\.pass) == [.activeFirst, .archived], "\(selections.map(\.candidateOrder))")
+
+        // The holder's word stands over the blank's missingOneTimeKey.
+        let rollback = try #require(sink.lines(containing: "pqs.recovery.laneRolledBack").last)
+        #expect(rollback.contains("ensured:") && rollback.contains("missingOneTimeKey"), "\(rollback)")
+        let failures = sink.lines(containing: "pqs.decryptFailure").filter { $0.contains(replayId) }
+        #expect(failures.count == 1 && failures[0].contains("failureClass=ratchet.maxSkippedHeadersExceeded"), "\(failures) \(rollback)")
+        await pair.finish()
+    }
+
+    @Test("a frame dropped at the ledger takes its pending archive pass and evidence with it")
+    func frameDroppedAtTheLedgerClearsItsArchivePass() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        let frame = try await openInitialChain(pair, frames: 1).frames[0]
+
+        // Another copy was accepted while the pass for this one sat queued.
+        await pair.bob.messagePipeline.queueArchivePass(ArchivedInboundFallbackToken(
+            senderSecretName: "alice",
+            senderDeviceId: pair.aliceDeviceId,
+            envelopeMessageId: frame.messageId,
+            fingerprint: try #require(frame.message.signed).data))
+        pair.aliceTransport.continuation?.yield(frame)
+
+        #expect(await pollUntil(timeout: 20) { sink.contains("pqs.recovery.redeliveryDropped reason=alreadyAccepted") })
+        #expect(await pair.bob.messagePipeline.archivedInboundFallbackPasses.isEmpty)
         await pair.finish()
     }
 

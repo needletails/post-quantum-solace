@@ -171,8 +171,9 @@ actor MessagePipeline {
     /// otherwise re-enqueue (and re-send) it from cache during that window.
     var inFlightJobIds: Set<UUID> = []
 
-    /// Archive-fallback pending tokens (`ArchivedInboundFallbackToken.storageKey`).
-    var archivedInboundFallbackPasses: Set<String> = []
+    /// Archive-fallback pending tokens (`ArchivedInboundFallbackToken.storageKey`), each
+    /// with the active-first verdicts its pass needs. A relaunch re-runs active-first.
+    var archivedInboundFallbackPasses: [String: [InboundAttemptFailure]] = [:]
 
     /// Completed archive-pass tokens. Blocks same-token re-defer storms.
     var archivedInboundFallbackExhausted: Set<String> = []

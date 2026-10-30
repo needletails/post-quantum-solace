@@ -805,7 +805,7 @@ struct DogfoodRecoveryStormPolicyTests {
 
     @Test("dogfood C2i: preferred expiredKey promotes only when an alternate proved maxSkipped")
     func dogfoodC2i_expiredKeyPromotesWhenAlternateProvedMaxSkipped() {
-        let promoted = InboundRecoveryStormPolicy.terminalTryAllError(
+        let promoted = terminalClass(
             preferred: RatchetError.expiredKey,
             alternates: [RatchetError.maxSkippedHeadersExceeded])
         #expect(
@@ -813,54 +813,106 @@ struct DogfoodRecoveryStormPolicyTests {
             "BUG: archived maxSkipped is hidden by preferred expiredKey and the frame is deleted")
 
         let pqxdhStyle = NSError(domain: "corecrypto", code: 503_316_581)
-        let nonProving = InboundRecoveryStormPolicy.terminalTryAllError(
+        let nonProving = terminalClass(
             preferred: RatchetError.expiredKey,
             alternates: [pqxdhStyle, RatchetError.stateUninitialized])
         #expect((nonProving as? RatchetError) == .expiredKey)
 
-        let lone = InboundRecoveryStormPolicy.terminalTryAllError(
+        let lone = terminalClass(
             preferred: RatchetError.expiredKey,
             alternates: [])
         #expect((lone as? RatchetError) == .expiredKey)
 
-        let alreadyMaxSkipped = InboundRecoveryStormPolicy.terminalTryAllError(
+        let alreadyMaxSkipped = terminalClass(
             preferred: RatchetError.maxSkippedHeadersExceeded,
             alternates: [RatchetError.expiredKey])
         #expect((alreadyMaxSkipped as? RatchetError) == .maxSkippedHeadersExceeded)
 
-        let decryptionFailed = InboundRecoveryStormPolicy.terminalTryAllError(
+        let decryptionFailed = terminalClass(
             preferred: RatchetError.decryptionFailed,
             alternates: [RatchetError.maxSkippedHeadersExceeded])
         #expect((decryptionFailed as? RatchetError) == .decryptionFailed)
     }
 
-    @Test("dogfood 2026-10-28: a state-less row's missingOneTimeKey names the class when no lane pinned the header's keys")
-    func stateLessMissingOneTimeKeyNamesTheClass() {
-        // Child C7420C75 at 02:10:08Z: the preferred and active stateful lanes
-        // said maxSkipped (not their frame); the ensured blank said
+    @Test("dogfood 2026-10-28: the class is the epoch holder's, then a blank's missingOneTimeKey, then the preferred row's")
+    func terminalClassFollowsTheFrameEpochHolder() {
+        // Child C7420C75 at 02:10:08Z: no row holds the frame's epoch. The stateful
+        // lanes said maxSkipped (not their frame); the ensured blank said
         // missingOneTimeKey (the frame cites a one-time key this device does not
-        // hold). The class is the blank's, so recovery replaces the batch and
-        // asks the peer to refresh instead of NACKing a lane that cannot open.
-        let fresh = InboundRecoveryStormPolicy.terminalTryAllError(
-            preferred: RatchetError.maxSkippedHeadersExceeded,
-            alternates: [RatchetError.maxSkippedHeadersExceeded, RatchetError.missingOneTimeKey],
-            stateLess: [RatchetError.missingOneTimeKey])
-        #expect((fresh as? RatchetError) == .missingOneTimeKey)
+        // hold). The class is the blank's, so recovery replaces the batch and asks
+        // the peer to refresh instead of NACKing a lane that cannot open.
+        let blank = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+            attempt(RatchetError.maxSkippedHeadersExceeded, isPreferred: true),
+            attempt(RatchetError.maxSkippedHeadersExceeded),
+            attempt(RatchetError.missingOneTimeKey, stateLess: true),
+        ])
+        #expect((blank as? RatchetError) == .missingOneTimeKey)
 
-        // A blank that could not even match the header says nothing new.
-        let unmatched = InboundRecoveryStormPolicy.terminalTryAllError(
-            preferred: RatchetError.maxSkippedHeadersExceeded,
-            alternates: [RatchetError.maxSkippedHeadersExceeded],
-            stateLess: [RatchetError.maxSkippedHeadersExceeded])
-        #expect((unmatched as? RatchetError) == .maxSkippedHeadersExceeded)
+        // Master at 23:20:46Z: the frames belong to 2824A981, which said maxSkipped.
+        // A fresh row had just become preferred and said missingOneTimeKey.
+        let holder = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+            attempt(RatchetError.missingOneTimeKey, isPreferred: true),
+            attempt(RatchetError.maxSkippedHeadersExceeded, holdsFrameEpoch: true),
+            attempt(RatchetError.missingOneTimeKey, stateLess: true),
+        ])
+        #expect((holder as? RatchetError) == .maxSkippedHeadersExceeded)
 
-        // The caller withholds the blank's error when a lane pinned the header's
-        // keys: the frame belongs to that lane and its failure is a desync.
-        let pinned = InboundRecoveryStormPolicy.terminalTryAllError(
-            preferred: NSError(domain: "corecrypto", code: 503_316_581),
-            alternates: [RatchetError.missingOneTimeKey],
-            stateLess: [])
-        #expect((pinned as? RatchetError) == nil)
+        // Child at 23:41:41Z: a chain desync. The one matching row failed AEAD and
+        // every other row said missingOneTimeKey. No new batch fixes that.
+        let aead = NSError(domain: "corecrypto", code: 503_316_581)
+        let desync = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+            attempt(RatchetError.missingOneTimeKey, isPreferred: true),
+            attempt(aead, holdsFrameEpoch: true),
+            attempt(RatchetError.missingOneTimeKey, stateLess: true),
+        ])
+        #expect((desync as NSError).domain == "corecrypto")
+
+        // Only missingOneTimeKey proves the claim. A blank's other failures, the
+        // refusal of a replay among them, say nothing about the frame's keys.
+        for blankError in [RatchetError.decryptionFailed, RatchetError.maxSkippedHeadersExceeded, aead] as [Error] {
+            let unproven = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+                attempt(RatchetError.headerDecryptFailed, isPreferred: true),
+                attempt(blankError, stateLess: true),
+            ])
+            #expect((unproven as? RatchetError) == .headerDecryptFailed)
+        }
+
+        // Preferred is the marked attempt wherever it landed in the list: a state-less
+        // preferred row runs after the stateful ones, and a pass merges two lists.
+        let marked = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+            attempt(RatchetError.maxSkippedHeadersExceeded),
+            attempt(RatchetError.headerDecryptFailed, isPreferred: true),
+        ])
+        #expect((marked as? RatchetError) == .headerDecryptFailed)
+
+        // expiredKey is thrown past a header match, so it comes from the row that owns
+        // the frame: C2i's override has to reach the holder too.
+        let expired = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+            attempt(RatchetError.expiredKey, holdsFrameEpoch: true, isPreferred: true),
+            attempt(RatchetError.maxSkippedHeadersExceeded),
+        ])
+        #expect((expired as? RatchetError) == .maxSkippedHeadersExceeded)
+    }
+
+    private func attempt(
+        _ error: Error,
+        stateLess: Bool = false,
+        holdsFrameEpoch: Bool = false,
+        isPreferred: Bool = false
+    ) -> InboundAttemptFailure {
+        InboundAttemptFailure(
+            laneId: UUID(),
+            label: "test",
+            error: error,
+            stateLess: stateLess,
+            holdsFrameEpoch: holdsFrameEpoch,
+            isPreferred: isPreferred)
+    }
+
+    /// The class from a preferred lane and alternates, none of them on the frame's epoch.
+    private func terminalClass(preferred: Error, alternates: [Error]) -> Error {
+        InboundRecoveryStormPolicy.terminalTryAllError(
+            attempts: [attempt(preferred, isPreferred: true)] + alternates.map { attempt($0) })
     }
 }
 
