@@ -63,6 +63,21 @@ extension EndToEndTests {
         return (try #require(holder), await captured.take())
     }
 
+    /// Bob archives the lane alice is sending on and holds a fresh state-less row
+    /// toward her: a remint on his side, as the child's at 02:10:03Z. Returns the
+    /// archived row.
+    private func archiveBobsLaneBehindABlank(_ pair: ConnectedPair) async throws -> UUID {
+        let bobRow = try #require(try await rows(on: pair.bob, peer: "alice", deviceId: pair.aliceDeviceId).first)
+        _ = try await pair.bob.demoteActiveSessionIdentityToInactive(try await identity(on: pair.bob, id: bobRow.id))
+        _ = try await pair.bob.resetSessionIdentityForFreshSession(
+            secretName: "alice",
+            deviceId: pair.aliceDeviceId,
+            sendOneTimeIdentities: false,
+            reason: "test",
+            demotePriorActives: false)
+        return bobRow.id
+    }
+
     @Test("a state-less preferred row waits for the archived row that holds the frame's epoch")
     func stateLessPreferredRowYieldsToTheArchivedHolder() async throws {
         let pair = try await connectedPair()
@@ -138,17 +153,7 @@ extension EndToEndTests {
         let pair = try await connectedPair()
         defer { Task { await shutdownSessions() } }
         try await settleLanes(pair)
-
-        // Bob archived the lane alice is sending on and holds a fresh state-less
-        // row toward her: a remint on his side, as the child's at 02:10:03Z.
-        let bobRow = try #require(try await rows(on: pair.bob, peer: "alice", deviceId: pair.aliceDeviceId).first)
-        _ = try await pair.bob.demoteActiveSessionIdentityToInactive(try await identity(on: pair.bob, id: bobRow.id))
-        _ = try await pair.bob.resetSessionIdentityForFreshSession(
-            secretName: "alice",
-            deviceId: pair.aliceDeviceId,
-            sendOneTimeIdentities: false,
-            reason: "test",
-            demotePriorActives: false)
+        let archivedRow = try await archiveBobsLaneBehindABlank(pair)
 
         // Alice's new keys open a new epoch, so no row holds the frame by its epoch
         // and only the archived row can mirror the re-key.
@@ -158,12 +163,94 @@ extension EndToEndTests {
 
         #expect(await persisted(pair.bob, sharedId), "the archived lane decrypts the frame in the background pass")
         #expect(await pair.bob.messagePipeline.inboundLaneSelectionStatsLog.contains {
-            $0.pass == .archived && $0.winningLaneId == bobRow.id
+            $0.pass == .archived && $0.winningLaneId == archivedRow
         }, "the archive pass, not the active-first pass, decrypted it")
         #expect(await pair.bobTransport.outOfBandResendRequestCount == 0,
                 "no resend request may leave before the archive pass has had its say")
         #expect(await pair.bob.resendRequestSubmissionCount(
             sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: sharedId) == 0)
+        await pair.finish()
+    }
+
+    @Test("a frame no row can decrypt asks for one resend, and only after the archive pass failed")
+    func archivePassFailureSendsExactlyOneResendRequest() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        try await pair.bob.createInactiveSessionSnapshot(for: "alice", policy: .archive)
+
+        // Alice's fresh lane cites a one-time key bob has lost, so no row of his and
+        // no blank can open the frame, and the archive pass has nothing to find. The
+        // hold stays on, so her answer to the request cannot draw a second one.
+        _ = try await pair.alice.resetSessionIdentityForFreshSession(
+            secretName: "bob",
+            deviceId: pair.bobDeviceId,
+            sendOneTimeIdentities: true,
+            reason: "test")
+        let held = HeldFrames()
+        pair.aliceTransport.shouldDeliver = { received in
+            guard received.recipient == "bob", received.isContentMessage else { return true }
+            await held.hold(received)
+            return false
+        }
+        try await pair.alice.send(recipient: .nickname("bob"), text: "no row opens this")
+        #expect(await pollUntil(timeout: 20) { await held.count == 1 })
+        let frame = try #require(await held.take().first)
+        let header = try BinaryDecoder().decode(RatchetMessage.self, from: try #require(frame.message.signed).data).header
+        #expect(try await pair.bob.removeOwnOneTimeKeys(x25519Id: try #require(header.oneTimeKeyId), mlKEMId: nil))
+        pair.aliceTransport.continuation?.yield(frame)
+
+        let sharedId = frame.messageId
+        #expect(await pollUntil(timeout: 30) { await pair.bobTransport.outOfBandResendRequestCount > 0 },
+                "the failed archive pass asks the sender")
+        #expect(await pair.bobTransport.outOfBandResendRequestCount == 1)
+        #expect(await pair.bob.resendRequestSubmissionCount(
+            sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: sharedId) == 1)
+        #expect(await laneSelections(on: pair.bob, sharedId: sharedId).map(\.pass) == [.activeFirst, .archived])
+
+        // The active-first miss reached no failure handler: the deferral comes first
+        // and the only failure outcome the frame gets is the archive pass's.
+        let trail = sink.lines(containing: sharedId)
+        let deferred = try #require(trail.firstIndex { $0.contains("pqs.recovery.inboundDeferredToArchivePass") }, "\(trail)")
+        let failures = trail.indices.filter { trail[$0].contains("pqs.decryptFailure") }
+        #expect(failures.count == 1, "\(trail)")
+        #expect(failures.allSatisfy { deferred < $0 }, "\(trail)")
+        await pair.finish()
+    }
+
+    @Test("a second copy of a deferred frame becomes the pass and the queued job finds it accepted")
+    func crashBetweenEnqueueAndDeleteAcceptsOnce() async throws {
+        let sink = RecordingAuditSink()
+        let pair = try await connectedPair(bobAuditSink: sink)
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        let archivedRow = try await archiveBobsLaneBehindABlank(pair)
+
+        // The first frame of alice's rotation: no row holds its epoch, so only the
+        // archive pass can decrypt it.
+        let held = HeldFrames()
+        pair.aliceTransport.shouldDeliver = { received in
+            guard received.recipient == "bob" else { return true }
+            await held.hold(received)
+            return false
+        }
+        try await pair.alice.rotateCurrentDeviceKeys()
+        #expect(await pollUntil(timeout: 20) { await held.count > 0 })
+        let frame = try #require(await held.take().first)
+
+        // A crash between the pass's enqueue and the original job's delete leaves two
+        // copies of the job, and a relaunch runs both.
+        pair.aliceTransport.continuation?.yield(frame)
+        pair.aliceTransport.continuation?.yield(frame)
+
+        #expect(await pollUntil(timeout: 20) { sink.contains("pqs.recovery.redeliveryDropped reason=alreadyAccepted") },
+                "whichever job runs after the pass finds the frame accepted")
+        let selections = await laneSelections(on: pair.bob, sharedId: frame.messageId)
+        #expect(selections.map(\.pass) == [.activeFirst, .archived], "\(selections.map(\.candidateOrder))")
+        #expect(selections.last?.winningLaneId == archivedRow)
+        #expect(sink.lines(containing: "pqs.recovery.envelopeAccepted").filter { $0.contains(frame.messageId) }.count == 1)
+        #expect(await pair.bobTransport.outOfBandResendRequestCount == 0, "nothing to ask the sender for")
         await pair.finish()
     }
 

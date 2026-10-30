@@ -216,12 +216,9 @@ extension MessagePipeline {
                     senderDeviceId: inboundTask.senderDeviceId,
                     envelopeMessageId: inboundTask.sharedMessageId,
                     fingerprint: frameFingerprint)
-                let includeArchivedFallback =
-                    archivedInboundFallbackPasses.contains(archiveToken.storageKey)
-                    || archivedInboundFallbackPasses.contains(inboundTask.sharedMessageId)
+                let includeArchivedFallback = archivedInboundFallbackPasses.contains(archiveToken.storageKey)
                 if includeArchivedFallback {
                     archivedInboundFallbackPasses.remove(archiveToken.storageKey)
-                    archivedInboundFallbackPasses.remove(inboundTask.sharedMessageId)
                     laneStats.pass = .archived
                 }
                 // Mark exhausted when this pass actually walks archives (success or
@@ -998,10 +995,9 @@ extension MessagePipeline {
     /// `(sender, device, envelope, fingerprint)` so a fresh orphan fingerprint
     /// cannot consume an older archive-only pass (T17).
     ///
-    /// - Returns: `true` when a pass owns this ciphertext's outcome: one was queued
-    ///   by this call, or one is already pending for the same token (a redelivered
-    ///   copy rides on it). `false` when the pass already ran for this token or the
-    ///   enqueue failed; the caller's failure then stands as the frame's outcome.
+    /// - Returns: `true` when this call queued the pass, which then owns this
+    ///   ciphertext's outcome. `false` when the pass already ran for this token or
+    ///   the enqueue failed; the caller's failure then stands as the frame's outcome.
     private func deferArchivedInboundFallback(
         inboundTask: InboundTaskMessage,
         session: PQSSession
@@ -1013,13 +1009,9 @@ extension MessagePipeline {
             senderDeviceId: inboundTask.senderDeviceId,
             envelopeMessageId: sharedId,
             fingerprint: currentFingerprint)
-        if archivedInboundFallbackPasses.contains(token.storageKey) {
-            return true
-        }
         guard InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
             token: token,
-            exhausted: archivedInboundFallbackExhausted,
-            pendingPass: archivedInboundFallbackPasses
+            exhausted: archivedInboundFallbackExhausted
         ) else {
             return false
         }

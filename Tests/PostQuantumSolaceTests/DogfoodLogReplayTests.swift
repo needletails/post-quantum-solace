@@ -721,19 +721,14 @@ struct DogfoodRecoveryStormPolicyTests {
             envelopeMessageId: sharedId,
             fingerprint: Data("offline-poison-ct".utf8))
         var exhausted = Set<String>()
-        var pending = Set<String>()
         var deferCount = 0
 
         for _ in 0..<20 {
             guard InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: token,
-                exhausted: exhausted,
-                pendingPass: pending
+                exhausted: exhausted
             ) else { continue }
             deferCount += 1
-            pending.insert(token.storageKey)
-            // Production removes pending at archive-pass start, then marks exhausted.
-            pending.remove(token.storageKey)
             exhausted = InboundRecoveryStormPolicy.exhaustedAfterArchivePassCompleted(
                 current: exhausted,
                 token: token
@@ -756,8 +751,7 @@ struct DogfoodRecoveryStormPolicyTests {
         #expect(
             !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: token,
-                exhausted: exhausted,
-                pendingPass: []
+                exhausted: exhausted
             ))
     }
 
@@ -772,15 +766,13 @@ struct DogfoodRecoveryStormPolicyTests {
         #expect(
             !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: token,
-                exhausted: exhausted,
-                pendingPass: []))
+                exhausted: exhausted))
         // Heal / new archive generation clears exhaustion for that ciphertext.
         exhausted.remove(token.storageKey)
         #expect(
             InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: token,
-                exhausted: exhausted,
-                pendingPass: []))
+                exhausted: exhausted))
     }
 
     @Test("dogfood C2g: new fingerprint clears exhaustion and re-arms one archive defer")
@@ -802,44 +794,13 @@ struct DogfoodRecoveryStormPolicyTests {
         #expect(
             !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: prior,
-                exhausted: exhausted,
-                pendingPass: []))
+                exhausted: exhausted))
         #expect(
             InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: remint,
-                exhausted: exhausted,
-                pendingPass: []),
+                exhausted: exhausted),
             "BUG: reminted CT token must retain an independent archive pass")
         #expect(InboundRecoveryStormPolicy.tokensAreIndependent(prior, remint))
-    }
-
-    @Test("dogfood C2h: pending archive pass defers dead-epoch terminalization")
-    func dogfoodC2h_pendingArchivePassDefersDeadEpochTerminalization() {
-        let token = ArchivedInboundFallbackToken(
-            senderSecretName: "nudge",
-            senderDeviceId: UUID(),
-            envelopeMessageId: "B07A45EC-780E-4B5C-AEAB-D5DAB91B9292",
-            fingerprint: Data("archive-pending-ct".utf8))
-        #expect(
-            !InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
-                token: token,
-                pendingPass: [token.storageKey]),
-            "BUG: terminalizing while archive pass is queued false-positives contentUnrecoverable")
-        #expect(
-            InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
-                token: token,
-                pendingPass: []),
-            "Absent pending pass must still terminalize (archive pass exhausted or never deferred)")
-        let other = ArchivedInboundFallbackToken(
-            senderSecretName: token.senderSecretName,
-            senderDeviceId: token.senderDeviceId,
-            envelopeMessageId: token.envelopeMessageId,
-            fingerprint: Data("different-ct".utf8))
-        #expect(
-            InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
-                token: other,
-                pendingPass: [token.storageKey]),
-            "Independent fingerprint token must not inherit another frame's deferral")
     }
 
     @Test("dogfood C2i: preferred expiredKey promotes only when an alternate proved maxSkipped")

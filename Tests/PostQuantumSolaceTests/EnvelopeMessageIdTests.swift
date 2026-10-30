@@ -296,23 +296,18 @@ struct EnvelopeMessageIdTests {
             fingerprint: Data([0x02]))
         #expect(InboundRecoveryStormPolicy.tokensAreIndependent(a, b))
         var exhausted: Set<String> = []
-        var pending: Set<String> = []
         #expect(
             InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
-                token: a, exhausted: exhausted, pendingPass: pending))
-        pending.insert(a.storageKey)
-        #expect(
-            !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
-                token: a, exhausted: exhausted, pendingPass: pending))
-        #expect(
-            InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
-                token: b, exhausted: exhausted, pendingPass: pending),
-            "Fresh fingerprint must retain its own archive pass")
+                token: a, exhausted: exhausted))
         exhausted = InboundRecoveryStormPolicy.exhaustedAfterArchivePassCompleted(
             current: exhausted, token: a)
         #expect(
+            !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
+                token: a, exhausted: exhausted))
+        #expect(
             InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
-                token: b, exhausted: exhausted, pendingPass: []))
+                token: b, exhausted: exhausted),
+            "Fresh fingerprint must retain its own archive pass")
     }
 
     @Test("S14: OOB resend controls authenticate origin, target, and request id")

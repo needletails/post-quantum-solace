@@ -1265,29 +1265,10 @@ extension MessagePipeline {
     /// cleared envelope is still swallowed without another OTK/peerRefresh storm.
     /// `markInboundContentUnrecoverable` is once-per-tuple, so redelivered
     /// copies do not re-notify the host.
-    ///
-    /// When an archive fallback pass is already queued for this ciphertext,
-    /// defer as well: the pass removes the token at start and rethrows on
-    /// failure, so the next handler invocation re-evaluates with no timer.
     private func maybeTerminalizeDeadEpochInbound(
         _ message: InboundTaskMessage,
         session: PQSSession
     ) async {
-        let token = ArchivedInboundFallbackToken(
-            senderSecretName: message.senderSecretName,
-            senderDeviceId: message.senderDeviceId,
-            envelopeMessageId: message.sharedMessageId,
-            fingerprint: PQSSession.nackFrameFingerprint(for: message))
-        let pendingPass = archivedInboundFallbackPasses
-        guard InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
-            token: token,
-            pendingPass: pendingPass
-        ) else {
-            audit(
-                .recovery,
-                "pqs.recovery.deadEpochTerminalizationDeferred reason=archivePassPending sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
-            return
-        }
         if await session.hasPendingResendAfterReestablishment(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId,
