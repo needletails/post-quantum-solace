@@ -29,6 +29,11 @@ extension MessagePipeline {
             parts.append(
                 RatchetHeaderAudit(signedMessage: message.message)?.unverifiedCitedFields
                     ?? "hdrCitesOtk=unreadable")
+            if let rolledBackEpochHolder, rolledBackEpochHolder.sharedId == message.sharedMessageId {
+                parts.append(rolledBackEpochHolder.fields)
+            } else {
+                parts.append("epochHolder=notAttempted")
+            }
         }
         if suppressed {
             parts.append("suppressed=true")

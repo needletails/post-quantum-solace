@@ -173,6 +173,8 @@ extension MessagePipeline {
     /// One line per frame handed to the transport, naming the keys its header binds
     /// so a failing frame can be matched to its send. `header` runs only when the
     /// sink is enabled: a pending frame has to decode its own message to get there.
+    /// `sentCount` is the lane's count after this frame's encrypt. A replayed frame has
+    /// none: its number sits in its encrypted header and the row has moved on since.
     func auditDeviceTransportOk(
         outboundTask: OutboundTaskMessage,
         envelopeMessageId: String,
@@ -180,9 +182,10 @@ extension MessagePipeline {
         recipientDeviceId: UUID,
         sessionIdentityId: UUID,
         pending: Bool,
+        sentCount: Int?,
         header: @autoclosure () -> RatchetHeaderAudit?
     ) {
-        audit(.send, "pqs.send.deviceTransportOk sharedId=\(outboundTask.sharedId) envelopeMessageId=\(envelopeMessageId) recipientSecret=\(recipientSecretName) recipientDeviceId=\(recipientDeviceId.uuidString) sessionIdentityId=\(sessionIdentityId.uuidString) recipient=\(outboundTask.message.recipient.auditRecipientTag) persisted=\(outboundTask.isPersistedOutbound) pending=\(pending) \(header()?.sendFields ?? "citesOtk=unreadable")",
+        audit(.send, "pqs.send.deviceTransportOk sharedId=\(outboundTask.sharedId) envelopeMessageId=\(envelopeMessageId) recipientSecret=\(recipientSecretName) recipientDeviceId=\(recipientDeviceId.uuidString) sessionIdentityId=\(sessionIdentityId.uuidString) recipient=\(outboundTask.message.recipient.auditRecipientTag) persisted=\(outboundTask.isPersistedOutbound) pending=\(pending) sentCount=\(sentCount.map(String.init) ?? "nil") \(header()?.sendFields ?? "citesOtk=unreadable")",
             level: .info)
     }
 
@@ -211,6 +214,7 @@ extension MessagePipeline {
             recipientDeviceId: pendingTransport.metadata.deviceId,
             sessionIdentityId: pendingTransport.sessionIdentityId,
             pending: true,
+            sentCount: nil,
             header: RatchetHeaderAudit(signedMessage: pendingTransport.message))
         logRecoveryTransportSendSuccess(
             pendingTransport.metadata.transportEvent,

@@ -338,7 +338,10 @@ extension MessagePipeline {
                     recordInboundLaneSelectionStats(laneStats)
                     let headerAudit = RatchetHeaderAudit(inboundHeader)
                     let deviceKeys = await session.sessionContext?.sessionUser.deviceKeys
-                    audit(.recovery, "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) \(headerAudit.inboundFields) \(deviceKeys.map { headerAudit.heldFields(deviceKeys: $0, rows: peerLanes.map(\.props) + [preferredLane.props]) } ?? "otkHeld=unknown mlkemHeld=unknown") attempts=[\(attemptFailures.map { "\($0.label):\($0.error)" }.joined(separator: "; "))] negativeCacheSkips=\(laneStats.negativeCacheSkips)")
+                    let auditLanes = peerLanes.contains { $0.identity.id == preferredLane.identity.id } ? peerLanes : peerLanes + [preferredLane]
+                    let epochHolder = headerAudit.epochHolderFields(rows: auditLanes.map { ($0.identity.id, $0.props) })
+                    rolledBackEpochHolder = (inboundTask.sharedMessageId, epochHolder)
+                    audit(.recovery, "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) \(headerAudit.inboundFields) \(deviceKeys.map { headerAudit.heldFields(deviceKeys: $0, rows: auditLanes.map(\.props)) } ?? "otkHeld=unknown mlkemHeld=unknown") \(epochHolder) attempts=[\(attemptFailures.map { "\($0.label):\($0.error)" }.joined(separator: "; "))] negativeCacheSkips=\(laneStats.negativeCacheSkips)")
                     // The queued pass owns this frame's outcome; see `InboundDecryptDeferral`.
                     if archivePassQueued {
                         throw InboundDecryptDeferral.archivePassQueued
