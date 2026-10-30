@@ -131,6 +131,17 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         }
     }
 
+    /// Re-reads the local session context from the store, replacing the warm copy.
+    /// For a store another process wrote (`PQSSession.refreshSessionCache`): the
+    /// warm copy is this process's past, not the store's present. Like
+    /// `fetchLocalSessionContext`, this installs nothing on the session; the
+    /// caller does, under its commit lock.
+    func reloadLocalSessionContext() async throws -> Data {
+        let data = try await store.fetchLocalSessionContext()
+        localDeviceConfiguration = data
+        return data
+    }
+
     /// Updates the local device configuration and refreshes the cache.
     /// - Parameter data: The new configuration data.
     /// - Throws: An error if the update fails.

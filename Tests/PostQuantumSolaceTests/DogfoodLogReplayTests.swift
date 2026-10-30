@@ -872,6 +872,35 @@ struct DogfoodRecoveryStormPolicyTests {
             alternates: [RatchetError.maxSkippedHeadersExceeded])
         #expect((decryptionFailed as? RatchetError) == .decryptionFailed)
     }
+
+    @Test("dogfood 2026-10-28: a state-less row's missingOneTimeKey names the class when no lane pinned the header's keys")
+    func stateLessMissingOneTimeKeyNamesTheClass() {
+        // Child C7420C75 at 02:10:08Z: the preferred and active stateful lanes
+        // said maxSkipped (not their frame); the ensured blank said
+        // missingOneTimeKey (the frame cites a one-time key this device does not
+        // hold). The class is the blank's, so recovery replaces the batch and
+        // asks the peer to refresh instead of NACKing a lane that cannot open.
+        let fresh = InboundRecoveryStormPolicy.terminalTryAllError(
+            preferred: RatchetError.maxSkippedHeadersExceeded,
+            alternates: [RatchetError.maxSkippedHeadersExceeded, RatchetError.missingOneTimeKey],
+            stateLess: [RatchetError.missingOneTimeKey])
+        #expect((fresh as? RatchetError) == .missingOneTimeKey)
+
+        // A blank that could not even match the header says nothing new.
+        let unmatched = InboundRecoveryStormPolicy.terminalTryAllError(
+            preferred: RatchetError.maxSkippedHeadersExceeded,
+            alternates: [RatchetError.maxSkippedHeadersExceeded],
+            stateLess: [RatchetError.maxSkippedHeadersExceeded])
+        #expect((unmatched as? RatchetError) == .maxSkippedHeadersExceeded)
+
+        // The caller withholds the blank's error when a lane pinned the header's
+        // keys: the frame belongs to that lane and its failure is a desync.
+        let pinned = InboundRecoveryStormPolicy.terminalTryAllError(
+            preferred: NSError(domain: "corecrypto", code: 503_316_581),
+            alternates: [RatchetError.missingOneTimeKey],
+            stateLess: [])
+        #expect((pinned as? RatchetError) == nil)
+    }
 }
 
 // MARK: - C3: same sharedId must not remint on every rearmNack (CHILD_DEVICE 2FA48892)

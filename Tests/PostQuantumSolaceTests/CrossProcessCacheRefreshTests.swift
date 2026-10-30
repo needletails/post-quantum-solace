@@ -10,6 +10,7 @@
 //  device, while frames the extension sent in between decrypted).
 //
 
+import DoubleRatchetKit
 import Foundation
 import Testing
 @testable import PQSSession
@@ -102,5 +103,48 @@ extension EndToEndTests {
         try await _senderSession.send(recipient: .nickname("bob"), text: "three", sharedIdOverride: third)
         await _senderSession.waitForOutboundJobDrain()
         #expect(await bobDecrypted(third), "the app must continue the lane where the extension left it")
+    }
+
+    @Test("a cache refresh re-installs the session context the other process persisted")
+    func refreshAfterExternalWriteReloadsSessionContext() async throws {
+        defer { Task { await shutdownSessions() } }
+        let aliceStore = createSenderStore()
+        await aliceStore.setDetachesRows(true)
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        try await createSenderSession(
+            store: aliceStore,
+            transport: aliceTransport,
+            sessionDelegate: SessionDelegate(session: _senderSession))
+
+        // The extension: Alice's account unlocked a second time over the same store.
+        var extensionSession = PQSSession()
+        let extensionTransport = _MockTransportDelegate(session: extensionSession, store: store)
+        await extensionSession.setDatabaseDelegate(conformer: aliceStore)
+        await extensionSession.setTransportDelegate(conformer: extensionTransport)
+        await extensionSession.setPQSSessionDelegate(conformer: SessionDelegate(session: extensionSession))
+        await extensionSession.setReceiverDelegate(conformer: ReceiverDelegate(session: extensionSession))
+        await extensionSession.setAppPassword(sMockUserData.sap)
+        extensionSession = try await extensionSession.unlock(appPassword: sMockUserData.sap)
+
+        // In its own process the extension consumed a one-time key and minted its
+        // replacement, and recorded host state.
+        let minted = try X25519PrivateKey(id: UUID(), crypto.generateCurve25519PrivateKey().rawRepresentation)
+        let hostState = Data("written by the extension".utf8)
+        try await extensionSession.commitSessionContextMutation { context in
+            context.sessionUser.deviceKeys.oneTimePrivateKeys.append(minted)
+            context.hostLocalPolicyData = hostState
+            return true
+        }
+        let stale = try #require(await _senderSession.sessionContext)
+        #expect(!stale.sessionUser.deviceKeys.oneTimePrivateKeys.contains { $0.id == minted.id },
+                "until it reloads, the app's live context is its own past")
+
+        try await _senderSession.refreshSessionCache()
+
+        let reloaded = try #require(await _senderSession.sessionContext)
+        #expect(reloaded.sessionUser.deviceKeys.oneTimePrivateKeys.contains { $0.id == minted.id },
+                "the private half the extension minted must reach the app's pool, or the app's next commit writes it out of existence while the server still advertises its public half")
+        #expect(reloaded.hostLocalPolicyData == hostState)
+        await extensionSession.shutdown()
     }
 }

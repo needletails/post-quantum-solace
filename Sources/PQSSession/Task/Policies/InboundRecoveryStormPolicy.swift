@@ -92,14 +92,43 @@ public enum InboundRecoveryStormPolicy: Sendable {
         a.storageKey != b.storageKey
     }
 
-    /// Terminal error for a failed try-all. `maxSkippedHeadersExceeded` from any
-    /// alternate is thrown only after that snapshot's header key authenticated
-    /// the frame, so it proves this lane cannot decrypt it locally; surface the
-    /// resend-owning class instead of the preferred session's `expiredKey`.
-    static func terminalTryAllError(preferred: Error, alternates: [Error]) -> Error {
+    /// Terminal error for a failed try-all.
+    ///
+    /// A state-less row's failure is about this frame: PQXDH ran from the frame's
+    /// own header, so `missingOneTimeKey` there means the header cites a one-time
+    /// key this device does not hold, and only a fresh batch (and the peer's
+    /// refresh) heals it. The caller passes those errors in `stateLess` only when
+    /// no row for the device pinned the header's keys; a row that did is the lane
+    /// the frame belongs to, and its failure is a chain desync the sender heals
+    /// by resending. A stateful lane's `maxSkippedHeadersExceeded` says nothing
+    /// about the frame: DRK throws it after failing to match the header under
+    /// any of that lane's header keys, without authenticating anything (dogfood
+    /// 2026-10-28, child C7420C75 02:10:08Z: the class hid the blank's
+    /// `missingOneTimeKey`, and recovery NACKed for ninety seconds before it
+    /// replaced the batch).
+    ///
+    /// Otherwise the preferred lane's error stands, except that an alternate's
+    /// `maxSkippedHeadersExceeded` is surfaced over the preferred session's
+    /// `expiredKey`, the resend-owning class.
+    static func terminalTryAllError(preferred: Error, alternates: [Error], stateLess: [Error] = []) -> Error {
+        if stateLess.contains(where: { ($0 as? RatchetError) == .missingOneTimeKey }) {
+            return RatchetError.missingOneTimeKey
+        }
         guard (preferred as? RatchetError) == .expiredKey,
               alternates.contains(where: { ($0 as? RatchetError) == .maxSkippedHeadersExceeded })
         else { return preferred }
         return RatchetError.maxSkippedHeadersExceeded
     }
+}
+
+/// The active-first pass missed and queued the archive pass for the frame. The
+/// job ends here; the pass re-runs the decrypt and owns the outcome. Nothing is
+/// asked of the sender before it has run: a resend request sent now reaches the
+/// sender before the pass, and the sender answers it by tearing down the very
+/// lane the pass is about to prove (dogfood 2026-10-28: 6DEB4DCE NACKed at
+/// 02:10:04Z, decrypted from the archive at 02:10:05Z; the sender had already
+/// reminted on the NACK and the next message went out on a lane the receiver
+/// could not open).
+enum InboundDecryptDeferral: Error {
+    case archivePassQueued
 }

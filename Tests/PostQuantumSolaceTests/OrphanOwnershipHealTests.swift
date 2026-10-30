@@ -102,22 +102,26 @@ struct OrphanOwnershipHealPolicyTests {
     }
 }
 
-/// Lane heal for waves the owner cannot service at all (every id
-/// terminally unavailable — ephemeral frames with no plaintext). The NACK
-/// proved the outbound lane is diverged; with zero queued replays nothing
-/// re-proves it, so new traffic would keep dying on the dead ratchet
-/// (dogfood: parent→child personal lane failing for 6+ hours after
-/// ownerMissingPlaintext-only waves).
+/// Waves the owner cannot service at all (every id terminally unavailable —
+/// ephemeral frames with no plaintext) heal nothing. A NACK is the requester
+/// saying it could not decrypt a frame, not proof that this lane is diverged:
+/// dogfood 2026-10-28 traced the requester's NACKs to its own blank refusals,
+/// to one-time keys it had lost and to NACKs sent before its archive pass ran,
+/// and the remint each one triggered archived the lane the requester was
+/// mid-sentence on, consumed one of its one-time keys and provoked the next
+/// NACK (17 remints in 71 minutes between two devices). Lane heal belongs to
+/// the content ladder, where a replay re-encrypted on the current lane and
+/// NACKed again is the proof, and to the requester's `peerRefresh`.
 @Suite("Unservicable resend lane heal policy")
 struct UnservicableResendLaneHealPolicyTests {
-    @Test("all-unavailable wave with no live mark remints the lane")
-    func allUnavailableWaveRemints() {
+    @Test("all-unavailable wave with no live mark does not remint the lane")
+    func allUnavailableWaveDoesNotRemint() {
         let decision = UnservicableResendLaneHealPolicy.decision(
             queuedReplayCount: 0,
             coalescedReplayCount: 0,
             unavailableCount: 3,
             stateLessInitiatingMarkIsLive: false)
-        #expect(decision == .remintLane)
+        #expect(decision == .noHealNeeded)
     }
 
     @Test("live state-less mark suppresses a second remint on NACK retries")

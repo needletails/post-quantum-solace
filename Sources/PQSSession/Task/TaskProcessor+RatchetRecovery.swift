@@ -390,26 +390,23 @@ extension MessagePipeline {
         }
     }
 
-    /// Remints the outbound lane toward a requester device after a resend wave
-    /// this owner could not service at all (every id terminally unavailable —
+    /// Reports whether a heal lane toward the requester is live after a resend
+    /// wave this owner could not service at all (every id terminally unavailable —
     /// typically ephemeral control/sync frames with no plaintext to replay).
     ///
-    /// The requester's NACK is cryptographic proof our outbound ratchet toward
-    /// that device is diverged. The content-replay ladder heals the lane as a
-    /// side effect of encrypting msg0 replays; with nothing to replay, that
-    /// side effect never happens and new outbound traffic keeps failing on the
-    /// dead lane indefinitely. This mints the same fresh initiating row the
-    /// `.mintFresh` replay path uses — minus the content — so the next real
-    /// outbound message goes out as msg0 the requester can accept via its
-    /// ensured inbound initiating slot.
+    /// Such a wave mints nothing. A NACK says the requester could not decrypt a
+    /// frame; it is not proof that this lane is diverged. Dogfood 2026-10-28:
+    /// the requester's NACKs came from its own blank refusals, from one-time
+    /// keys it had lost, and from NACKs it sent before its archive pass ran, and
+    /// the remint each one triggered archived the lane the requester was
+    /// mid-sentence on, consumed one of its one-time keys and provoked the next
+    /// NACK (17 remints in 71 minutes between two devices). Lane heal belongs to
+    /// the content ladder, where a replay re-encrypted on the current lane and
+    /// NACKed again is the proof (`performOrphanEscapeRemint`), and to the
+    /// requester's `peerRefresh` on `missingOneTimeKey`.
     ///
-    /// Bounded by `UnservicableResendLaneHealPolicy`: a live state-less
-    /// initiating mark (a prior heal not yet used for traffic) suppresses
-    /// re-minting on the requester's bounded NACK retries.
-    ///
-    /// - Returns: `true` when a heal lane toward the requester is active after
-    ///   this call (freshly reminted, or a live state-less mark from a prior
-    ///   heal). `false` when no heal ran or the remint failed.
+    /// - Returns: `true` when a live state-less initiating mark (a prior heal not
+    ///   yet used for traffic) already covers the requester; `false` otherwise.
     @discardableResult
     private func healOutboundLaneAfterUnservicableResendWave(
         requesterName: String,
@@ -444,36 +441,11 @@ extension MessagePipeline {
             unavailableCount: unavailableCount,
             stateLessInitiatingMarkIsLive: stateLessMarkIsLive)
         switch decision {
-        case .noHealNeeded:
+        case .noHealNeeded, .remintLane:
             return false
         case .reuseExistingStateLessMark:
             audit(.recovery, "pqs.recovery.resendUnavailableLaneHealSkipped reason=stateLessMarkLive requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) sessionId=\(liveMarkId?.uuidString ?? "nil")")
             return true
-        case .remintLane:
-            break
-        }
-
-        do {
-            let fresh = try await session.resetSessionIdentityForFreshSession(
-                secretName: requesterName,
-                deviceId: requesterDeviceId,
-                sendOneTimeIdentities: true,
-                reason: "orphanResend")
-            await session.markOrphanResendInitiatingSession(
-                secretName: requesterName,
-                deviceId: requesterDeviceId,
-                sessionId: fresh.id)
-            clearPreferredSessionIdentity(
-                secretName: requesterName,
-                deviceId: requesterDeviceId)
-            audit(.recovery, "pqs.recovery.resendUnavailableLaneReminted requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) newSessionId=\(fresh.id.uuidString) unavailableCount=\(unavailableCount)")
-            return true
-        } catch {
-            logger.log(
-                level: .warning,
-                message: "pqs.recovery.resendUnavailableLaneHealFailed requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) error=\(error)")
-            audit(.recovery, "pqs.recovery.resendUnavailableLaneHealFailed requester=\(requesterName) deviceId=\(requesterDeviceId.uuidString) error=\(error)")
-            return false
         }
     }
 

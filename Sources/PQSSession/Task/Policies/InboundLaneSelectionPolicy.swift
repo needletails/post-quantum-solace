@@ -74,16 +74,6 @@ enum InboundLaneSelectionPolicy: Sendable {
         before != after
     }
 
-    /// Whether a state-less row that just bootstrapped from a frame's header may
-    /// become the lane. A header carries PQXDH material until the sender has
-    /// processed a reply, so a blank can decrypt any frame of that initial
-    /// chain, including one whose session this device already holds (a replay,
-    /// or a row the sender's epoch outran). Adopting it then splits the lane.
-    /// A blank opens a lane with a session's first frame (received count 1), or
-    /// when no stateful row for the device exists to be split.
-    static func blankMayBecomeLane(receivedMessagesCount: Int, statefulRowExists: Bool) -> Bool {
-        !statefulRowExists || receivedMessagesCount == 1
-    }
 
     /// What decides whether a frame can decrypt on a lane: whether a ratchet
     /// snapshot exists, how far its receiving side advanced, and the local and

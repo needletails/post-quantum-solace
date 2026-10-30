@@ -495,6 +495,16 @@ extension MessagePipeline {
             try await cache.deleteJob(job)
             return .processed
             
+        } catch is InboundDecryptDeferral {
+            // The active-first pass missed and queued the archive pass for this
+            // frame. That pass re-runs the whole decrypt and, if it fails too,
+            // lands in the handlers below. Nothing is asked of the sender before it.
+            if case .streamMessage(let message) = props.task.task {
+                audit(.recovery, "pqs.recovery.inboundDeferredToArchivePass sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
+            }
+            try await cache.deleteJob(job)
+            return .deleted
+
         } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
             switch props.task.task {
             case .streamMessage(let message):

@@ -89,16 +89,6 @@ struct InboundLaneSelectionTests {
         #expect(InboundLaneSelectionPolicy.shouldRestoreIdentityData(before: before, after: Data()))
     }
 
-    // MARK: - Blank adoption
-
-    @Test("a blank opens a lane with a session's first frame, or when there is no lane to split")
-    func blankAdoption() {
-        #expect(InboundLaneSelectionPolicy.blankMayBecomeLane(receivedMessagesCount: 1, statefulRowExists: true))
-        #expect(!InboundLaneSelectionPolicy.blankMayBecomeLane(receivedMessagesCount: 2, statefulRowExists: true),
-                "a mid-chain frame belongs to a session this device already holds")
-        #expect(InboundLaneSelectionPolicy.blankMayBecomeLane(receivedMessagesCount: 7, statefulRowExists: false),
-                "first contact with a lost first frame still bootstraps")
-    }
 
     // MARK: - Negative cache
 
