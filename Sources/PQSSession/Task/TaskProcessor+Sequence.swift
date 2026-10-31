@@ -797,7 +797,7 @@ extension MessagePipeline {
                 await session.markInboundFailure(message, failureClass: failureClass)
                 // Dead-epoch frames never heal by re-decrypt, only by the sender
                 // answering the NACK deferred above. Terminal is owned by
-                // oobUnavailable / resendSubmissionCap while that NACK is pending;
+                // oobUnavailable while that NACK is pending;
                 // this only terminalizes a tuple with no NACK left to answer.
                 await maybeTerminalizeDeadEpochInbound(message, session: session)
 
@@ -1257,10 +1257,9 @@ extension MessagePipeline {
     /// event told the host `inboundContentUnrecoverable` (spool purge + a
     /// `failed` receipt to the author) for content that arrived minutes later.
     ///
-    /// Terminal for a dead-epoch envelope is therefore owned by the events that
-    /// prove the sender cannot answer the NACK: `oobUnavailable`
-    /// (`handleOutOfBandResendUnavailable`) or `resendSubmissionCap`
-    /// (`sendDeferredResendRequests`). This path only terminalizes when no NACK
+    /// Terminal for a dead-epoch envelope is therefore owned by the event that
+    /// proves the sender cannot answer the NACK: `oobUnavailable`
+    /// (`handleOutOfBandResendUnavailable`). This path only terminalizes when no NACK
     /// is pending for the tuple, so a redelivery of an already-settled or
     /// cleared envelope is still swallowed without another OTK/peerRefresh storm.
     /// `markInboundContentUnrecoverable` is once-per-tuple, so redelivered
@@ -1405,40 +1404,6 @@ extension MessagePipeline {
         }
 
         if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
-            let submissionCount = await session.resendRequestSubmissionCount(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId,
-                failedMessageId: message.sharedMessageId)
-            if submissionCount >= PQSSessionConstants.peerResendRequestMaxSubmissions {
-                // Lost-NACK safety while awaiting sender: close this sharedId only.
-                await session.clearPendingResends(
-                    sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId,
-                    messageIds: [message.sharedMessageId])
-                auditInboundDecryptFailure(
-                    message: message,
-                    failureClass: failureClass,
-                    error: diagnostic,
-                    action: "contentUnrecoverable",
-                    suppressed: true,
-                    metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
-                let newlyTerminal = await session.markInboundContentUnrecoverable(
-                    sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId,
-                    sharedId: message.sharedMessageId)
-                if newlyTerminal {
-                    audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
-                    await session.sessionDelegate?.inboundContentUnrecoverable(
-                        senderSecretName: message.senderSecretName,
-                        senderDeviceId: message.senderDeviceId,
-                        sharedMessageId: message.sharedMessageId)
-                }
-                logger.log(
-                    level: .warning,
-                    message: "pqs.recovery.resendRequestExhausted failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) attempts=\(submissionCount)")
-                try await cache.deleteJob(job)
-                return .deleted
-            }
             // Already requested resend for this tuple; wait for sender orphanResend /
             // replay. Do not mint a receive-side repair session.
             auditInboundDecryptFailure(
@@ -1751,26 +1716,11 @@ extension MessagePipeline {
             deviceId: message.senderDeviceId,
             failedMessageId: message.sharedMessageId)
         if submissionCount >= PQSSessionConstants.peerResendRequestMaxSubmissions {
-            // Lost-NACK safety: the peer is expected to answer; when our NACK never
-            // arrives, stop asking for this sharedId only. Never open receive ASR.
-            await session.clearPendingResends(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId,
-                messageIds: [message.sharedMessageId])
+            // Rate limit, not a verdict (see `peerResendRequestMaxSubmissions`): stop
+            // asking for this sharedId in this process. Never open receive ASR.
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.resendRequestExhausted failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) attempts=\(submissionCount)")
-            let newlyTerminal = await session.markInboundContentUnrecoverable(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId,
-                sharedId: message.sharedMessageId)
-            if newlyTerminal {
-                audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
-                await session.sessionDelegate?.inboundContentUnrecoverable(
-                    senderSecretName: message.senderSecretName,
-                    senderDeviceId: message.senderDeviceId,
-                    sharedMessageId: message.sharedMessageId)
-            }
             return false
         }
 

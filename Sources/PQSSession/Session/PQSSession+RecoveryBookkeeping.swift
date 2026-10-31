@@ -1251,7 +1251,7 @@ extension PQSSession {
     /// The persist branch already clears the satisfied id via
     /// `takePendingResendsAfterReestablishment(satisfiedSharedMessageId:)`.
     /// Without this, a control frame that decrypts keeps its pending NACK,
-    /// re-NACKs on later drains, and can hit `resendSubmissionCap` /
+    /// re-NACKs on later drains, and can hit the resend cap /
     /// `oobUnavailable` after the content was already accepted. Does not end
     /// the episode or drain sibling NACKs.
     func settlePendingResendForAcceptedEnvelope(
@@ -1282,7 +1282,7 @@ extension PQSSession {
     /// (S12). Matching only on the envelope therefore never settles a replay:
     /// the original envelope stays pending, is re-NACKed at every drain boundary
     /// (`offlineReplayComplete`, next successful decrypt, peerRefresh response),
-    /// the sender replays again, and the loop only ends at `resendSubmissionCap`
+    /// the sender replays again, and the loop only ends at the resend cap
     /// — observed as repeated `resendRequestReceived` for identical ids after the
     /// content had already been delivered (dogfood 2026-09-24, same-account
     /// sibling bootstrap; also cross-account `sunflower`/`sdx26`).

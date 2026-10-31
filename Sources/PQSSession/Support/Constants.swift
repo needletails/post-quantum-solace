@@ -169,17 +169,18 @@ public enum PQSSessionConstants: Sendable {
     public static let recoveryTrackingMaxEntries = 512
 
     /// Maximum total resend-request submissions per failed message before the
-    /// requester drops it as exhausted. Defense in depth for when the responder's
-    /// `messageResendUnavailable` notice is lost in transit.
+    /// requester stops asking in this process. It counts requests sent, not answers,
+    /// so it is a rate limit and proves nothing about the content: only the responder's
+    /// `messageResendUnavailable` notice or a removed device ends recovery, and the
+    /// host's placeholder row re-arms the id on the next launch.
     public static let peerResendRequestMaxSubmissions = 3
 
     /// Sliding window for counting transport-confirmed resend-request submissions
     /// toward `peerResendRequestMaxSubmissions`. Drain events (episode end,
     /// offline replay boundary) are routinely further apart than the failure-policy
     /// cooldown; pruning attempts on that cooldown resets the cap between drains,
-    /// so a dead lane would re-NACK on every event and never terminalize. Aligned
-    /// with `terminalInboundOutcomeTTLSeconds` so exhaustion and quarantine expire
-    /// together.
+    /// so a dead lane would re-NACK on every event. Aligned with
+    /// `terminalInboundOutcomeTTLSeconds`.
     public static let resendRequestAttemptWindowSeconds: TimeInterval = 60 * 60 * 24 * 7
 
     /// Distinct undecryptable inbound messages from the same peer device after which

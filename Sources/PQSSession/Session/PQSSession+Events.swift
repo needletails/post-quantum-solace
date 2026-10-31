@@ -280,7 +280,7 @@ public extension PQSSession {
             guard newlyTerminal else { continue }
             auditSink.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(messageId) sender=\(senderName) deviceId=\(senderDeviceId.uuidString) reason=oobUnavailable")
             // Protocol signal: drives the transport's terminal purge of the
-            // spool copy. Same contract as pending-resend TTL / resend-cap.
+            // spool copy.
             _ = await scheduleTransportProtocolWork {
                 await delegate?.inboundContentUnrecoverable(
                     senderSecretName: senderName,

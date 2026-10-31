@@ -1264,7 +1264,7 @@ extension MessagePipeline {
         for (key, groupedRequests) in grouped {
             var ready: [PQSSession.PendingResendAfterReestablishment] = []
             for pending in groupedRequests {
-                // Terminal cap: if the peer's unavailable notice never arrived, stop
+                // Rate limit, not a verdict (see `peerResendRequestMaxSubmissions`): stop
                 // after a bounded number of submissions instead of looping until the
                 // pending TTL. Dropped ids are not re-deferred.
                 let attempts = await session.resendRequestSubmissionCount(
@@ -1276,23 +1276,6 @@ extension MessagePipeline {
                         level: .warning,
                         message: "pqs.recovery.pendingResendExhausted sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId) failureClass=\(pending.failureClass) attempts=\(attempts)")
                     audit(.recovery, "pqs.recovery.pendingResendExhausted sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) failureClass=\(pending.failureClass) attempts=\(attempts)")
-                    // Terminal on the requester: stop asking and quarantine so poison
-                    // redelivery cannot reopen recovery for this sharedId.
-                    await session.clearPendingResends(
-                        sender: pending.senderName,
-                        deviceId: pending.senderDeviceId,
-                        messageIds: [pending.failedSharedMessageId])
-                    let newlyTerminal = await session.markInboundContentUnrecoverable(
-                        sender: pending.senderName,
-                        deviceId: pending.senderDeviceId,
-                        sharedId: pending.failedSharedMessageId)
-                    if newlyTerminal {
-                        audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(pending.failedSharedMessageId) sender=\(pending.senderName) deviceId=\(pending.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(attempts)")
-                        await session.sessionDelegate?.inboundContentUnrecoverable(
-                            senderSecretName: pending.senderName,
-                            senderDeviceId: pending.senderDeviceId,
-                            sharedMessageId: pending.failedSharedMessageId)
-                    }
                     continue
                 }
 

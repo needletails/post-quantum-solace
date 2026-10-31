@@ -691,7 +691,7 @@ extension MessagePipeline {
                 // Persist branch settles pending resend under `if canSaveMessage`
                 // below. Non-persist accepts must clear this frame's own NACK too,
                 // or later drains re-NACK an already-accepted envelope until
-                // `resendSubmissionCap`. Match by logical id as well: a sender
+                // the resend cap. Match by logical id as well: a sender
                 // resend of a failed control frame arrives under a new envelope id.
                 await session.settlePendingResendsForAcceptedInbound(
                     sender: inboundTask.senderSecretName,
