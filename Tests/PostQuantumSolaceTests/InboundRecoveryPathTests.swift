@@ -292,7 +292,8 @@ extension EndToEndTests {
         #expect(await pollUntil(timeout: 20) { await held.count == 1 })
         let frame = try #require(await held.take().first)
         let header = try BinaryDecoder().decode(RatchetMessage.self, from: try #require(frame.message.signed).data).header
-        #expect(try await pair.bob.removeOwnOneTimeKeys(x25519Id: try #require(header.oneTimeKeyId), mlKEMId: nil))
+        let oneTimeKeyId = try #require(header.oneTimeKeyId)
+        #expect(try await pair.bob.removeOwnOneTimeKeys(x25519Id: oneTimeKeyId, mlKEMId: nil))
         pair.aliceTransport.continuation?.yield(frame)
 
         // Child 02:10:08Z: the stateful rows said maxSkipped and the ensured blank said
@@ -330,7 +331,8 @@ extension EndToEndTests {
         let lane = try await openInitialChain(pair, frames: 2)
         let frame = lane.frames[1]
         let header = try BinaryDecoder().decode(RatchetMessage.self, from: try #require(frame.message.signed).data).header
-        #expect(try await pair.bob.removeOwnOneTimeKeys(x25519Id: try #require(header.oneTimeKeyId), mlKEMId: nil))
+        let oneTimeKeyId = try #require(header.oneTimeKeyId)
+        #expect(try await pair.bob.removeOwnOneTimeKeys(x25519Id: oneTimeKeyId, mlKEMId: nil))
 
         // Master 23:20:46Z: the row for a fresh lane has just become preferred, and the
         // frames still arriving belong to the row it archived.
