@@ -788,9 +788,10 @@ extension MessagePipeline {
                 servicedFromPersistedStore = true
             }
 
-            // Orphan-resend: a NACK alone never mints (dogfood C3 / 2FA48892
-            // triple newSessionId thrash). The replay rides a lane the
-            // requester has answered; a mint is initiating (msg0).
+            // Orphan-resend: a NACK mints only when no row can carry the replay
+            // (dogfood C3 / 2FA48892 triple newSessionId thrash). The replay rides
+            // a lane the requester has answered, else the live recovery row; a
+            // mint is initiating (msg0).
             var replayIdentity = identity
             var retransportCached = false
             let recoverySessionId = await session.orphanResendRecoverySessionId(
@@ -842,6 +843,14 @@ extension MessagePipeline {
                 answeredIdentity = candidate
                 break
             }
+            var liveRecoveryIdentity: SessionIdentity?
+            if let recovered = latestIdentities.first(where: { $0.id == recoverySessionId }),
+               let recoveredProps = await recovered.props(symmetricKey: symmetricKey),
+               !recoveredProps.deviceName.hasPrefix(
+                PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            {
+                liveRecoveryIdentity = recovered
+            }
             let remintDecision = OrphanResendRemintPolicy.decision(
                 messageRecordSessionId: requestedMessageRecord?.sessionIdentityId,
                 recoverySessionId: recoverySessionId,
@@ -849,6 +858,7 @@ extension MessagePipeline {
                 markIsStateLess: markIsStateLess,
                 citationProvesDeadLane: citationProvesDeadLane,
                 hasAnsweredLane: answeredIdentity != nil,
+                recoverySessionIsLiveActive: liveRecoveryIdentity != nil,
                 priorRetransportCount: priorRetransportCount,
                 remintsAfterRetransportProveFail: remintsAfterProveFail)
 
@@ -930,8 +940,8 @@ extension MessagePipeline {
                     audit(.recovery, "pqs.recovery.orphanResendStickyAdvancedRemint sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) priorSessionId=\(protectedId.uuidString)")
                 }
 
-            case .replayOnAnsweredLane:
-                // Continue a ratchet the requester can open. A NACK changes no
+            case .replayOnAnsweredLane, .reuseRecoveryWave:
+                // Continue a live ratchet with no mint. A NACK changes no
                 // lane, but a row its own replay proved dead leaves here. Left
                 // active, the write path rebinds this replay onto it, and two
                 // dead rows would trade the replay forever.
@@ -942,10 +952,10 @@ extension MessagePipeline {
                         secretName: requesterSecretName,
                         deviceId: request.requestingDeviceId)
                 }
-                if let answeredIdentity {
-                    replayIdentity = answeredIdentity
-                    identity = answeredIdentity
-                    audit(.recovery, "pqs.recovery.orphanResendReused sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(answeredIdentity.id.uuidString) reason=answeredLane")
+                if let reusedLane = answeredIdentity ?? liveRecoveryIdentity {
+                    replayIdentity = reusedLane
+                    identity = reusedLane
+                    audit(.recovery, "pqs.recovery.orphanResendReused sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(reusedLane.id.uuidString) reason=\(answeredIdentity == nil ? "reuseRecoveryWave" : "answeredLane")")
                 }
 
             case .exhaustedUnrecoverable:

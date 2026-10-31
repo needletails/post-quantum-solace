@@ -22,9 +22,9 @@ extension EndToEndTests {
 
         var keyFetches: Int { sink.lines(containing: "consumedOTK=true").count }
 
-        func record() async throws -> OutboundDeviceSendRecord {
+        func record(of id: String? = nil) async throws -> OutboundDeviceSendRecord {
             try #require(await pair.alice.outboundDeviceSendRecord(
-                sharedId: sharedId,
+                sharedId: id ?? sharedId,
                 recipientDeviceId: pair.bobDeviceId))
         }
 
@@ -265,6 +265,56 @@ extension EndToEndTests {
         #expect(minted.sessionIdentityId != sent.lane.id)
         #expect(minted.sessionIdentityId != newest.id)
         #expect(try await activeRowIds(sent) == [minted.sessionIdentityId])
+        #expect(sent.keyFetches == keyFetchesBefore + 1)
+        await sent.pair.finish()
+    }
+
+    /// A requester NACKs each failed frame, so one dead lane's frames arrive as separate
+    /// waves. The first proof mints and the rest ride that row, even a proof about the
+    /// row it replaced: each mint spends a one-time key and retires a row Bob may be
+    /// opening (dogfood C3 / 2FA48892 triple newSessionId thrash).
+    @Test("every failed frame of one dead lane rides the one recovery row")
+    func deadLaneFramesShareOneRecoveryRow() async throws {
+        let sent = try await sendOnAnsweredLane()
+        defer { Task { await shutdownSessions() } }
+        let alice = sent.pair.alice
+        sent.pair.aliceTransport.shouldDeliver = { _ in false }
+        var siblingIds: [String] = []
+        for _ in 1...3 {
+            let siblingId = "escape-proof-\(UUID().uuidString)"
+            try await alice.send(
+                recipient: .nickname("bob"),
+                text: "on the same lane",
+                sharedIdOverride: siblingId)
+            siblingIds.append(siblingId)
+        }
+        await alice.waitForOutboundJobDrain()
+        let original = try await sent.record()
+        _ = try await sent.nack(original.envelopeMessageId)
+        let replay = try await sent.record()
+        let keyFetchesBefore = sent.keyFetches
+
+        _ = try await sent.nack(replay.envelopeMessageId)
+        let recoveryRowId = try await sent.record().sessionIdentityId
+        #expect(recoveryRowId != sent.lane.id)
+        #expect(sent.keyFetches == keyFetchesBefore + 1)
+
+        let provenOnOldRowId = UUID().uuidString
+        await alice.recordOutboundDeviceSend(
+            sharedId: siblingIds[2],
+            recipientSecretName: "bob",
+            recipientDeviceId: sent.pair.bobDeviceId,
+            sessionIdentityId: sent.lane.id,
+            envelopeMessageId: provenOnOldRowId,
+            resendAttempt: 1)
+        _ = try await sent.nack(try await sent.record(of: siblingIds[0]).envelopeMessageId)
+        _ = try await sent.nack(try await sent.record(of: siblingIds[1]).envelopeMessageId)
+        _ = try await sent.nack(provenOnOldRowId)
+
+        for siblingId in siblingIds {
+            #expect(try await sent.record(of: siblingId).sessionIdentityId == recoveryRowId)
+        }
+        #expect(try await activeRowIds(sent) == [recoveryRowId])
         #expect(sent.keyFetches == keyFetchesBefore + 1)
         await sent.pair.finish()
     }

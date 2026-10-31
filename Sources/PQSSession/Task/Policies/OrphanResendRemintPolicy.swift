@@ -14,8 +14,9 @@
 //  3. remint spent + priorRetransportCount >= 1 → exhaustedUnrecoverable
 //
 //  Otherwise a replay rides the newest lane the peer has answered, with no mint and
-//  no one-time key. Only with no such lane does it take the sticky state-less mark
-//  (msg0 then msg1+ for the whole wave), then mint.
+//  no one-time key. With no such lane it takes the sticky state-less mark (msg0 then
+//  msg1+ for the whole wave), then the live recovery row, so the frames of one dead
+//  lane share one mint. Only a frame on that row itself, or no row at all, mints.
 //
 
 import Foundation
@@ -30,6 +31,9 @@ public enum OrphanResendRemintPolicy: Sendable {
         /// The peer has answered a live lane — continue that ratchet. Re-encrypting
         /// on an unanswered row would cite the same one-time key again.
         case replayOnAnsweredLane
+        /// Live recovery SessionID for this peer device — continue its ratchet (msg1+)
+        /// for a frame on another row. Do not mint a competing row.
+        case reuseRecoveryWave
         /// Escape remint already spent; MessageRecord settled on recovery —
         /// retransport the reminted orphan ciphertext once (not another remint).
         case retransportAlreadyServiced
@@ -58,6 +62,8 @@ public enum OrphanResendRemintPolicy: Sendable {
     ///     the live replay record but never proves it failed.
     ///   - hasAnsweredLane: a live row for this peer device has received frames, not
     ///     counting the row a proven citation names.
+    ///   - recoverySessionIsLiveActive: recovery SessionID names a live active row for
+    ///     this peer device.
     ///   - priorRetransportCount: how many times this sharedId was retransported after
     ///     escape remint (0 = first post-escape delivery → retransport reminted CT).
     ///   - remintsAfterRetransportProveFail: escape-hatch mints already used for this id.
@@ -69,6 +75,7 @@ public enum OrphanResendRemintPolicy: Sendable {
         markIsStateLess: Bool,
         citationProvesDeadLane: Bool = false,
         hasAnsweredLane: Bool = false,
+        recoverySessionIsLiveActive: Bool = false,
         priorRetransportCount: Int = 0,
         remintsAfterRetransportProveFail: Int = 0,
         maxRemintsAfterRetransportProveFail: Int = defaultMaxRemintsAfterRetransportProveFail
@@ -96,6 +103,10 @@ public enum OrphanResendRemintPolicy: Sendable {
 
         if initiatingMarkSessionId != nil, markIsStateLess {
             return .reuseStateLessMark
+        }
+
+        if recoverySessionIsLiveActive, messageRecordSessionId != recoverySessionId {
+            return .reuseRecoveryWave
         }
 
         return .mintFresh

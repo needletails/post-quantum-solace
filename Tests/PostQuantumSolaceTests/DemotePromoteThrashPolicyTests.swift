@@ -96,6 +96,25 @@ struct DemotePromoteThrashPolicyTests {
         #expect(decision == .mintFresh)
     }
 
+    @Test("P1: live recovery row carries another row's frame; its own frame still mints")
+    func liveRecoveryRowCarriesOnlyOtherRowsFrames() {
+        let recovery = UUID()
+        #expect(
+            OrphanResendRemintPolicy.decision(
+                messageRecordSessionId: UUID(),
+                recoverySessionId: recovery,
+                initiatingMarkSessionId: nil,
+                markIsStateLess: false,
+                recoverySessionIsLiveActive: true) == .reuseRecoveryWave)
+        #expect(
+            OrphanResendRemintPolicy.decision(
+                messageRecordSessionId: recovery,
+                recoverySessionId: recovery,
+                initiatingMarkSessionId: nil,
+                markIsStateLess: false,
+                recoverySessionIsLiveActive: true) == .mintFresh)
+    }
+
     @Test("P1: proven citation on recovery escape-remints first while budget remains")
     func messageRecordRecoveryEscapeRemintsFirst() {
         let id = UUID()
