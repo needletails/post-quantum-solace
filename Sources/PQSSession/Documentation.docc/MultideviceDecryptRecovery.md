@@ -258,9 +258,9 @@ accept-without-chat-row) `settlePendingResendsForAcceptedInbound` clears
 every entry on that peer-device lane whose envelope id, or recorded
 logical id, equals the accepted envelope/logical id, lifts the terminal
 mark, and audits `pendingResendSettled reason=logicalReplay` /
-`recovered`. Host placeholder rows and the durable ledger are keyed by
-the logical id (`resolveInboundLogicalSharedId` in nudge-kit) so the
-replay heals in place and `inboundCiphertextAccepted` clears the entry.
+`recovered`. Host placeholder rows are keyed by the logical id
+(`resolveInboundLogicalSharedId` in nudge-kit) so the replay heals in
+place.
 Legacy packets without a logical id keep envelope-only matching (T18).
 
 ### S13 — OOB retry names exact envelope + requester device

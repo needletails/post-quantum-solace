@@ -1473,6 +1473,7 @@ extension MessagePipeline {
         // row with a fresh UUID. The sender-tuple match keeps this from ever colliding
         // with a *different* sender's frame or with our own outbound record for the same
         // conversation.
+        var misfiledPlaceholder: EncryptedMessage?
         if let existing = try await cache.fetchMessageIfExists(
             sharedId: inboundTask.resolvedLogicalSharedId),
            let existingProps = await existing.props(symmetricKey: databaseSymmetricKey),
@@ -1500,7 +1501,15 @@ extension MessagePipeline {
                     conversationRecipient: decodedMessage.recipient)
                 return
             }
-            try await cache.deleteMessage(existing)
+            misfiledPlaceholder = existing
+        }
+
+        // Content first: until it exists the placeholder is the only durable record of
+        // the message, and any exit below this point has to leave it in place.
+        func persist(_ messageModel: EncryptedMessage) async throws {
+            try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            guard let misfiledPlaceholder else { return }
+            try await cache.deleteMessage(misfiledPlaceholder)
             audit(.recovery, "pqs.recovery.placeholderRefiled envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
         }
         
@@ -1561,7 +1570,7 @@ extension MessagePipeline {
                 }
             }
             
-            try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            try await persist(messageModel)
             logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
             audit(.recv, "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
                 level: .info)
@@ -1631,7 +1640,7 @@ extension MessagePipeline {
                 await session.receiverDelegate?.updatedCommunication(communicationModel, members: [mySecretName])
             }
             
-            try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            try await persist(messageModel)
             logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
             audit(.recv, "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
                 level: .info)
@@ -1700,7 +1709,7 @@ extension MessagePipeline {
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
             }
-            try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            try await persist(messageModel)
             if shouldUpdateCommunication,
                let members = await communicationModel.props(symmetricKey: databaseSymmetricKey)?.members {
                 await session.receiverDelegate?.updatedCommunication(communicationModel, members: members)

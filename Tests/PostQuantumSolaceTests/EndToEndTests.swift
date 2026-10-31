@@ -4020,6 +4020,157 @@ actor EndToEndTests {
         _ = await bobTask?.value
     }
     
+    @Test("A refile whose channel persist throws leaves the placeholder in place")
+    func testRefileThatThrowsLeavesPlaceholderInPlace() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 8,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(until: .now + .milliseconds(50))
+            }
+            return false
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        aliceTask = Task {
+            for await received in aliceStream {
+                if received.sender == self.sMockUserData.ssn { continue }
+                _ = try? await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
+            }
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                if received.sender == self.rMockUserData.rsn { continue }
+                _ = try? await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received)
+            }
+        }
+        try await Task.sleep(until: .now + .milliseconds(100))
+
+        try await _senderSession.send(
+            recipient: .nickname("bob"),
+            text: "establish lane")
+        #expect(
+            await waitUntil {
+                await recipientStore.getAllMessages().contains { $0.sharedId != "" }
+            },
+            "Establish message must persist before staging the placeholder")
+
+        guard let aliceDeviceId = await _senderSession.sessionContext?.sessionUser.deviceId,
+              let bobConversation = try await recipientStore.fetchCommunications().first else {
+            Issue.record("Alice device id or Bob's conversation missing")
+            return
+        }
+        let databaseKey = try await _recipientSession.getDatabaseSymmetricKey()
+        let sessionContextId = await _recipientSession.sessionContext?.sessionContextId ?? 0
+
+        let channelName = "room"
+        let channelMetadata = try BinaryEncoder().encode(ChannelInfo(
+            name: channelName,
+            administrator: "alice",
+            members: ["alice", "bob"],
+            operators: ["alice"]))
+        try await senderStore.createCommunication(BaseCommunication(
+            id: UUID(),
+            props: .init(
+                messageCount: 0,
+                administrator: "alice",
+                operators: ["alice"],
+                members: ["alice", "bob"],
+                metadata: channelMetadata,
+                blockedMembers: [],
+                communicationType: .channel(channelName)),
+            symmetricKey: try await _senderSession.getDatabaseSymmetricKey()))
+
+        // A channel message's placeholder is filed in the sender's DM.
+        let sharedId = UUID().uuidString
+        let messageId = UUID()
+        let placeholder = try EncryptedMessage(
+            id: messageId,
+            communicationId: bobConversation.id,
+            sessionContextId: sessionContextId,
+            sharedId: sharedId,
+            sequenceNumber: 1,
+            props: EncryptedMessage.UnwrappedProps(
+                id: messageId,
+                base: bobConversation,
+                sentDate: Date(),
+                receiveDate: Date(),
+                deliveryState: .waitingDelivery,
+                message: CryptoMessage(
+                    text: "",
+                    metadata: Data(),
+                    recipient: .nickname("alice"),
+                    transportInfo: SessionDelegate.recoveryPlaceholderMarker,
+                    sentDate: Date(),
+                    destructionTime: nil),
+                senderSecretName: "alice",
+                senderDeviceId: aliceDeviceId),
+            symmetricKey: databaseKey)
+        try await recipientStore.createMessage(placeholder, symmetricKey: databaseKey)
+        await recipientStore.failCreateMessage(sharedId: sharedId)
+
+        try await _senderSession.send(
+            recipient: .channel(channelName),
+            text: "channel body",
+            metadata: channelMetadata,
+            sharedIdOverride: sharedId)
+
+        // Same sender, same queue: once this persists the channel frame has been handled.
+        try await _senderSession.send(
+            recipient: .nickname("bob"),
+            text: "after the channel frame")
+        #expect(
+            await waitUntil {
+                for row in await recipientStore.getAllMessages() {
+                    if await row.props(symmetricKey: databaseKey)?.message.text == "after the channel frame" {
+                        return true
+                    }
+                }
+                return false
+            },
+            "The frame after the channel message must persist, proving the channel frame was handled")
+
+        let rows = await recipientStore.getAllMessages().filter { $0.sharedId == sharedId }
+        #expect(rows.map(\.id) == [messageId], "Until the content exists the placeholder is the only record of the message")
+
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await aliceTask?.value
+        _ = await bobTask?.value
+    }
+
     @Test("Device Synchronization Issues - Simulate Clock Drift and Processing Delays")
     func testDeviceSynchronizationIssues() async throws {
         // Setup two devices with their own sessions
@@ -12385,6 +12536,7 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     var localDeviceSalt: String?
     var encyrptedConfigurationForTesting = Data()
     var createdMessages = [EncryptedMessage]()
+    var failingCreateMessageSharedId: String?
     var contacts = [ContactModel]()
     let recoveryLedger = InMemoryRecoveryLedger()
     /// Disk-persistence boundary spy: jobs currently retained by the store.
@@ -12569,7 +12721,14 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     }
     
     func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {
+        if message.sharedId == failingCreateMessageSharedId {
+            throw PQSError.databaseNotInitialized
+        }
         createdMessages.append(message)
+    }
+
+    func failCreateMessage(sharedId: String) {
+        failingCreateMessageSharedId = sharedId
     }
     
     func getAllMessages() async -> [EncryptedMessage] {

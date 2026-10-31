@@ -736,7 +736,7 @@ extension PQSSession {
     }
 
     /// Lane prune already decided this device is gone. Clear its pending
-    /// resends and tell the host so the durable ledger cannot rearm them.
+    /// resends and tell the host so its placeholder rows cannot rearm them.
     func dropPendingResendsForRemovedDevice(sender: String, deviceId: UUID) async {
         let pending = await takePendingResendsAfterReestablishment(
             sender: sender,
@@ -754,7 +754,7 @@ extension PQSSession {
     private enum ReplacedDeviceHostSignal: Sendable {
         /// New inbound miss: delete the spool copy without a placeholder.
         case purgeSpool
-        /// Pending id or relaunch rearm: clear the durable recovery ledger.
+        /// Pending id or relaunch rearm: retire the host's placeholder row.
         case terminal
     }
 
@@ -1107,7 +1107,7 @@ extension PQSSession {
 
     /// Resolves the id a resend request cites to the envelope record it names for
     /// the requesting device: by envelope id (§4.1), else by logical shared id — a
-    /// host re-arm from the placeholder ledger cites the logical id (S12a). Either
+    /// host re-arm from a placeholder row cites the logical id (S12a). Either
     /// way the record must be one this device addressed to that device.
     func outboundDeviceSendRecord(
         citedId: String,
