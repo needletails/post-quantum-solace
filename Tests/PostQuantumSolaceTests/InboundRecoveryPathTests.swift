@@ -554,6 +554,30 @@ extension EndToEndTests {
         await pair.finish()
     }
 
+    @Test("a replay after the host deleted the placeholder creates the row")
+    func replayAfterTheHostDeletedThePlaceholderCreatesTheRow() async throws {
+        let pair = try await connectedPair()
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+
+        // F5C42C7B's shape: an unavailable notice deletes the placeholder through the raw
+        // store while a replay is in flight, so PQS's cache still lists the row.
+        let sharedId = "placeholder-\(UUID().uuidString)"
+        try await seedChatRowOnBob(
+            pair, sharedId: sharedId, text: "", deliveryState: .waitingDelivery,
+            transportInfo: SessionDelegate.recoveryPlaceholderMarker)
+        let placeholder = try #require(await pair.bobStore.getAllMessages().first { $0.sharedId == sharedId })
+        try await pair.bobStore.deleteMessage(placeholder)
+
+        try await pair.alice.send(recipient: .nickname("bob"), text: "the content", sharedIdOverride: sharedId)
+
+        #expect(await persisted(pair.bob, sharedId))
+        #expect(await pollUntil(timeout: 20) {
+            await pair.bobStore.getAllMessages().filter { $0.sharedId == sharedId }.count == 1
+        }, "the decrypted frame reached the store, not only the cached list")
+        await pair.finish()
+    }
+
     @Test("a content row in .failed is not replaced by a redelivered copy")
     func contentRowInFailedIsNotReplaced() async throws {
         let sink = RecordingAuditSink()

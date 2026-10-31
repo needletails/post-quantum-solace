@@ -12738,8 +12738,13 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
         return createdMessages
     }
     
-    func updateMessage(_: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws
-    {}
+    /// As SQLiteStore: an update of a row that is gone throws `recordNotFound`.
+    func updateMessage(_ message: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws {
+        guard let index = createdMessages.firstIndex(where: { $0.id == message.id }) else {
+            throw SessionCache.CacheErrors.messageNotFound
+        }
+        createdMessages[index] = message
+    }
     func removeMessage(_: SessionModels.EncryptedMessage) async throws {}
     func deleteMessage(_ message: SessionModels.EncryptedMessage) async throws {
         createdMessages.removeAll(where: { $0.id == message.id })
