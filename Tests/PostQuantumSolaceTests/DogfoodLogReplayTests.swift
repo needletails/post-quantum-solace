@@ -960,6 +960,7 @@ struct DogfoodOrphanRemintThrashPolicyTests {
             recoverySessionId: recoverySessionId,
             initiatingMarkSessionId: initiatingMark,
             markIsStateLess: markIsStateLess,
+            citationProvesDeadLane: true,
             priorRetransportCount: 0,
             remintsAfterRetransportProveFail: 0)
         #expect(
@@ -974,6 +975,7 @@ struct DogfoodOrphanRemintThrashPolicyTests {
             recoverySessionId: recoverySessionId,
             initiatingMarkSessionId: initiatingMark,
             markIsStateLess: markIsStateLess,
+            citationProvesDeadLane: true,
             priorRetransportCount: 0,
             remintsAfterRetransportProveFail: 1)
         #expect(postEscape == .retransportAlreadyServiced)
@@ -987,33 +989,34 @@ struct DogfoodOrphanRemintThrashPolicyTests {
             messageRecordSessionId: sessionId,
             recoverySessionId: sessionId,
             initiatingMarkSessionId: sessionId,
-            markIsStateLess: false)
+            markIsStateLess: false,
+            citationProvesDeadLane: true)
         #expect(
             decision == .mintFreshAfterRetransportProveFailed,
             "BUG: settled recovery with budget must escape-remint, got \(decision)")
     }
 
-    @Test("dogfood C3c: live recovery reuses wave for unrelated MessageRecord")
-    func dogfoodC3c_liveRecoveryReusesWaveForUnrelatedMessageRecord() {
+    @Test("dogfood C3c: answered lane carries a replay for unrelated MessageRecord")
+    func dogfoodC3c_answeredLaneCarriesReplayForUnrelatedMessageRecord() {
         let decision = OrphanResendRemintPolicy.decision(
             messageRecordSessionId: UUID(),
             recoverySessionId: UUID(),
             initiatingMarkSessionId: nil,
             markIsStateLess: false,
-            recoverySessionIsLiveActive: true)
+            hasAnsweredLane: true)
         #expect(
-            decision == .reuseRecoveryWave,
-            "BUG: live recovery reminted instead of wave reuse, got \(decision)")
+            decision == .replayOnAnsweredLane,
+            "BUG: answered lane reminted instead of carrying the replay, got \(decision)")
     }
 
-    @Test("dogfood C3c: dead recovery still allows mint for unrelated MessageRecord")
-    func dogfoodC3c_deadRecoveryStillMints() {
+    @Test("dogfood C3c: no answered lane still allows mint for unrelated MessageRecord")
+    func dogfoodC3c_noAnsweredLaneStillMints() {
         let decision = OrphanResendRemintPolicy.decision(
             messageRecordSessionId: UUID(),
             recoverySessionId: UUID(),
             initiatingMarkSessionId: nil,
             markIsStateLess: false,
-            recoverySessionIsLiveActive: false)
+            hasAnsweredLane: false)
         #expect(decision == .mintFresh)
     }
 }

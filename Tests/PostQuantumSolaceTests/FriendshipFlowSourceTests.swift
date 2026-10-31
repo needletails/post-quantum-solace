@@ -76,7 +76,7 @@
 //      EnvelopeMessageIdTests T17, OrphanInPlaceHealTests P1b.
 //  sticky orphan wave drain does not clear mark
 //      Covered by OrphanInPlaceHealTests P3 + DogfoodLogReplayTests C3* +
-//      DemotePromoteThrashPolicyTests P1 reuseRecoveryWave.
+//      DemotePromoteThrashPolicyTests P1 replayOnAnsweredLane.
 //  non-viable transport parks recovery outbound / enqueue persists without enqueue
 //      Covered by SessionConcurrencyHardeningTests + OutboundJobEnqueueTests nonviable compose.
 //  failed orphan replay re-arms bounded NACK; personal refresh cannot stomp orphan lane

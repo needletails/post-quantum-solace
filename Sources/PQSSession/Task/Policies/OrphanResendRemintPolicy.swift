@@ -2,20 +2,20 @@
 //  OrphanResendRemintPolicy.swift
 //  post-quantum-solace
 //
-//  Orphan-resend remint gate. After MessageRecord settles on the recovery
-//  SessionID, a peer NACK means that recovery ciphertext already failed to
-//  decrypt (typically blankForHeaderExists). Retransporting the identical
-//  signed payload cannot clear that trap and cannot change nackFrameFingerprint,
-//  so the requester never rearms — escape remint would never run.
+//  Orphan-resend remint gate. A peer NACK says one frame failed, not that its lane
+//  is dead. Only a NACK citing a replay's own envelope proves that: that ciphertext
+//  already failed to decrypt (typically blankForHeaderExists), and retransporting
+//  the identical signed payload cannot clear that trap and cannot change
+//  nackFrameFingerprint, so the requester never rearms.
 //
-//  Settled ladder (hard-capped):
+//  Proven on the recovery SessionID, the ladder runs (hard-capped):
 //  1. remint budget remaining → one escape remint (new OTK header)
 //  2. remint spent + priorRetransportCount == 0 → retransport the reminted CT
 //  3. remint spent + priorRetransportCount >= 1 → exhaustedUnrecoverable
 //
-//  One recovery SessionID per peer-device wave: unrecovered sharedIds re-encrypt on
-//  the same ratchet (msg0 then msg1+). Do not mintFresh solely because MessageRecord
-//  still names an unrelated historical session.
+//  Otherwise a replay rides the newest lane the peer has answered, with no mint and
+//  no one-time key. Only with no such lane does it take the sticky state-less mark
+//  (msg0 then msg1+ for the whole wave), then mint.
 //
 
 import Foundation
@@ -27,9 +27,9 @@ public enum OrphanResendRemintPolicy: Sendable {
         case mintFresh
         /// Sticky mark still names a state-less row — reuse it (no remint).
         case reuseStateLessMark
-        /// Live recovery SessionID for this peer-device wave — continue ratchet
-        /// (msg1+) for unrecovered sharedIds; do not mint a competing blank.
-        case reuseRecoveryWave
+        /// The peer has answered a live lane — continue that ratchet. Re-encrypting
+        /// on an unanswered row would cite the same one-time key again.
+        case replayOnAnsweredLane
         /// Escape remint already spent; MessageRecord settled on recovery —
         /// retransport the reminted orphan ciphertext once (not another remint).
         case retransportAlreadyServiced
@@ -53,8 +53,11 @@ public enum OrphanResendRemintPolicy: Sendable {
     ///     (`orphanResendRecoverySessionByPeer`).
     ///   - initiatingMarkSessionId: sticky initiating mark, if any.
     ///   - markIsStateLess: whether the marked row is still state-less (msg0-capable).
-    ///   - recoverySessionIsLiveActive: recovery SessionID names a live active row
-    ///     (state-less or advanced) for this peer device.
+    ///   - citationProvesDeadLane: the request cited this record's own envelope and that
+    ///     envelope is a replay (`resendAttempt > 0`). A logical-id citation resolves to
+    ///     the live replay record but never proves it failed.
+    ///   - hasAnsweredLane: a live row for this peer device has received frames, not
+    ///     counting the row a proven citation names.
     ///   - priorRetransportCount: how many times this sharedId was retransported after
     ///     escape remint (0 = first post-escape delivery → retransport reminted CT).
     ///   - remintsAfterRetransportProveFail: escape-hatch mints already used for this id.
@@ -64,15 +67,17 @@ public enum OrphanResendRemintPolicy: Sendable {
         recoverySessionId: UUID?,
         initiatingMarkSessionId: UUID?,
         markIsStateLess: Bool,
-        recoverySessionIsLiveActive: Bool = false,
+        citationProvesDeadLane: Bool = false,
+        hasAnsweredLane: Bool = false,
         priorRetransportCount: Int = 0,
         remintsAfterRetransportProveFail: Int = 0,
         maxRemintsAfterRetransportProveFail: Int = defaultMaxRemintsAfterRetransportProveFail
     ) -> Decision {
-        // Settled MessageRecord == recovery: peer NACK is already prove-fail for that
-        // CT (identical retransport cannot rearm). Escape remint first while budget
-        // remains; then one retransport of the reminted CT; then terminal.
-        if let messageRecordSessionId,
+        // Proven dead on the recovery lane (identical retransport cannot rearm).
+        // Escape remint first while budget remains; then one retransport of the
+        // reminted CT; then terminal.
+        if citationProvesDeadLane,
+           let messageRecordSessionId,
            let recoverySessionId,
            messageRecordSessionId == recoverySessionId
         {
@@ -85,26 +90,24 @@ public enum OrphanResendRemintPolicy: Sendable {
             return .retransportAlreadyServiced
         }
 
-        if initiatingMarkSessionId != nil, markIsStateLess {
-            return .reuseStateLessMark
+        if hasAnsweredLane {
+            return .replayOnAnsweredLane
         }
 
-        // Wave reuse: live recovery lane continues the ratchet for other sharedIds
-        // whose MessageRecord still names a dead historical session.
-        if recoverySessionId != nil, recoverySessionIsLiveActive {
-            return .reuseRecoveryWave
+        if initiatingMarkSessionId != nil, markIsStateLess {
+            return .reuseStateLessMark
         }
 
         return .mintFresh
     }
 
-    /// Escape remint: MessageRecord already settled on the recovery SessionID and the
-    /// remint budget remains. Used to order escape candidates ahead of sibling
-    /// `reuseRecoveryWave` encrypts so they do not advance a blankForHeaderExists-
-    /// poisoned recovery row first.
+    /// Escape remint: a proven citation on the recovery SessionID with remint budget
+    /// left. Used to order escape candidates ahead of sibling replays so they do not
+    /// advance a blankForHeaderExists-poisoned recovery row first.
     public static func needsEscapeRemintAfterRetransportProveFail(
         messageRecordSessionId: UUID?,
         recoverySessionId: UUID?,
+        citationProvesDeadLane: Bool,
         priorRetransportCount: Int,
         remintsAfterRetransportProveFail: Int,
         maxRemintsAfterRetransportProveFail: Int = defaultMaxRemintsAfterRetransportProveFail
@@ -114,6 +117,7 @@ public enum OrphanResendRemintPolicy: Sendable {
             recoverySessionId: recoverySessionId,
             initiatingMarkSessionId: nil,
             markIsStateLess: false,
+            citationProvesDeadLane: citationProvesDeadLane,
             priorRetransportCount: priorRetransportCount,
             remintsAfterRetransportProveFail: remintsAfterRetransportProveFail,
             maxRemintsAfterRetransportProveFail: maxRemintsAfterRetransportProveFail

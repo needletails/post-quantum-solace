@@ -1120,20 +1120,16 @@ extension MessagePipeline {
         let priorAttempt = await session.outboundDeviceSendRecord(
             sharedId: outboundTask.sharedId,
             recipientDeviceId: props.deviceId)?.resendAttempt ?? -1
-        let isOrphanReplayForAttempt =
-            await session.isOrphanResendInitiatingSession(
-                secretName: props.secretName,
-                deviceId: props.deviceId,
-                sessionId: sessionIdentity.id)
-            || pendingResendReplayBySharedId[outboundTask.sharedId] != nil
+        // Servicing produced this envelope. Riding the orphan row does not make a
+        // frame a replay: its NACK would read as proof that the lane is dead.
+        let isOrphanReplay = pendingResendReplayBySharedId[outboundTask.sharedId] != nil
         await session.recordOutboundDeviceSend(
             sharedId: outboundTask.sharedId,
             recipientSecretName: props.secretName,
             recipientDeviceId: props.deviceId,
             sessionIdentityId: sessionIdentity.id,
             envelopeMessageId: envelopeMessageId,
-            resendAttempt: isOrphanReplayForAttempt ? max(0, priorAttempt) + 1 : 0)
-        let isOrphanReplay = isOrphanReplayForAttempt
+            resendAttempt: isOrphanReplay ? max(0, priorAttempt) + 1 : 0)
 
         try await transportDelegate.sendMessage(signedMessage, metadata: transportMetadata)
         
