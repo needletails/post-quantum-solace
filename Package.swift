@@ -28,7 +28,7 @@ let package = Package(
         .default(enabledTraits: ["PQSAuditLog"]),
     ],
     dependencies: [
-        // BRANCH ONLY, fix/child-decrypt-recovery: before merging, restore the URL requirement with the DRK release containing 608b17e.
+        // BRANCH ONLY, fix/child-decrypt-recovery: before merging, restore the URL requirement with the DRK release containing bcbb252.
 //        .package(url: "https://github.com/needletails/double-ratchet-kit.git", from: "<that release>"),
         .package(path: "../double-ratchet-kit"),
         .package(url: "https://github.com/needletails/binary-codable.git", "1.1.1"..<"2.0.0"),
