@@ -28,12 +28,12 @@ extension EndToEndTests {
                 recipientDeviceId: pair.bobDeviceId))
         }
 
-        /// Alice answers Bob's request for `citedId` and finishes the replay.
-        func nack(_ citedId: String) async throws -> PQSSession.OutOfBandResendResult {
+        /// Alice answers Bob's request for `citedIds` and finishes the replay.
+        func nack(_ citedIds: String...) async throws -> PQSSession.OutOfBandResendResult {
             let result = try await pair.alice.handleOutOfBandResendRequest(
                 from: "bob",
                 deviceId: pair.bobDeviceId,
-                failedSharedMessageIds: [citedId])
+                failedSharedMessageIds: citedIds)
             await pair.alice.waitForOutboundJobDrain()
             return result
         }
@@ -99,6 +99,25 @@ extension EndToEndTests {
         let replay = try await sent.record()
         #expect(replay.sessionIdentityId == sent.lane.id)
         #expect(replay.resendAttempt == 2)
+        await sent.pair.finish()
+    }
+
+    /// 02:11:07Z: a wave cited one message by more than one id. The logical id resolves
+    /// to the live replay, but only that replay's own envelope is proof, and this wave
+    /// names the original and an older replay.
+    @Test("a wave that names no live replay mints nothing")
+    func waveNamingNoLiveReplayMintsNothing() async throws {
+        let sent = try await sendOnAnsweredLane()
+        defer { Task { await shutdownSessions() } }
+        let original = try await sent.record()
+        let olderReplayId = await sent.seedReplayOnRecoveryLane()
+        _ = await sent.seedReplayOnRecoveryLane()
+        let keyFetchesBefore = sent.keyFetches
+
+        let result = try await sent.nack(original.envelopeMessageId, olderReplayId, sent.sharedId)
+
+        #expect(result.queuedIds == [original.envelopeMessageId, olderReplayId, sent.sharedId])
+        try await expectNoMint(sent, keyFetchesBefore: keyFetchesBefore)
         await sent.pair.finish()
     }
 

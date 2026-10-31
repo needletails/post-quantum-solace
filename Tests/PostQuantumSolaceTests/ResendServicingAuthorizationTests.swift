@@ -29,6 +29,10 @@ actor SentEnvelopeLog {
     func contains(after index: Int, where predicate: (ReceivedMessage) -> Bool) -> Bool {
         sent.dropFirst(index).contains(where: predicate)
     }
+
+    func count(after index: Int, where predicate: (ReceivedMessage) -> Bool) -> Int {
+        sent.dropFirst(index).filter(predicate).count
+    }
 }
 
 /// Keeps every audit line so a test can assert what reached the injected sink.
@@ -326,6 +330,101 @@ extension EndToEndTests {
             laneBefore,
             "after the wave")
         #expect(sink.lines(containing: "consumedOTK=true").count == keyFetchesBefore)
+        await pair.finish()
+    }
+
+    /// A settled pair with one persisted message from Alice, and a log of every
+    /// envelope she sends.
+    private func sendLoggedMessage() async throws -> (
+        pair: ConnectedPair,
+        log: SentEnvelopeLog,
+        sharedId: String,
+        envelopeId: String
+    ) {
+        let pair = try await connectedPair()
+        try await settleLanes(pair)
+        let log = SentEnvelopeLog()
+        pair.aliceTransport.duringSendMessage = { received in await log.record(received) }
+        let sharedId = "dm-\(UUID().uuidString)"
+        try await pair.alice.send(
+            recipient: .nickname("bob"),
+            text: "hello bob",
+            sharedIdOverride: sharedId)
+        await pair.alice.waitForOutboundJobDrain()
+        let envelope = try #require(await log.first { $0.logicalMessageId == sharedId })
+        return (pair, log, sharedId, envelope.messageId)
+    }
+
+    /// Bob's wave reaches Alice and every replay it queued leaves her device.
+    private func serviceWave(
+        _ citedIds: [String],
+        on pair: ConnectedPair
+    ) async throws -> PQSSession.OutOfBandResendResult {
+        let result = try await pair.alice.handleOutOfBandResendRequest(
+            from: "bob",
+            deviceId: pair.bobDeviceId,
+            failedSharedMessageIds: citedIds)
+        await pair.alice.waitForOutboundJobDrain()
+        return result
+    }
+
+    /// 02:11:08Z: a wave citing 8B2FF9BC and its logical id 61176234 sent two replays
+    /// of one message, A2D7E1C8 and 6AB795EB.
+    @Test("a wave citing the envelope and logical id of one message sends one replay")
+    func envelopeAndLogicalCitationsSendOneReplay() async throws {
+        let (pair, log, sharedId, envelopeId) = try await sendLoggedMessage()
+        defer { Task { await shutdownSessions() } }
+        let sentBefore = await log.count()
+
+        let result = try await serviceWave([envelopeId, sharedId], on: pair)
+
+        #expect(result.queuedIds == [envelopeId, sharedId])
+        #expect(await log.count(after: sentBefore) { $0.logicalMessageId == sharedId } == 1)
+        await pair.finish()
+    }
+
+    /// 02:10:03Z: the child's wave cited several envelopes of one logical id and
+    /// serviced drecv:3:EF7FAF06, drecv:3:124EF508 and drecv:3:8846FCA1 twice each.
+    @Test("two envelopes of one logical id send one replay")
+    func twoEnvelopesOfOneMessageSendOneReplay() async throws {
+        let (pair, log, sharedId, envelopeId) = try await sendLoggedMessage()
+        defer { Task { await shutdownSessions() } }
+        _ = try await serviceWave([envelopeId], on: pair)
+        let replay = try #require(await pair.alice.outboundDeviceSendRecord(
+            sharedId: sharedId,
+            recipientDeviceId: pair.bobDeviceId))
+        let sentBefore = await log.count()
+
+        let result = try await serviceWave([envelopeId, replay.envelopeMessageId], on: pair)
+
+        #expect(result.queuedIds == [envelopeId, replay.envelopeMessageId])
+        #expect(await log.count(after: sentBefore) { $0.logicalMessageId == sharedId } == 1)
+        await pair.finish()
+    }
+
+    /// The servicing cooldown holds back repeats of a logical id. A failed replay is
+    /// NACKed by its own envelope a second or two later and the requester has no other
+    /// ask for that envelope, so the NACK must get through, even beside the logical id.
+    @Test("a NACK citing a replay's envelope inside 15 s is still serviced")
+    func replayEnvelopeNackInsideCooldownIsServiced() async throws {
+        let (pair, log, sharedId, envelopeId) = try await sendLoggedMessage()
+        defer { Task { await shutdownSessions() } }
+        _ = try await serviceWave([envelopeId], on: pair)
+        let replay = try #require(await pair.alice.outboundDeviceSendRecord(
+            sharedId: sharedId,
+            recipientDeviceId: pair.bobDeviceId))
+        #expect(replay.envelopeMessageId != envelopeId)
+        #expect(
+            await !pair.alice.canServicePeerResendRequest(
+                requestingDeviceId: pair.bobDeviceId,
+                sharedId: sharedId),
+            "the replay's transport arms the cooldown")
+        let sentBefore = await log.count()
+
+        let result = try await serviceWave([replay.envelopeMessageId, sharedId], on: pair)
+
+        #expect(result.queuedIds == [replay.envelopeMessageId, sharedId])
+        #expect(await log.count(after: sentBefore) { $0.logicalMessageId == sharedId } == 1)
         await pair.finish()
     }
 }

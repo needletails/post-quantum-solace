@@ -53,7 +53,7 @@ public enum OrphanResendRemintPolicy: Sendable {
     ///     (`orphanResendRecoverySessionByPeer`).
     ///   - initiatingMarkSessionId: sticky initiating mark, if any.
     ///   - markIsStateLess: whether the marked row is still state-less (msg0-capable).
-    ///   - citationProvesDeadLane: the request cited this record's own envelope and that
+    ///   - citationProvesDeadLane: the request cited the live record's own envelope and that
     ///     envelope is a replay (`resendAttempt > 0`). A logical-id citation resolves to
     ///     the live replay record but never proves it failed.
     ///   - hasAnsweredLane: a live row for this peer device has received frames, not
