@@ -931,8 +931,17 @@ extension MessagePipeline {
                 }
 
             case .replayOnAnsweredLane:
-                // Continue a ratchet the requester can open. No lane changes:
-                // a NACK is not proof this lane is dead.
+                // Continue a ratchet the requester can open. A NACK changes no
+                // lane, but a row its own replay proved dead leaves here. Left
+                // active, the write path rebinds this replay onto it, and two
+                // dead rows would trade the replay forever.
+                if let provenDeadLane = latestIdentities.first(where: { $0.id == provenDeadLaneId }) {
+                    _ = try? await session.demoteActiveSessionIdentityToInactive(provenDeadLane)
+                    await session.invalidateSessionIdentityCache(secretName: requesterSecretName)
+                    clearPreferredSessionIdentity(
+                        secretName: requesterSecretName,
+                        deviceId: request.requestingDeviceId)
+                }
                 if let answeredIdentity {
                     replayIdentity = answeredIdentity
                     identity = answeredIdentity

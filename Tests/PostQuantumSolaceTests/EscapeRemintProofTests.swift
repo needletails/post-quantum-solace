@@ -73,6 +73,12 @@ extension EndToEndTests {
         return SentOnAnsweredLane(pair: pair, sink: sink, lane: lane, sharedId: sharedId)
     }
 
+    /// Alice's rows for Bob that are still active.
+    private func activeRowIds(_ sent: SentOnAnsweredLane) async throws -> Set<UUID> {
+        let rows = try await rows(on: sent.pair.alice, peer: "bob", deviceId: sent.pair.bobDeviceId)
+        return Set(rows.filter { !$0.archived }.map(\.id))
+    }
+
     private func expectNoMint(_ sent: SentOnAnsweredLane, keyFetchesBefore: Int) async throws {
         expectSameLane(
             try await rows(on: sent.pair.alice, peer: "bob", deviceId: sent.pair.bobDeviceId),
@@ -219,6 +225,47 @@ extension EndToEndTests {
         let healed = try await sent.record()
         #expect(healed.sessionIdentityId == minted.id)
         #expect(healed.resendAttempt == 2)
+        await sent.pair.finish()
+    }
+
+    /// 01:41:46Z and sunflower 02:10:03Z: two answered rows and no marks, after a relaunch
+    /// or in the extension. The write path rebinds a replay to the newest answered row, so
+    /// a row left standing after its replay's NACK takes every later replay and nothing
+    /// ever mints.
+    @Test("a proven answered row leaves, so its sibling and then a mint carry the replay")
+    func provenAnsweredRowLeavesForItsSibling() async throws {
+        let sent = try await sendOnAnsweredLane()
+        defer { Task { await shutdownSessions() } }
+        let alice = sent.pair.alice
+        sent.pair.aliceTransport.shouldDeliver = { _ in false }
+        let key = try await alice.getDatabaseSymmetricKey()
+        let lane = try #require(
+            try await alice.cache?.fetchSessionIdentities().first { $0.id == sent.lane.id })
+        let props = try #require(await lane.props(symmetricKey: key))
+        let newest = try SessionIdentity(id: UUID(), props: props, symmetricKey: key)
+        try await alice.cache?.createSessionIdentity(newest)
+        await alice.messagePipeline.clearPreferredSessionIdentity(
+            secretName: "bob",
+            deviceId: sent.pair.bobDeviceId)
+        let original = try await sent.record()
+        let keyFetchesBefore = sent.keyFetches
+
+        _ = try await sent.nack(original.envelopeMessageId)
+        let onNewest = try await sent.record()
+        #expect(onNewest.sessionIdentityId == newest.id)
+
+        _ = try await sent.nack(onNewest.envelopeMessageId)
+        let onSibling = try await sent.record()
+        #expect(onSibling.sessionIdentityId == sent.lane.id)
+        #expect(try await activeRowIds(sent) == [sent.lane.id])
+        #expect(sent.keyFetches == keyFetchesBefore)
+
+        _ = try await sent.nack(onSibling.envelopeMessageId)
+        let minted = try await sent.record()
+        #expect(minted.sessionIdentityId != sent.lane.id)
+        #expect(minted.sessionIdentityId != newest.id)
+        #expect(try await activeRowIds(sent) == [minted.sessionIdentityId])
+        #expect(sent.keyFetches == keyFetchesBefore + 1)
         await sent.pair.finish()
     }
 
