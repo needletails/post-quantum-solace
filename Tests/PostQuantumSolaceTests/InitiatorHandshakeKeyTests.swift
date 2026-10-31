@@ -30,11 +30,11 @@ extension EndToEndTests {
     }
 
     /// Alice opens a fresh lane toward bob and sends one frame on it, held in transit.
-    private func heldFirstFrame(_ pair: ConnectedPair) async throws -> ReceivedMessage {
+    private func heldFirstFrame(_ pair: ConnectedPair, consumingAKey: Bool = true) async throws -> ReceivedMessage {
         _ = try await pair.alice.resetSessionIdentityForFreshSession(
             secretName: "bob",
             deviceId: pair.bobDeviceId,
-            sendOneTimeIdentities: true,
+            sendOneTimeIdentities: consumingAKey,
             reason: "test")
         let held = HeldFrames()
         pair.aliceTransport.shouldDeliver = { received in
@@ -185,6 +185,68 @@ extension EndToEndTests {
         #expect(embedded.dropFirst(citing.count).allSatisfy { $0 == nil }, "\(embedded)")
         #expect(citing.count < embedded.count, "both handshakes finished, so the key retired")
         #expect(Set(headers.map(\.ratchetEpochDigest)).count == 1, "no epoch re-key")
+        #expect(await pair.controls.reestablishments == 0)
+        await pair.finish()
+    }
+
+    /// A row that consumed no key leaves the ephemeral nothing to agree with. Embedded
+    /// anyway, it made bob's reply want a local key he could only mint, and a key new
+    /// to an established lane is a re-key the peer mirrors only in order: every turn
+    /// re-keyed, and a frame crossing one failed on every row.
+    @Test("a lane that consumed no key keeps one epoch with its first reply crossing a frame")
+    func laneWithoutAKeyKeepsOneEpochAcrossItsFirstReply() async throws {
+        let pair = try await connectedPair()
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        let first = try await heldFirstFrame(pair, consumingAKey: false)
+        #expect(try header(of: first).oneTimeKeyId == nil)
+        #expect(try header(of: first).remoteOneTimePublicKey == nil, "the ephemeral would agree with nothing")
+        _ = try await pair.bob.resetSessionIdentityForFreshSession(
+            secretName: "alice",
+            deviceId: pair.aliceDeviceId,
+            sendOneTimeIdentities: false,
+            reason: "test")
+        await deliverToBob(pair, first)
+
+        let toBob = HeldFrames()
+        let toAlice = HeldFrames()
+        pair.aliceTransport.shouldDeliver = { received in
+            guard received.recipient == "bob", received.isContentMessage else { return true }
+            await toBob.hold(received)
+            return false
+        }
+        pair.bobTransport.shouldDeliver = { received in
+            guard received.recipient == "alice", received.isContentMessage else { return true }
+            await toAlice.hold(received)
+            return false
+        }
+        try await pair.alice.send(recipient: .nickname("bob"), text: "second frame")
+        try await pair.bob.send(recipient: .nickname("alice"), text: "first reply")
+        #expect(await pollUntil(timeout: 20) { await toBob.count == 1 })
+        #expect(await pollUntil(timeout: 20) { await toAlice.count == 1 })
+        pair.aliceTransport.shouldDeliver = nil
+        pair.bobTransport.shouldDeliver = nil
+        let second = try #require(await toBob.take().first)
+        let reply = try #require(await toAlice.take().first)
+
+        let aliceBefore = await inboundCount(pair.alice)
+        let bobBefore = await inboundCount(pair.bob)
+        pair.aliceTransport.continuation?.yield(second)
+        pair.bobTransport.continuation?.yield(reply)
+        #expect(await pollUntil(timeout: 20) { await self.inboundCount(pair.bob) > bobBefore })
+        #expect(await pollUntil(timeout: 20) { await self.inboundCount(pair.alice) > aliceBefore })
+
+        for (session, before) in [(pair.alice, aliceBefore), (pair.bob, bobBefore)] {
+            let stats = try #require(await session.messagePipeline.inboundLaneSelectionStatsLog.dropFirst(before).first)
+            #expect(stats.winningLaneId != nil && stats.attempts.count == 1, "\(stats.candidateOrder)")
+        }
+        let headers = try [first, second, reply].map { try header(of: $0) }
+        #expect(Set(headers.map(\.ratchetEpochDigest)).count == 1, "no epoch re-key")
+
+        for (sender, recipient, receiver) in [(pair.alice, "bob", pair.bob), (pair.bob, "alice", pair.alice)] {
+            let next = try await sendAndAwaitInbound(from: sender, to: recipient, on: receiver, text: "after the crossing")
+            #expect(next.winningLaneId != nil && next.attempts.count == 1, "\(next.candidateOrder)")
+        }
         #expect(await pair.controls.reestablishments == 0)
         await pair.finish()
     }

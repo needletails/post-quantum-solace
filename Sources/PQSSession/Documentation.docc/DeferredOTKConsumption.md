@@ -88,9 +88,10 @@ Implementation points:
 - `TaskProcessor.updateOneTimeKey(remove:)` (`TaskProcessor+Ratchet.swift`)
   handles the consumption *request*: prune the spent signed public key,
   mint + publish the replacement, keep the private half. Replay-idempotent.
-- `loadKeys` never reads the pools. A lane's sending handshake takes a minted
-  ephemeral, held only in that lane's ratchet state, and the final MLKEM key.
-  A peer's reply cites that ephemeral, which no pool holds, so nothing here
+- `loadKeys` never reads the pools. A lane's sending handshake takes the final
+  MLKEM key and, on a row that consumed a peer's key, a minted ephemeral, held
+  only in that lane's ratchet state. A lane with state takes no new key. A
+  peer's reply cites that ephemeral, which no pool holds, so nothing here
   records it or touches a published key: the pools shrink only when a peer
   consumes a key.
 - `noteAcceptedInboundForDeferredOneTimeKeyConsumption`

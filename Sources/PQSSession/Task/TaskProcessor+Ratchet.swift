@@ -337,17 +337,16 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
     func loadKeys(
         props: SessionIdentity.UnwrappedProps,
         sessionContext: SessionContext,
-        session: PQSSession,
-        sessionIdentityId: UUID
+        session: PQSSession
     ) async throws -> LoadedKeysResult {
         /// Loads the key material for one outbound encrypt on one lane.
-        /// - No ratchet state: a handshake from a minted ephemeral and the final ML-KEM
-        ///   key, never a published key.
-        /// - Ratchet state: the keys in the lane's own snapshot.
+        /// - No ratchet state: a handshake from the final ML-KEM key, plus a minted
+        ///   ephemeral when the row consumed a peer's one-time key. Never a published key.
+        /// - Ratchet state: the keys in the lane's own snapshot, and no others.
         /// - Routine ML-KEM rotation due: the published bundle and the pool move on;
         ///   an established lane keeps its snapshot keys.
         
-        var localOneTimePrivateKey: X25519PrivateKey?
+        let localOneTimePrivateKey: X25519PrivateKey?
         var localMLKEMPrivateKey: MLKEMPrivateKey
         var remoteLongTermPublicKey: Data
         var remoteOneTimePublicKey: X25519PublicKey?
@@ -370,7 +369,10 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
             localMLKEMPrivateKey = props.ratchetMLKEMPrivateKey
                 ?? sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
         } else {
-            localOneTimePrivateKey = try mintHandshakeEphemeral()
+            // The ephemeral agrees only with a consumed key. With none it adds nothing to
+            // the handshake, and a peer that sees it embedded wants a local key on its
+            // reply, which only a re-key of the established lane can supply.
+            localOneTimePrivateKey = props.oneTimePublicKey == nil ? nil : try mintHandshakeEphemeral()
             localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
         }
         
@@ -392,17 +394,6 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
             localMLKEMPrivateKey = refreshedContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
         }
         
-        // Strict encrypt throws if a sending handshake still wants a remote OTK
-        // but the state copy of our local OTK is gone (cleared on inbound
-        // consume, or a reminted lane that kept peer OTK props). Mint one
-        // only while the sending handshake is unfinished — doing so after the
-        // handshake would look like a sending-key change and trigger a DH ratchet.
-        if localOneTimePrivateKey == nil,
-           let status = try? await ratchetManager.sessionStatus(sessionId: sessionIdentityId),
-           !status.sendingHandshakeFinished {
-            localOneTimePrivateKey = try mintHandshakeEphemeral()
-        }
-
         if shouldEmitKeyPayloadLogs {
             logger.log(level: .debug, message: """
                 loadKeys: recipient=\(props.secretName) \n
