@@ -1340,10 +1340,8 @@ actor TaskProcessorSequenceTests {
             )
             try await exhaustInboundHandshakeDeferrals()
             #expect(
-                await session.resendRequestSubmissionCount(
-                    sender: peerName,
-                    deviceId: peerDeviceId,
-                    failedMessageId: envelope) == min(attempt + 1, cap),
+                await transport.outOfBandResendRequestCalls.filter { $0.secretName == peerName }.count
+                    == min(attempt + 1, cap),
                 "Attempt \(attempt) must spend one of the message's \(cap) requests")
         }
 
@@ -4607,5 +4605,244 @@ actor ErrorTracker {
     
     func getErrorCount() -> Int {
         errorCount
+    }
+}
+
+// MARK: - Replay rearm across envelopes
+
+extension PQSSession {
+    func clearResendCooldownsForTests() { lastResendRequestAtByPeer.removeAll() }
+}
+
+extension MessagePipeline {
+    func preferredLaneForTests(secretName: String, deviceId: UUID, to id: UUID) {
+        preferredSessionIdentityIdByPeerDevice[
+            peerDeviceIdentityPreferenceKey(secretName: secretName, deviceId: deviceId)] = id
+    }
+    func preferredLaneForTests(secretName: String, deviceId: UUID) -> UUID? {
+        preferredSessionIdentityIdByPeerDevice[
+            peerDeviceIdentityPreferenceKey(secretName: secretName, deviceId: deviceId)]
+    }
+}
+
+/// Throws the error currently scripted for an envelope.
+actor ScriptedInboundErrors {
+    var byEnvelope: [String: Error] = [:]
+    func set(_ envelope: String, _ error: Error) { byEnvelope[envelope] = error }
+    func error(_ envelope: String) -> Error { byEnvelope[envelope] ?? RatchetError.maxSkippedHeadersExceeded }
+    var dropOn: Set<String> = []
+    func dropConnectivity(on envelope: String) { dropOn.insert(envelope) }
+    func takeDrop(_ envelope: String) -> Bool { dropOn.remove(envelope) != nil }
+}
+
+final class ScriptedInboundDelegate: TaskSequenceDelegate, @unchecked Sendable {
+    let script: ScriptedInboundErrors
+    init(script: ScriptedInboundErrors) { self.script = script }
+    func performRatchet(task: SessionModels.TaskType, session: PQSSession) async throws {
+        if case .streamMessage(let inbound) = task {
+            if await script.takeDrop(inbound.sharedMessageId) {
+                await session.setConnectivity(false)
+            }
+            throw await script.error(inbound.sharedMessageId)
+        }
+    }
+}
+
+extension TaskProcessorSequenceTests {
+    private func rearmSetup(peer: String) async throws -> (UUID, ScriptedInboundErrors) {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        let script = ScriptedInboundErrors()
+        await session.messagePipeline.setTaskDelegate(ScriptedInboundDelegate(script: script))
+        let bundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        await self.store.upsertUserConfiguration(
+            secretName: peer,
+            deviceId: bundle.deviceKeys.deviceId,
+            config: bundle.userConfiguration)
+        return (bundle.deviceKeys.deviceId, script)
+    }
+
+    private func rearmDeliver(_ inbound: InboundTaskMessage) async throws {
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .streamMessage(inbound)),
+            session: session)
+        try await exhaustInboundHandshakeDeferrals()
+    }
+
+    private func rearmFrame(_ peer: String, _ deviceId: UUID, _ envelope: String, _ logical: String) throws -> InboundTaskMessage {
+        try makeTestInboundTaskMessage(
+            senderSecretName: peer,
+            senderDeviceId: deviceId,
+            sharedMessageId: envelope,
+            logicalSharedId: logical)
+    }
+
+    private func rearmNacks(_ peer: String) async -> Int {
+        await transport.outOfBandResendRequestCalls.filter { $0.secretName == peer }.count
+    }
+
+    /// Host boundary: reconcileInboundRecoveryPlaceholders re-arms the placeholder's
+    /// logical id, then flushPendingResendsAfterOfflineReplay drains it.
+    private func rearmOfflineBoundary(_ peer: String, _ deviceId: UUID, logical: String) async {
+        await session.rearmInboundRecoveryPendingResend(sender: peer, deviceId: deviceId, sharedMessageId: logical)
+        await session.flushPendingResendsAfterOfflineReplay()
+    }
+
+    @Test("two offline boundaries while the sender is away leave the replay a NACK")
+    func testReplayRearmHostRearmBurnsReplayBudget() async throws {
+        let peer = "bob_probe_a"
+        let (deviceId, _) = try await rearmSetup(peer: peer)
+        let logical = "probe_a_message"
+        try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_a_env0", logical))
+        #expect(await rearmNacks(peer) == 1)
+        await rearmOfflineBoundary(peer, deviceId, logical: logical)
+        await session.clearResendCooldownsForTests()
+        await rearmOfflineBoundary(peer, deviceId, logical: logical)
+        await session.clearResendCooldownsForTests()
+        let before = await rearmNacks(peer)
+        // The sender comes back and answers. Its replay fails. Its proof NACK is the only
+        // thing that can get the lane minted.
+        try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_a_env1", logical))
+        let after = await rearmNacks(peer)
+        #expect(after == before + 1, "The failed replay must be cited: \(before) -> \(after)")
+        await session.shutdown()
+    }
+
+    @Test("coalesced envelope drained three times leaves the replay a NACK")
+    func testReplayRearmDrainsBurnReplayBudget() async throws {
+        let peer = "bob_probe_b"
+        let (deviceId, _) = try await rearmSetup(peer: peer)
+        let logical = "probe_b_message"
+        _ = await session.tryBeginReestablishmentEpisode(sender: peer, deviceId: deviceId, heldOfflineFramesCanHeal: false)
+        try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_b_env0", logical))
+        for _ in 0..<3 {
+            await session.flushPendingResendsAfterOfflineReplay()
+            await session.clearResendCooldownsForTests()
+        }
+        let before = await rearmNacks(peer)
+        await session.endReestablishmentEpisode(sender: peer, deviceId: deviceId)
+        await session.clearResendCooldownsForTests()
+        let mid = await rearmNacks(peer)
+        try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_b_env1", logical))
+        let after = await rearmNacks(peer)
+        #expect(after == mid + 1, "The failed replay must be cited: \(mid) -> \(after)")
+        await session.shutdown()
+    }
+
+    @Test("a sibling's unavailable notice must not refill a pending id's budget")
+    func testReplayRearmUnavailableResetsPendingBudget() async throws {
+        let peer = "bob_probe_c"
+        let (deviceId, _) = try await rearmSetup(peer: peer)
+        let logical = "probe_c_message"
+        try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_c_env0", logical))
+        await session.rearmInboundRecoveryPendingResend(sender: peer, deviceId: deviceId, sharedMessageId: logical)
+        var drainNacks = 0
+        let cycles = 8
+        for cycle in 1...cycles {
+            await session.clearResendCooldownsForTests()
+            let before = await rearmNacks(peer)
+            await session.flushPendingResendsAfterOfflineReplay()
+            drainNacks += await rearmNacks(peer) - before
+            let envelope = "probe_c_replay_\(cycle)"
+            try await rearmDeliver(try rearmFrame(peer, deviceId, envelope, logical))
+            await session.handleOutOfBandResendUnavailable(
+                from: peer,
+                deviceId: deviceId,
+                unavailableEnvelopeMessageIds: [envelope])
+        }
+        #expect(drainNacks <= PQSSessionConstants.peerResendRequestMaxSubmissions,
+                "The pending id must stop at the cap: \(drainNacks)")
+        await session.shutdown()
+    }
+
+    @Test("a copy of the original after a failed replay must not rearm")
+    func testReplayRearmOldFrameAfterReplayRearms() async throws {
+        let peer = "bob_probe_d"
+        let (deviceId, _) = try await rearmSetup(peer: peer)
+        let logical = "probe_d_message"
+        let original = try rearmFrame(peer, deviceId, "probe_d_env0", logical)
+        try await rearmDeliver(original)
+        try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_d_env1", logical))
+        let before = await rearmNacks(peer)
+        let healthyLane = UUID()
+        await session.messagePipeline.preferredLaneForTests(secretName: peer, deviceId: deviceId, to: healthyLane)
+        await session.clearResendCooldownsForTests()
+        try await rearmDeliver(original)
+        let after = await rearmNacks(peer)
+        let pin = await session.messagePipeline.preferredLaneForTests(secretName: peer, deviceId: deviceId)
+        #expect(after == before, "Same ciphertext must not spend an attempt")
+        #expect(pin == healthyLane, "Same ciphertext must not clear the pin")
+        await session.shutdown()
+    }
+
+    @Test("unlinked replay failing OTK takes the OTK path")
+    func testReplayRearmOtkUnlinkedReplay() async throws {
+        let peer = "bob_probe_e1"
+        let (deviceId, script) = try await rearmSetup(peer: peer)
+        let logical = "probe_e1_message"
+        try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_e1_env0", logical))
+        await script.set("probe_e1_env1", RatchetError.missingOneTimeKey)
+        try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_e1_env1", logical))
+        let awaiting = await session.isAwaitingSenderOrphanResend(sender: peer, deviceId: deviceId, messageId: "probe_e1_env1")
+        let pending = await session.hasPendingResendAfterReestablishment(sender: peer, deviceId: deviceId, failedMessageId: "probe_e1_env1")
+        #expect(pending, "OTK path defers its NACK")
+        await session.shutdown()
+    }
+
+    @Test("replay NACKed under another class then OTK stays awaiting")
+    func testReplayRearmOtkLinkedWithOwnNack() async throws {
+        let peer = "bob_probe_e2"
+        let (deviceId, script) = try await rearmSetup(peer: peer)
+        let logical = "probe_e2_message"
+        try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_e2_env0", logical))
+        let replay = try rearmFrame(peer, deviceId, "probe_e2_env1", logical)
+        try await rearmDeliver(replay)
+        await script.set("probe_e2_env1", RatchetError.missingOneTimeKey)
+        try await rearmDeliver(replay)
+        let pending = await session.hasPendingResendAfterReestablishment(sender: peer, deviceId: deviceId, failedMessageId: "probe_e2_env1")
+        let episode = await session.hasOpenReestablishmentEpisode(sender: peer, deviceId: deviceId)
+        #expect(!pending && !episode, "orphan resend owns it")
+        await session.shutdown()
+    }
+
+    @Test("replay linked with no NACK of its own, then OTK")
+    func testReplayRearmOtkLinkedWithoutOwnNack() async throws {
+        let peer = "bob_probe_e3"
+        let (deviceId, script) = try await rearmSetup(peer: peer)
+        let logical = "probe_e3_message"
+        try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_e3_env0", logical))
+        // Viability drops while the replay is decrypting: it parks with no NACK.
+        await script.dropConnectivity(on: "probe_e3_env1")
+        let replay = try rearmFrame(peer, deviceId, "probe_e3_env1", logical)
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .streamMessage(replay)),
+            session: session)
+        try await Task.sleep(until: .now + .seconds(1))
+        await script.set("probe_e3_env1", RatchetError.missingOneTimeKey)
+        await session.setConnectivity(true)
+        try await exhaustInboundHandshakeDeferrals()
+        let pending = await session.hasPendingResendAfterReestablishment(sender: peer, deviceId: deviceId, failedMessageId: "probe_e3_env1")
+        let episode = await session.hasOpenReestablishmentEpisode(sender: peer, deviceId: deviceId)
+        let nacks = await rearmNacks(peer)
+        #expect(pending, "With no NACK for this envelope the frame must stay in recovery")
+        await session.shutdown()
+    }
+
+    @Test("a count recorded before the link is stranded")
+    func testReplayRearmCountStrandedByLink() async throws {
+        let peer = "bob_probe_f"
+        let (deviceId, script) = try await rearmSetup(peer: peer)
+        let logical = "probe_f_message"
+        let frame = try rearmFrame(peer, deviceId, "probe_f_env0", logical)
+        await script.set("probe_f_env0", RatchetError.missingOneTimeKey)
+        try await rearmDeliver(frame)
+        await session.endReestablishmentEpisode(sender: peer, deviceId: deviceId)
+        await session.flushPendingResendsAfterOfflineReplay()
+        let first = await session.resendRequestSubmissionCount(sender: peer, deviceId: deviceId, failedMessageId: "probe_f_env0")
+        await script.set("probe_f_env0", RatchetError.maxSkippedHeadersExceeded)
+        try await rearmDeliver(frame)
+        let second = await session.resendRequestSubmissionCount(sender: peer, deviceId: deviceId, failedMessageId: "probe_f_env0")
+        #expect(second >= first, "The count must survive the link")
+        await session.shutdown()
     }
 }
