@@ -265,7 +265,7 @@ extension PQSSession {
             //
             // The privates are stored before the upload, so the server can only serve
             // keys this device can open. The publics wait for the upload: they count what
-            // the server took, so a failed upload leaves only unused privates behind.
+            // the server took.
             let snapshot = try await currentSessionContext(cache: cache)
             let secretName = snapshot.sessionUser.secretName
             let deviceId = snapshot.sessionUser.deviceId
@@ -298,7 +298,7 @@ extension PQSSession {
                     }
                 }
 
-                try await auditingBatchStage("upload", kind: .x25519) {
+                try await uploadingOneTimeKeyBatch(kind: .x25519, keyIds: privateOneTimeKeyPairs.map(\.id), cache: cache) {
                     try await transportDelegate?.updateOneTimeKeys(
                         for: secretName,
                         deviceId: deviceId.uuidString,
@@ -334,7 +334,7 @@ extension PQSSession {
                     }
                 }
 
-                try await auditingBatchStage("upload", kind: .mlKEM) {
+                try await uploadingOneTimeKeyBatch(kind: .mlKEM, keyIds: mlKEMOneTimeKeyPairs.map(\.id), cache: cache) {
                     try await transportDelegate?.updateOneTimeMLKEMKeys(
                         for: secretName,
                         deviceId: deviceId.uuidString,
@@ -405,6 +405,34 @@ extension PQSSession {
             let failure = error as NSError
             auditSink.log(.recovery, "pqs.otk.batchReplaceFailed kind=\(kind) stage=\(stage) error=\(failure.domain):\(failure.code)")
             throw error
+        }
+    }
+
+    /// Uploads a batch whose privates are already stored. `oneTimeKeyUploadFailed` is the
+    /// server's non-2xx answer, so the batch never landed and its privates come back out:
+    /// the retry mints its own, and orphans left in the pool would count against the
+    /// retained cap and evict keys in-flight frames still need. Any other failure may have
+    /// landed, so its privates stay.
+    private func uploadingOneTimeKeyBatch(
+        kind: KeyKind,
+        keyIds: [UUID],
+        cache: SessionCache,
+        _ upload: () async throws -> Void
+    ) async throws {
+        do {
+            try await auditingBatchStage("upload", kind: kind, upload)
+        } catch let sessionError as PQSError where sessionError == .oneTimeKeyUploadFailed {
+            try await auditingBatchStage("commit", kind: kind) {
+                _ = try await commitSessionContextMutation(cache: cache) { context in
+                    switch kind {
+                    case .x25519:
+                        context.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll { keyIds.contains($0.id) }
+                    case .mlKEM:
+                        context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll { keyIds.contains($0.id) }
+                    }
+                }
+            }
+            throw sessionError
         }
     }
 
@@ -493,7 +521,7 @@ extension PQSSession {
                 }
             }
 
-            try await auditingBatchStage("upload", kind: .x25519) {
+            try await uploadingOneTimeKeyBatch(kind: .x25519, keyIds: privateOneTimeKeyPairs.map(\.id), cache: cache) {
                 try await transportDelegate.updateOneTimeKeys(
                     for: secretName,
                     deviceId: deviceId.uuidString,
@@ -538,7 +566,7 @@ extension PQSSession {
                 }
             }
 
-            try await auditingBatchStage("upload", kind: .mlKEM) {
+            try await uploadingOneTimeKeyBatch(kind: .mlKEM, keyIds: mlKEMOneTimeKeyPairs.map(\.id), cache: cache) {
                 try await transportDelegate.updateOneTimeMLKEMKeys(
                     for: secretName,
                     deviceId: deviceId.uuidString,

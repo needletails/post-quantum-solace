@@ -68,6 +68,21 @@ actor KeyRotationTests {
         return (transport, cacheStore)
     }
 
+    private func refresh(_ kind: KeyKind, policy: PQSSession.OneTimeKeyRefreshPolicy) async -> Bool {
+        switch kind {
+        case .x25519: await session.refreshOneTimeKeysTask(policy: policy)
+        case .mlKEM: await session.refreshMLKEMOneTimeKeysTask(policy: policy)
+        }
+    }
+
+    private func heldPrivateIds(_ kind: KeyKind) async throws -> [UUID] {
+        let deviceKeys = try #require(await session.sessionContext).sessionUser.deviceKeys
+        switch kind {
+        case .x25519: return deviceKeys.oneTimePrivateKeys.map(\.id)
+        case .mlKEM: return deviceKeys.mlKEMOneTimePrivateKeys.map(\.id)
+        }
+    }
+
     private func makeLinkedSignedDevice(from context: SessionContext) throws -> UserConfiguration.SignedDeviceConfiguration {
         let signingPrivateKey = try Curve25519.Signing.PrivateKey(
             rawRepresentation: context.sessionUser.deviceKeys.signingPrivateKey
@@ -1479,6 +1494,63 @@ actor KeyRotationTests {
         #expect(held.isSuperset(of: before.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id)))
         #expect(after.activeUserConfiguration.signedOneTimePublicKeys.map(\.id)
             == before.activeUserConfiguration.signedOneTimePublicKeys.map(\.id))
+        await session.shutdown()
+    }
+
+    /// The retry that lands is the one that evicts, so a rejected attempt's privates must
+    /// not still be in the pool to count against the cap. The prior 200 lose only the 100
+    /// the new batch displaces, as with no failure at all.
+    @Test("a rejected upload costs no retained key when its retry lands", arguments: [KeyKind.x25519, .mlKEM])
+    func rejectedUploadThenRetryKeepsRetainedKeys(kind: KeyKind) async throws {
+        let (transport, _) = try await setupRotatableSession()
+        #expect(await refresh(kind, policy: .replacePublishedBatch))
+        let before = try await heldPrivateIds(kind)
+        #expect(before.count == PQSSessionConstants.retainedOneTimePrivateKeyCap)
+        await transport.setOTKUploadFailCount(1)
+
+        #expect(await refresh(kind, policy: .replacePublishedBatch))
+
+        let after = try await heldPrivateIds(kind)
+        #expect(after.count == PQSSessionConstants.retainedOneTimePrivateKeyCap)
+        #expect(Set(after).intersection(before).count == PQSSessionConstants.oneTimeKeyBatchSize)
+        await session.shutdown()
+    }
+
+    /// Top-ups have no cap, so a rejected attempt's privates would stay for good.
+    @Test("rejected top-ups leave no private behind", arguments: [KeyKind.x25519, .mlKEM])
+    func rejectedTopUpsLeaveNoPrivates(kind: KeyKind) async throws {
+        let (transport, _) = try await setupRotatableSession()
+        try await session.commitSessionContextMutation { context in
+            context.activeUserConfiguration.signedOneTimePublicKeys.removeLast(5)
+            context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeLast(5)
+            return true
+        }
+        let before = try await heldPrivateIds(kind)
+        await transport.setOTKUploadFailCount(6)
+
+        #expect(await refresh(kind, policy: .replenishBatch) == false)
+        #expect(await refresh(kind, policy: .replenishBatch) == false)
+
+        #expect(try await heldPrivateIds(kind) == before)
+        await session.shutdown()
+    }
+
+    /// An upload that died without an answer may have landed, so the server could be
+    /// serving this batch: its privates have to stay.
+    @Test("an upload with no answer keeps its privates", arguments: [KeyKind.x25519, .mlKEM])
+    func unansweredUploadKeepsPrivates(kind: KeyKind) async throws {
+        let (transport, _) = try await setupRotatableSession()
+        try await session.commitSessionContextMutation { context in
+            context.activeUserConfiguration.signedOneTimePublicKeys.removeLast(5)
+            context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeLast(5)
+            return true
+        }
+        let before = try await heldPrivateIds(kind)
+        await transport.setOTKUploadFailCount(1, error: URLError(.timedOut))
+
+        #expect(await refresh(kind, policy: .replenishBatch) == false)
+
+        #expect(try await heldPrivateIds(kind).count == before.count + 5)
         await session.shutdown()
     }
 
