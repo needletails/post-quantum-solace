@@ -1413,6 +1413,75 @@ actor KeyRotationTests {
         await session.shutdown()
     }
 
+    /// Dogfood 2026-10-28: 9CC8CF14 failed `missingOneTimeKey` on every row, which needs
+    /// a key this device held nowhere. An upload that outruns its commit can leave the
+    /// server serving exactly that: a batch whose private halves were never stored.
+    @Test("a batch this device could not store is never uploaded", arguments:
+            [KeyKind.x25519, .mlKEM],
+            [PQSSession.OneTimeKeyRefreshPolicy.replenishBatch, .replacePublishedBatch])
+    func failedCommitPublishesNoBatch(kind: KeyKind, policy: PQSSession.OneTimeKeyRefreshPolicy) async throws {
+        let (transport, cacheStore) = try await setupRotatableSession()
+        // Room for a replenish to mint, with every local public still on the server so
+        // no prune commit fails ahead of the batch.
+        try await session.commitSessionContextMutation { context in
+            context.activeUserConfiguration.signedOneTimePublicKeys.removeLast(5)
+            context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeLast(5)
+            return true
+        }
+        await transport.setOTKUploadFailCount(0)
+        await cacheStore.setReplaceLocalSessionContextError(PQSError.sessionEncryptionError)
+
+        let refreshed = switch kind {
+        case .x25519: await session.refreshOneTimeKeysTask(policy: policy)
+        case .mlKEM: await session.refreshMLKEMOneTimeKeysTask(policy: policy)
+        }
+
+        #expect(refreshed == false)
+        #expect(await transport.otkUploadAttemptCount == 0)
+        await cacheStore.setReplaceLocalSessionContextError(nil)
+        await session.shutdown()
+    }
+
+    @Test("a replacement key this device could not store is never uploaded")
+    func failedCommitPublishesNoReplacementKey() async throws {
+        let (transport, cacheStore) = try await setupRotatableSession()
+        let context = try #require(await session.sessionContext)
+        let spent = try #require(context.activeUserConfiguration.signedOneTimePublicKeys.first)
+        await transport.resetCallTracking()
+        await cacheStore.setReplaceLocalSessionContextError(PQSError.sessionEncryptionError)
+
+        let pipeline = await session.messagePipeline
+        await pipeline.bindSessionForTesting(session)
+        await pipeline.updateOneTimeKey(remove: spent.id)
+        for task in Array(await pipeline.updateKeyTasks.values) {
+            await task.value
+        }
+
+        #expect(await transport.updateOneTimeKeysCallCount == 0)
+        await cacheStore.setReplaceLocalSessionContextError(nil)
+        await session.shutdown()
+    }
+
+    /// Storing privates ahead of the upload must not cost anything when the upload then
+    /// fails: every retry mints a batch, and the retained pool is already at its cap.
+    @Test("failed uploads evict no retained key and leave the published list alone")
+    func failedUploadsKeepRetainedKeys() async throws {
+        let (transport, _) = try await setupRotatableSession()
+        #expect(await session.refreshOneTimeKeysTask(policy: .replacePublishedBatch))
+        let before = try #require(await session.sessionContext)
+        #expect(before.sessionUser.deviceKeys.oneTimePrivateKeys.count == PQSSessionConstants.retainedOneTimePrivateKeyCap)
+        await transport.setOTKUploadFailCount(3)
+
+        #expect(await session.refreshOneTimeKeysTask(policy: .replacePublishedBatch) == false)
+
+        let after = try #require(await session.sessionContext)
+        let held = Set(after.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        #expect(held.isSuperset(of: before.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id)))
+        #expect(after.activeUserConfiguration.signedOneTimePublicKeys.map(\.id)
+            == before.activeUserConfiguration.signedOneTimePublicKeys.map(\.id))
+        await session.shutdown()
+    }
+
     @Test("child linkDevice publishes its first bundle exactly once")
     func testChildLinkDevice_publishesFirstBundleOnce() async throws {
         _ = try await setupRotatableSession()

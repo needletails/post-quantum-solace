@@ -188,17 +188,15 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
                 let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: sessionUser.deviceKeys.signingPrivateKey)
                 let newSignedKey = try UserConfiguration.SignedOneTimePublicKey(key: publicKey, deviceId: sessionUser.deviceId, signingKey: signingKey)
                 
-                try await session.transportDelegate?.updateOneTimeKeys(
-                    for: sessionUser.secretName,
-                    deviceId: sessionUser.deviceId.uuidString,
-                    keys: [newSignedKey]
-                )
-                
-                // The server accepted the replacement. Apply this task's delta to the
-                // *current* context, not the snapshot taken before the round-trip: a
-                // sibling replacement may have committed in the meantime, and writing the
-                // snapshot back would resurrect its spent public key and drop its new
-                // private key (the peer could then pick an OTK we cannot decrypt).
+                // Store the replacement's private half first, so the server can only serve
+                // a key this device can open. A failed upload leaves one unused private, and
+                // the spent public entry stays, so a replay mints again.
+                //
+                // Both commits apply this task's delta to the *current* context, not the
+                // snapshot taken above: a sibling replacement may commit in the meantime,
+                // and writing the snapshot back would resurrect its spent public key and
+                // drop its new private key (the peer could then pick an OTK we cannot
+                // decrypt).
                 //
                 // Mutation and persistence run as one exclusive commit: persisting
                 // re-installs the stored blob as the live context, so an overlapping
@@ -211,6 +209,18 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
                     var user = context.sessionUser
                     user.deviceKeys = deviceKeys
                     context.updateSessionUser(user)
+                }) != nil else {
+                    throw PQSError.sessionNotInitialized
+                }
+                
+                try await session.transportDelegate?.updateOneTimeKeys(
+                    for: sessionUser.secretName,
+                    deviceId: sessionUser.deviceId.uuidString,
+                    keys: [newSignedKey]
+                )
+                
+                // The server accepted the replacement.
+                guard try await session.commitLiveSessionContextMutation({ context in
                     context.activeUserConfiguration.signedOneTimePublicKeys.removeAll { $0.id == id }
                     context.activeUserConfiguration.signedOneTimePublicKeys.append(newSignedKey)
                 }) != nil else {

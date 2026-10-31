@@ -257,11 +257,15 @@ extension PQSSession {
             shouldReplenish = false
         }
         if shouldReplenish {
-            // Identity inputs only. The new batch is merged into the *live* context after
-            // the upload (`commitSessionContextMutation`), never written back from this
-            // snapshot: the curve and ML-KEM refreshes run concurrently, and a snapshot
-            // taken before the network round-trip would drop the sibling's committed
-            // private keys while their publics are already on the server.
+            // Identity inputs only. The new batch is merged into the *live* context
+            // (`commitSessionContextMutation`), never written back from this snapshot:
+            // the curve and ML-KEM refreshes run concurrently, and a snapshot taken
+            // before the network round-trip would drop the sibling's committed private
+            // keys while their publics are already on the server.
+            //
+            // The privates are stored before the upload, so the server can only serve
+            // keys this device can open. The publics wait for the upload: they count what
+            // the server took, so a failed upload leaves only unused privates behind.
             let snapshot = try await currentSessionContext(cache: cache)
             let secretName = snapshot.sessionUser.secretName
             let deviceId = snapshot.sessionUser.deviceId
@@ -288,6 +292,12 @@ extension PQSSession {
                         signingKey: signingKey)
                 }
 
+                try await auditingBatchStage("commit", kind: .x25519) {
+                    _ = try await commitSessionContextMutation(cache: cache) { context in
+                        context.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
+                    }
+                }
+
                 try await auditingBatchStage("upload", kind: .x25519) {
                     try await transportDelegate?.updateOneTimeKeys(
                         for: secretName,
@@ -297,7 +307,6 @@ extension PQSSession {
                 }
 
                 try await commitOneTimeKeyBatch(kind: .x25519, policy: policy, keyIds: signedOneTimePublicKeys.map(\.id), cache: cache) { context in
-                    context.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
                     context.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
                 }
 
@@ -319,6 +328,12 @@ extension PQSSession {
                     )
                 }
 
+                try await auditingBatchStage("commit", kind: .mlKEM) {
+                    _ = try await commitSessionContextMutation(cache: cache) { context in
+                        context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
+                    }
+                }
+
                 try await auditingBatchStage("upload", kind: .mlKEM) {
                     try await transportDelegate?.updateOneTimeMLKEMKeys(
                         for: secretName,
@@ -328,7 +343,6 @@ extension PQSSession {
                 }
 
                 try await commitOneTimeKeyBatch(kind: .mlKEM, policy: policy, keyIds: signedMLKEMOneTimeKeys.map(\.id), cache: cache) { context in
-                    context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
                     context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
                 }
             }
@@ -394,9 +408,9 @@ extension PQSSession {
         }
     }
 
-    /// Commits an uploaded batch and audits it. The line follows the commit, not the
-    /// upload, so it is proof the private halves are stored. `lastId` is the newest key
-    /// in this batch.
+    /// Finishes an uploaded batch and audits it. The line follows the final commit, so
+    /// it is proof the private halves are stored and the server took the batch. `lastId`
+    /// is the newest key in this batch.
     private func commitOneTimeKeyBatch(
         kind: KeyKind,
         policy: OneTimeKeyRefreshPolicy,
@@ -432,9 +446,13 @@ extension PQSSession {
             throw PQSError.transportNotInitialized
         }
 
-        // Identity inputs only; the batch swap is merged into the live context after the
-        // upload (see `commitSessionContextMutation`) so a concurrent refresh of the other
-        // key kind is not overwritten by this pre-upload snapshot.
+        // Identity inputs only; the batch swap is merged into the live context (see
+        // `commitSessionContextMutation`) so a concurrent refresh of the other key kind is
+        // not overwritten by this pre-upload snapshot.
+        //
+        // The new privates are stored before the upload, as in `refreshOneTimeKeys`. The
+        // swap itself waits for it: every retried attempt mints a batch, and evicting
+        // here would let failed uploads cost keys an in-flight message still needs.
         let snapshot = try await currentSessionContext(cache: cache)
         let signingKey = try Curve25519.Signing.PrivateKey(
             rawRepresentation: snapshot.sessionUser.deviceKeys.signingPrivateKey
@@ -469,6 +487,12 @@ extension PQSSession {
                 )
             }
 
+            try await auditingBatchStage("commit", kind: .x25519) {
+                _ = try await commitSessionContextMutation(cache: cache) { context in
+                    context.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
+                }
+            }
+
             try await auditingBatchStage("upload", kind: .x25519) {
                 try await transportDelegate.updateOneTimeKeys(
                     for: secretName,
@@ -478,11 +502,7 @@ extension PQSSession {
             }
 
             try await commitOneTimeKeyBatch(kind: .x25519, policy: policy, keyIds: signedOneTimePublicKeys.map(\.id), cache: cache) { context in
-                if !retainLocalPrivateKeys {
-                    context.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
-                }
                 context.activeUserConfiguration.signedOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
-                context.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
                 context.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
                 if retainLocalPrivateKeys {
                     let overflow = context.sessionUser.deviceKeys.oneTimePrivateKeys.count
@@ -490,6 +510,8 @@ extension PQSSession {
                     if overflow > 0 {
                         context.sessionUser.deviceKeys.oneTimePrivateKeys.removeFirst(overflow)
                     }
+                } else {
+                    context.sessionUser.deviceKeys.oneTimePrivateKeys = privateOneTimeKeyPairs.map(\.privateKey)
                 }
             }
 
@@ -510,6 +532,12 @@ extension PQSSession {
                 )
             }
 
+            try await auditingBatchStage("commit", kind: .mlKEM) {
+                _ = try await commitSessionContextMutation(cache: cache) { context in
+                    context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
+                }
+            }
+
             try await auditingBatchStage("upload", kind: .mlKEM) {
                 try await transportDelegate.updateOneTimeMLKEMKeys(
                     for: secretName,
@@ -519,11 +547,7 @@ extension PQSSession {
             }
 
             try await commitOneTimeKeyBatch(kind: .mlKEM, policy: policy, keyIds: signedMLKEMOneTimeKeys.map(\.id), cache: cache) { context in
-                if !retainLocalPrivateKeys {
-                    context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
-                }
                 context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
-                context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
                 context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
                 if retainLocalPrivateKeys {
                     let overflow = context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count
@@ -531,6 +555,8 @@ extension PQSSession {
                     if overflow > 0 {
                         context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeFirst(overflow)
                     }
+                } else {
+                    context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys = mlKEMOneTimeKeyPairs.map(\.privateKey)
                 }
             }
         }

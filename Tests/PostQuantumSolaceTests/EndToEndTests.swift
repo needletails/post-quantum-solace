@@ -12560,6 +12560,13 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
         createLocalSessionContextError = error
     }
 
+    /// When set, `replaceLocalSessionContext` throws instead of writing — models a
+    /// commit that never reaches the disk.
+    var replaceLocalSessionContextError: Error?
+    func setReplaceLocalSessionContextError(_ error: Error?) {
+        replaceLocalSessionContextError = error
+    }
+
     init(mockUserData: MockUserData, session: PQSSession, isSender: Bool) {
         AppPasswordKDFTestOverride.iterations = 64
         self.mockUserData = mockUserData
@@ -12584,7 +12591,12 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     func updateLocalSessionContext(_ data: Data) async throws { sessionContext = data }
     func deleteLocalSessionContext() async throws { sessionContext = nil }
     /// Atomic replace, as a production store does in one transaction.
-    func replaceLocalSessionContext(_ data: Data) async throws { sessionContext = data }
+    func replaceLocalSessionContext(_ data: Data) async throws {
+        if let replaceLocalSessionContextError {
+            throw replaceLocalSessionContextError
+        }
+        sessionContext = data
+    }
     func fetchLocalDeviceSalt(keyData: Data) async throws -> Data {
         keyData + "salt".data(using: .utf8)!
     }
