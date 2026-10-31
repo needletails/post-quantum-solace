@@ -948,7 +948,7 @@ extension MessagePipeline {
             session: session,
             sessionIdentityId: sessionIdentity.id)
         
-        // If we are intially attempting communication with a contact, we need to first send a session identity created message for the contact to delete their one time keys from being used again, the recipient can know what keys via key identities that are sent. This call also needs to send the sender's one time key identities so that the recipient also knows what one times to create their session with. We get the sender's next.
+        // If we are intially attempting communication with a contact, we need to first send a session identity created message for the contact to delete their one time keys from being used again, the recipient can know what keys via key identities that are sent.
         var transportEvent: TransportEvent?
         if let data = outboundTask.message.transportInfo {
             do {
@@ -961,10 +961,7 @@ extension MessagePipeline {
                         message: "Prepared to send session reestablishment: \(envelope.kind.rawValue) intent=\(envelope.intentId?.uuidString ?? "nil") epoch=\(envelope.epoch)")
                 case .linkedDeviceReprovisioning(let bundle):
                     logger.log(level: .info, message: "Prepared to send linked-device reprovisioning for target=\(bundle.targetDeviceId.uuidString)")
-                case .synchronizeOneTimeKeys(var info):
-                    info.senderX25519Id = results.localOneTimePrivateKey?.id.uuidString
-                    info.senderMLKEMId = results.localMLKEMPrivateKey.id.uuidString
-                    transportEvent = .synchronizeOneTimeKeys(info)
+                case .synchronizeOneTimeKeys(let info):
                     let encodedData = try BinaryEncoder().encode(info)
                     await session.setAddingContact(encodedData)
                     outboundTask.message.transportInfo = encodedData

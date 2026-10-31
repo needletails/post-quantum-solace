@@ -21,15 +21,13 @@ struct SessionIdentitySourceTests {
     /// Private helper `verifiedDevicesWithUsableKeyMaterial` is not @testable.
     @Test("identity refresh skips malformed provisional devices")
     func identityRefreshSkipsMalformedProvisionalDevices() {
-        let pin: (PQSSession, String, [SessionIdentity], Bool, Bool, String?, String?) async throws -> [SessionIdentity] = {
+        let pin: (PQSSession, String, [SessionIdentity], Bool, Bool) async throws -> [SessionIdentity] = {
             try await $0.refreshSessionIdentities(
                 for: $1,
                 from: $2,
                 createIdentity: $3,
                 forceRefresh: $4,
-                sendOneTimeIdentities: false,
-                oneTime: $5,
-                oneTime: $6)
+                sendOneTimeIdentities: false)
         }
         _ = pin
     }
@@ -39,15 +37,13 @@ struct SessionIdentitySourceTests {
     /// Private helper `pruneStaleSessionIdentities` is not @testable.
     @Test("full identity refresh prunes ghost devices via shared helper")
     func fullIdentityRefreshPrunesGhostDevicesViaSharedHelper() {
-        let pin: (PQSSession, String, [SessionIdentity], Bool, String?, String?) async throws -> [SessionIdentity] = {
+        let pin: (PQSSession, String, [SessionIdentity], Bool) async throws -> [SessionIdentity] = {
             try await $0.refreshSessionIdentities(
                 for: $1,
                 from: $2,
                 createIdentity: true,
                 forceRefresh: $3,
-                sendOneTimeIdentities: false,
-                oneTime: $4,
-                oneTime: $5)
+                sendOneTimeIdentities: false)
         }
         _ = pin
     }

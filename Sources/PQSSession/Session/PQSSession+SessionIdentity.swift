@@ -250,8 +250,8 @@ public extension PQSSession {
         // Check if we have valid identities for this specific recipient
         let hasValidIdentities = await hasValidIdentitiesForRecipient(existingIdentities, secretName: secretName)
         
-        // Extract synchronization keys if available
-        let syncKeys = await extractSynchronizationKeys()
+        // The first refresh after an outbound notify lifts the handshake gate.
+        addingContactData = nil
         
         // Determine if refresh is needed
         let needsRefresh = forceRefresh || !hasValidIdentities
@@ -284,9 +284,7 @@ public extension PQSSession {
                     createIdentity: createIdentity,
                     forceRefresh: forceRefresh,
                     sendOneTimeIdentities: sendOneTimeIdentities,
-                    lookup: lookup,
-                    oneTime: syncKeys?.x25519Id,
-                    oneTime: syncKeys?.mlKEMId)
+                    lookup: lookup)
                 
                 knownDeletedAccountSecretNames.remove(secretName)
 
@@ -723,24 +721,6 @@ public extension PQSSession {
             }
         }
         return false
-    }
-
-    /// Extracts synchronization keys from adding contact data if available
-    /// - Returns: Optional tuple containing curve and mlKEM key IDs
-    private func extractSynchronizationKeys() async -> (x25519Id: String?, mlKEMId: String?)? {
-        guard let addingContactData else { return nil }
-
-        do {
-            let keys = try BinaryDecoder().decode(SynchronizationKeyIdentities.self, from: addingContactData)
-            await setAddingContact(nil)
-            return (x25519Id: keys.senderX25519Id, mlKEMId: keys.senderMLKEMId)
-        } catch {
-            logger.log(
-                level: .warning,
-                message: "extractSynchronizationKeys: ignoring undecodable addingContactData bytes=\(addingContactData.count) error=\(error)")
-            await setAddingContact(nil)
-            return nil
-        }
     }
 
     /// Whether an established inbound ratchet exists for traffic from the given peer
@@ -1874,8 +1854,6 @@ public extension PQSSession {
         let (x25519, mlKEM) = try await createOneTimeKeys(
             secretName: secretName,
             deviceId: device.deviceId,
-            x25519Id: nil,
-            mlKEMId: nil,
             configuration: configuration,
             fetchOneTimeKeys: sendOneTimeIdentities)
 
@@ -1945,9 +1923,7 @@ public extension PQSSession {
         createIdentity: Bool = true,
         forceRefresh: Bool,
         sendOneTimeIdentities: Bool = false,
-        lookup: ConfigurationLookup = .cached,
-        oneTime x25519Id: String?,
-        oneTime mlKEMId: String?
+        lookup: ConfigurationLookup = .cached
     ) async throws -> [SessionIdentity] {
         
         if !otkUploadCircuitOpen {
@@ -2062,8 +2038,6 @@ public extension PQSSession {
                     let (x25519, mlKEM) = try await createOneTimeKeys(
                         secretName: secretName,
                         deviceId: device.deviceId,
-                        x25519Id: x25519Id,
-                        mlKEMId: mlKEMId,
                         configuration: configuration,
                         fetchOneTimeKeys: sendOneTimeIdentities)
 
@@ -2501,8 +2475,6 @@ public extension PQSSession {
     func createOneTimeKeys(
         secretName: String,
         deviceId: UUID,
-        x25519Id: String?,
-        mlKEMId: String?,
         configuration: UserConfiguration,
         fetchOneTimeKeys: Bool
     ) async throws -> (x25519: X25519PublicKey?, mlKEM: MLKEMPublicKey){
@@ -2516,39 +2488,19 @@ public extension PQSSession {
             throw PQSError.invalidDeviceIdentity
         }
         let currentDevice = try configuration.deviceWithCurrentKeyBundle(verifiedDevice)
-        let deviceSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: verifiedDevice.signingPublicKey)
         
         guard let transportDelegate else {
             throw PQSError.transportNotInitialized
         }
         
-            // On Contact Creation this will be false for the requester. The recipient will contained the passed identities, thus containing values.
-        if fetchOneTimeKeys {
-            let keys = try await transportDelegate.fetchOneTimeKeys(for: secretName, deviceId: deviceId.uuidString)
-            // Prefer the consumed key material itself. Looking up only by id against a
-            // stale findConfiguration snapshot can miss keys that were just consumed.
-            let consumedX25519Id = keys.x25519?.id.uuidString ?? x25519Id
-            let consumedMLKEMId = keys.mlKEM?.id.uuidString ?? mlKEMId
-            let fallbackX25519 = try configuration.signedOneTimePublicKeys
-                .first(where: { $0.id.uuidString == consumedX25519Id })?
-                .verified(using: deviceSigningPublicKey)
-            let fallbackMLKEM = try configuration.signedMLKEMOneTimePublicKeys
-                .first(where: { $0.id.uuidString == consumedMLKEMId })?
-                .verified(using: deviceSigningPublicKey)
-            let x25519PublicKey = keys.x25519 ?? fallbackX25519
-            let mlKEMPublicKey = keys.mlKEM ?? fallbackMLKEM ?? currentDevice.finalMLKEMPublicKey
-            return (x25519PublicKey, mlKEMPublicKey)
+        // On Contact Creation this will be false for the requester. A row that consumes
+        // nothing binds no curve key and the final ML-KEM key: a peer's handshake keys
+        // are not published, so its first frame's header supplies them.
+        guard fetchOneTimeKeys else {
+            return (nil, currentDevice.finalMLKEMPublicKey)
         }
-        
-        let x25519PublicKey = try configuration.signedOneTimePublicKeys.first(where: { $0.id.uuidString == x25519Id })?.verified(using: deviceSigningPublicKey)
-
-        var mlKEMPublicKey: MLKEMPublicKey
-        if let signedKey = try configuration.signedMLKEMOneTimePublicKeys.first(where: { $0.id.uuidString == mlKEMId })?.verified(using: deviceSigningPublicKey) {
-            mlKEMPublicKey = signedKey
-        } else {
-            mlKEMPublicKey = currentDevice.finalMLKEMPublicKey
-        }
-        return (x25519PublicKey, mlKEMPublicKey)
+        let keys = try await transportDelegate.fetchOneTimeKeys(for: secretName, deviceId: deviceId.uuidString)
+        return (keys.x25519, keys.mlKEM ?? currentDevice.finalMLKEMPublicKey)
     }
 
     /// Notifies the network of identity creation with associated keys.
