@@ -11329,6 +11329,11 @@ actor EndToEndTests {
         for (name, session) in [("alice", aliceSession), ("child1", aliceChild1), ("child2", aliceChild2)] {
             try await session.send(recipient: .nickname("bob"), text: "baseline from \(name)")
         }
+        // Bob answers only after Alice's first frames land, or both sides open lanes at once.
+        #expect(await pollUntil(timeout: 30) {
+            let frames = await wireState.sent.dropFirst(baselineStart)
+            return frames.count >= 9 ? await delivered(Array(frames)) : false
+        }, "alice's baseline frames should all be decrypted")
         try await bobSession.send(recipient: .nickname("alice"), text: "baseline from bob")
         #expect(await pollUntil(timeout: 30) { await delivered(Array(wireState.sent.dropFirst(baselineStart))) },
                 "baseline frames should all be decrypted")
