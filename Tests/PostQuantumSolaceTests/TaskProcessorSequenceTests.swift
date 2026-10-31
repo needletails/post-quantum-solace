@@ -841,6 +841,8 @@ actor TaskProcessorSequenceTests {
             session: session
         )
 
+        // enqueue returns early when another loop holds the processor.
+        #expect(try await waitUntil { await probe.contains(claimedDeviceId) })
         #expect(await probe.contains(claimedDeviceId), "Master should report same-account invalidSignature as linked-device compromise")
         #expect(await probe.count() == 1, "Same invalidSignature should produce one compromise report")
 
