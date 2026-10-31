@@ -333,11 +333,22 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
     private func mintHandshakeEphemeral() throws -> X25519PrivateKey {
         try X25519PrivateKey(id: UUID(), crypto.generateCurve25519PrivateKey().rawRepresentation)
     }
+
+    /// One lane, one ephemeral. A replay and a queued send can both reach a state-less row
+    /// before either starts the handshake, and a second key on that row reads to the ratchet
+    /// as a local key change: an epoch before frame 0, which a blank row can never mirror.
+    private func handshakeEphemeral(forLane laneId: UUID) throws -> X25519PrivateKey {
+        if let held = handshakeEphemeralByLane[laneId] { return held }
+        let minted = try mintHandshakeEphemeral()
+        handshakeEphemeralByLane[laneId] = minted
+        return minted
+    }
     
     func loadKeys(
         props: SessionIdentity.UnwrappedProps,
         sessionContext: SessionContext,
-        session: PQSSession
+        session: PQSSession,
+        laneId: UUID
     ) async throws -> LoadedKeysResult {
         /// Loads the key material for one outbound encrypt on one lane.
         /// - No ratchet state: a handshake from the final ML-KEM key, plus a minted
@@ -365,6 +376,7 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
         // seeing it fails on this lane (the responder's first reply, or the first
         // send after a relaunch, with the peer's traffic crossing it).
         if props.hasRatchetState {
+            handshakeEphemeralByLane[laneId] = nil
             localOneTimePrivateKey = props.ratchetOneTimePrivateKey
             localMLKEMPrivateKey = props.ratchetMLKEMPrivateKey
                 ?? sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
@@ -372,7 +384,7 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
             // The ephemeral agrees only with a consumed key. With none it adds nothing to
             // the handshake, and a peer that sees it embedded wants a local key on its
             // reply, which only a re-key of the established lane can supply.
-            localOneTimePrivateKey = props.oneTimePublicKey == nil ? nil : try mintHandshakeEphemeral()
+            localOneTimePrivateKey = props.oneTimePublicKey == nil ? nil : try handshakeEphemeral(forLane: laneId)
             localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
         }
         

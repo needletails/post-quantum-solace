@@ -202,6 +202,9 @@ actor MessagePipeline {
     /// Used to debounce control-plane churn during reconnect bursts.
     var lastPeerRefreshRequestAt: [String: Date] = [:]
 
+    /// Ephemerals of lanes that have not started, until the lane's ratchet state holds one.
+    var handshakeEphemeralByLane: [UUID: X25519PrivateKey] = [:]
+
     /// The active identity row that most recently decrypted traffic for a concrete peer device.
     /// Legacy persistence races can leave more than one active row for the same device; retaining
     /// the cryptographically proven row prevents alternating between divergent ratchet states.

@@ -189,6 +189,40 @@ extension EndToEndTests {
         await pair.finish()
     }
 
+    /// A replay and a queued send can both reach a state-less row before either starts
+    /// the handshake. A second key on that row reads to the ratchet as a local key change:
+    /// an epoch before frame 0, which leaves bob a body he can't open on any row.
+    @Test("every writer that reaches a state-less lane gets the lane's one ephemeral")
+    func writersToAStatelessLaneShareOneEphemeral() async throws {
+        let pair = try await connectedPair()
+        defer { Task { await shutdownSessions() } }
+        try await settleLanes(pair)
+        _ = try await pair.alice.resetSessionIdentityForFreshSession(
+            secretName: "bob",
+            deviceId: pair.bobDeviceId,
+            sendOneTimeIdentities: true,
+            reason: "test")
+
+        let symmetricKey = try await pair.alice.getDatabaseSymmetricKey()
+        var unstarted: (id: UUID, props: SessionIdentity.UnwrappedProps)?
+        for row in try await #require(await pair.alice.cache).fetchSessionIdentities() {
+            if let props = await row.props(symmetricKey: symmetricKey),
+               props.deviceId == pair.bobDeviceId, !props.hasRatchetState, props.oneTimePublicKey != nil {
+                unstarted = (row.id, props)
+            }
+        }
+        let lane = try #require(unstarted)
+        let context = try #require(await pair.alice.sessionContext)
+        let first = try await pair.alice.messagePipeline.loadKeys(
+            props: lane.props, sessionContext: context, session: pair.alice, laneId: lane.id)
+        let second = try await pair.alice.messagePipeline.loadKeys(
+            props: lane.props, sessionContext: context, session: pair.alice, laneId: lane.id)
+
+        let ephemeral = try #require(first.localOneTimePrivateKey)
+        #expect(second.localOneTimePrivateKey?.id == ephemeral.id)
+        await pair.finish()
+    }
+
     /// A row that consumed no key leaves the ephemeral nothing to agree with. Embedded
     /// anyway, it made bob's reply want a local key he could only mint, and a key new
     /// to an established lane is a re-key the peer mirrors only in order: every turn

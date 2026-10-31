@@ -6780,6 +6780,9 @@ actor EndToEndTests {
         let bobStore = createRecipientStore()
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: bobStore, transport: bobTransport, sessionDelegate: rsd)
+        // A server that accepted these frames never retransmits them; a retransmit past
+        // the dropper would heal the lane by a path production does not have.
+        await _senderMaxSkipSession.messagePipeline.testSetAckDeadlineNanosecondsForTests(3_600_000_000_000)
         
         aliceRepairTask = Task {
             for await received in aliceRepairStream {
@@ -6826,7 +6829,8 @@ actor EndToEndTests {
         })
         
         try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
-        try await Task.sleep(until: .now + .milliseconds(200))
+        // Sample after the warmup lands, so only repair can raise the count.
+        #expect(await waitUntil { await bobStore.getAllMessages().count >= 3 })
         let baselineMessageCount = await bobStore.getAllMessages().count
         
         actor Dropper {

@@ -945,7 +945,8 @@ extension MessagePipeline {
         let results = try await loadKeys(
             props: props,
             sessionContext: sessionContext,
-            session: session)
+            session: session,
+            laneId: sessionIdentity.id)
         
         // If we are intially attempting communication with a contact, we need to first send a session identity created message for the contact to delete their one time keys from being used again, the recipient can know what keys via key identities that are sent.
         var transportEvent: TransportEvent?
