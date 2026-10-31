@@ -3721,10 +3721,14 @@ actor TaskProcessorSequenceTests {
     /// Simulates concrete lifecycle/transport wake-ups while an inbound frame is
     /// waiting for its initial peer ratchet. The processor intentionally pauses
     /// after each pass; it must never consume these bounded passes in a tight loop.
+    /// A resume returns at once while a pass is running, so this keeps waking the
+    /// queue until the job has left it: its outcome is recorded before its row goes.
     private func exhaustInboundHandshakeDeferrals() async throws {
-        for _ in 0..<24 {
-            try await session.resumeJobQueue()
+        let drained = try await waitUntil(timeout: 10) {
+            try? await self.session.resumeJobQueue()
+            return (try? await self.session.cache?.fetchJobs().isEmpty) == true
         }
+        #expect(drained, "Inbound job should exhaust its deferral passes and leave the queue")
     }
 
     func waitUntil(
