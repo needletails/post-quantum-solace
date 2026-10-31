@@ -1280,6 +1280,7 @@ extension MessagePipeline {
         // undecryptable: clear cooldown/suppress so sender orphanResend can be asked
         // again (bounded). Same ciphertext redelivery must not rearm (cap burn).
         let frameFingerprint = PQSSession.nackFrameFingerprint(for: message)
+        await session.linkFailedEnvelopeToMessage(message)
         // Preference map is success-only (never written on try-all failure — that
         // dogfood cascade demoted unique session ids under blankForHeader storms).
         // Pin existence alone is NOT prove-fail: offline backlog / ephemeral frames

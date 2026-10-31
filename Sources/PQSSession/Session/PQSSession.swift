@@ -1053,6 +1053,10 @@ public actor PQSSession: SessionCacheSynchronizer {
     /// for `(sender|device|sharedId)`. Same fingerprint → await sender; different → rearm.
     var lastNackFrameFingerprintByKey: [String: Data] = [:]
 
+    /// `(sender|device|envelope)` to `(sender|device|logical id)`, for failed envelopes the
+    /// orphan-resend path has seen. See `resendAttemptKey(sender:deviceId:failedMessageId:)`.
+    var resendAttemptKeyByEnvelopeKey: [String: String] = [:]
+
 
     /// Sets the logger log level for both the session and task processor
     ///

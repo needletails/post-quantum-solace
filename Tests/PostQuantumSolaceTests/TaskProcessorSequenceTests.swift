@@ -1307,6 +1307,49 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    @Test("A failed replay asks again under its own envelope, capped per message")
+    func testFailedReplayRearmsAcrossEnvelopesUpToTheMessageCap() async throws {
+        // A replay arrives under a new envelope id. Counting attempts by envelope read
+        // every replay as a first failure, so none rearmed and saturation then parked the
+        // lane until the 90 s episode expired: a poisoned lane stalled with no retry.
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        await session.messagePipeline.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.maxSkippedHeadersExceeded)
+        )
+
+        let peerName = "bob_replay_rearm"
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await self.store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
+
+        let cap = PQSSessionConstants.peerResendRequestMaxSubmissions
+        for attempt in 0...cap {
+            let envelope = "replay_rearm_\(attempt)"
+            let inbound = try makeTestInboundTaskMessage(
+                senderSecretName: peerName,
+                senderDeviceId: peerDeviceId,
+                sharedMessageId: envelope,
+                logicalSharedId: "replay_rearm_message")
+            try await session.messagePipeline.enqueue(
+                EncryptableTask(task: .streamMessage(inbound)),
+                session: session
+            )
+            try await exhaustInboundHandshakeDeferrals()
+            #expect(
+                await session.resendRequestSubmissionCount(
+                    sender: peerName,
+                    deviceId: peerDeviceId,
+                    failedMessageId: envelope) == min(attempt + 1, cap),
+                "Attempt \(attempt) must spend one of the message's \(cap) requests")
+        }
+
+        await session.shutdown()
+    }
+
     @Test("sessionDecryptionError resends and awaits sender orphanResend")
     func testSessionDecryptionErrorResendsAndAwaitsSenderOrphanResend() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
@@ -3940,7 +3983,8 @@ actor TaskProcessorSequenceTests {
     func makeTestInboundTaskMessage(
         senderSecretName: String,
         senderDeviceId: UUID,
-        sharedMessageId: String
+        sharedMessageId: String,
+        logicalSharedId: String? = nil
     ) throws -> InboundTaskMessage {
         let signingKey = Curve25519.Signing.PrivateKey()
         let header = EncryptedHeader(
@@ -3963,7 +4007,7 @@ actor TaskProcessorSequenceTests {
             senderSecretName: senderSecretName,
             senderDeviceId: senderDeviceId,
             sharedMessageId: sharedMessageId,
-            logicalSharedId: sharedMessageId
+            logicalSharedId: logicalSharedId ?? sharedMessageId
         )
     }
 

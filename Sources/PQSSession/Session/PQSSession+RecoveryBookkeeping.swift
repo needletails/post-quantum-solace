@@ -59,6 +59,33 @@ extension PQSSession {
         "\(sender)|\(deviceId.uuidString)|\(failedMessageId)"
     }
     
+    /// The key resend attempts and NACK fingerprints count under. A replay keeps the logical
+    /// id and mints a new envelope id, so counting by envelope read every replay as a first
+    /// failure: none rearmed, and a poisoned lane waited out its episode with no retry.
+    func resendAttemptKey(sender: String, deviceId: UUID, failedMessageId: String) -> String {
+        let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        return resendAttemptKeyByEnvelopeKey[requestKey] ?? requestKey
+    }
+
+    /// Files a failed envelope under its logical message, for ``resendAttemptKey(sender:deviceId:failedMessageId:)``.
+    func linkFailedEnvelopeToMessage(_ message: InboundTaskMessage) {
+        let requestKey = peerResendRequestKey(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            failedMessageId: message.sharedMessageId)
+        resendAttemptKeyByEnvelopeKey[requestKey] = peerResendRequestKey(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            failedMessageId: message.resolvedLogicalSharedId)
+        if resendAttemptKeyByEnvelopeKey.count > PQSSessionConstants.recoveryTrackingMaxEntries {
+            let overflow = resendAttemptKeyByEnvelopeKey.count
+                - PQSSessionConstants.recoveryTrackingMaxEntries
+            for key in resendAttemptKeyByEnvelopeKey.keys.prefix(overflow) {
+                resendAttemptKeyByEnvelopeKey.removeValue(forKey: key)
+            }
+        }
+    }
+
     /// Drops expired entries from inbound-failure policy state.
     func cleanupInboundFailurePolicy(now: Date = Date()) {
         inboundFailurePolicyUntil = inboundFailurePolicyUntil.filter { _, expiry in
@@ -357,11 +384,11 @@ extension PQSSession {
         failedMessageId: String,
         fingerprint: Data
     ) {
-        let requestKey = peerResendRequestKey(
+        let attemptKey = resendAttemptKey(
             sender: sender,
             deviceId: deviceId,
             failedMessageId: failedMessageId)
-        lastNackFrameFingerprintByKey[requestKey] = fingerprint
+        lastNackFrameFingerprintByKey[attemptKey] = fingerprint
         if lastNackFrameFingerprintByKey.count > PQSSessionConstants.recoveryTrackingMaxEntries {
             let overflow = lastNackFrameFingerprintByKey.count
                 - PQSSessionConstants.recoveryTrackingMaxEntries
@@ -389,11 +416,10 @@ extension PQSSession {
             deviceId: deviceId,
             failedMessageId: failedMessageId,
             now: now)
-        let requestKey = peerResendRequestKey(
+        let priorFingerprint = lastNackFrameFingerprintByKey[resendAttemptKey(
             sender: sender,
             deviceId: deviceId,
-            failedMessageId: failedMessageId)
-        let priorFingerprint = lastNackFrameFingerprintByKey[requestKey]
+            failedMessageId: failedMessageId)]
         guard OrphanReplayRearmPolicy.shouldRearm(
             priorFingerprint: priorFingerprint,
             currentFingerprint: currentFingerprint,
@@ -401,7 +427,10 @@ extension PQSSession {
         else {
             return false
         }
-        lastResendRequestAtByPeer.removeValue(forKey: requestKey)
+        lastResendRequestAtByPeer.removeValue(forKey: peerResendRequestKey(
+            sender: sender,
+            deviceId: deviceId,
+            failedMessageId: failedMessageId))
         _ = takeInboundFailureClasses(
             sender: sender,
             deviceId: deviceId,
@@ -429,9 +458,9 @@ extension PQSSession {
     func markPeerResendRequestTransported(sender: String, deviceId: UUID, failedMessageIds: [String], now: Date = Date()) {
         pruneResendRequestAttempts(now: now)
         for failedMessageId in failedMessageIds {
-            let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
-            let attempts = (resendRequestAttemptsByKey[requestKey]?.attempts ?? 0) + 1
-            resendRequestAttemptsByKey[requestKey] = (attempts, now)
+            let attemptKey = resendAttemptKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+            let attempts = (resendRequestAttemptsByKey[attemptKey]?.attempts ?? 0) + 1
+            resendRequestAttemptsByKey[attemptKey] = (attempts, now)
         }
     }
 
@@ -440,8 +469,8 @@ extension PQSSession {
     /// (`PQSSessionConstants.resendRequestAttemptWindowSeconds`).
     func resendRequestSubmissionCount(sender: String, deviceId: UUID, failedMessageId: String, now: Date = Date()) -> Int {
         pruneResendRequestAttempts(now: now)
-        let requestKey = peerResendRequestKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
-        return resendRequestAttemptsByKey[requestKey]?.attempts ?? 0
+        let attemptKey = resendAttemptKey(sender: sender, deviceId: deviceId, failedMessageId: failedMessageId)
+        return resendRequestAttemptsByKey[attemptKey]?.attempts ?? 0
     }
 
     /// `true` when any resend-request for this peer device has been transport-confirmed.
@@ -1220,7 +1249,10 @@ extension PQSSession {
             if pendingResendAfterReestablishment.removeValue(forKey: requestKey) != nil {
                 clearedIds.append(messageId)
             }
-            resendRequestAttemptsByKey.removeValue(forKey: requestKey)
+            resendRequestAttemptsByKey.removeValue(forKey: resendAttemptKey(
+                sender: sender,
+                deviceId: deviceId,
+                failedMessageId: messageId))
             lastResendRequestAtByPeer.removeValue(forKey: requestKey)
             quarantineInboundFailure(sender: sender, deviceId: deviceId, messageId: messageId, now: now)
         }
