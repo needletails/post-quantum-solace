@@ -12180,6 +12180,8 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     /// If set, publishing rotated keys will throw this error (test-only).
     /// Used to simulate rotation publish failures.
     var publishRotatedKeysError: Error?
+    /// Runs during the publish, so a test can land a commit inside rotation's round-trip.
+    var onPublishRotatedKeys: (@Sendable () async throws -> Void)?
     
     /// If set, `findConfiguration` throws this error after optional hang (dogfood API timeout).
     var findConfigurationError: Error?
@@ -12437,6 +12439,7 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
         if let publishRotatedKeysError {
             throw publishRotatedKeysError
         }
+        try await onPublishRotatedKeys?()
         await rotationTracker.increment()
         try await store.publishRotatedKeys(for: secretName, deviceId: deviceId, rotated: keys)
     }

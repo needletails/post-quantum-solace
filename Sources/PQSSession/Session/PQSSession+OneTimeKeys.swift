@@ -337,7 +337,7 @@ extension PQSSession {
 
     /// The live context when a session is active, otherwise the persisted one
     /// (store-only setups before `unlock`, and tests that seed the store directly).
-    private func currentSessionContext(cache: SessionCache) async throws -> SessionContext {
+    func currentSessionContext(cache: SessionCache) async throws -> SessionContext {
         if let live = _sessionContext {
             return live
         }
@@ -358,7 +358,7 @@ extension PQSSession {
     /// device cannot open. Falls back to the persisted context only when no live session
     /// exists (store-only setups before `unlock`).
     @discardableResult
-    private func commitSessionContextMutation(
+    func commitSessionContextMutation(
         cache: SessionCache,
         _ mutate: (inout SessionContext) throws -> Void
     ) async throws -> SessionContext {

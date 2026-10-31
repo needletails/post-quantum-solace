@@ -56,4 +56,56 @@ extension EndToEndTests {
         #expect(committed == nil)
         #expect(try await aliceStore.fetchLocalSessionContext() == before)
     }
+
+    @Test("adoption starts from the live context, not the cache's warm copy")
+    func adoptionKeepsLiveEdit() async throws {
+        defer { Task { await shutdownSessions() } }
+        let aliceStore = createSenderStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        try await createSenderSession(
+            store: aliceStore,
+            transport: aliceTransport,
+            sessionDelegate: SessionDelegate(session: _senderSession))
+        // Installed on the session only: the warm copy never sees this edit.
+        let hostState = Data([1, 2, 3])
+        var live = try #require(await _senderSession.sessionContext)
+        live.hostLocalPolicyData = hostState
+        await _senderSession.setSessionContext(live)
+
+        try await _senderSession.adoptVerifiedUserConfiguration(live.activeUserConfiguration)
+
+        #expect(await _senderSession.sessionContext?.hostLocalPolicyData == hostState)
+        #expect(try await persistedContext(store: aliceStore).hostLocalPolicyData == hostState)
+    }
+
+    @Test("rotation keeps what the session committed during its publish")
+    func rotationKeepsCommitsFromItsPublishWindow() async throws {
+        defer { Task { await shutdownSessions() } }
+        let aliceStore = createSenderStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        try await createSenderSession(
+            store: aliceStore,
+            transport: aliceTransport,
+            sessionDelegate: SessionDelegate(session: _senderSession))
+        let before = try #require(await _senderSession.sessionContext)
+        let hostState = Data([4, 5, 6])
+        let session = _senderSession
+        aliceTransport.onPublishRotatedKeys = {
+            try await session.commitSessionContextMutation { context in
+                context.hostLocalPolicyData = hostState
+                context.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
+                return true
+            }
+        }
+
+        try await _senderSession.rotateCurrentDeviceKeys()
+
+        let live = try #require(await _senderSession.sessionContext)
+        let persisted = try await persistedContext(store: aliceStore)
+        for context in [live, persisted] {
+            #expect(context.hostLocalPolicyData == hostState)
+            #expect(context.sessionUser.deviceKeys.oneTimePrivateKeys.isEmpty)
+            #expect(context.sessionUser.deviceKeys.longTermPrivateKey != before.sessionUser.deviceKeys.longTermPrivateKey)
+        }
+    }
 }
