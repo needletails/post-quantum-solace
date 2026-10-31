@@ -763,10 +763,6 @@ extension MessagePipeline {
                         level: .info,
                         message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=pendingPeerRefresh")
                     await session.markInboundFailure(message, failureClass: failureClass)
-                    // Coalesced frames follow the leader's rule: the NACK just
-                    // deferred above owns recovery, so this only terminalizes when
-                    // no NACK is pending (see `maybeTerminalizeDeadEpochInbound`).
-                    await maybeTerminalizeDeadEpochInbound(message, session: session)
                     try await cache.deleteJob(job)
                     return .deleted
                 }
@@ -796,10 +792,7 @@ extension MessagePipeline {
                 // batch replacement and the cooldown-bypassing peerRefresh re-emit.
                 await session.markInboundFailure(message, failureClass: failureClass)
                 // Dead-epoch frames never heal by re-decrypt, only by the sender
-                // answering the NACK deferred above. Terminal is owned by
-                // oobUnavailable while that NACK is pending;
-                // this only terminalizes a tuple with no NACK left to answer.
-                await maybeTerminalizeDeadEpochInbound(message, session: session)
+                // answering the NACK deferred above. `oobUnavailable` owns terminal.
 
                 // The published-batch replacement (key generation + two uploads with
                 // retry backoff) and the subsequent peerRefresh emit must not block the
@@ -1245,56 +1238,6 @@ extension MessagePipeline {
             session: session,
             symmetricKey: symmetricKey,
             failureClass: failureClass)
-    }
-
-    /// `missingOneTimeKey` proves the sender's session epoch is dead: the
-    /// referenced one-time key is consumed, so this *envelope* can never decrypt
-    /// locally. The *content* still heals via sender re-encryption on the healed
-    /// lane — every caller has just registered a deferred NACK for this envelope
-    /// (`deferPeerResendUntilReestablished`), and dogfood 2026-09-26 showed
-    /// sixteen dead-epoch envelopes terminalized here and then settled via
-    /// `logicalReplay` after that NACK drained. Terminalizing at the failure
-    /// event told the host `inboundContentUnrecoverable` (spool purge + a
-    /// `failed` receipt to the author) for content that arrived minutes later.
-    ///
-    /// Terminal for a dead-epoch envelope is therefore owned by the event that
-    /// proves the sender cannot answer the NACK: `oobUnavailable`
-    /// (`handleOutOfBandResendUnavailable`). This path only terminalizes when no NACK
-    /// is pending for the tuple, so a redelivery of an already-settled or
-    /// cleared envelope is still swallowed without another OTK/peerRefresh storm.
-    /// `markInboundContentUnrecoverable` is once-per-tuple, so redelivered
-    /// copies do not re-notify the host.
-    private func maybeTerminalizeDeadEpochInbound(
-        _ message: InboundTaskMessage,
-        session: PQSSession
-    ) async {
-        if await session.hasPendingResendAfterReestablishment(
-            sender: message.senderSecretName,
-            deviceId: message.senderDeviceId,
-            failedMessageId: message.sharedMessageId)
-        {
-            audit(
-                .recovery,
-                "pqs.recovery.deadEpochTerminalizationDeferred reason=resendPending sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
-            return
-        }
-        await terminalizeDeadEpochInbound(message, session: session)
-    }
-
-    private func terminalizeDeadEpochInbound(
-        _ message: InboundTaskMessage,
-        session: PQSSession
-    ) async {
-        let newlyTerminal = await session.markInboundContentUnrecoverable(
-            sender: message.senderSecretName,
-            deviceId: message.senderDeviceId,
-            sharedId: message.sharedMessageId)
-        guard newlyTerminal else { return }
-        audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=missingOneTimeKeyDeadEpoch")
-        await session.sessionDelegate?.inboundContentUnrecoverable(
-            senderSecretName: message.senderSecretName,
-            senderDeviceId: message.senderDeviceId,
-            sharedMessageId: message.sharedMessageId)
     }
 
     /// Undecryptable inbound policy (orphan-resend):

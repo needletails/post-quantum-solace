@@ -2209,6 +2209,60 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    /// The offline boundary flush runs while backlog jobs are still processing, so a
+    /// drain can take a frame's NACK while its job is still between the deferral and
+    /// its end. The drain owns that NACK from there, so finding nothing pending proves
+    /// nothing about the frame. Nothing but the peer's answer may write it off.
+    @Test("a boundary flush during a missingOneTimeKey burst writes no frame off")
+    func testBoundaryFlushDuringMissingOneTimeKeyBurstWritesNoFrameOff() async throws {
+        let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
+        try await createSenderSession(store: store)
+        let probe = EpisodeEndProbe()
+        await session.setPQSSessionDelegate(conformer: RecordingEpisodeEndDelegate(probe: probe))
+        await session.messagePipeline.setTaskDelegate(
+            MockTaskDelegateWithStreamError(error: RatchetError.missingOneTimeKey)
+        )
+
+        let uploadPause = OTKUploadPause()
+        transport.beforeUpdateOneTimeKeys = {
+            await uploadPause.beforeFirstUpload()
+        }
+        defer {
+            transport.beforeUpdateOneTimeKeys = nil
+        }
+
+        let sender = "bob_missing_otk_flushed"
+        let peerDeviceId = UUID()
+        let boundaryFlushes = Task { [session] in
+            while !Task.isCancelled {
+                await session.flushPendingResendsAfterOfflineReplay()
+                await Task.yield()
+            }
+        }
+        for index in 0..<32 {
+            let frame = try makeTestInboundTaskMessage(
+                senderSecretName: sender,
+                senderDeviceId: peerDeviceId,
+                sharedMessageId: "missing_otk_flushed_\(index)")
+            try await session.messagePipeline.enqueue(
+                EncryptableTask(task: .streamMessage(frame)),
+                session: session
+            )
+        }
+        let drained = try await waitUntil(timeout: 20) {
+            guard let cache = await self.session.cache else { return false }
+            return (try? await cache.fetchJobs())?.isEmpty == true
+        }
+        boundaryFlushes.cancel()
+        #expect(drained, "Every frame should leave the job queue")
+        #expect(
+            await probe.unrecoverableContent().isEmpty,
+            "BUG: a frame was written off because a drain held its NACK")
+
+        await uploadPause.release()
+        await session.shutdown()
+    }
+
     /// `tryBeginReestablishmentEpisode(heldOfflineFramesCanHeal: false)` documents
     /// that the dead-epoch mark "also applies when the episode is already open",
     /// but the `missingOneTimeKey` coalesce branch never called it. A healable
