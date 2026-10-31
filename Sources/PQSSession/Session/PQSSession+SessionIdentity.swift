@@ -911,11 +911,11 @@ public extension PQSSession {
 
         guard var props = await identity.props(symmetricKey: symmetricKey) else { return false }
         if props.oneTimePublicKey == nil {
-            try await attachPublishedPeerOneTimeKeys(
-                to: &props,
+            (props.oneTimePublicKey, props.mlKEMPublicKey) = try await createOneTimeKeys(
                 secretName: secretName,
-                device: targetDevice,
-                configuration: configuration)
+                deviceId: targetDevice.deviceId,
+                configuration: configuration,
+                fetchOneTimeKeys: true)
             try await identity.update(props, symmetricKey: symmetricKey)
             try await cache?.updateSessionIdentity(identity)
         }
@@ -1257,45 +1257,6 @@ public extension PQSSession {
             message: "requestPeerToReplenishPublishedOneTimeKeys: refresh control queued for \(secretName)")
     }
 
-    /// Resolves peer OTK material from the published pool without consuming server keys.
-    internal func attachPublishedPeerOneTimeKeys(
-        to props: inout SessionIdentity.UnwrappedProps,
-        secretName: String,
-        device: UserDeviceConfiguration,
-        configuration: UserConfiguration
-    ) async throws {
-        guard let transportDelegate else {
-            throw PQSError.transportNotInitialized
-        }
-
-        let x25519Ids = try await transportDelegate.fetchOneTimeKeyIdentities(
-            for: secretName,
-            deviceId: device.deviceId.uuidString,
-            type: .x25519)
-        if let signedX25519 = try resolvePublishedX25519OneTimeKey(
-            x25519Ids: x25519Ids,
-            configuration: configuration,
-            device: device) {
-            props.oneTimePublicKey = signedX25519
-        } else {
-            props.oneTimePublicKey = nil
-        }
-
-        let mlKEMIds = try await transportDelegate.fetchOneTimeKeyIdentities(
-            for: secretName,
-            deviceId: device.deviceId.uuidString,
-            type: .mlKEM)
-        let deviceSigningPublicKey = try Curve25519.Signing.PublicKey(rawRepresentation: device.signingPublicKey)
-        if let signedMLKEM = try resolvePublishedMLKEMOneTimeKey(
-            mlKEMIds: mlKEMIds,
-            configuration: configuration,
-            deviceSigningPublicKey: deviceSigningPublicKey) {
-            props.mlKEMPublicKey = signedMLKEM
-        } else {
-            props.mlKEMPublicKey = device.finalMLKEMPublicKey
-        }
-    }
-
     private func resolvePublishedX25519OneTimeKey(
         x25519Ids: [UUID],
         configuration: UserConfiguration,
@@ -1307,21 +1268,6 @@ public extension PQSSession {
                 .first(where: { $0.id == x25519Id })?
                 .verified(using: deviceSigningPublicKey) {
                 return signedX25519
-            }
-        }
-        return nil
-    }
-
-    private func resolvePublishedMLKEMOneTimeKey(
-        mlKEMIds: [UUID],
-        configuration: UserConfiguration,
-        deviceSigningPublicKey: Curve25519.Signing.PublicKey
-    ) throws -> MLKEMPublicKey? {
-        for mlKEMId in mlKEMIds.reversed() {
-            if let signedMLKEM = try configuration.signedMLKEMOneTimePublicKeys
-                .first(where: { $0.id == mlKEMId })?
-                .verified(using: deviceSigningPublicKey) {
-                return signedMLKEM
             }
         }
         return nil
@@ -2120,20 +2066,10 @@ public extension PQSSession {
                         currentProps.setLongTermPublicKey(device.longTermPublicKey)
                         currentProps.setSigningPublicKey(device.signingPublicKey)
                         
-                        if forceRefresh, !currentProps.hasRatchetState {
-                            do {
-                                try await attachPublishedPeerOneTimeKeys(
-                                    to: &currentProps,
-                                    secretName: secretName,
-                                    device: device,
-                                    configuration: configuration)
-                            } catch {
-                                logger.log(level: .warning, message: "Failed to refresh one-time keys for \(secretName) (\(device.deviceId)): \(error)")
-                            }
-                        } else if forceRefresh {
-                            logger.log(
-                                level: .debug,
-                                message: "Skipping one-time key refresh for initialized SessionIdentity \(secretName) (\(device.deviceId))")
+                        // Final ML-KEM rotation never replaces a row, so a row with no
+                        // consumed key follows it here. A consumed key stays bound.
+                        if forceRefresh, !currentProps.hasRatchetState, currentProps.oneTimePublicKey == nil {
+                            currentProps.mlKEMPublicKey = device.finalMLKEMPublicKey
                         }
                         try await foundIdentity.update(currentProps, symmetricKey: symmetricKey)
                         try await cache?.updateSessionIdentity(foundIdentity)
@@ -2533,11 +2469,11 @@ public extension PQSSession {
         guard !props.hasRatchetState else { return }
 
         if props.oneTimePublicKey == nil {
-            try await attachPublishedPeerOneTimeKeys(
-                to: &props,
+            (props.oneTimePublicKey, props.mlKEMPublicKey) = try await createOneTimeKeys(
                 secretName: secretName,
-                device: device,
-                configuration: configuration)
+                deviceId: device.deviceId,
+                configuration: configuration,
+                fetchOneTimeKeys: true)
             try await identity.update(props, symmetricKey: symmetricKey)
             try await cache?.updateSessionIdentity(identity)
         }
