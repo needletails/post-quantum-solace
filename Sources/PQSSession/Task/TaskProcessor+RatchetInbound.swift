@@ -325,9 +325,9 @@ extension MessagePipeline {
                     }
                     // Do NOT write the failed try-first id into the preference map here.
                     // Dogfood 2026-07-25: that armed preferredFailedInTryAll on every
-                    // poison redelivery → demoteProveFailedActive walked unique session
+                    // poison redelivery, and the demote it drove walked unique session
                     // ids (nudge primary: 92 demotes / 4k blankForHeader skips against
-                    // linked). Preference stays success-only; demote remains rearm-gated.
+                    // linked). Preference stays success-only.
                     decryptFailedTerminally = true
                     throw InboundRecoveryStormPolicy.terminalTryAllError(attempts: attemptFailures)
                 }

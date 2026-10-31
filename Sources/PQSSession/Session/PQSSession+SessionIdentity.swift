@@ -546,7 +546,7 @@ public extension PQSSession {
             }
         }
         if byDevice.isEmpty, !verifiedIds.isEmpty, isViable {
-            // A prove-failed demotion can leave no active row between the initial
+            // A zombie demotion can leave no active row between the initial
             // snapshot and the live re-read. The outbound send is the concrete
             // event that requires a lane, so perform one authoritative refresh
             // and selection pass instead of dropping the compose or polling.
@@ -1638,76 +1638,6 @@ public extension PQSSession {
         return true
     }
 
-    /// Demote a specific prove-failed active (initialized or state-less) so it cannot
-    /// win `bestSessionIdentity` / preferred selection. Used after inbound try-all
-    /// failure and sender orphan remint when MessageRecord named a dead lane.
-    /// Keeps the device's last initialized active: a receiver never forks the lane.
-    @discardableResult
-    internal func demoteProveFailedActive(
-        sessionId: UUID,
-        secretName: String,
-        deviceId: UUID
-    ) async throws -> Bool {
-        guard let cache else {
-            throw PQSError.databaseNotInitialized
-        }
-        let symmetricKey = try await getDatabaseSymmetricKey()
-        let allIdentities = try await cache.fetchSessionIdentities()
-        guard let identity = allIdentities.first(where: { $0.id == sessionId }) else {
-            return false
-        }
-        guard let props = await identity.props(symmetricKey: symmetricKey),
-              props.secretName == secretName,
-              props.deviceId == deviceId,
-              !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
-        else {
-            return false
-        }
-        // Do not demote an in-flight orphan-resend initiating or recovery session.
-        if isOrphanResendInitiatingSession(
-            secretName: secretName,
-            deviceId: deviceId,
-            sessionId: identity.id
-        ) || isOrphanResendRecoverySession(
-            secretName: secretName,
-            deviceId: deviceId,
-            sessionId: identity.id
-        ) {
-            return false
-        }
-        // With no other initialized active for this device, demoting would leave
-        // outbound a blank to initiate on: a one-time key burned and a second
-        // session the peer must now track (dogfood 2026-10-27). The pin is already
-        // cleared; the peer's next initiating frame activates its replacement and
-        // demotes this row then.
-        if props.hasRatchetState {
-            var otherInitializedActive = false
-            for other in allIdentities where other.id != identity.id {
-                guard let otherProps = await other.props(symmetricKey: symmetricKey),
-                      otherProps.secretName == secretName,
-                      otherProps.deviceId == deviceId,
-                      !otherProps.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix),
-                      otherProps.hasRatchetState
-                else { continue }
-                otherInitializedActive = true
-                break
-            }
-            if !otherInitializedActive {
-                auditSink.log(.recovery, "pqs.recovery.proveFailedActiveDemoteSkipped reason=lastInitializedLane peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(sessionId.uuidString)")
-                return false
-            }
-        }
-        let demoted = try await demoteActiveSessionIdentityToInactive(identity)
-        if demoted {
-            invalidateSessionIdentityCache(secretName: secretName)
-            auditSink.log(.recovery, "pqs.recovery.proveFailedActiveDemoted peer=\(secretName) deviceId=\(deviceId.uuidString) sessionId=\(sessionId.uuidString)")
-            logger.log(
-                level: .warning,
-                message: "Demoted prove-failed active SessionIdentity \(sessionId) for \(secretName) (\(deviceId))")
-        }
-        return demoted
-    }
-
     /// Recovery allows a state-less initiating active after orphan-resend insert. A *zombie*
     /// is a state-less active left after failed outbound repair with no successful
     /// initiating encrypt — it cannot decrypt peer Whisper frames and poisons try-all.
@@ -1844,13 +1774,19 @@ public extension PQSSession {
     ///   prekey, with the final MLKEM key playing the signed-prekey role. Binding a
     ///   published, un-consumed OTK is forbidden: two initiators can race onto the same
     ///   key and the losing handshake fails with `ratchet.missingOneTimeKey` at the peer.
+    ///
+    /// - Parameters:
+    ///   - retiring: which prior active rows this mint archives.
+    ///   - provenDeadLaneId: the row whose replay was NACKed on its own envelope. It
+    ///     leaves with this mint even when the peer had answered it.
     @discardableResult
     internal func resetSessionIdentityForFreshSession(
         secretName: String,
         deviceId: UUID,
         sendOneTimeIdentities: Bool = true,
         reason: String = "unspecified",
-        demotePriorActives: Bool = true,
+        retiring: PriorLaneRetirement = .all,
+        provenDeadLaneId: UUID? = nil,
         reuseStateLessRepairLane: Bool = true
     ) async throws -> SessionIdentity {
         guard let cache else {
@@ -1963,14 +1899,11 @@ public extension PQSSession {
         // Device record: previous current becomes inactive (demote in place).
         // Do not copy+delete — that minted a second inactive UUID and destroyed the
         // original row id outbound ledgers may still reference.
-        // Surgical control insert (`demotePriorActives == false`) keeps live
-        // recovery / honest actives — NACK escape must not demote-all.
         var demotedActiveCount = 0
-        if demotePriorActives {
-            for match in activeMatches {
-                if try await demoteActiveSessionIdentityToInactive(match.identity) {
-                    demotedActiveCount += 1
-                }
+        for match in activeMatches
+        where retiring.retires(match.props, currentDevice: device) || match.identity.id == provenDeadLaneId {
+            if try await demoteActiveSessionIdentityToInactive(match.identity) {
+                demotedActiveCount += 1
             }
         }
 
@@ -1986,11 +1919,11 @@ public extension PQSSession {
 
         logger.log(
             level: .info,
-            message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities) demotePrior=\(demotePriorActives)")
+            message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities) demotePrior=\(retiring)")
         // Lane teardown in the same audit file as the decrypt failures: a proven
         // inbound lane failing right after one of these entries identifies the
         // caller that clobbered it.
-        if demotePriorActives {
+        if retiring != .none {
             auditSink.log(.recovery, "pqs.recovery.laneReset outcome=reset reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
         } else {
             auditSink.log(.recovery, "pqs.recovery.laneReset outcome=surgicalControlInsert reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")

@@ -849,12 +849,13 @@ extension MessagePipeline {
                     // Process restart / cache eviction: mint once more.
                     audit(.recovery, "pqs.recovery.orphanResendRetransportCacheMiss sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString)")
                     do {
-                        let priorRecordSessionId = messageRecord?.sessionIdentityId
                         replayIdentity = try await session.resetSessionIdentityForFreshSession(
                             secretName: requesterSecretName,
                             deviceId: request.requestingDeviceId,
                             sendOneTimeIdentities: true,
-                            reason: "orphanResend")
+                            reason: "orphanResend",
+                            retiring: .unanswered,
+                            provenDeadLaneId: provenDeadLaneId)
                         await session.markOrphanResendInitiatingSession(
                             secretName: requesterSecretName,
                             deviceId: request.requestingDeviceId,
@@ -863,12 +864,6 @@ extension MessagePipeline {
                         clearPreferredSessionIdentity(
                             secretName: requesterSecretName,
                             deviceId: request.requestingDeviceId)
-                        await demotePriorOrphanMessageRecordSession(
-                            priorSessionId: priorRecordSessionId,
-                            newSessionId: replayIdentity.id,
-                            secretName: requesterSecretName,
-                            deviceId: request.requestingDeviceId,
-                            session: session)
                         audit(.recovery, "pqs.recovery.orphanResend sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) newSessionId=\(replayIdentity.id.uuidString)")
                     } catch {
                         logger.log(
@@ -884,7 +879,7 @@ extension MessagePipeline {
                     replayIdentity = try await performOrphanEscapeRemint(
                         serviceKey: serviceKeyForPolicy,
                         remintsAfterProveFail: remintsAfterProveFail,
-                        priorRecordSessionId: messageRecord?.sessionIdentityId,
+                        provenDeadLaneId: provenDeadLaneId,
                         secretName: requesterSecretName,
                         deviceId: request.requestingDeviceId,
                         sharedId: failedSharedMessageId,
@@ -963,12 +958,13 @@ extension MessagePipeline {
                     audit(.recovery, "pqs.recovery.orphanResendRearmed sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId.uuidString) sessionId=\(replayIdentity.id.uuidString) reason=stateLess")
                 } else {
                     do {
-                        let priorRecordSessionId = messageRecord?.sessionIdentityId
                         replayIdentity = try await session.resetSessionIdentityForFreshSession(
                             secretName: requesterSecretName,
                             deviceId: request.requestingDeviceId,
                             sendOneTimeIdentities: true,
-                            reason: "orphanResend")
+                            reason: "orphanResend",
+                            retiring: .unanswered,
+                            provenDeadLaneId: provenDeadLaneId)
                         await session.markOrphanResendInitiatingSession(
                             secretName: requesterSecretName,
                             deviceId: request.requestingDeviceId,
@@ -977,12 +973,6 @@ extension MessagePipeline {
                         clearPreferredSessionIdentity(
                             secretName: requesterSecretName,
                             deviceId: request.requestingDeviceId)
-                        await demotePriorOrphanMessageRecordSession(
-                            priorSessionId: priorRecordSessionId,
-                            newSessionId: replayIdentity.id,
-                            secretName: requesterSecretName,
-                            deviceId: request.requestingDeviceId,
-                            session: session)
                         logger.log(
                             level: .info,
                             message: "pqs.recovery.orphanResend sharedId=\(failedSharedMessageId) requester=\(requesterSecretName) deviceId=\(request.requestingDeviceId) newSessionId=\(replayIdentity.id)")

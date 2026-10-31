@@ -137,7 +137,7 @@ extension EndToEndTests {
             secretName: "bob",
             deviceId: bobDeviceId,
             reason: "orphanResend",
-            demotePriorActives: false)
+            retiring: .none)
         await alice.markOrphanResendInitiatingSession(
             secretName: "bob",
             deviceId: bobDeviceId,

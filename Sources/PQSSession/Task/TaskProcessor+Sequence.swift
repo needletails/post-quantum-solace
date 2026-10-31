@@ -1338,17 +1338,13 @@ extension MessagePipeline {
         // undecryptable: clear cooldown/suppress so sender orphanResend can be asked
         // again (bounded). Same ciphertext redelivery must not rearm (cap burn).
         let frameFingerprint = PQSSession.nackFrameFingerprint(for: message)
-        let preferenceKey = peerDeviceIdentityPreferenceKey(
-            secretName: message.senderSecretName,
-            deviceId: message.senderDeviceId)
         // Preference map is success-only (never written on try-all failure — that
         // dogfood cascade demoted unique session ids under blankForHeader storms).
         // Pin existence alone is NOT prove-fail: offline backlog / ephemeral frames
-        // fail on a healthy preferred. Demoting that pin on every undecryptable
-        // thrash-demotes the live lane (dogfood 745495D9 after 386AD133). Clear +
-        // demote only when orphan replay rearm proves retransported material still
-        // cannot decrypt — matching "demote remains rearm-gated".
-        let pinnedPreferredId = preferredSessionIdentityIdByPeerDevice[preferenceKey]
+        // fail on a healthy preferred. Clear it only when orphan replay rearm proves
+        // retransported material still cannot decrypt. The pinned row stays active
+        // even then: a pin means the peer answered it, and only a decrypt archives
+        // an answered lane (dogfood 745495D9 after 386AD133).
         let rearmedAfterFailedReplay = await session.armPeerResendRetryAfterFailedReplay(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId,
@@ -1359,19 +1355,12 @@ extension MessagePipeline {
             logger.log(
                 level: .info,
                 message: "pqs.recovery.orphanReplayStillUndecryptable failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=rearmNack")
-            // Stuck preferred after failed owner retransport — clear pin, demote that
-            // active, and demote zombie blanks so NACK control / next initiating frame
-            // can land.
+            // Stuck preferred after failed owner retransport — clear pin and demote
+            // zombie blanks so NACK control / next initiating frame can land.
             clearPreferredSessionIdentity(
                 secretName: message.senderSecretName,
                 deviceId: message.senderDeviceId)
             preferredCleared = true
-            if let pinnedPreferredId {
-                _ = try? await session.demoteProveFailedActive(
-                    sessionId: pinnedPreferredId,
-                    secretName: message.senderSecretName,
-                    deviceId: message.senderDeviceId)
-            }
             _ = try? await session.demoteZombieStateLessActives(
                 secretName: message.senderSecretName,
                 deviceId: message.senderDeviceId)
@@ -1532,7 +1521,6 @@ extension MessagePipeline {
         // for the retry itself. Sender orphan-resend owns content heal.
         _ = preferredCleared
         _ = liveOrphanOrRecovery
-        _ = preferenceKey
         let didRequestResend = await requestPeerResendIfAllowed(
             message: message,
             failureClass: failureClass,

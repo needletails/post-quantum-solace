@@ -396,6 +396,7 @@ clear each other.
 | Retry transport                   | Authenticated **OOB**, not Double Ratchet                                                 |
 | MessageID                         | Unique **envelope** per device encrypt; logical ID separate                               |
 | Demote-all on retry?              | **Never**                                                                                 |
+| What archives an answered lane?   | A sibling's decrypt, or a NACK of a replay on that exact row                              |
 | Preference write on try-all fail? | **Never**                                                                                 |
 | Encrypted NACK / retry control    | Rejected after decode; never emitted or serviced                                           |
 

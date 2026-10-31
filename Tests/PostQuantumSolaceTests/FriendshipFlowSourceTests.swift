@@ -137,13 +137,13 @@ struct FriendshipFlowSourceTests {
         }
         _ = needsBootstrap
 
-        let reset: (PQSSession, String, UUID, Bool, String, Bool) async throws -> SessionIdentity = {
+        let reset: (PQSSession, String, UUID, Bool, String, PriorLaneRetirement) async throws -> SessionIdentity = {
             try await $0.resetSessionIdentityForFreshSession(
                 secretName: $1,
                 deviceId: $2,
                 sendOneTimeIdentities: $3,
                 reason: $4,
-                demotePriorActives: $5)
+                retiring: $5)
         }
         _ = reset
 

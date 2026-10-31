@@ -156,7 +156,7 @@ extension EndToEndTests {
             deviceId: pair.aliceDeviceId,
             sendOneTimeIdentities: false,
             reason: "test",
-            demotePriorActives: false)
+            retiring: .none)
         return bobRow.id
     }
 
@@ -175,7 +175,7 @@ extension EndToEndTests {
             deviceId: pair.aliceDeviceId,
             sendOneTimeIdentities: false,
             reason: "test",
-            demotePriorActives: false)
+            retiring: .none)
         let blank = try #require(try await rows(on: pair.bob, peer: "alice", deviceId: pair.aliceDeviceId).first { !$0.archived })
 
         let next = try await sendAndAwaitInbound(from: pair.alice, to: "bob", on: pair.bob, text: "next on the initial chain")
