@@ -1712,8 +1712,7 @@ public extension PQSSession {
         sendOneTimeIdentities: Bool = true,
         reason: String = "unspecified",
         retiring: PriorLaneRetirement = .all,
-        provenDeadLaneId: UUID? = nil,
-        reuseStateLessRepairLane: Bool = true
+        provenDeadLaneId: UUID? = nil
     ) async throws -> SessionIdentity {
         guard let cache else {
             throw PQSError.databaseNotInitialized
@@ -1756,26 +1755,18 @@ public extension PQSSession {
             try await synchronizeActiveUserConfiguration(configuration)
         }
 
-        let allIdentities = try await cache.fetchSessionIdentities()
-        var generatedSessionContextIds = Set<Int>()
-        var activeMatches: [(identity: SessionIdentity, props: SessionIdentity.UnwrappedProps)] = []
-
-        for identity in allIdentities {
-            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
-            generatedSessionContextIds.insert(props.sessionContextId)
-            guard props.secretName == secretName,
-                  props.deviceId == deviceId,
-                  !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
-            else { continue }
-            activeMatches.append((identity, props))
-        }
+        let lanes = try await deviceLanes(
+            secretName: secretName,
+            deviceId: deviceId,
+            cache: cache,
+            symmetricKey: symmetricKey)
+        let activeMatches = lanes.active
 
         // Repair-lane reuse: a prior repair may already have left a state-less row.
         // Reuse it instead of tearing the row down again under concurrent recovery.
         // Consume-lane callers (`sendOneTimeIdentities == true`) must fall through to
         // the atomic OTK consume below so bootstrap semantics stay exact.
-        if reuseStateLessRepairLane,
-           !sendOneTimeIdentities,
+        if !sendOneTimeIdentities,
            let reusable = activeMatches.last(where: { !$0.props.hasRatchetState }),
            activeMatches.allSatisfy({ !$0.props.hasRatchetState }) {
             let keysMatchDevice =
@@ -1803,10 +1794,104 @@ public extension PQSSession {
             configuration: configuration,
             fetchOneTimeKeys: sendOneTimeIdentities)
 
+        return try await insertFreshRow(
+            device: device,
+            oneTimePublicKey: x25519,
+            mlKEMPublicKey: mlKEM,
+            secretName: secretName,
+            lanes: lanes,
+            consumedOneTimeKey: sendOneTimeIdentities,
+            reason: reason,
+            retiring: retiring,
+            provenDeadLaneId: provenDeadLaneId,
+            cache: cache,
+            symmetricKey: symmetricKey)
+    }
+
+    /// Replaces the lane toward a device after a send threw `missingOneTimeKey`, using
+    /// only what the device holds. That lane encrypts with no lookup, so a repair that
+    /// needed the directory would turn a slow directory into a lost message.
+    ///
+    /// The row takes the lane's own identity keys and ML-KEM key, which were verified
+    /// when it was bound. Nothing new is trusted: a send on the lane would have used
+    /// them. If the peer has since moved on, its decrypt failure opens the usual recovery.
+    func replaceLaneFromLocalKeys(
+        secretName: String,
+        deviceId: UUID
+    ) async throws -> SessionIdentity {
+        guard let cache else {
+            throw PQSError.databaseNotInitialized
+        }
+        let symmetricKey = try await getDatabaseSymmetricKey()
+        let lanes = try await deviceLanes(
+            secretName: secretName,
+            deviceId: deviceId,
+            cache: cache,
+            symmetricKey: symmetricKey)
+        guard let lane = lanes.active.last?.props else {
+            throw PQSError.missingSessionIdentity
+        }
+        clearOrphanResendRecoveryState(secretName: secretName, deviceId: deviceId)
+        return try await insertFreshRow(
+            device: UserDeviceConfiguration(
+                deviceId: deviceId,
+                signingPublicKey: lane.signingPublicKey,
+                longTermPublicKey: lane.longTermPublicKey,
+                finalMLKEMPublicKey: lane.mlKEMPublicKey,
+                deviceName: lane.deviceName,
+                hmacData: Data(),
+                isMasterDevice: lane.isMasterDevice),
+            oneTimePublicKey: nil,
+            mlKEMPublicKey: lane.mlKEMPublicKey,
+            secretName: secretName,
+            lanes: lanes,
+            consumedOneTimeKey: false,
+            reason: "outboundMissingOneTimeKey",
+            retiring: .all,
+            provenDeadLaneId: nil,
+            cache: cache,
+            symmetricKey: symmetricKey)
+    }
+
+    /// The device's active rows, and every session context id in use.
+    private func deviceLanes(
+        secretName: String,
+        deviceId: UUID,
+        cache: SessionCache,
+        symmetricKey: SymmetricKey
+    ) async throws -> (active: [(identity: SessionIdentity, props: SessionIdentity.UnwrappedProps)], usedContextIds: Set<Int>) {
+        var usedContextIds = Set<Int>()
+        var active: [(identity: SessionIdentity, props: SessionIdentity.UnwrappedProps)] = []
+
+        for identity in try await cache.fetchSessionIdentities() {
+            guard let props = await identity.props(symmetricKey: symmetricKey) else { continue }
+            usedContextIds.insert(props.sessionContextId)
+            guard props.secretName == secretName,
+                  props.deviceId == deviceId,
+                  !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
+            else { continue }
+            active.append((identity, props))
+        }
+        return (active, usedContextIds)
+    }
+
+    private func insertFreshRow(
+        device: UserDeviceConfiguration,
+        oneTimePublicKey: X25519PublicKey?,
+        mlKEMPublicKey: MLKEMPublicKey,
+        secretName: String,
+        lanes: (active: [(identity: SessionIdentity, props: SessionIdentity.UnwrappedProps)], usedContextIds: Set<Int>),
+        consumedOneTimeKey: Bool,
+        reason: String,
+        retiring: PriorLaneRetirement,
+        provenDeadLaneId: UUID?,
+        cache: SessionCache,
+        symmetricKey: SymmetricKey
+    ) async throws -> SessionIdentity {
         var sessionContextId: Int
         repeat {
             sessionContextId = Int.random(in: 1 ..< Int.max)
-        } while generatedSessionContextIds.contains(sessionContextId)
+        } while lanes.usedContextIds.contains(sessionContextId)
 
         // Insert the replacement BEFORE demoting the previous actives: the store
         // must never hold zero active rows for a live device lane, or a concurrent
@@ -1814,8 +1899,8 @@ public extension PQSSession {
         // to the host. A failed insert also leaves the old lane intact this way.
         let identity = try await createEncryptableSessionIdentityModel(
             with: device,
-            oneTimePublicKey: x25519,
-            mlKEMPublicKey: mlKEM,
+            oneTimePublicKey: oneTimePublicKey,
+            mlKEMPublicKey: mlKEMPublicKey,
             for: secretName,
             associatedWith: device.deviceId,
             new: sessionContextId)
@@ -1824,7 +1909,7 @@ public extension PQSSession {
         // Do not copy+delete — that minted a second inactive UUID and destroyed the
         // original row id outbound ledgers may still reference.
         var demotedActiveCount = 0
-        for match in activeMatches
+        for match in lanes.active
         where retiring.retires(match.props, currentDevice: device) || match.identity.id == provenDeadLaneId {
             if try await demoteActiveSessionIdentityToInactive(match.identity) {
                 demotedActiveCount += 1
@@ -1843,14 +1928,14 @@ public extension PQSSession {
 
         logger.log(
             level: .info,
-            message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities) demotePrior=\(retiring)")
+            message: "Reset SessionIdentity for \(secretName) (\(device.deviceId)); demotedActive=\(demotedActiveCount) consumedOTK=\(consumedOneTimeKey) demotePrior=\(retiring)")
         // Lane teardown in the same audit file as the decrypt failures: a proven
         // inbound lane failing right after one of these entries identifies the
         // caller that clobbered it.
         if retiring != .none {
-            auditSink.log(.recovery, "pqs.recovery.laneReset outcome=reset reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
+            auditSink.log(.recovery, "pqs.recovery.laneReset outcome=reset reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(consumedOneTimeKey)")
         } else {
-            auditSink.log(.recovery, "pqs.recovery.laneReset outcome=surgicalControlInsert reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(sendOneTimeIdentities)")
+            auditSink.log(.recovery, "pqs.recovery.laneReset outcome=surgicalControlInsert reason=\(reason) peer=\(secretName) deviceId=\(device.deviceId.uuidString) demotedActive=\(demotedActiveCount) consumedOTK=\(consumedOneTimeKey)")
         }
 
         return identity

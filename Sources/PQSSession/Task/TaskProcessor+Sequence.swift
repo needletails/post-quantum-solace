@@ -1913,10 +1913,18 @@ extension MessagePipeline {
             deviceId: props.deviceId,
             flow: .outbound)
         let canBypassCooldown =
-            (isRecoveryCriticalControl || requiresFreshNoOTKLane)
+            isRecoveryCriticalControl
             && consumeOutboundRepairBypass(sharedId: message.sharedId)
+        // Only a lane with state throws `missingOneTimeKey`, so a new row cures it and
+        // the cooldown guards nothing: this repair consumes no key. A frame from the
+        // peer can promote the old lane over the new row before the retry runs, and
+        // the retry then fails there through no fault of the repair. Each such failure
+        // takes a frame from the peer, so this cannot spin. A retry that failed on the
+        // new row itself has nothing left to try.
+        let failedOnBlank = await failedOnLiveBlank(message, cache: cache, symmetricKey: symmetricKey)
+        let replacesFailedLane = requiresFreshNoOTKLane && !failedOnBlank
 
-        guard canAttempt || canBypassCooldown else {
+        guard canAttempt || canBypassCooldown || replacesFailedLane else {
             if isRecoveryCriticalControl {
                 await session.endReestablishmentEpisode(
                     sender: props.secretName,
@@ -1968,14 +1976,15 @@ extension MessagePipeline {
             } else {
                 // Outbound repair only needs a fresh state-less row. Consuming an OTK
                 // here races with inbound recovery and depletes the peer's pool.
-                replacement = try await session.resetSessionIdentityForFreshSession(
-                    secretName: props.secretName,
-                    deviceId: props.deviceId,
-                    sendOneTimeIdentities: false,
-                    reason: requiresFreshNoOTKLane
-                        ? "outboundMissingOneTimeKey"
-                        : "outboundRepair",
-                    reuseStateLessRepairLane: !requiresFreshNoOTKLane)
+                replacement = requiresFreshNoOTKLane
+                    ? try await session.replaceLaneFromLocalKeys(
+                        secretName: props.secretName,
+                        deviceId: props.deviceId)
+                    : try await session.resetSessionIdentityForFreshSession(
+                        secretName: props.secretName,
+                        deviceId: props.deviceId,
+                        sendOneTimeIdentities: false,
+                        reason: "outboundRepair")
                 clearPreferredSessionIdentity(
                     secretName: props.secretName,
                     deviceId: props.deviceId)
@@ -2024,6 +2033,20 @@ extension MessagePipeline {
             try await cache.deleteJob(job)
             return .deleted
         }
+    }
+
+    /// The job names a live row with no state, which outbound resolution honors.
+    private func failedOnLiveBlank(
+        _ message: OutboundTaskMessage,
+        cache: SessionCache,
+        symmetricKey: SymmetricKey
+    ) async -> Bool {
+        guard let identity = try? await cache.fetchSessionIdentities()
+            .first(where: { $0.id == message.recipientIdentity.id }),
+              let props = await identity.props(symmetricKey: symmetricKey)
+        else { return false }
+        return !props.hasRatchetState
+            && !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
     }
 
     private func reportTerminalOutboundRepairIfNeeded(

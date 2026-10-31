@@ -794,6 +794,128 @@ actor TaskProcessorSequenceTests {
         await session.shutdown()
     }
 
+    @Test("Outbound missing OTK repair makes no directory lookup")
+    func testOutboundMissingOneTimeKeyRepairNeedsNoLookup() async throws {
+        let identityStore = MockIdentityStore(
+            mockUserData: .init(session: session),
+            session: session,
+            isSender: true)
+        try await createSenderSession(store: identityStore)
+
+        let probe = OutboundUnrecoverableProbe()
+        await session.setPQSSessionDelegate(conformer: SessionDelegate(
+            session: session,
+            outboundUnrecoverableProbe: probe))
+
+        let peerName = "bob_outbound_missing_otk_no_lookup"
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
+
+        let original = try await session.resetSessionIdentityForFreshSession(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            sendOneTimeIdentities: false,
+            reason: "testSeed")
+        let symmetricKey = try await session.getDatabaseSymmetricKey()
+        let originalProps = try #require(await original.props(symmetricKey: symmetricKey))
+        let sharedId = "outbound-missing-otk-no-lookup"
+
+        let delegate = MockTaskDelegateWithOneShotOutboundError(
+            error: RatchetError.missingOneTimeKey)
+        await session.messagePipeline.setTaskDelegate(delegate)
+        transport.findConfigurationError = URLError(.timedOut)
+
+        let message = CryptoMessage(
+            text: "sent while lookups time out",
+            metadata: .init(),
+            recipient: .nickname(peerName),
+            sentDate: Date(),
+            destructionTime: nil)
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .writeMessage(.init(
+                message: message,
+                recipientIdentity: original,
+                localId: localId,
+                sharedId: sharedId,
+                isPersistedOutbound: true))),
+            session: session)
+
+        let attempts = await delegate.attempts()
+        #expect(attempts.count == 2, "The repair must retry with no directory answer")
+        #expect(attempts.last?.recipientIdentity.id != original.id)
+        let replacement = try #require(await attempts.last?.recipientIdentity.props(symmetricKey: symmetricKey))
+        #expect(!replacement.hasRatchetState)
+        #expect(replacement.oneTimePublicKey == nil)
+        #expect(replacement.longTermPublicKey == originalProps.longTermPublicKey)
+        #expect(replacement.signingPublicKey == originalProps.signingPublicKey)
+        #expect(replacement.mlKEMPublicKey == originalProps.mlKEMPublicKey)
+        #expect(await probe.recorded().isEmpty)
+        #expect((try await session.cache?.fetchJobs() ?? []).isEmpty)
+
+        await session.shutdown()
+    }
+
+    @Test("Outbound missing OTK repairs again when a frame promoted the old lane over the new row")
+    func testOutboundMissingOneTimeKeyRepairSurvivesPromotedLane() async throws {
+        let identityStore = MockIdentityStore(
+            mockUserData: .init(session: session),
+            session: session,
+            isSender: true)
+        try await createSenderSession(store: identityStore)
+
+        let probe = OutboundUnrecoverableProbe()
+        await session.setPQSSessionDelegate(conformer: SessionDelegate(
+            session: session,
+            outboundUnrecoverableProbe: probe))
+
+        let peerName = "bob_outbound_missing_otk_promoted"
+        let peerBundle = try await session.createDeviceCryptographicBundle(isMaster: true)
+        let peerDeviceId = peerBundle.deviceKeys.deviceId
+        await store.upsertUserConfiguration(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            config: peerBundle.userConfiguration)
+
+        let original = try await session.resetSessionIdentityForFreshSession(
+            secretName: peerName,
+            deviceId: peerDeviceId,
+            sendOneTimeIdentities: false,
+            reason: "testSeed")
+        let sharedId = "outbound-missing-otk-promoted"
+
+        // Every crossing frame sends the retry back to the old lane.
+        let crossingFrames = 3
+        let delegate = MockTaskDelegateWithPromotedLaneBeforeRetry(lane: original.id, crossingFrames: crossingFrames)
+        await session.messagePipeline.setTaskDelegate(delegate)
+
+        let message = CryptoMessage(
+            text: "repaired, then overtaken",
+            metadata: .init(),
+            recipient: .nickname(peerName),
+            sentDate: Date(),
+            destructionTime: nil)
+        try await session.messagePipeline.enqueue(
+            EncryptableTask(task: .writeMessage(.init(
+                message: message,
+                recipientIdentity: original,
+                localId: localId,
+                sharedId: sharedId,
+                isPersistedOutbound: true))),
+            session: session)
+
+        let attempts = await delegate.attempts()
+        #expect(attempts.count == crossingFrames + 2, "Each promotion is repaired and the last retry sends")
+        #expect(Set(attempts.map(\.recipientIdentity.id)).count == attempts.count)
+        #expect(await probe.recorded().isEmpty, "The message must not be written off")
+        #expect((try await session.cache?.fetchJobs() ?? []).isEmpty)
+
+        await session.shutdown()
+    }
+
     @Test("Error Handling - Same Account Invalid Signature Reports Linked Device Compromise")
     func testSameAccountInvalidSignatureReportsLinkedDeviceCompromise() async throws {
         let store = MockIdentityStore(mockUserData: .init(session: session), session: session, isSender: true)
@@ -4187,6 +4309,35 @@ final class MockTaskDelegateWithAlwaysOutboundError: TaskSequenceDelegate, @unch
         guard case .writeMessage(let message) = task else { return }
         _ = await probe.record(message)
         throw error
+    }
+
+    func attempts() async -> [OutboundTaskMessage] {
+        await probe.attempts()
+    }
+}
+
+/// A send on a lane with a peer key and no local key. A frame opening on the
+/// archived lane promotes it over the repair's row before each retry.
+final class MockTaskDelegateWithPromotedLaneBeforeRetry: TaskSequenceDelegate, @unchecked Sendable {
+    private let lane: UUID
+    private let crossingFrames: Int
+    private let probe = OneShotOutboundErrorProbe()
+
+    init(lane: UUID, crossingFrames: Int) {
+        self.lane = lane
+        self.crossingFrames = crossingFrames
+    }
+
+    func performRatchet(task: SessionModels.TaskType, session: PQSSession) async throws {
+        guard case .writeMessage(let message) = task else { return }
+        _ = await probe.record(message)
+        let attempt = await probe.attempts().count
+        guard attempt <= crossingFrames + 1 else { return }
+        if attempt > 1,
+           let archived = try await session.cache?.fetchSessionIdentities().first(where: { $0.id == lane }) {
+            _ = try await session.promoteArchivedSessionIdentityToActive(archived)
+        }
+        throw RatchetError.missingOneTimeKey
     }
 
     func attempts() async -> [OutboundTaskMessage] {

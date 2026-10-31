@@ -23,8 +23,7 @@ extension EndToEndTests {
             secretName: "alice",
             deviceId: pair.aliceDeviceId,
             sendOneTimeIdentities: consumingOneTimeKeys,
-            reason: "test",
-            reuseStateLessRepairLane: false).id
+            reason: "test").id
     }
 
     private func bobsRow(_ pair: ConnectedPair, _ id: UUID) async throws -> SessionIdentity.UnwrappedProps {
