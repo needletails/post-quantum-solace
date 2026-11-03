@@ -141,8 +141,30 @@ actor MessagePipeline {
     /// A prepared frame failed at the transport boundary and must remain parked
     /// until a concrete registration/writer-ready event calls `loadTasks`.
     /// This prevents the processing-loop tail from immediately retrying without
-    /// any state transition.
+    /// any state transition. It only gates the loop tail's auto-restart: parking
+    /// is per job (`transportParkedJobIds`), so inbound decrypt and other sends
+    /// keep flowing while a failed send waits for the resume.
     var isPausedUntilTransportReady = false
+
+    /// Jobs whose prepared frame failed at the transport boundary. They stay
+    /// durable but are skipped by the drain and by cache reloads until the next
+    /// explicit resume (`loadTasks(session:)`) clears the set. Scoped per job so
+    /// one failed send can never stall the shared inbound/outbound queue.
+    var transportParkedJobIds = Set<UUID>()
+
+    /// A start request (resume, enqueue) arrived while the loop was running.
+    /// Consumed when the loop exits so the wake-up is never lost — the running
+    /// loop may park and discard exactly the work the request just loaded.
+    var hasPendingStartRequest = false
+
+    /// Bumped by every explicit resume (`loadTasks(session:)`).
+    var resumeGeneration: UInt64 = 0
+
+    /// `resumeGeneration` when the executing job started. A send that fails
+    /// after a resume landed mid-attempt is not parked: that resume is the
+    /// transport-ready signal it would otherwise wait for, so it retries once
+    /// on the pending-start restart. The loop runs one job at a time.
+    var executingJobResumeGeneration: UInt64 = 0
 
     /// Event-driven shutdown waiters resumed when the active processing loop exits.
     var processingIdleWaiters: [CheckedContinuation<Void, Never>] = []
@@ -282,6 +304,11 @@ actor MessagePipeline {
     var pendingOutboundTransportBySharedId: [String: PendingOutboundTransport] = [:]
     let pendingOutboundTransportTTL: TimeInterval = 60 * 10
     let pendingOutboundTransportLimit = 256
+    /// Deferred transport retries per job before the send fails out visibly.
+    /// Unbounded deferral livelocked the queue when a retry failed at every
+    /// resume (interrupted media send: the retry runs at reconnect moments,
+    /// exactly when the leg it needs is not up yet).
+    let maxDeferredTransportRetryAttempts = 10
 
     /// A durable outbound envelope that has reached the local transport but has
     /// not yet been accepted by the server.
