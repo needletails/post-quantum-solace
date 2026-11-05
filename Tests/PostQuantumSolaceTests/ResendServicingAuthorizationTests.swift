@@ -402,6 +402,42 @@ extension EndToEndTests {
         await pair.finish()
     }
 
+    /// Each replay goes out under a fresh envelope and a NACK citing it is served, so the
+    /// servicing cooldown alone never bounds a requester that NACKs every replay. The
+    /// orphan-resend ladder does: reuse the answered lane, reset it, remint once, retransport
+    /// once, then the heal is exhausted and every later NACK gets an out-of-band unavailable
+    /// notice with no replay, no re-encrypt and no one-time key.
+    @Test("a requester NACKing every replay is cut off once the heal is exhausted")
+    func exhaustedHealCutsOffARequesterNackingEveryReplay() async throws {
+        let (pair, log, sharedId, envelopeId) = try await sendLoggedMessage()
+        defer { Task { await shutdownSessions() } }
+        var cited = envelopeId
+        var replayWaves = 0
+        var exhaustedWaves = 0
+        for _ in 0..<12 {
+            let sentBefore = await log.count()
+            let result = try await serviceWave([cited], on: pair)
+            let sent = await log.count(after: sentBefore) { $0.logicalMessageId == sharedId }
+            if result.queuedIds.isEmpty {
+                #expect(sent == 0)
+                #expect(result.permanentlyUnavailableIds == [cited])
+                exhaustedWaves += 1
+            } else {
+                #expect(exhaustedWaves == 0, "a replay after the heal was exhausted")
+                #expect(sent == 1)
+                replayWaves += 1
+                let replay = try #require(await pair.alice.outboundDeviceSendRecord(
+                    sharedId: sharedId,
+                    recipientDeviceId: pair.bobDeviceId))
+                cited = replay.envelopeMessageId
+            }
+        }
+
+        #expect(replayWaves <= 4, "reuse, reset, remint, retransport")
+        #expect(exhaustedWaves == 12 - replayWaves)
+        await pair.finish()
+    }
+
     /// The servicing cooldown holds back repeats of a logical id. A failed replay is
     /// NACKed by its own envelope a second or two later and the requester has no other
     /// ask for that envelope, so the NACK must get through, even beside the logical id.
