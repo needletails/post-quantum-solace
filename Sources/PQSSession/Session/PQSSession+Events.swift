@@ -280,7 +280,7 @@ public extension PQSSession {
             guard newlyTerminal else { continue }
             auditSink.log(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(messageId) sender=\(senderName) deviceId=\(senderDeviceId.uuidString) reason=oobUnavailable")
             // Protocol signal: drives the transport's terminal purge of the
-            // spool copy. Same contract as pending-resend TTL / resend-cap.
+            // spool copy.
             _ = await scheduleTransportProtocolWork {
                 await delegate?.inboundContentUnrecoverable(
                     senderSecretName: senderName,
@@ -379,6 +379,7 @@ public extension PQSSession {
         administrator: String,
         members: Set<String>,
         operators: Set<String>,
+        title: String? = nil,
         welcomeMessage: String? = nil,
         transportInfo: Data? = nil,
         shouldSynchronize: Bool = true
@@ -392,7 +393,8 @@ public extension PQSSession {
             name: channelName,
             administrator: administrator,
             members: members,
-            operators: operators)
+            operators: operators,
+            title: title)
         
         let metadata = try BinaryEncoder().encode(info)
         
@@ -449,6 +451,7 @@ public extension PQSSession {
         administrator: String,
         members: Set<String>,
         operators: Set<String>,
+        title: String? = nil,
         shouldSynchronize: Bool
     ) async throws {
         guard let cache else {
@@ -459,6 +462,7 @@ public extension PQSSession {
             administrator: administrator,
             members: members,
             operators: operators,
+            title: title,
             symmetricKey: getDatabaseSymmetricKey(),
             session: self,
             cache: cache,
@@ -822,5 +826,15 @@ extension PQSSession: ContactService {
                 symmetricKey: symmetricKey
             )
         }
+    }
+
+    /// Deletes a communication from the store and the in-memory cache together.
+    ///
+    /// Deleting on the persistence host directly leaves the cache holding the model, so
+    /// ``conversation(for:)`` keeps returning a conversation the store no longer has.
+    /// - Throws: `PQSError.databaseNotInitialized` before the cache exists, or the store's error.
+    public func deleteCommunication(_ communication: BaseCommunication) async throws {
+        guard let cache else { throw PQSError.databaseNotInitialized }
+        try await cache.deleteCommunication(communication)
     }
 }

@@ -612,7 +612,7 @@ struct SessionReestablishmentCoalescingTests {
 
     /// RED→GREEN: OOB unavailable already marks terminal locally; the host must
     /// get `inboundContentUnrecoverable` once per newly terminal id so spool
-    /// copies can be deleted (same contract as pending-resend TTL / resend cap).
+    /// copies can be deleted.
     @Test("OOB resend unavailable notifies the host that content is unrecoverable")
     func oobResendUnavailableNotifiesHostContentUnrecoverable() async throws {
         let session = PQSSession()
@@ -867,7 +867,7 @@ struct SessionReestablishmentCoalescingTests {
 
     @Test("Transported resend-request attempts survive past the failure-policy cooldown")
     func resendRequestAttemptsSurviveFailurePolicyCooldown() async throws {
-        // Terminality contract: 3 transported NACKs → contentUnrecoverable. That
+        // Rate limit: 3 transported NACKs stop the asking in this process. That
         // cap only accumulates if attempt history outlives the 10-minute inbound
         // failure-policy TTL, because consecutive drain events are usually
         // further apart than one cooldown.
@@ -1473,6 +1473,7 @@ struct RecordingEpisodeEndDelegate: MessagingPolicy, RecoveryObserver {
     func editMessage(recipient: MessageRecipient, metadata: Data) async throws {}
     func shouldPersist(transportInfo: Data?) -> Bool { true }
     func shouldReplayNonPersistentOutbound(transportInfo: Data?) -> Bool { false }
+    func isInboundRecoveryPlaceholder(transportInfo: Data?) -> Bool { false }
     func retrieveUserInfo(_ transportInfo: Data?) async -> (secretName: String, deviceId: String)? { nil }
     func updateCryptoMessageMetadata(
         _ message: CryptoMessage,

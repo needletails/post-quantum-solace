@@ -68,6 +68,7 @@ struct OrphanInPlaceHealTests {
             recoverySessionId: recovery,
             initiatingMarkSessionId: recovery,
             markIsStateLess: false,
+            citationProvesDeadLane: true,
             priorRetransportCount: 0,
             remintsAfterRetransportProveFail: remitsAfterProveFail)
         #expect(
@@ -83,6 +84,7 @@ struct OrphanInPlaceHealTests {
             recoverySessionId: newRecovery,
             initiatingMarkSessionId: newRecovery,
             markIsStateLess: false,
+            citationProvesDeadLane: true,
             priorRetransportCount: 0,
             remintsAfterRetransportProveFail: remitsAfterProveFail)
         #expect(secondRearm == .retransportAlreadyServiced)
@@ -92,6 +94,7 @@ struct OrphanInPlaceHealTests {
             recoverySessionId: newRecovery,
             initiatingMarkSessionId: newRecovery,
             markIsStateLess: false,
+            citationProvesDeadLane: true,
             priorRetransportCount: 1,
             remintsAfterRetransportProveFail: remitsAfterProveFail)
         #expect(
@@ -108,6 +111,7 @@ struct OrphanInPlaceHealTests {
             recoverySessionId: recovery,
             initiatingMarkSessionId: recovery,
             markIsStateLess: false,
+            citationProvesDeadLane: true,
             priorRetransportCount: 0,
             remintsAfterRetransportProveFail: 1)
         #expect(decision == .retransportAlreadyServiced)
@@ -121,6 +125,7 @@ struct OrphanInPlaceHealTests {
             recoverySessionId: recovery,
             initiatingMarkSessionId: recovery,
             markIsStateLess: false,
+            citationProvesDeadLane: true,
             priorRetransportCount: 0,
             remintsAfterRetransportProveFail: 0)
         #expect(withBudget == .mintFreshAfterRetransportProveFailed)
@@ -131,6 +136,7 @@ struct OrphanInPlaceHealTests {
                 recoverySessionId: recovery,
                 initiatingMarkSessionId: recovery,
                 markIsStateLess: false,
+                citationProvesDeadLane: true,
                 priorRetransportCount: prior,
                 remintsAfterRetransportProveFail: 1)
             if prior == 0 {
@@ -144,25 +150,28 @@ struct OrphanInPlaceHealTests {
 
     // MARK: - P5: escape-first ordering helper
 
-    @Test("P5: needsEscapeRemint helper matches settled + remint budget")
+    @Test("P5: needsEscapeRemint helper matches proven citation + remint budget")
     func p5_needsEscapeRemintHelper() {
         let recovery = UUID()
         #expect(
             OrphanResendRemintPolicy.needsEscapeRemintAfterRetransportProveFail(
                 messageRecordSessionId: recovery,
                 recoverySessionId: recovery,
+                citationProvesDeadLane: true,
                 priorRetransportCount: 0,
                 remintsAfterRetransportProveFail: 0))
         #expect(
             OrphanResendRemintPolicy.needsEscapeRemintAfterRetransportProveFail(
                 messageRecordSessionId: recovery,
                 recoverySessionId: recovery,
+                citationProvesDeadLane: true,
                 priorRetransportCount: 1,
                 remintsAfterRetransportProveFail: 0))
         #expect(
             !OrphanResendRemintPolicy.needsEscapeRemintAfterRetransportProveFail(
                 messageRecordSessionId: recovery,
                 recoverySessionId: recovery,
+                citationProvesDeadLane: true,
                 priorRetransportCount: 0,
                 remintsAfterRetransportProveFail: 1))
         // Unsettled historical MessageRecord must not force wave remint.
@@ -170,7 +179,16 @@ struct OrphanInPlaceHealTests {
             !OrphanResendRemintPolicy.needsEscapeRemintAfterRetransportProveFail(
                 messageRecordSessionId: UUID(),
                 recoverySessionId: recovery,
+                citationProvesDeadLane: true,
                 priorRetransportCount: 1,
+                remintsAfterRetransportProveFail: 0))
+        // A NACK that does not cite the replay's envelope proves nothing.
+        #expect(
+            !OrphanResendRemintPolicy.needsEscapeRemintAfterRetransportProveFail(
+                messageRecordSessionId: recovery,
+                recoverySessionId: recovery,
+                citationProvesDeadLane: false,
+                priorRetransportCount: 0,
                 remintsAfterRetransportProveFail: 0))
     }
 

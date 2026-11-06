@@ -40,7 +40,7 @@ sender orphan-resend.
 | Activate inactive session only on decrypt success | §3.4 | `activateSessionIdentityAfterInboundDecrypt` | S16 |
 | Discard all state changes on decrypt failure | §3.4 | Snapshot rollback | S16 |
 | Retry request is unencrypted | §4.1 | `PQSRecoveryTransport.sendOutOfBandResendRequest` | S1, S7, S13 |
-| Retry cites unique MessageID of failed envelope | §4.1 | `failedEnvelopeMessageIds` | S11–S13 |
+| Retry cites the failed envelope's MessageID; a host re-arm cites its logical id, resolved only through the record addressed to the requesting device | §4.1 | `outboundDeviceSendRecord(citedId:requestingDeviceId:)` | S11–S13, `ResendServicingAuthorizationTests` |
 | MessageRecord per (device, envelope), new ID on resend | §4.1 | `OutboundDeviceSendRecord` envelope index | S11, S12 |
 | Replay settles the failed envelope's deferred NACK by logical id | §4.1 | `settlePendingResendsForAcceptedInbound` | S12a |
 | Remint only when active SessionID matches MessageRecord | §4.1 | `OrphanResendRemintPolicy` | S15 |
@@ -258,9 +258,9 @@ accept-without-chat-row) `settlePendingResendsForAcceptedInbound` clears
 every entry on that peer-device lane whose envelope id, or recorded
 logical id, equals the accepted envelope/logical id, lifts the terminal
 mark, and audits `pendingResendSettled reason=logicalReplay` /
-`recovered`. Host placeholder rows and the durable ledger are keyed by
-the logical id (`resolveInboundLogicalSharedId` in nudge-kit) so the
-replay heals in place and `inboundCiphertextAccepted` clears the entry.
+`recovered`. Host placeholder rows are keyed by the logical id
+(`resolveInboundLogicalSharedId` in nudge-kit) so the replay heals in
+place.
 Legacy packets without a logical id keep envelope-only matching (T18).
 
 ### S13 — OOB retry names exact envelope + requester device
@@ -396,6 +396,7 @@ clear each other.
 | Retry transport                   | Authenticated **OOB**, not Double Ratchet                                                 |
 | MessageID                         | Unique **envelope** per device encrypt; logical ID separate                               |
 | Demote-all on retry?              | **Never**                                                                                 |
+| What archives an answered lane?   | A sibling's decrypt, or a NACK of a replay on that exact row                              |
 | Preference write on try-all fail? | **Never**                                                                                 |
 | Encrypted NACK / retry control    | Rejected after decode; never emitted or serviced                                           |
 

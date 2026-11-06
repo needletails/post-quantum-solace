@@ -72,31 +72,50 @@ struct DemotePromoteThrashPolicyTests {
                 isRepairLaneBlank: false))
     }
 
-    // MARK: - P1 OrphanResendRemintPolicy wave reuse
+    // MARK: - P1 OrphanResendRemintPolicy answered lane
 
-    @Test("P1: live recovery + unrelated MessageRecord → reuseRecoveryWave (flip C3c)")
-    func liveRecoveryReusesWaveForUnrelatedMessageRecord() {
+    @Test("P1: answered lane + unrelated MessageRecord → replayOnAnsweredLane (flip C3c)")
+    func answeredLaneCarriesReplayForUnrelatedMessageRecord() {
         let decision = OrphanResendRemintPolicy.decision(
             messageRecordSessionId: UUID(),
             recoverySessionId: UUID(),
             initiatingMarkSessionId: nil,
             markIsStateLess: false,
-            recoverySessionIsLiveActive: true)
-        #expect(decision == .reuseRecoveryWave)
+            hasAnsweredLane: true)
+        #expect(decision == .replayOnAnsweredLane)
     }
 
-    @Test("P1: no live recovery still mints for unrelated MessageRecord")
-    func noLiveRecoveryStillMints() {
+    @Test("P1: no answered lane still mints for unrelated MessageRecord")
+    func noAnsweredLaneStillMints() {
         let decision = OrphanResendRemintPolicy.decision(
             messageRecordSessionId: UUID(),
             recoverySessionId: UUID(),
             initiatingMarkSessionId: nil,
             markIsStateLess: false,
-            recoverySessionIsLiveActive: false)
+            hasAnsweredLane: false)
         #expect(decision == .mintFresh)
     }
 
-    @Test("P1: MessageRecord==recovery escape-remints first while budget remains")
+    @Test("P1: live recovery row carries another row's frame; its own frame still mints")
+    func liveRecoveryRowCarriesOnlyOtherRowsFrames() {
+        let recovery = UUID()
+        #expect(
+            OrphanResendRemintPolicy.decision(
+                messageRecordSessionId: UUID(),
+                recoverySessionId: recovery,
+                initiatingMarkSessionId: nil,
+                markIsStateLess: false,
+                recoverySessionIsLiveActive: true) == .reuseRecoveryWave)
+        #expect(
+            OrphanResendRemintPolicy.decision(
+                messageRecordSessionId: recovery,
+                recoverySessionId: recovery,
+                initiatingMarkSessionId: nil,
+                markIsStateLess: false,
+                recoverySessionIsLiveActive: true) == .mintFresh)
+    }
+
+    @Test("P1: proven citation on recovery escape-remints first while budget remains")
     func messageRecordRecoveryEscapeRemintsFirst() {
         let id = UUID()
         let decision = OrphanResendRemintPolicy.decision(
@@ -104,7 +123,8 @@ struct DemotePromoteThrashPolicyTests {
             recoverySessionId: id,
             initiatingMarkSessionId: id,
             markIsStateLess: false,
-            recoverySessionIsLiveActive: true,
+            citationProvesDeadLane: true,
+            hasAnsweredLane: true,
             priorRetransportCount: 0)
         #expect(decision == .mintFreshAfterRetransportProveFailed)
     }
@@ -114,7 +134,7 @@ struct DemotePromoteThrashPolicyTests {
 /// - StrictOOBRetryTests.undecryptableEmitsOOBWithoutDRMint (P0 OOB, no surgical mint)
 /// - StrictOOBRetryTests (same-account NACK does not mint control lanes)
 /// - skipPersonalRefreshForHealLanes (P0 personal refresh)
-/// - liveRecoveryReusesWaveForUnrelatedMessageRecord (P1 no PerSharedIdInitiating remint)
+/// - answeredLaneCarriesReplayForUnrelatedMessageRecord (P1 no PerSharedIdInitiating remint)
 /// - OrphanOwnershipHealPolicyTests (P2 owner vs non-owner; missing plaintext cannot service)
 @Suite("Demote/promote thrash contracts")
 struct DemotePromoteThrashSourceTests {
@@ -144,7 +164,7 @@ struct DemotePromoteThrashSourceTests {
                 isRepairLaneBlank: false))
     }
 
-    @Test("P1: mid-wave PerSharedIdInitiating remint is gone; wave continues ratchet")
+    @Test("P1: PerSharedIdInitiating remint is gone; replay continues an answered ratchet")
     func noPerSharedIdInitiatingRemint() {
         let recovery = UUID()
         let unrelated = UUID()
@@ -154,7 +174,7 @@ struct DemotePromoteThrashSourceTests {
                 recoverySessionId: recovery,
                 initiatingMarkSessionId: nil,
                 markIsStateLess: false,
-                recoverySessionIsLiveActive: true) == .reuseRecoveryWave)
+                hasAnsweredLane: true) == .replayOnAnsweredLane)
     }
 
     @Test("P1: activate does not demote live recovery session")

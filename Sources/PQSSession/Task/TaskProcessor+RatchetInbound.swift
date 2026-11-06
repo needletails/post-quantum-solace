@@ -63,12 +63,24 @@ extension MessagePipeline {
         inboundTask: InboundTaskMessage,
         session: PQSSession
     ) async throws {
+        // A waiting token makes this job the frame's archive pass. It is spent before
+        // any exit: a frame dropped below never reaches the pass, and the evidence the
+        // token carries must not outlive the job.
+        let frameFingerprint = PQSSession.nackFrameFingerprint(for: inboundTask)
+        let carriedFailures = archivedInboundFallbackPasses.removeValue(forKey: ArchivedInboundFallbackToken(
+            senderSecretName: inboundTask.senderSecretName,
+            senderDeviceId: inboundTask.senderDeviceId,
+            envelopeMessageId: inboundTask.sharedMessageId,
+            fingerprint: frameFingerprint).storageKey)
+
         // T13: accepted-envelope ledger covers non-persisted successes (nudgeLocal).
         // Re-emit spool ACK; never re-enter ratchet / NACK / remint.
         // The envelope id is transport metadata and a replay can carry a fresh
         // one, so the ledger is also asked by the signed payload: an accepted
         // frame must never reach lane selection again, where its still-valid
         // PQXDH header could bootstrap a blank and demote the established lane.
+        // The ledger knows these bytes, not the chat row they name, so a resend
+        // pending for the logical id stays for the drain to settle.
         if try await session.hasAcceptedEnvelope(
             senderSecretName: inboundTask.senderSecretName,
             senderDeviceId: inboundTask.senderDeviceId,
@@ -76,40 +88,12 @@ extension MessagePipeline {
             frameFingerprint: PQSSession.frameFingerprintDigest(for: inboundTask)
         ) {
             audit(.recovery, "pqs.recovery.redeliveryDropped reason=alreadyAccepted sharedId=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-            let acceptedSharedId = inboundTask.sharedMessageId
-            let acceptedDelegate = await session.sessionDelegate
-            await session.scheduleTransportProtocolWork {
-                await acceptedDelegate?.inboundCiphertextAccepted(sharedMessageId: acceptedSharedId)
-            }
+            await acknowledgeAcceptedInbound(inboundTask, session: session)
             return
-        }
-
-        // Redelivery ingress guard: offline queues redeliver un-ACKed frames on
-        // every reconnect. Lookup by logical id (chat row) with sender-device match.
-        // Waiting/failed recovery placeholders must NOT short-circuit — orphan
-        // resend heals by decrypting into that same sharedId.
-        let logicalLookupId = inboundTask.resolvedLogicalSharedId
-        if let existing = try await session.cache?.fetchMessageIfExists(sharedId: logicalLookupId) {
-            let databaseSymmetricKey = try await session.getDatabaseSymmetricKey()
-            if let existingProps = await existing.props(symmetricKey: databaseSymmetricKey),
-               existingProps.senderSecretName == inboundTask.senderSecretName,
-               existingProps.senderDeviceId == inboundTask.senderDeviceId,
-               !Self.isReplaceableInboundRecoveryPlaceholder(existingProps)
-            {
-                audit(.recovery, "pqs.recovery.redeliveryDropped reason=alreadyPersisted sharedId=\(inboundTask.sharedMessageId) logical=\(logicalLookupId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-                try await session.markEnvelopeAccepted(inboundTask)
-                let acceptedSharedId = inboundTask.sharedMessageId
-                let acceptedDelegate = await session.sessionDelegate
-                await session.scheduleTransportProtocolWork {
-                    await acceptedDelegate?.inboundCiphertextAccepted(sharedMessageId: acceptedSharedId)
-                }
-                return
-            }
         }
 
         let verificationResult = try await verifyEncryptedMessage(session: session, inboundTask: inboundTask)
         let inboundHeader = verificationResult.ratchetMessage.header
-        let frameFingerprint = PQSSession.nackFrameFingerprint(for: inboundTask)
         let rollbackSymmetricKey = try await session.getDatabaseSymmetricKey()
         var laneStats = InboundLaneSelectionStats(
             sharedId: inboundTask.sharedMessageId,
@@ -130,17 +114,20 @@ extension MessagePipeline {
             peerLanes.append(InboundLane(identity: identity, props: props, header: inboundHeader))
         }
         let rollbackPeerIdentities = peerLanes.map(\.identity)
-        let statefulRowExists = peerLanes.contains(where: \.hasRatchetState)
         // The host store owns row uniqueness; a duplicate id must not trap inbound.
         let rollbackIdentityData = Dictionary(
             rollbackPeerIdentities.map { ($0.id, $0.data) },
             uniquingKeysWith: { _, last in last })
         
+        // Set when no lane can open this frame and no pass is left to try.
+        var decryptFailedTerminally = false
+
         // Everything up until this point delt with message recovery, meaning if a message was in a state of non recovery then we tried to recover that message stored in the SessionWorkCoordinator(via 2 different enqueue methods scheduleTransportProtocolWork and scheduleBackgroundWork messages use scheduleBackgroundWork via setConnectivity which reloads the job queue) ran on the background if we are a new message all of that recovery work is skipped and we start here.
         do {
-            // Inbound decrypt: try the preferred/current session, then other
-            // actives, then inactive sessions. Whichever decrypts becomes current
-            // (activate = promote inactive / demote sibling actives).
+            // Inbound decrypt: try the preferred/current session if it has state,
+            // then other actives, inactive sessions, then state-less rows. Whichever
+            // decrypts becomes current (activate = promote inactive / demote sibling
+            // actives).
             let preferredSessionIdentity = verificationResult.sessionIdentity
             let preferredLane: InboundLane
             if let lane = peerLanes.first(where: { $0.identity.id == preferredSessionIdentity.id }) {
@@ -155,17 +142,18 @@ extension MessagePipeline {
             var decryptionSessionIdentity = preferredSessionIdentity
             // Per-candidate failure classes for the rollback audit and terminal
             // error. Without this the try-all loop swallows every alternate.
-            var attemptFailures: [(label: String, error: Error)] = []
+            var attemptFailures: [InboundAttemptFailure] = []
+            let frameEpochHolders = (peerLanes + [preferredLane]).filter(\.holdsFrameEpoch)
 
             var decryptedData: Data
-            if let data = await attemptInboundDecrypt(
+            if preferredLane.hasRatchetState, let data = await attemptInboundDecrypt(
                 preferredLane, kind: "preferred", frame: verificationResult, fingerprint: frameFingerprint,
-                statefulRowExists: statefulRowExists, session: session, stats: &laneStats, failures: &attemptFailures)
+                frameEpochHolders: frameEpochHolders, session: session, stats: &laneStats, failures: &attemptFailures)
             {
                 decryptedData = data
             } else {
-                let preferredError = attemptFailures[0].error
-                // Inbound try-all: stateful Active → Archives → state-less Active.
+                // Inbound try-all: stateful Active → archived rows that belong to the
+                // frame → state-less rows, the preferred one included → ensured blank.
                 // Blank PQXDH runs only on state-less rows already in (or ensured into)
                 // the device record — not a gated post-failure matching mint.
                 //
@@ -173,7 +161,8 @@ extension MessagePipeline {
                 // header go first (stable), so the common case decrypts on the first
                 // or second attempt. Tiers never reorder against each other.
                 //
-                // activeFirstInboundPass: try actives + state-less first. Archive walk is
+                // activeFirstInboundPass: try actives, the archived rows holding the
+                // frame's epoch and state-less rows first. The full archive walk is
                 // deferred to a `.background` job via deferArchivedInboundFallback so
                 // fresher `.urgent` ciphertext is not HOL-blocked on the single consumer.
                 let alternates = peerLanes.filter { !$0.isArchived && $0.identity.id != preferredSessionIdentity.id }
@@ -186,23 +175,15 @@ extension MessagePipeline {
                     peerLanes.filter(\.isArchived).sorted { $0.props.sessionContextId > $1.props.sessionContextId },
                     rank: \.headerMatch.rank)
                 let archivedBlanks = archivedLanes.filter { !$0.hasRatchetState }
+                let stateLessPreferred = preferredLane.hasRatchetState ? [] : [(lane: preferredLane, kind: "preferred")]
                 // Active-first never walks full archives, but blankForHeaderExists
                 // counts archived blanks. Include the single header-matched archived
                 // blank in the active pass so demoted blanks are not invisible until
                 // a (possibly exhausted) archive defer.
                 let headerMatchedArchivedBlank = archivedBlanks.first(where: \.matchesHeaderKeys)
 
-                let archiveToken = ArchivedInboundFallbackToken(
-                    senderSecretName: inboundTask.senderSecretName,
-                    senderDeviceId: inboundTask.senderDeviceId,
-                    envelopeMessageId: inboundTask.sharedMessageId,
-                    fingerprint: frameFingerprint)
-                let includeArchivedFallback =
-                    archivedInboundFallbackPasses.contains(archiveToken.storageKey)
-                    || archivedInboundFallbackPasses.contains(inboundTask.sharedMessageId)
+                let includeArchivedFallback = carriedFailures != nil
                 if includeArchivedFallback {
-                    archivedInboundFallbackPasses.remove(archiveToken.storageKey)
-                    archivedInboundFallbackPasses.remove(inboundTask.sharedMessageId)
                     laneStats.pass = .archived
                 }
                 // Mark exhausted when this pass actually walks archives (success or
@@ -212,14 +193,18 @@ extension MessagePipeline {
                 var fallbackData: Data?
                 let candidates: [(lane: InboundLane, kind: String)]
                 if includeArchivedFallback {
-                    // Background pass: archives only (actives already failed).
-                    candidates = archivedLanes.map { (lane: $0, kind: "archived") }
+                    // Background pass: archives only (actives already failed), and
+                    // every stateful row before a blank can be judged against it.
+                    candidates = (archivedLanes.filter(\.hasRatchetState) + archivedBlanks)
+                        .map { (lane: $0, kind: "archived") } + stateLessPreferred
                 } else {
                     // activeFirstInboundPass — decryptInboundActiveOnly candidates,
-                    // plus header-matched archived blank when policy allows.
+                    // the archived rows that belong to this frame (holders of its epoch,
+                    // then the header-matched archived blank when policy allows), then
+                    // state-less rows.
                     var activeFirstCandidates =
                         statefulAlternates.map { (lane: $0, kind: "active") }
-                        + stateLessAlternates.map { (lane: $0, kind: "stateLess") }
+                        + archivedLanes.filter(\.holdsFrameEpoch).map { (lane: $0, kind: "archivedHolder") }
                     if let matched = headerMatchedArchivedBlank,
                        InboundInitiatingSlotPolicy.shouldTryArchivedHeaderMatchBeforeEnsureSkip(
                            blankForHeaderExists: true,
@@ -229,11 +214,13 @@ extension MessagePipeline {
                         activeFirstCandidates.append((lane: matched, kind: "archivedHeaderMatch"))
                     }
                     candidates = activeFirstCandidates
+                        + stateLessPreferred
+                        + stateLessAlternates.map { (lane: $0, kind: "stateLess") }
                 }
                 for candidate in candidates {
                     guard let data = await attemptInboundDecrypt(
                         candidate.lane, kind: candidate.kind, frame: verificationResult, fingerprint: frameFingerprint,
-                        statefulRowExists: statefulRowExists, session: session, stats: &laneStats, failures: &attemptFailures)
+                        frameEpochHolders: frameEpochHolders, session: session, stats: &laneStats, failures: &attemptFailures)
                     else { continue }
                     logger.log(
                         level: .info,
@@ -285,7 +272,7 @@ extension MessagePipeline {
                                let data = await attemptInboundDecrypt(
                                    InboundLane(identity: ensured, props: ensuredProps, header: inboundHeader),
                                    kind: "ensured", frame: verificationResult, fingerprint: frameFingerprint,
-                                   statefulRowExists: statefulRowExists, session: session, stats: &laneStats, failures: &attemptFailures)
+                                   frameEpochHolders: frameEpochHolders, session: session, stats: &laneStats, failures: &attemptFailures)
                             {
                                 logger.log(
                                     level: .info,
@@ -297,7 +284,7 @@ extension MessagePipeline {
                             logger.log(
                                 level: .warning,
                                 message: "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) error=\(error)")
-                            audit(.recovery, "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) error=\(error)")
+                            audit(.recovery, "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) error=\(PQSAuditRedaction.describe(error))")
                         }
                     }
                 }
@@ -312,23 +299,37 @@ extension MessagePipeline {
                     }
                     // Active-first miss with archives remaining: defer archive try-all
                     // to a background job so urgent inbound can proceed.
+                    var archivePassQueued = false
                     if !includeArchivedFallback, !archivedLanes.isEmpty {
-                        await deferArchivedInboundFallback(
+                        archivePassQueued = await deferArchivedInboundFallback(
                             inboundTask: inboundTask,
+                            failures: attemptFailures,
                             session: session)
+                    }
+                    // The pass cannot learn again what active-first learned (the ensured
+                    // blank left with that job), so its verdicts join the pass's. A lane
+                    // tried in both passes speaks once, with the newer verdict.
+                    if let carriedFailures {
+                        let retriedLanes = Set(attemptFailures.map(\.laneId))
+                        attemptFailures += carriedFailures.filter { !retriedLanes.contains($0.laneId) }
                     }
                     // Inbound decrypt: no session decrypted. Every failed lane was
                     // already rolled back by `attemptInboundDecrypt`; nothing else was mutated.
                     recordInboundLaneSelectionStats(laneStats)
-                    audit(.recovery, "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) attempts=[\(attemptFailures.map { "\($0.label):\($0.error)" }.joined(separator: "; "))] negativeCacheSkips=\(laneStats.negativeCacheSkips)")
+                    let headerAudit = RatchetHeaderAudit(inboundHeader)
+                    let deviceKeys = await session.sessionContext?.sessionUser.deviceKeys
+                    audit(.recovery, "pqs.recovery.laneRolledBack reason=active and archived inbound decrypt attempts failed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) \(headerAudit.inboundFields) \(deviceKeys.map { headerAudit.heldFields(deviceKeys: $0, rows: peerLanes.map(\.props) + [preferredLane.props]) } ?? "otkHeld=unknown mlkemHeld=unknown") attempts=[\(attemptFailures.map { "\($0.label):\($0.error)" }.joined(separator: "; "))] negativeCacheSkips=\(laneStats.negativeCacheSkips)")
+                    // The queued pass owns this frame's outcome; see `InboundDecryptDeferral`.
+                    if archivePassQueued {
+                        throw InboundDecryptDeferral.archivePassQueued
+                    }
                     // Do NOT write the failed try-first id into the preference map here.
                     // Dogfood 2026-07-25: that armed preferredFailedInTryAll on every
-                    // poison redelivery → demoteProveFailedActive walked unique session
+                    // poison redelivery, and the demote it drove walked unique session
                     // ids (nudge primary: 92 demotes / 4k blankForHeader skips against
-                    // linked). Preference stays success-only; demote remains rearm-gated.
-                    throw InboundRecoveryStormPolicy.terminalTryAllError(
-                        preferred: preferredError,
-                        alternates: attemptFailures.dropFirst().map(\.error))
+                    // linked). Preference stays success-only.
+                    decryptFailedTerminally = true
+                    throw InboundRecoveryStormPolicy.terminalTryAllError(attempts: attemptFailures)
                 }
                 if shouldMarkArchivePassExhausted {
                     markArchivedInboundFallbackExhausted(
@@ -372,16 +373,20 @@ extension MessagePipeline {
                 throw PQSError.sessionDecryptionError
             }
 
+            // A copy of content this device holds has done its work on the ratchet. The
+            // host saw the message when it landed, so it must not run a second time.
+            let contentHeld = try await holdsInboundContent(inboundTask, session: session)
             var canSaveMessage = true
             
-            if let sessionDelegate = await session.sessionDelegate {
+            if !contentHeld, let sessionDelegate = await session.sessionDelegate {
                 canSaveMessage = await sessionDelegate.processMessage(
                     decodedMessage,
                     senderSecretName: inboundTask.senderSecretName,
                     senderDeviceId: inboundTask.senderDeviceId)
             }
 
-            if let transportInfo = decodedMessage.transportInfo,
+            if !contentHeld,
+               let transportInfo = decodedMessage.transportInfo,
                let event = try? BinaryDecoder().decode(TransportEvent.self, from: transportInfo) {
                 var processedReestablishment: SessionReestablishmentEnvelope?
                 do {
@@ -402,7 +407,8 @@ extension MessagePipeline {
                                 inboundTask: inboundTask,
                                 session: session,
                                 headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
-                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                                headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest)
                             return
                         }
 
@@ -426,7 +432,8 @@ extension MessagePipeline {
                                 inboundTask: inboundTask,
                                 session: session,
                                 headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
-                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                                headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest)
                             return
                         case .skipStale:
                             logger.log(
@@ -438,7 +445,8 @@ extension MessagePipeline {
                                 inboundTask: inboundTask,
                                 session: session,
                                 headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
-                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                                headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest)
                             return
                         case .process:
                             processedReestablishment = envelope
@@ -512,7 +520,8 @@ extension MessagePipeline {
                                         inboundTask: inboundTask,
                                         session: session,
                                         headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
-                                        headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
+                                        headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                                        headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest)
                                     return
                                 }
                                 // Keep the proven lane after a correlated peerRefresh
@@ -577,7 +586,8 @@ extension MessagePipeline {
                                 inboundTask: inboundTask,
                                 session: session,
                                 headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
-                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                                headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest)
                             return
                         }
                         try await session.installLinkedDeviceReprovisioningBundle(bundle)
@@ -646,18 +656,30 @@ extension MessagePipeline {
 
             var didAcceptInbound = false
             if canSaveMessage {
-                /// Now we can handle the message
-                try await handleDecodedMessage(
-                    decodedMessage,
-                    inboundTask: inboundTask,
-                    session: session,
-                    sessionIdentity: decryptionSessionIdentity)
+                if contentHeld {
+                    audit(.recovery, "pqs.recovery.duplicateInboundPersistSkipped envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                } else {
+                    /// Now we can handle the message
+                    try await handleDecodedMessage(
+                        decodedMessage,
+                        inboundTask: inboundTask,
+                        session: session,
+                        sessionIdentity: decryptionSessionIdentity)
+                }
+                // A held copy can be stale: the row that opened it may be one the sender
+                // has left, so it takes no lane back. A state-less row is different, the
+                // frame just bootstrapped it and the sender is on that lane.
+                let bootstrappedLane = !(peerLanes + [preferredLane]).contains {
+                    $0.identity.id == decryptionSessionIdentity.id && $0.hasRatchetState
+                }
                 decryptionSessionIdentity = try await finalizeAcceptedInbound(
                     decryptionSessionIdentity,
                     inboundTask: inboundTask,
                     session: session,
                     headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
                     headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                    headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest,
+                    activateLane: !contentHeld || bootstrappedLane,
                     acknowledgeTransport: false)
                 didAcceptInbound = true
             } else if await shouldAcceptWithoutChatRow(decodedMessage, session: session) {
@@ -670,12 +692,13 @@ extension MessagePipeline {
                     session: session,
                     headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
                     headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                    headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest,
                     acknowledgeTransport: false)
                 didAcceptInbound = true
                 // Persist branch settles pending resend under `if canSaveMessage`
                 // below. Non-persist accepts must clear this frame's own NACK too,
                 // or later drains re-NACK an already-accepted envelope until
-                // `resendSubmissionCap`. Match by logical id as well: a sender
+                // the resend cap. Match by logical id as well: a sender
                 // resend of a failed control frame arrives under a new envelope id.
                 await session.settlePendingResendsForAcceptedInbound(
                     sender: inboundTask.senderSecretName,
@@ -801,6 +824,25 @@ extension MessagePipeline {
                 await session.invalidateSessionIdentityCache(
                     secretName: inboundTask.senderSecretName)
             }
+            // No lane opens this copy, but the content is here, so the sender owes
+            // nothing: every NACK still pending for it is answered, whichever envelope
+            // carried this copy. A sender resend arrives under a new envelope id, and a
+            // host re-arm is keyed by the chat row's logical id. Left pending, the id was
+            // re-NACKed at every drain boundary until the cap wrote it off and told the
+            // author "failed" (dogfood 2026-10-28, C653BE44 on the master). Only a
+            // terminal decrypt failure lands here: a queued pass still owns the frame,
+            // and a failure after a decrypt must stay retryable.
+            if decryptFailedTerminally, (try? await holdsInboundContent(inboundTask, session: session)) == true {
+                audit(.recovery, "pqs.recovery.redeliveryDropped reason=alreadyPersisted sharedId=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                try await session.markEnvelopeAccepted(inboundTask)
+                await session.settlePendingResendsForAcceptedInbound(
+                    sender: inboundTask.senderSecretName,
+                    deviceId: inboundTask.senderDeviceId,
+                    envelopeMessageId: inboundTask.sharedMessageId,
+                    logicalSharedId: inboundTask.resolvedLogicalSharedId)
+                await acknowledgeAcceptedInbound(inboundTask, session: session)
+                return
+            }
 #if DEBUG
             logger.log(
                 level: .debug,
@@ -808,6 +850,25 @@ extension MessagePipeline {
 #endif
             throw error
         }
+    }
+
+    /// Whether this device already holds the content `inboundTask` carries: a chat row
+    /// for its logical id from this sender tuple that the host does not call a recovery
+    /// placeholder. It is asked after decrypt, never in place of it: the id is
+    /// unauthenticated wire metadata, and a frame dropped before the ratchet leaves a
+    /// header gap and throws away a resend opening a new lane. With no delegate the row
+    /// is not known to be content, so nothing is dropped on its account.
+    private func holdsInboundContent(
+        _ inboundTask: InboundTaskMessage,
+        session: PQSSession
+    ) async throws -> Bool {
+        guard let existing = try await session.cache?.fetchMessageIfExists(sharedId: inboundTask.resolvedLogicalSharedId),
+              let props = await existing.props(symmetricKey: try await session.getDatabaseSymmetricKey()),
+              props.senderSecretName == inboundTask.senderSecretName,
+              props.senderDeviceId == inboundTask.senderDeviceId
+        else { return false }
+        return await session.sessionDelegate?.isInboundRecoveryPlaceholder(
+            transportInfo: props.message.transportInfo) == false
     }
 
     /// True when decrypt succeeded but no chat row is expected — TransportEvent
@@ -835,10 +896,27 @@ extension MessagePipeline {
         session: PQSSession,
         headerOneTimeKeyId: UUID?,
         headerMLKEMOneTimeKeyId: UUID?,
+        headerEpochDigest: Data? = nil,
+        activateLane: Bool = true,
         acknowledgeTransport: Bool = true
     ) async throws -> SessionIdentity {
-        let activated = try await session.activateSessionIdentityAfterInboundDecrypt(
-            decryptionSessionIdentity)
+        // A frame from an epoch the row has since moved past is a late frame opened from the
+        // row's stash. It proves the row could open it, not that the peer sends on the row
+        // now, so it neither promotes the row nor makes it the outbound preference. Without
+        // this, frames a peer sent before our rotation steered our next send back onto the
+        // lane the peer had dropped.
+        var rowEpochDigest: Data?
+        if headerEpochDigest != nil, let cache = await session.cache,
+           let row = try await cache.fetchSessionIdentities().first(where: { $0.id == decryptionSessionIdentity.id }) {
+            rowEpochDigest = try await row.props(symmetricKey: session.getDatabaseSymmetricKey())?.ratchetEpochDigest
+        }
+        let frameOnRowEpoch = headerEpochDigest == nil || rowEpochDigest == nil || headerEpochDigest == rowEpochDigest
+        if !frameOnRowEpoch {
+            audit(.recovery, "pqs.recovery.laneNotProvenByEarlierEpochFrame sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) sessionId=\(decryptionSessionIdentity.id)")
+        }
+        let activated = activateLane && frameOnRowEpoch
+            ? try await session.activateSessionIdentityAfterInboundDecrypt(decryptionSessionIdentity)
+            : decryptionSessionIdentity
         // Do not publish preference / clear recovery state until the durable
         // accepted ledger write succeeds. The outer catch restores identity
         // inventory if persistence fails.
@@ -854,7 +932,7 @@ extension MessagePipeline {
         // archive (promotion refused) must not capture general outbound.
         let activatedIsActive = try await activated.props(symmetricKey: session.getDatabaseSymmetricKey())
             .map { !$0.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) } ?? false
-        if activatedIsActive {
+        if activatedIsActive, frameOnRowEpoch {
             preferredSessionIdentityIdByPeerDevice[
                 peerDeviceIdentityPreferenceKey(
                     secretName: inboundTask.senderSecretName,
@@ -952,11 +1030,17 @@ extension MessagePipeline {
     /// Enqueues a `.background` re-process of `inboundTask` that includes archived
     /// SessionIdentity rows. Pass ownership is tokenized by
     /// `(sender, device, envelope, fingerprint)` so a fresh orphan fingerprint
-    /// cannot consume an older archive-only pass (T17).
+    /// cannot consume an older archive-only pass (T17). The token carries `failures`,
+    /// this pass's verdicts, to the pass that decides the frame's class.
+    ///
+    /// - Returns: `true` when this call queued the pass, which then owns this
+    ///   ciphertext's outcome. `false` when the pass already ran for this token or
+    ///   the enqueue failed; the caller's failure then stands as the frame's outcome.
     private func deferArchivedInboundFallback(
         inboundTask: InboundTaskMessage,
+        failures: [InboundAttemptFailure],
         session: PQSSession
-    ) async {
+    ) async -> Bool {
         let sharedId = inboundTask.sharedMessageId
         let currentFingerprint = PQSSession.nackFrameFingerprint(for: inboundTask)
         let token = ArchivedInboundFallbackToken(
@@ -966,14 +1050,11 @@ extension MessagePipeline {
             fingerprint: currentFingerprint)
         guard InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
             token: token,
-            exhausted: archivedInboundFallbackExhausted,
-            pendingPass: archivedInboundFallbackPasses
+            exhausted: archivedInboundFallbackExhausted
         ) else {
-            return
+            return false
         }
-        guard archivedInboundFallbackPasses.insert(token.storageKey).inserted else {
-            return
-        }
+        archivedInboundFallbackPasses[token.storageKey] = failures
         audit(.recovery, "pqs.recovery.deferArchivedInboundFallback sharedId=\(sharedId) token=\(token.storageKey.prefix(64)) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
         do {
             try await enqueue(
@@ -981,11 +1062,13 @@ extension MessagePipeline {
                     task: .streamMessage(inboundTask),
                     priority: .background),
                 session: session)
+            return true
         } catch {
-            archivedInboundFallbackPasses.remove(token.storageKey)
+            archivedInboundFallbackPasses.removeValue(forKey: token.storageKey)
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.deferArchivedInboundFallbackFailed sharedId=\(sharedId) error=\(error)")
+            return false
         }
     }
 
@@ -1004,7 +1087,6 @@ extension MessagePipeline {
             current: archivedInboundFallbackExhausted,
             token: token)
         archivedInboundFallbackExhaustedPeerKey[token.storageKey] = token.peerKey
-        archivedInboundFallbackPasses.remove(token.storageKey)
     }
 
     func clearArchivedInboundFallbackExhausted(sender: String, deviceId: UUID) {
@@ -1031,28 +1113,42 @@ extension MessagePipeline {
     /// rejected this ciphertext under the same ratchet state is skipped with its
     /// recorded failure; a fresh failure is recorded and rolled back only if the
     /// attempt changed the row (the ratchet manager's lane is always evicted).
-    /// A state-less row that bootstraps mid-session is refused and rolled back
-    /// to blank (`InboundLaneSelectionPolicy.blankMayBecomeLane`); the frame then
-    /// takes the resend path as `decryptionFailed`, which the sender answers on
-    /// a lane this device can open.
+    /// A frame a state-less row decrypts is authentic under keys derived from the
+    /// frame's own header and this device's keys, so with no row holding the
+    /// frame's epoch it becomes the lane whatever the frame's position in the
+    /// sender's chain, with the skipped keys stashed for the frames before it.
+    /// Refusing it past the first frame kept authenticated content from the user
+    /// and NACKed a lane that worked (dogfood 2026-10-28: 105 refusals across three
+    /// devices, a channel message held 59 minutes). With a holder it must also
+    /// pass `InboundLaneSelectionPolicy.blankMayBecomeLane`; refused, it rolls back
+    /// to blank and the frame takes the resend path as `decryptionFailed`.
     private func attemptInboundDecrypt(
         _ lane: InboundLane,
         kind: String,
         frame: VerificationResult,
         fingerprint: Data,
-        statefulRowExists: Bool,
+        frameEpochHolders: [InboundLane],
         session: PQSSession,
         stats: inout InboundLaneSelectionStats,
-        failures: inout [(label: String, error: Error)]
+        failures: inout [InboundAttemptFailure]
     ) async -> Data? {
         let laneId = lane.identity.id
         let dataBeforeAttempt = lane.identity.data
         let stateToken = lane.ratchetStateToken
         let label = "\(kind):\(laneId.uuidString.prefix(8))"
+        let failure = { (error: Error) in
+            InboundAttemptFailure(
+                laneId: laneId,
+                label: label,
+                error: error,
+                stateLess: !lane.hasRatchetState,
+                holdsFrameEpoch: lane.holdsFrameEpoch,
+                isPreferred: laneId == frame.sessionIdentity.id)
+        }
         if let cached = inboundNegativeDecryptCache.cachedFailure(
             laneId: laneId, fingerprint: fingerprint, laneState: stateToken)
         {
-            failures.append((label, cached))
+            failures.append(failure(cached))
             stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .skippedNegativeCache, failure: "\(cached)"))
             return nil
         }
@@ -1064,19 +1160,27 @@ extension MessagePipeline {
                 ratchetMessage: frame.ratchetMessage)
             let data = try await ratchetManager.decrypt(frame.ratchetMessage, sessionId: laneId)
             if !lane.hasRatchetState {
-                let receivedMessagesCount = try await ratchetManager.sessionStatus(sessionId: laneId).receivedMessagesCount
+                let status = try await ratchetManager.sessionStatus(sessionId: laneId)
                 guard InboundLaneSelectionPolicy.blankMayBecomeLane(
-                    receivedMessagesCount: receivedMessagesCount, statefulRowExists: statefulRowExists)
+                    receivedMessagesCount: status.receivedMessagesCount,
+                    remoteRatchetPublicKey: status.remoteRatchetPublicKey,
+                    holders: frameEpochHolders.map { holder in
+                        // Every failed attempt lands in the cache, whichever pass made it.
+                        (rejectedFrame: inboundNegativeDecryptCache.cachedFailure(
+                            laneId: holder.identity.id, fingerprint: fingerprint, laneState: holder.ratchetStateToken) != nil,
+                         receivedMessagesCount: holder.props.ratchetReceivedMessagesCount,
+                         remoteRatchetPublicKey: holder.props.ratchetRemotePublicKey)
+                    })
                 else {
-                    audit(.recovery, "pqs.recovery.blankBootstrapRefused reason=midSessionFrame messageNumber=\(receivedMessagesCount - 1) lane=\(laneId.uuidString) kind=\(kind)")
+                    audit(.recovery, "pqs.recovery.blankBootstrapRefused reason=replayOfConsumedFrame messageNumber=\(status.receivedMessagesCount - 1) lane=\(laneId.uuidString) kind=\(kind)")
                     throw RatchetError.decryptionFailed
                 }
             }
             stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .decrypted))
             return data
         } catch {
-            failures.append((label, error))
-            stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .failed, failure: "\(error)"))
+            failures.append(failure(error))
+            stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .failed, failure: "\(PQSAuditRedaction.describe(error))"))
             inboundNegativeDecryptCache.recordFailure(
                 laneId: laneId, fingerprint: fingerprint, laneState: stateToken, error: error)
             if await rollBackFailedAttempt(
@@ -1384,48 +1488,51 @@ extension MessagePipeline {
             sender: inboundTask.senderSecretName,
             mySecretName: mySecretName)
 
-        // Duplicate-persist guard: the same logical message can decrypt twice
-        // (an orphan replay landing after the original, or a redelivery racing
-        // the ingress guard). One sharedId from one sender tuple is one chat
-        // row — persisting again would mint a second row with a fresh UUID and
-        // notify the host twice. The sender-tuple match keeps this from ever
-        // colliding with a *different* sender's frame or with our own outbound
-        // record for the same conversation.
-        // Recovery placeholders (waiting/failed) are replaced in place on heal.
+        // Held content stopped in `handleStreamMessage`, so a row here for this logical
+        // id and sender tuple is not known to be content: it is a recovery placeholder,
+        // or no delegate was there to say. One sharedId from one sender tuple is one chat
+        // row, so the frame replaces it in place on heal: inserting would mint a second
+        // row with a fresh UUID. The sender-tuple match keeps this from ever colliding
+        // with a *different* sender's frame or with our own outbound record for the same
+        // conversation.
+        var misfiledPlaceholder: EncryptedMessage?
         if let existing = try await cache.fetchMessageIfExists(
             sharedId: inboundTask.resolvedLogicalSharedId),
            let existingProps = await existing.props(symmetricKey: databaseSymmetricKey),
            existingProps.senderSecretName == inboundTask.senderSecretName,
            existingProps.senderDeviceId == inboundTask.senderDeviceId
         {
-            if Self.isReplaceableInboundRecoveryPlaceholder(existingProps) {
-                let target = try? await conversation(
-                    cache: cache,
-                    communicationType: conversationType,
-                    session: session)
-                if target?.id == existing.communicationId {
-                    var healedProps = existingProps
-                    healedProps.message = decodedMessage
-                    healedProps.deliveryState = .received
-                    let healed = try await existing.updateMessage(
-                        with: healedProps,
-                        symmetricKey: databaseSymmetricKey)
-                    try await cache.updateMessage(healed, symmetricKey: databaseSymmetricKey)
-                    audit(.recovery, "pqs.recovery.placeholderHealed envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-                    await session.receiverDelegate?.createdMessage(healed)
-                    await sendAutomaticDeliveredReceiptIfNeeded(
-                        session: session,
-                        inboundTask: inboundTask,
-                        sharedId: healed.sharedId,
-                        conversationRecipient: decodedMessage.recipient)
-                    return
-                }
-                try await cache.deleteMessage(existing)
-                audit(.recovery, "pqs.recovery.placeholderRefiled envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
-            } else {
-                audit(.recovery, "pqs.recovery.duplicateInboundPersistSkipped envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+            let target = try? await conversation(
+                cache: cache,
+                communicationType: conversationType,
+                session: session)
+            if target?.id == existing.communicationId {
+                var healedProps = existingProps
+                healedProps.message = decodedMessage
+                healedProps.deliveryState = .received
+                let healed = try await existing.updateMessage(
+                    with: healedProps,
+                    symmetricKey: databaseSymmetricKey)
+                try await cache.updateMessage(healed, symmetricKey: databaseSymmetricKey)
+                audit(.recovery, "pqs.recovery.placeholderHealed envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
+                await session.receiverDelegate?.createdMessage(healed)
+                await sendAutomaticDeliveredReceiptIfNeeded(
+                    session: session,
+                    inboundTask: inboundTask,
+                    sharedId: healed.sharedId,
+                    conversationRecipient: decodedMessage.recipient)
                 return
             }
+            misfiledPlaceholder = existing
+        }
+
+        // Content first: until it exists the placeholder is the only durable record of
+        // the message, and any exit below this point has to leave it in place.
+        func persist(_ messageModel: EncryptedMessage) async throws {
+            try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            guard let misfiledPlaceholder else { return }
+            try await cache.deleteMessage(misfiledPlaceholder)
+            audit(.recovery, "pqs.recovery.placeholderRefiled envelope=\(inboundTask.sharedMessageId) logical=\(inboundTask.resolvedLogicalSharedId) sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString)")
         }
         
         switch decodedMessage.recipient {
@@ -1485,7 +1592,7 @@ extension MessagePipeline {
                 }
             }
             
-            try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            try await persist(messageModel)
             logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
             audit(.recv, "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
                 level: .info)
@@ -1555,7 +1662,7 @@ extension MessagePipeline {
                 await session.receiverDelegate?.updatedCommunication(communicationModel, members: [mySecretName])
             }
             
-            try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            try await persist(messageModel)
             logger.log(level: .info, message: "Inbound message persisted with sharedId=\(messageModel.sharedId), recipient=\(decodedMessage.recipient), flag=\(decodedMessage.transportInfo != nil ? "hasTransportInfo" : "noTransportInfo")")
             audit(.recv, "pqs.recv.persisted sharedId=\(messageModel.sharedId) sender=\(inboundTask.senderSecretName) senderDeviceId=\(inboundTask.senderDeviceId.uuidString) recipient=\(decodedMessage.recipient.auditRecipientTag) sessionIdentityId=\(sessionIdentity.id.uuidString)",
                 level: .info)
@@ -1624,7 +1731,7 @@ extension MessagePipeline {
             if shouldUpdateCommunication {
                 try await cache.updateCommunication(communicationModel)
             }
-            try await cache.createMessage(messageModel, symmetricKey: databaseSymmetricKey)
+            try await persist(messageModel)
             if shouldUpdateCommunication,
                let members = await communicationModel.props(symmetricKey: databaseSymmetricKey)?.members {
                 await session.receiverDelegate?.updatedCommunication(communicationModel, members: members)
@@ -1649,19 +1756,6 @@ extension MessagePipeline {
     ) -> MessageRecipient {
         guard case .nickname(let peer) = recipient else { return recipient }
         return .nickname(sender == mySecretName ? peer : sender)
-    }
-
-    /// Host-inserted inbound recovery placeholders use `.waitingDelivery` / `.failed` until
-    /// an orphan resend decrypts into the same logical sharedId.
-    static func isReplaceableInboundRecoveryPlaceholder(
-        _ props: EncryptedMessage.UnwrappedProps
-    ) -> Bool {
-        switch props.deliveryState {
-        case .waitingDelivery, .failed:
-            return true
-        default:
-            return false
-        }
     }
 
     /// Verifies and decrypts an encrypted message received in an inbound task.

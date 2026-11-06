@@ -221,7 +221,8 @@ extension MessagePipeline {
             secretName: props.secretName,
             deviceId: props.deviceId,
             sendOneTimeIdentities: true,
-            reason: "stateLessPersonalOutboundRefresh")
+            reason: "stateLessPersonalOutboundRefresh",
+            retiring: .unanswered)
     }
     
     /// Picks the active identity row for a peer device.
@@ -229,7 +230,9 @@ extension MessagePipeline {
     /// Active `sessionContextId`s are intentionally random, so they are not a recency signal.
     /// If duplicate active rows survive from an older persistence failure, prefer the row whose
     /// key bundle matches the peer's currently advertised device bundle, then prefer initialized
-    /// ratchet state, then preserve store order by choosing the last row.
+    /// ratchet state, then a row the peer has answered, then preserve store order by choosing
+    /// the last row. The received count is persisted, so answered rows win with no in-memory
+    /// recovery mark: after a relaunch and in the extension.
     /// Archived (inactive) identities are excluded so they are never used for outbound encryption.
     func bestSessionIdentity(
         secretName: String,
@@ -285,12 +288,12 @@ extension MessagePipeline {
     /// Orphan remint **inserts** a new initiating session (becomes active) and
     /// encrypts that replay via explicit `recipientIdentity` on the outbound task.
     ///
-    /// When an orphan mark and another initialized active both exist (transient):
+    /// When an orphan mark and another initialized active both exist:
     /// - **Same-account (personal/sibling):** bind outbound to the orphan recovery
     ///   row so sibling sync does not keep riding the dead maxSkipped lane.
     /// - **Cross-account (peer):** StickyAdvancedRemint — prefer the initialized
-    ///   non-orphan active (one-active invariant); remint encrypt uses explicit
-    ///   `recipientIdentity`.
+    ///   non-orphan active until the peer's decrypt on the new row retires it; remint
+    ///   encrypt uses explicit `recipientIdentity`.
     func outboundSessionIdentity(
         secretName: String,
         deviceId: UUID,
@@ -571,7 +574,7 @@ extension MessagePipeline {
                 deviceId: deviceId,
                 sendOneTimeIdentities: false,
                 reason: "resendRequestControlDelivery",
-                demotePriorActives: false)
+                retiring: .none)
             let episodeIsCurrent =
                 surgicalControlEpisodeGenerationByPeerDevice[episodeKey, default: 0]
                     == mintEpisodeGeneration
@@ -720,13 +723,16 @@ extension MessagePipeline {
     /// peer signals it cannot decrypt us (inbound peerRefresh request) or when we
     /// open a missingOneTimeKey episode for the peer device.
     /// `ratchetReceivedMessagesCount == 0` on an initialized state proves the peer has
-    /// never advanced our session; answered lanes are never touched. The repair
-    /// mint (`sendOneTimeIdentities: false`) rides long-term + final ML-KEM keys
-    /// only, so it cannot re-enter the missingOneTimeKey failure.
+    /// never advanced our session. That is tested on the rows our frames ride, the
+    /// recovery row and what outbound selects: an answered sibling says nothing about
+    /// their pinned keys, and it stays active. The repair mint
+    /// (`sendOneTimeIdentities: false`) rides long-term + final ML-KEM keys only, so
+    /// it cannot re-enter the missingOneTimeKey failure.
     ///
     /// - Parameter forceRemintEvenIfAnswered: same-account `missingOneTimeKeyEpisode`
-    ///   only (`UnansweredInitiatingLanePolicy`). Cross-account answered lanes stay
-    ///   untouched so we do not remint on every undecryptable NACK.
+    ///   only (`UnansweredInitiatingLanePolicy`), and it retires every active row.
+    ///   Cross-account answered lanes stay untouched so we do not remint on every
+    ///   undecryptable NACK.
     func resetUnansweredInitiatingLane(
         peerSecretName: String,
         peerDeviceId: UUID,
@@ -740,6 +746,20 @@ extension MessagePipeline {
             else { return }
             let symmetricKey = try await session.getDatabaseSymmetricKey()
             let identities = try await session.getSessionIdentities(with: peerSecretName)
+            let trafficIds = [
+                await session.orphanResendInitiatingSessionId(
+                    secretName: peerSecretName,
+                    deviceId: peerDeviceId),
+                await session.orphanResendRecoverySessionId(
+                    secretName: peerSecretName,
+                    deviceId: peerDeviceId),
+                await outboundSessionIdentity(
+                    secretName: peerSecretName,
+                    deviceId: peerDeviceId,
+                    in: identities,
+                    symmetricKey: symmetricKey,
+                    session: session)?.id,
+            ]
             var shouldRemint = false
             for identity in identities {
                 guard let props = await identity.props(symmetricKey: symmetricKey),
@@ -747,25 +767,24 @@ extension MessagePipeline {
                       !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix),
                       props.hasRatchetState
                 else { continue }
-                if props.ratchetReceivedMessagesCount > 0 {
-                    // The peer has decrypted us on this session before, so the
-                    // handshake is not the failure — unless same-account OTK
-                    // evidence forces remint so peerRefresh cannot ride the
-                    // answered poison pin (dogfood echo primary↔linked deadlock).
-                    if forceRemintEvenIfAnswered {
-                        shouldRemint = true
-                        break
-                    }
-                    return
+                // Once the peer has decrypted us on a session the handshake is not
+                // the failure — unless same-account OTK evidence forces remint so
+                // peerRefresh cannot ride the answered poison pin (dogfood echo
+                // primary↔linked deadlock).
+                if forceRemintEvenIfAnswered
+                    || (trafficIds.contains(identity.id) && props.ratchetReceivedMessagesCount == 0)
+                {
+                    shouldRemint = true
+                    break
                 }
-                shouldRemint = true
             }
             guard shouldRemint else { return }
             _ = try await session.resetSessionIdentityForFreshSession(
                 secretName: peerSecretName,
                 deviceId: peerDeviceId,
                 sendOneTimeIdentities: false,
-                reason: "unansweredInitiatorReset")
+                reason: "unansweredInitiatorReset",
+                retiring: forceRemintEvenIfAnswered ? .all : .unanswered)
             clearPreferredSessionIdentity(secretName: peerSecretName, deviceId: peerDeviceId)
             audit(.recovery, "pqs.recovery.unansweredInitiatorLaneReset trigger=\(trigger) peer=\(peerSecretName) deviceId=\(peerDeviceId.uuidString) forceAnswered=\(forceRemintEvenIfAnswered)")
         } catch PQSError.invalidDeviceIdentity {
@@ -809,28 +828,12 @@ extension MessagePipeline {
                 deviceId: deviceId))
     }
 
-    /// After orphan remint, demote MessageRecord's prior SessionID when it differs
-    /// from the new recovery row so `bestSessionIdentity` cannot keep the poison.
-    func demotePriorOrphanMessageRecordSession(
-        priorSessionId: UUID?,
-        newSessionId: UUID,
-        secretName: String,
-        deviceId: UUID,
-        session: PQSSession
-    ) async {
-        guard let priorSessionId, priorSessionId != newSessionId else { return }
-        _ = try? await session.demoteProveFailedActive(
-            sessionId: priorSessionId,
-            secretName: secretName,
-            deviceId: deviceId)
-    }
-
     /// One escape-hatch initiating session (new OTK header) when settled recovery
     /// still fails to prove (peer NACK) — clears the receiver `blankForHeaderExists` trap.
     func performOrphanEscapeRemint(
         serviceKey: String,
         remintsAfterProveFail: Int,
-        priorRecordSessionId: UUID?,
+        provenDeadLaneId: UUID?,
         secretName: String,
         deviceId: UUID,
         sharedId: String,
@@ -846,18 +849,14 @@ extension MessagePipeline {
             secretName: secretName,
             deviceId: deviceId,
             sendOneTimeIdentities: true,
-            reason: "orphanResend")
+            reason: "orphanResend",
+            retiring: .unanswered,
+            provenDeadLaneId: provenDeadLaneId)
         await session.markOrphanResendInitiatingSession(
             secretName: secretName,
             deviceId: deviceId,
             sessionId: replayIdentity.id)
         clearPreferredSessionIdentity(secretName: secretName, deviceId: deviceId)
-        await demotePriorOrphanMessageRecordSession(
-            priorSessionId: priorRecordSessionId,
-            newSessionId: replayIdentity.id,
-            secretName: secretName,
-            deviceId: deviceId,
-            session: session)
         audit(.recovery, "pqs.recovery.orphanResendRemintAfterProveFail sharedId=\(sharedId) requester=\(secretName) deviceId=\(deviceId.uuidString) newSessionId=\(replayIdentity.id.uuidString)")
         return replayIdentity
     }
@@ -865,7 +864,8 @@ extension MessagePipeline {
     private func bestCandidatePreservingStoreOrder(
         _ candidates: [(identity: SessionIdentity, props: SessionIdentity.UnwrappedProps, index: Int)]
     ) -> (identity: SessionIdentity, props: SessionIdentity.UnwrappedProps, index: Int)? {
-        candidates.max(by: { $0.index < $1.index })
+        let answered = candidates.filter { $0.props.ratchetReceivedMessagesCount > 0 }
+        return (answered.isEmpty ? candidates : answered).max(by: { $0.index < $1.index })
     }
 
     /// Resolves a device bundle for outbound selection from **local** configuration
@@ -946,9 +946,9 @@ extension MessagePipeline {
             props: props,
             sessionContext: sessionContext,
             session: session,
-            sessionIdentityId: sessionIdentity.id)
+            laneId: sessionIdentity.id)
         
-        // If we are intially attempting communication with a contact, we need to first send a session identity created message for the contact to delete their one time keys from being used again, the recipient can know what keys via key identities that are sent. This call also needs to send the sender's one time key identities so that the recipient also knows what one times to create their session with. We get the sender's next.
+        // If we are intially attempting communication with a contact, we need to first send a session identity created message for the contact to delete their one time keys from being used again, the recipient can know what keys via key identities that are sent.
         var transportEvent: TransportEvent?
         if let data = outboundTask.message.transportInfo {
             do {
@@ -961,10 +961,7 @@ extension MessagePipeline {
                         message: "Prepared to send session reestablishment: \(envelope.kind.rawValue) intent=\(envelope.intentId?.uuidString ?? "nil") epoch=\(envelope.epoch)")
                 case .linkedDeviceReprovisioning(let bundle):
                     logger.log(level: .info, message: "Prepared to send linked-device reprovisioning for target=\(bundle.targetDeviceId.uuidString)")
-                case .synchronizeOneTimeKeys(var info):
-                    info.senderX25519Id = results.localOneTimePrivateKey?.id.uuidString
-                    info.senderMLKEMId = results.localMLKEMPrivateKey.id.uuidString
-                    transportEvent = .synchronizeOneTimeKeys(info)
+                case .synchronizeOneTimeKeys(let info):
                     let encodedData = try BinaryEncoder().encode(info)
                     await session.setAddingContact(encodedData)
                     outboundTask.message.transportInfo = encodedData
@@ -996,6 +993,7 @@ extension MessagePipeline {
             atomicOutboundPreparationIdentityIds.insert(sessionIdentity.id)
         }
         let signedMessage: SignedRatchetMessage
+        let sentHeader: EncryptedHeader
         do {
             try await ratchetManager.initiateSession(
                 sessionIdentity: sessionIdentity,
@@ -1019,6 +1017,7 @@ extension MessagePipeline {
             let ratchetedMessage = try await ratchetManager.encrypt(
                 plainText: encodedData,
                 sessionId: sessionIdentity.id)
+            sentHeader = ratchetedMessage.header
             signedMessage = try await signRatchetMessage(message: ratchetedMessage, session: session)
         } catch {
             atomicOutboundPreparationIdentityIds.remove(sessionIdentity.id)
@@ -1078,7 +1077,7 @@ extension MessagePipeline {
                     job: persistenceJob)
             } catch {
                 atomicOutboundPreparationIdentityIds.remove(sessionIdentity.id)
-                audit(.send, "pqs.send.preparedCommitFailed sharedId=\(outboundTask.sharedId) sessionIdentityId=\(sessionIdentity.id.uuidString) recipientDeviceId=\(props.deviceId.uuidString) persisted=\(outboundTask.isPersistedOutbound) error=\(error)")
+                audit(.send, "pqs.send.preparedCommitFailed sharedId=\(outboundTask.sharedId) sessionIdentityId=\(sessionIdentity.id.uuidString) recipientDeviceId=\(props.deviceId.uuidString) persisted=\(outboundTask.isPersistedOutbound) error=\(PQSAuditRedaction.describe(error))")
                 jobProps.preparedOutbound = nil
                 _ = try? await persistenceJob.updateProps(
                     symmetricKey: databaseSymmetricKey,
@@ -1118,25 +1117,27 @@ extension MessagePipeline {
         let priorAttempt = await session.outboundDeviceSendRecord(
             sharedId: outboundTask.sharedId,
             recipientDeviceId: props.deviceId)?.resendAttempt ?? -1
-        let isOrphanReplayForAttempt =
-            await session.isOrphanResendInitiatingSession(
-                secretName: props.secretName,
-                deviceId: props.deviceId,
-                sessionId: sessionIdentity.id)
-            || pendingResendReplayBySharedId[outboundTask.sharedId] != nil
+        // Servicing produced this envelope. Riding the orphan row does not make a
+        // frame a replay: its NACK would read as proof that the lane is dead.
+        let isOrphanReplay = pendingResendReplayBySharedId[outboundTask.sharedId] != nil
         await session.recordOutboundDeviceSend(
             sharedId: outboundTask.sharedId,
             recipientSecretName: props.secretName,
             recipientDeviceId: props.deviceId,
             sessionIdentityId: sessionIdentity.id,
             envelopeMessageId: envelopeMessageId,
-            resendAttempt: isOrphanReplayForAttempt ? max(0, priorAttempt) + 1 : 0)
-        let isOrphanReplay = isOrphanReplayForAttempt
+            resendAttempt: isOrphanReplay ? max(0, priorAttempt) + 1 : 0)
 
         try await transportDelegate.sendMessage(signedMessage, metadata: transportMetadata)
         
-        audit(.send, "pqs.send.deviceTransportOk sharedId=\(outboundTask.sharedId) envelopeMessageId=\(envelopeMessageId) recipientSecret=\(props.secretName) recipientDeviceId=\(props.deviceId.uuidString) sessionIdentityId=\(sessionIdentity.id.uuidString) recipient=\(outboundTask.message.recipient.auditRecipientTag) persisted=\(outboundTask.isPersistedOutbound)",
-            level: .info)
+        auditDeviceTransportOk(
+            outboundTask: outboundTask,
+            envelopeMessageId: envelopeMessageId,
+            recipientSecretName: props.secretName,
+            recipientDeviceId: props.deviceId,
+            sessionIdentityId: sessionIdentity.id,
+            pending: false,
+            header: RatchetHeaderAudit(sentHeader))
         
         if isOrphanReplay {
             audit(.recovery, "pqs.recovery.messageRecordSessionId=\(sessionIdentity.id.uuidString) sharedId=\(outboundTask.sharedId) recipientDeviceId=\(props.deviceId.uuidString)")

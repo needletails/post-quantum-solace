@@ -76,7 +76,7 @@
 //      EnvelopeMessageIdTests T17, OrphanInPlaceHealTests P1b.
 //  sticky orphan wave drain does not clear mark
 //      Covered by OrphanInPlaceHealTests P3 + DogfoodLogReplayTests C3* +
-//      DemotePromoteThrashPolicyTests P1 reuseRecoveryWave.
+//      DemotePromoteThrashPolicyTests P1 replayOnAnsweredLane.
 //  non-viable transport parks recovery outbound / enqueue persists without enqueue
 //      Covered by SessionConcurrencyHardeningTests + OutboundJobEnqueueTests nonviable compose.
 //  failed orphan replay re-arms bounded NACK; personal refresh cannot stomp orphan lane
@@ -137,13 +137,13 @@ struct FriendshipFlowSourceTests {
         }
         _ = needsBootstrap
 
-        let reset: (PQSSession, String, UUID, Bool, String, Bool) async throws -> SessionIdentity = {
+        let reset: (PQSSession, String, UUID, Bool, String, PriorLaneRetirement) async throws -> SessionIdentity = {
             try await $0.resetSessionIdentityForFreshSession(
                 secretName: $1,
                 deviceId: $2,
                 sendOneTimeIdentities: $3,
                 reason: $4,
-                demotePriorActives: $5)
+                retiring: $5)
         }
         _ = reset
 
@@ -256,7 +256,6 @@ struct FriendshipFlowSourceTests {
         _ = InboundRecoveryStormPolicy.terminalTryAllError
         _ = ExplicitOutboundRecipientPinPolicy.shouldHonorExplicitRecipient
         _ = OrphanReplayRearmPolicy.shouldRearm
-        _ = MessagePipeline.isReplaceableInboundRecoveryPlaceholder
         _ = MessagePipeline.inboundConversationType
     }
 

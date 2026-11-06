@@ -432,7 +432,6 @@ extension PQSSession {
             // repair flow from that context so reprovisioning/control messages do not
             // carry or re-expose the pre-rotation one-time-key batches.
             sessionContext = try await getSessionContext()
-            await setSessionContext(sessionContext)
             
             guard let cache else {
                 throw PQSError.databaseNotInitialized
@@ -535,14 +534,7 @@ extension PQSSession {
                 if rotateKeyDate <= rotationDate {
                     try await rotateMLKEMFinalKey()
                     
-                    guard let cache else {
-                        throw PQSError.databaseNotInitialized
-                    }
-                    let data = try await cache.fetchLocalSessionContext()
-                    
-                    let configurationData = try await openSessionContextPlaintext(data)
-                    
-                    var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+                    var sessionContext = try await getSessionContext()
                     await sessionContext.sessionUser.deviceKeys.updateRotateKeysDate(Date())
                     try await updateRotatedKeySessionContext(sessionContext: sessionContext)
                     return true
@@ -865,31 +857,25 @@ private extension PQSSession {
             throw PQSError.databaseNotInitialized
         }
         
-        let config = try await cache.fetchLocalSessionContext()
-        
-        let configurationData = try await openSessionContextPlaintext(config)
-        
-        return try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+        return try await currentSessionContext(cache: cache)
     }
     
-    func updateRotatedKeySessionContext(sessionContext: SessionContext) async throws {
-        var sessionContext = sessionContext
-        
+    /// Lands a rotation on the live context as one exclusive commit. `rotated` was read
+    /// before the publish, and the commit lock cannot span that round-trip without
+    /// stalling every inbound commit on the network. So only what rotation owns moves
+    /// over, and whatever the session committed meanwhile stays (one-time keys, host
+    /// state, peer pins).
+    func updateRotatedKeySessionContext(sessionContext rotated: SessionContext) async throws {
         guard let cache else {
             throw PQSError.databaseNotInitialized
         }
         
-        sessionContext.updateSessionUser(sessionContext.sessionUser)
-        await setSessionContext(sessionContext)
-        
-        // Encrypt and persist
-        let encodedData = try BinaryEncoder().encode(sessionContext)
-        let symmetricKey = try await getAppSymmetricKey()
-        guard let encryptedConfig = try crypto.encrypt(data: encodedData, symmetricKey: symmetricKey) else {
-            throw PQSError.sessionEncryptionError
+        try await commitSessionContextMutation(cache: cache) { context in
+            context.sessionUser.deviceKeys.adoptRotatedKeys(from: rotated.sessionUser.deviceKeys)
+            context.activeUserConfiguration.signingPublicKey = rotated.activeUserConfiguration.signingPublicKey
+            context.activeUserConfiguration.signedDevices = rotated.activeUserConfiguration.signedDevices
+            context.activeUserConfiguration.signedDeviceKeyBundles = rotated.activeUserConfiguration.signedDeviceKeyBundles
         }
-        
-        try await cache.updateLocalSessionContext(encryptedConfig)
         logger.log(level: .debug, message: "Updated session context during key rotation")
     }
     

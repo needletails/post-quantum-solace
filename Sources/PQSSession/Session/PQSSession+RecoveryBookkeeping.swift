@@ -59,6 +59,27 @@ extension PQSSession {
         "\(sender)|\(deviceId.uuidString)|\(failedMessageId)"
     }
     
+    /// Files a failed envelope under its logical message and returns how many earlier
+    /// envelopes of that message failed here. A replay keeps the logical id and mints a new
+    /// envelope id, so this is what lets one rearm with no count of its own.
+    func noteFailedEnvelope(_ message: InboundTaskMessage) -> Int {
+        let messageKey = peerResendRequestKey(
+            sender: message.senderSecretName,
+            deviceId: message.senderDeviceId,
+            failedMessageId: message.resolvedLogicalSharedId)
+        var envelopes = failedEnvelopesByMessageKey[messageKey] ?? []
+        envelopes.insert(message.sharedMessageId)
+        failedEnvelopesByMessageKey[messageKey] = envelopes
+        if failedEnvelopesByMessageKey.count > PQSSessionConstants.recoveryTrackingMaxEntries {
+            let overflow = failedEnvelopesByMessageKey.count
+                - PQSSessionConstants.recoveryTrackingMaxEntries
+            for key in failedEnvelopesByMessageKey.keys.prefix(overflow) {
+                failedEnvelopesByMessageKey.removeValue(forKey: key)
+            }
+        }
+        return envelopes.count - 1
+    }
+
     /// Drops expired entries from inbound-failure policy state.
     func cleanupInboundFailurePolicy(now: Date = Date()) {
         inboundFailurePolicyUntil = inboundFailurePolicyUntil.filter { _, expiry in
@@ -381,14 +402,15 @@ extension PQSSession {
         sender: String,
         deviceId: UUID,
         failedMessageId: String,
+        earlierFailedEnvelopes: Int = 0,
         currentFingerprint: Data,
         now: Date = Date()
     ) -> Bool {
-        let attempts = resendRequestSubmissionCount(
+        let attempts = max(earlierFailedEnvelopes, resendRequestSubmissionCount(
             sender: sender,
             deviceId: deviceId,
             failedMessageId: failedMessageId,
-            now: now)
+            now: now))
         let requestKey = peerResendRequestKey(
             sender: sender,
             deviceId: deviceId,
@@ -736,7 +758,7 @@ extension PQSSession {
     }
 
     /// Lane prune already decided this device is gone. Clear its pending
-    /// resends and tell the host so the durable ledger cannot rearm them.
+    /// resends and tell the host so its placeholder rows cannot rearm them.
     func dropPendingResendsForRemovedDevice(sender: String, deviceId: UUID) async {
         let pending = await takePendingResendsAfterReestablishment(
             sender: sender,
@@ -754,7 +776,7 @@ extension PQSSession {
     private enum ReplacedDeviceHostSignal: Sendable {
         /// New inbound miss: delete the spool copy without a placeholder.
         case purgeSpool
-        /// Pending id or relaunch rearm: clear the durable recovery ledger.
+        /// Pending id or relaunch rearm: retire the host's placeholder row.
         case terminal
     }
 
@@ -1105,6 +1127,20 @@ extension PQSSession {
         return nil
     }
 
+    /// Resolves the id a resend request cites to the envelope record it names for
+    /// the requesting device: by envelope id (§4.1), else by logical shared id — a
+    /// host re-arm from a placeholder row cites the logical id (S12a). Either
+    /// way the record must be one this device addressed to that device.
+    func outboundDeviceSendRecord(
+        citedId: String,
+        requestingDeviceId: UUID
+    ) async -> OutboundDeviceSendRecord? {
+        if let record = await outboundDeviceSendRecord(envelopeMessageId: citedId) {
+            return record
+        }
+        return await outboundDeviceSendRecord(sharedId: citedId, recipientDeviceId: requestingDeviceId)
+    }
+
     /// Whether this sender device already had the frame accepted: by envelope id,
     /// or, when `frameFingerprint` is given, by the signed payload under any
     /// envelope id. The id rides outside the signature, so a redelivery can
@@ -1237,7 +1273,7 @@ extension PQSSession {
     /// The persist branch already clears the satisfied id via
     /// `takePendingResendsAfterReestablishment(satisfiedSharedMessageId:)`.
     /// Without this, a control frame that decrypts keeps its pending NACK,
-    /// re-NACKs on later drains, and can hit `resendSubmissionCap` /
+    /// re-NACKs on later drains, and can hit the resend cap /
     /// `oobUnavailable` after the content was already accepted. Does not end
     /// the episode or drain sibling NACKs.
     func settlePendingResendForAcceptedEnvelope(
@@ -1268,7 +1304,7 @@ extension PQSSession {
     /// (S12). Matching only on the envelope therefore never settles a replay:
     /// the original envelope stays pending, is re-NACKed at every drain boundary
     /// (`offlineReplayComplete`, next successful decrypt, peerRefresh response),
-    /// the sender replays again, and the loop only ends at `resendSubmissionCap`
+    /// the sender replays again, and the loop only ends at the resend cap
     /// — observed as repeated `resendRequestReceived` for identical ids after the
     /// content had already been delivered (dogfood 2026-09-24, same-account
     /// sibling bootstrap; also cross-account `sunflower`/`sdx26`).
@@ -1430,7 +1466,7 @@ extension PQSSession {
                 envelopeMessageIds: envelopeMessageIds)
             auditSink.log(
                 .recovery,
-                "pqs.recovery.resendUnavailableEmitFailed requester=\(requester) deviceId=\(deviceId.uuidString) unavailableCount=\(envelopeMessageIds.count) error=\(error) reason=\(reason)")
+                "pqs.recovery.resendUnavailableEmitFailed requester=\(requester) deviceId=\(deviceId.uuidString) unavailableCount=\(envelopeMessageIds.count) error=\(PQSAuditRedaction.describe(error)) reason=\(reason)")
             return false
         }
     }

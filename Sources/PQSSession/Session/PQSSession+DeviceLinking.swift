@@ -610,47 +610,40 @@ extension PQSSession {
         }
 
         guard let cache else { return }
-        let data = try await cache.fetchLocalSessionContext()
-        let configurationData = try await openSessionContextPlaintext(data)
+        var contextBeforeAdoption: SessionContext?
+        try await commitSessionContextMutation(cache: cache) { sessionContext in
+            // 2. TOFU pin on the account-level signing key. A change here is a security
+            //    event (potential server-side identity swap) and must NOT be silently
+            //    accepted. Legitimate rotations install via the reprovisioning bundle
+            //    or `rotateKeysOnPotentialCompromise`, both of which update the local
+            //    pin first, so a subsequent refresh sees a matching key.
+            let pinnedKey = sessionContext.activeUserConfiguration.signingPublicKey
+            if !pinnedKey.isEmpty, pinnedKey != configuration.signingPublicKey {
+                logger.log(
+                    level: .error,
+                    message: "[adoptVerifiedUserConfiguration] account signing key changed without an authenticated rotation; refusing to adopt. pinnedPrefix=\(pinnedKey.prefix(8).map { String(format: "%02x", $0) }.joined()) incomingPrefix=\(configuration.signingPublicKey.prefix(8).map { String(format: "%02x", $0) }.joined())"
+                )
+                setAccountIdentityRequiresAcknowledgement(true)
+                throw PQSError.signingKeyOutOfSync
+            }
 
-        var sessionContext = try BinaryDecoder().decode(SessionContext.self, from: configurationData)
+            // Healthy adoption restores the TOFU pin match; clear any prior mismatch gate.
+            setAccountIdentityRequiresAcknowledgement(false)
 
-        // 2. TOFU pin on the account-level signing key. A change here is a security
-        //    event (potential server-side identity swap) and must NOT be silently
-        //    accepted. Legitimate rotations install via the reprovisioning bundle
-        //    or `rotateKeysOnPotentialCompromise`, both of which update the local
-        //    pin first, so a subsequent refresh sees a matching key.
-        let pinnedKey = sessionContext.activeUserConfiguration.signingPublicKey
-        if !pinnedKey.isEmpty, pinnedKey != configuration.signingPublicKey {
-            logger.log(
-                level: .error,
-                message: "[adoptVerifiedUserConfiguration] account signing key changed without an authenticated rotation; refusing to adopt. pinnedPrefix=\(pinnedKey.prefix(8).map { String(format: "%02x", $0) }.joined()) incomingPrefix=\(configuration.signingPublicKey.prefix(8).map { String(format: "%02x", $0) }.joined())"
+            contextBeforeAdoption = sessionContext
+            sessionContext.activeUserConfiguration = userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
+                configuration,
+                currentContext: sessionContext
             )
-            setAccountIdentityRequiresAcknowledgement(true)
-            throw PQSError.signingKeyOutOfSync
         }
-
-        // Healthy adoption restores the TOFU pin match; clear any prior mismatch gate.
-        setAccountIdentityRequiresAcknowledgement(false)
-
-        let contextBeforeAdoption = sessionContext
-        sessionContext.activeUserConfiguration = userConfigurationPreservingLocalCurrentDeviceOneTimeKeys(
-            configuration,
-            currentContext: sessionContext
-        )
-        await setSessionContext(sessionContext)
-
-        let encodedData = try BinaryEncoder().encode(sessionContext)
-        guard let encryptedConfig = try await crypto.encrypt(data: encodedData, symmetricKey: getAppSymmetricKey()) else {
-            throw PQSError.sessionEncryptionError
-        }
-        try await cache.updateLocalSessionContext(encryptedConfig)
 
         // The snapshot may advertise our retired device-signed bundle (sealed-sender
         // final ML-KEM key). Local state is already correct; converge the server record.
-        await republishLocalDeviceKeyBundleIfRemoteDrifted(
-            incoming: configuration,
-            currentContext: contextBeforeAdoption)
+        if let contextBeforeAdoption {
+            await republishLocalDeviceKeyBundleIfRemoteDrifted(
+                incoming: configuration,
+                currentContext: contextBeforeAdoption)
+        }
     }
 
     /// Explicitly clears the locally pinned account-level signing key and adopts

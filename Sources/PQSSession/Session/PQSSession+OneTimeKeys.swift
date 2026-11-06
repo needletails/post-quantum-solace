@@ -74,6 +74,7 @@ extension PQSSession {
                Date().timeIntervalSince(openedAt) < otkCircuitCooldownSeconds {
                 let remaining = Int(otkCircuitCooldownSeconds - Date().timeIntervalSince(openedAt))
                 logger.log(level: .info, message: "OTK upload circuit breaker open; skipping curve refresh (\(remaining)s until probe)")
+                auditSink.log(.recovery, "pqs.otk.batchReplaceSkipped kind=x25519 reason=circuitOpen remainingS=\(remaining)")
                 return false
             }
             logger.log(level: .info, message: "OTK circuit breaker cooldown elapsed; allowing probe attempt for curve keys")
@@ -140,6 +141,7 @@ extension PQSSession {
                Date().timeIntervalSince(openedAt) < otkCircuitCooldownSeconds {
                 let remaining = Int(otkCircuitCooldownSeconds - Date().timeIntervalSince(openedAt))
                 logger.log(level: .info, message: "OTK upload circuit breaker open; skipping MLKEM refresh (\(remaining)s until probe)")
+                auditSink.log(.recovery, "pqs.otk.batchReplaceSkipped kind=mlKEM reason=circuitOpen remainingS=\(remaining)")
                 return false
             }
             logger.log(level: .info, message: "OTK circuit breaker cooldown elapsed; allowing probe attempt for MLKEM keys")
@@ -226,7 +228,7 @@ extension PQSSession {
             try await replaceCurrentDeviceOneTimeKeys(
                 cache: cache,
                 refreshType: refreshType,
-                retainLocalPrivateKeys: policy == .replacePublishedBatch)
+                policy: policy)
             return
         }
         var keys = [UUID]()
@@ -255,11 +257,15 @@ extension PQSSession {
             shouldReplenish = false
         }
         if shouldReplenish {
-            // Identity inputs only. The new batch is merged into the *live* context after
-            // the upload (`commitSessionContextMutation`), never written back from this
-            // snapshot: the curve and ML-KEM refreshes run concurrently, and a snapshot
-            // taken before the network round-trip would drop the sibling's committed
-            // private keys while their publics are already on the server.
+            // Identity inputs only. The new batch is merged into the *live* context
+            // (`commitSessionContextMutation`), never written back from this snapshot:
+            // the curve and ML-KEM refreshes run concurrently, and a snapshot taken
+            // before the network round-trip would drop the sibling's committed private
+            // keys while their publics are already on the server.
+            //
+            // The privates are stored before the upload, so the server can only serve
+            // keys this device can open. The publics wait for the upload: they count what
+            // the server took.
             let snapshot = try await currentSessionContext(cache: cache)
             let secretName = snapshot.sessionUser.secretName
             let deviceId = snapshot.sessionUser.deviceId
@@ -286,14 +292,21 @@ extension PQSSession {
                         signingKey: signingKey)
                 }
 
-                try await transportDelegate?.updateOneTimeKeys(
-                    for: secretName,
-                    deviceId: deviceId.uuidString,
-                    keys: signedOneTimePublicKeys
-                )
+                try await auditingBatchStage("commit", kind: .x25519) {
+                    _ = try await commitSessionContextMutation(cache: cache) { context in
+                        context.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
+                    }
+                }
 
-                try await commitSessionContextMutation(cache: cache) { context in
-                    context.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
+                try await uploadingOneTimeKeyBatch(kind: .x25519, keyIds: privateOneTimeKeyPairs.map(\.id), cache: cache) {
+                    try await transportDelegate?.updateOneTimeKeys(
+                        for: secretName,
+                        deviceId: deviceId.uuidString,
+                        keys: signedOneTimePublicKeys
+                    )
+                }
+
+                try await commitOneTimeKeyBatch(kind: .x25519, policy: policy, keyIds: signedOneTimePublicKeys.map(\.id), cache: cache) { context in
                     context.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
                 }
 
@@ -315,14 +328,21 @@ extension PQSSession {
                     )
                 }
 
-                try await transportDelegate?.updateOneTimeMLKEMKeys(
-                    for: secretName,
-                    deviceId: deviceId.uuidString,
-                    keys: signedMLKEMOneTimeKeys
-                )
+                try await auditingBatchStage("commit", kind: .mlKEM) {
+                    _ = try await commitSessionContextMutation(cache: cache) { context in
+                        context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
+                    }
+                }
 
-                try await commitSessionContextMutation(cache: cache) { context in
-                    context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
+                try await uploadingOneTimeKeyBatch(kind: .mlKEM, keyIds: mlKEMOneTimeKeyPairs.map(\.id), cache: cache) {
+                    try await transportDelegate?.updateOneTimeMLKEMKeys(
+                        for: secretName,
+                        deviceId: deviceId.uuidString,
+                        keys: signedMLKEMOneTimeKeys
+                    )
+                }
+
+                try await commitOneTimeKeyBatch(kind: .mlKEM, policy: policy, keyIds: signedMLKEMOneTimeKeys.map(\.id), cache: cache) { context in
                     context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
                 }
             }
@@ -331,7 +351,7 @@ extension PQSSession {
 
     /// The live context when a session is active, otherwise the persisted one
     /// (store-only setups before `unlock`, and tests that seed the store directly).
-    private func currentSessionContext(cache: SessionCache) async throws -> SessionContext {
+    func currentSessionContext(cache: SessionCache) async throws -> SessionContext {
         if let live = _sessionContext {
             return live
         }
@@ -352,7 +372,7 @@ extension PQSSession {
     /// device cannot open. Falls back to the persisted context only when no live session
     /// exists (store-only setups before `unlock`).
     @discardableResult
-    private func commitSessionContextMutation(
+    func commitSessionContextMutation(
         cache: SessionCache,
         _ mutate: (inout SessionContext) throws -> Void
     ) async throws -> SessionContext {
@@ -370,38 +390,112 @@ extension PQSSession {
         return persisted
     }
 
+    /// Runs one stage of a batch swap and audits its failure. The refresh tasks retry the
+    /// whole swap, so every failed attempt leaves its own line. The line names the error
+    /// by domain and code: a `URLError`'s description carries the failing URL, and the key
+    /// routes hold this account's secret name.
+    private func auditingBatchStage<Value>(
+        _ stage: String,
+        kind: KeyKind,
+        _ work: () async throws -> Value
+    ) async throws -> Value {
+        do {
+            return try await work()
+        } catch {
+            let failure = error as NSError
+            auditSink.log(.recovery, "pqs.otk.batchReplaceFailed kind=\(kind) stage=\(stage) error=\(failure.domain):\(failure.code)")
+            throw error
+        }
+    }
+
+    /// Uploads a batch whose privates are already stored. `oneTimeKeyUploadFailed` is the
+    /// server's non-2xx answer, so the batch never landed and its privates come back out:
+    /// the retry mints its own, and orphans left in the pool would count against the
+    /// retained cap and evict keys in-flight frames still need. Any other failure may have
+    /// landed, so its privates stay.
+    private func uploadingOneTimeKeyBatch(
+        kind: KeyKind,
+        keyIds: [UUID],
+        cache: SessionCache,
+        _ upload: () async throws -> Void
+    ) async throws {
+        do {
+            try await auditingBatchStage("upload", kind: kind, upload)
+        } catch let sessionError as PQSError where sessionError == .oneTimeKeyUploadFailed {
+            try await auditingBatchStage("commit", kind: kind) {
+                _ = try await commitSessionContextMutation(cache: cache) { context in
+                    switch kind {
+                    case .x25519:
+                        context.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll { keyIds.contains($0.id) }
+                    case .mlKEM:
+                        context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll { keyIds.contains($0.id) }
+                    }
+                }
+            }
+            throw sessionError
+        }
+    }
+
+    /// Finishes an uploaded batch and audits it. The line follows the final commit, so
+    /// it is proof the private halves are stored and the server took the batch. `lastId`
+    /// is the newest key in this batch.
+    private func commitOneTimeKeyBatch(
+        kind: KeyKind,
+        policy: OneTimeKeyRefreshPolicy,
+        keyIds: [UUID],
+        cache: SessionCache,
+        _ mutate: (inout SessionContext) throws -> Void
+    ) async throws {
+        let committed = try await auditingBatchStage("commit", kind: kind) {
+            try await commitSessionContextMutation(cache: cache, mutate)
+        }
+        guard let firstId = keyIds.first, let lastId = keyIds.last else { return }
+        let deviceKeys = committed.sessionUser.deviceKeys
+        let retainedPrivates = kind == .x25519
+            ? deviceKeys.oneTimePrivateKeys.count
+            : deviceKeys.mlKEMOneTimePrivateKeys.count
+        auditSink.log(.recovery, "pqs.otk.batchReplaced kind=\(kind) policy=\(policy) count=\(keyIds.count) firstId=\(firstId.uuidString) lastId=\(lastId.uuidString) retainedPrivates=\(retainedPrivates)")
+    }
+
     /// Replaces this device's one-time-key batch on the server.
     ///
-    /// - Parameter retainLocalPrivateKeys: When `true` (recovery paths), existing local
-    ///   private keys are kept so in-flight messages encrypted against the previous
-    ///   batch can still decrypt; the retained pool is capped at
+    /// - Parameter policy: `.replacePublishedBatch` (recovery paths) keeps existing local
+    ///   private keys so in-flight messages encrypted against the previous batch can still
+    ///   decrypt; the retained pool is capped at
     ///   `PQSSessionConstants.retainedOneTimePrivateKeyCap` with oldest-first eviction.
-    ///   When `false` (compromise rotation), the local private pool is wiped with the
-    ///   published batch.
+    ///   `.replaceCurrentDeviceBatch` (compromise rotation) wipes the local private pool
+    ///   with the published batch.
     private func replaceCurrentDeviceOneTimeKeys(
         cache: SessionCache,
         refreshType: KeyKind,
-        retainLocalPrivateKeys: Bool = false
+        policy: OneTimeKeyRefreshPolicy
     ) async throws {
         guard let transportDelegate else {
             throw PQSError.transportNotInitialized
         }
 
-        // Identity inputs only; the batch swap is merged into the live context after the
-        // upload (see `commitSessionContextMutation`) so a concurrent refresh of the other
-        // key kind is not overwritten by this pre-upload snapshot.
+        // Identity inputs only; the batch swap is merged into the live context (see
+        // `commitSessionContextMutation`) so a concurrent refresh of the other key kind is
+        // not overwritten by this pre-upload snapshot.
+        //
+        // The new privates are stored before the upload, as in `refreshOneTimeKeys`. The
+        // swap itself waits for it: every retried attempt mints a batch, and evicting
+        // here would let failed uploads cost keys an in-flight message still needs.
         let snapshot = try await currentSessionContext(cache: cache)
         let signingKey = try Curve25519.Signing.PrivateKey(
             rawRepresentation: snapshot.sessionUser.deviceKeys.signingPrivateKey
         )
         let secretName = snapshot.sessionUser.secretName
         let deviceId = snapshot.sessionUser.deviceId
+        let retainLocalPrivateKeys = policy == .replacePublishedBatch
 
-        try await transportDelegate.batchDeleteOneTimeKeys(
-            for: secretName,
-            with: deviceId.uuidString,
-            type: refreshType
-        )
+        try await auditingBatchStage("delete", kind: refreshType) {
+            try await transportDelegate.batchDeleteOneTimeKeys(
+                for: secretName,
+                with: deviceId.uuidString,
+                type: refreshType
+            )
+        }
 
         switch refreshType {
         case .x25519:
@@ -421,18 +515,22 @@ extension PQSSession {
                 )
             }
 
-            try await transportDelegate.updateOneTimeKeys(
-                for: secretName,
-                deviceId: deviceId.uuidString,
-                keys: signedOneTimePublicKeys
-            )
-
-            let updated = try await commitSessionContextMutation(cache: cache) { context in
-                if !retainLocalPrivateKeys {
-                    context.sessionUser.deviceKeys.oneTimePrivateKeys.removeAll()
+            try await auditingBatchStage("commit", kind: .x25519) {
+                _ = try await commitSessionContextMutation(cache: cache) { context in
+                    context.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
                 }
+            }
+
+            try await uploadingOneTimeKeyBatch(kind: .x25519, keyIds: privateOneTimeKeyPairs.map(\.id), cache: cache) {
+                try await transportDelegate.updateOneTimeKeys(
+                    for: secretName,
+                    deviceId: deviceId.uuidString,
+                    keys: signedOneTimePublicKeys
+                )
+            }
+
+            try await commitOneTimeKeyBatch(kind: .x25519, policy: policy, keyIds: signedOneTimePublicKeys.map(\.id), cache: cache) { context in
                 context.activeUserConfiguration.signedOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
-                context.sessionUser.deviceKeys.oneTimePrivateKeys.append(contentsOf: privateOneTimeKeyPairs.map(\.privateKey))
                 context.activeUserConfiguration.signedOneTimePublicKeys.append(contentsOf: signedOneTimePublicKeys)
                 if retainLocalPrivateKeys {
                     let overflow = context.sessionUser.deviceKeys.oneTimePrivateKeys.count
@@ -440,9 +538,10 @@ extension PQSSession {
                     if overflow > 0 {
                         context.sessionUser.deviceKeys.oneTimePrivateKeys.removeFirst(overflow)
                     }
+                } else {
+                    context.sessionUser.deviceKeys.oneTimePrivateKeys = privateOneTimeKeyPairs.map(\.privateKey)
                 }
             }
-            logger.log(level: .debug, message: "Replaced published curve OTK batch; count=\(signedOneTimePublicKeys.count) retainedPrivates=\(retainLocalPrivateKeys ? updated.sessionUser.deviceKeys.oneTimePrivateKeys.count : 0)")
 
         case .mlKEM:
             let mlKEMOneTimeKeyPairs: [KeyPair] = try (0 ..< PQSSessionConstants.oneTimeKeyBatchSize).map { _ in
@@ -461,18 +560,22 @@ extension PQSSession {
                 )
             }
 
-            try await transportDelegate.updateOneTimeMLKEMKeys(
-                for: secretName,
-                deviceId: deviceId.uuidString,
-                keys: signedMLKEMOneTimeKeys
-            )
-
-            let updated = try await commitSessionContextMutation(cache: cache) { context in
-                if !retainLocalPrivateKeys {
-                    context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeAll()
+            try await auditingBatchStage("commit", kind: .mlKEM) {
+                _ = try await commitSessionContextMutation(cache: cache) { context in
+                    context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
                 }
+            }
+
+            try await uploadingOneTimeKeyBatch(kind: .mlKEM, keyIds: mlKEMOneTimeKeyPairs.map(\.id), cache: cache) {
+                try await transportDelegate.updateOneTimeMLKEMKeys(
+                    for: secretName,
+                    deviceId: deviceId.uuidString,
+                    keys: signedMLKEMOneTimeKeys
+                )
+            }
+
+            try await commitOneTimeKeyBatch(kind: .mlKEM, policy: policy, keyIds: signedMLKEMOneTimeKeys.map(\.id), cache: cache) { context in
                 context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeAll { $0.deviceId == deviceId }
-                context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.append(contentsOf: mlKEMOneTimeKeyPairs.map(\.privateKey))
                 context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.append(contentsOf: signedMLKEMOneTimeKeys)
                 if retainLocalPrivateKeys {
                     let overflow = context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count
@@ -480,9 +583,10 @@ extension PQSSession {
                     if overflow > 0 {
                         context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.removeFirst(overflow)
                     }
+                } else {
+                    context.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys = mlKEMOneTimeKeyPairs.map(\.privateKey)
                 }
             }
-            logger.log(level: .debug, message: "Replaced published MLKEM OTK batch; count=\(signedMLKEMOneTimeKeys.count) retainedPrivates=\(retainLocalPrivateKeys ? updated.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.count : 0)")
         }
     }
 

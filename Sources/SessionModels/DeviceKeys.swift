@@ -264,6 +264,19 @@ public struct DeviceKeys: Codable, Sendable, Equatable {
         signingPrivateKey = data
     }
 
+    /// Takes the keys a rotation replaced from `rotated`, a copy read before its publish.
+    /// One-time keys, their pending consumptions and the device JWT state have commits of
+    /// their own that may have landed since, so they stay.
+    package mutating func adoptRotatedKeys(from rotated: DeviceKeys) {
+        rotateAccountSigningKey(rotated.signingPrivateKey)
+        longTermPrivateKey = rotated.longTermPrivateKey
+        finalMLKEMPrivateKey = rotated.finalMLKEMPrivateKey
+        previousFinalMLKEMPrivateKey = rotated.previousFinalMLKEMPrivateKey
+        sealedSenderMLKEMPrivateKey = rotated.sealedSenderMLKEMPrivateKey
+        previousSealedSenderMLKEMPrivateKey = rotated.previousSealedSenderMLKEMPrivateKey
+        rotateKeysDate = rotated.rotateKeysDate
+    }
+
     /// Installs a new final MLKEM private key.
     ///
     /// - Parameters:

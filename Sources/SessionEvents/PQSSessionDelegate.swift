@@ -128,6 +128,12 @@ public protocol RecoveryObserver: Sendable {
         sharedMessageId: String
     ) async
 
+    /// Whether `transportInfo` marks a chat row as the host's recovery placeholder, an
+    /// empty row standing in for a message that has not decrypted yet. PQS cannot read
+    /// the host's transport metadata, and `deliveryState` does not answer this: receipts
+    /// and read sweeps move a placeholder's state as well.
+    func isInboundRecoveryPlaceholder(transportInfo: Data?) -> Bool
+
     func outboundMessageUnrecoverable(sharedMessageId: String, reason: String) async
 
     func reestablishmentEpisodeDidEnd(

@@ -131,6 +131,17 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         }
     }
 
+    /// Re-reads the local session context from the store, replacing the warm copy.
+    /// For a store another process wrote (`PQSSession.refreshSessionCache`): the
+    /// warm copy is this process's past, not the store's present. Like
+    /// `fetchLocalSessionContext`, this installs nothing on the session; the
+    /// caller does, under its commit lock.
+    func reloadLocalSessionContext() async throws -> Data {
+        let data = try await store.fetchLocalSessionContext()
+        localDeviceConfiguration = data
+        return data
+    }
+
     /// Updates the local device configuration and refreshes the cache.
     /// - Parameter data: The new configuration data.
     /// - Throws: An error if the update fails.
@@ -273,18 +284,12 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
 
     /// Fetches a message by its shared message ID, returning `nil` when it does not exist.
     /// Recovery paths use this to probe for replayable messages without treating an
-    /// expected miss as a store failure.
+    /// expected miss as a store failure. It reads the store, not `messages`: the host and
+    /// the extension write rows directly, so the list can hold a row that is gone or stale.
     /// - Parameter sharedId: The shared message ID of the message to fetch.
     /// - Returns: The fetched message, or `nil` if no message exists for the shared ID.
     func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage? {
-        if let message = messages.first(where: { $0.sharedId == sharedId }) {
-            return message
-        }
-        guard let message = try await store.fetchMessageIfExists(sharedId: sharedId) else {
-            return nil
-        }
-        messages.append(message) // Cache the fetched message
-        return message
+        try await store.fetchMessageIfExists(sharedId: sharedId)
     }
 
     /// Fetches a message using a custom predicate.

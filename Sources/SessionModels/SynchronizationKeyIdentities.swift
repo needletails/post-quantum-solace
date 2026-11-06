@@ -31,8 +31,6 @@ import BinaryCodable
 /// ## Usage
 /// ```swift
 /// let keyIds = SynchronizationKeyIdentities(
-///     senderX25519Id: "curve-sender-123",
-///     senderMLKEMId: "mlKEM-sender-456",
 ///     recipientX25519Id: "curve-recipient-789",
 ///     recipientMLKEMId: "mlKEM-recipient-012"
 /// )
@@ -48,16 +46,13 @@ import BinaryCodable
 public struct SynchronizationKeyIdentities: Sendable, Codable {
     /// Optional identifier for the sender's Curve25519 public key.
     ///
-    /// This identifier is used to track the specific Curve25519 key used by the sender
-    /// for message encryption. It may be `nil` if the sender's key is not yet established
-    /// or if using a different key type.
+    /// Only older builds set this. A sender's handshake key is not published, so
+    /// nothing resolves it by id; the field stays for wire compatibility.
     public var senderX25519Id: String?
 
     /// Optional identifier for the sender's MLKEM public key.
     ///
-    /// This identifier is used to track the specific MLKEM key used by the sender
-    /// for post-quantum key exchange. It may be `nil` if the sender's MLKEM key is not
-    /// yet established or if using a different key type.
+    /// Only older builds set this; the field stays for wire compatibility.
     public var senderMLKEMId: String?
 
     /// Required identifier for the recipient's Curve25519 public key.

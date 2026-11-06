@@ -161,7 +161,10 @@ public actor PQSSession: SessionCacheSynchronizer {
     public init(_ ratchetConfiguration: RatchetConfiguration? = nil) {
         self.ratchetConfiguration = ratchetConfiguration
         self.auditSink = FilePQSAuditSink()
-        messagePipeline = MessagePipeline(logger: logger, ratchetConfiguration: ratchetConfiguration)
+        messagePipeline = MessagePipeline(
+            logger: logger,
+            ratchetConfiguration: ratchetConfiguration,
+            auditSink: auditSink)
     }
 
     /// Host construction path. Wires transport, store, and receiver before any session work.
@@ -171,7 +174,10 @@ public actor PQSSession: SessionCacheSynchronizer {
     ) async {
         self.ratchetConfiguration = ratchetConfiguration
         self.auditSink = configuration.auditSink
-        messagePipeline = MessagePipeline(logger: logger, ratchetConfiguration: ratchetConfiguration)
+        messagePipeline = MessagePipeline(
+            logger: logger,
+            ratchetConfiguration: ratchetConfiguration,
+            auditSink: auditSink)
         await setTransportDelegate(conformer: configuration.transport)
         await setDatabaseDelegate(conformer: configuration.store)
         setReceiverDelegate(conformer: configuration.observer)
@@ -397,7 +403,8 @@ public actor PQSSession: SessionCacheSynchronizer {
 
         let replacement = MessagePipeline(
             logger: logger,
-            ratchetConfiguration: ratchetConfiguration)
+            ratchetConfiguration: ratchetConfiguration,
+            auditSink: auditSink)
         await replacement.setDelegate(transportDelegate)
         messagePipeline = replacement
         sessionWorkCoordinator = nil
@@ -1046,6 +1053,9 @@ public actor PQSSession: SessionCacheSynchronizer {
     /// for `(sender|device|sharedId)`. Same fingerprint → await sender; different → rearm.
     var lastNackFrameFingerprintByKey: [String: Data] = [:]
 
+    /// `(sender|device|logical id)` to the envelopes of that message that failed here.
+    var failedEnvelopesByMessageKey: [String: Set<String>] = [:]
+
 
     /// Sets the logger log level for both the session and task processor
     ///
@@ -1290,6 +1300,11 @@ public actor PQSSession: SessionCacheSynchronizer {
     func setTransportDelegate(conformer: (any PQSNetworkHost)?) async {
         transportDelegate = conformer
         await messagePipeline.setDelegate(conformer)
+        // Envelopes whose accept deadline fired with no transport were parked; a transport
+        // gives them a window again.
+        if conformer != nil {
+            await messagePipeline.rearmAllServerAcceptDeadlines(session: self)
+        }
     }
 
     /// Sets the database delegate conforming to `PQSPersistenceHost`.

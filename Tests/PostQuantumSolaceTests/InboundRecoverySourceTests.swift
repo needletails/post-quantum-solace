@@ -58,17 +58,14 @@ struct InboundRecoverySourceTests {
         _ = pin
     }
 
+    /// Covered by EndToEndTests placeholderMovedToReadIsHealedByTheResend and
+    /// contentRowInFailedIsNotReplaced: the host's marker decides, in every delivery state.
     @Test("orphan resend can heal inbound recovery placeholders")
     func orphanResendCanHealInboundRecoveryPlaceholders() {
-        _ = MessagePipeline.isReplaceableInboundRecoveryPlaceholder
-        #expect(MessagePipeline.isReplaceableInboundRecoveryPlaceholder(
-            placeholderProps(deliveryState: .waitingDelivery)))
-        #expect(MessagePipeline.isReplaceableInboundRecoveryPlaceholder(
-            placeholderProps(deliveryState: .failed("pending"))))
-        #expect(!MessagePipeline.isReplaceableInboundRecoveryPlaceholder(
-            placeholderProps(deliveryState: .delivered)))
-        #expect(!MessagePipeline.isReplaceableInboundRecoveryPlaceholder(
-            placeholderProps(deliveryState: .sending)))
+        let pin: (any PQSHostDelegate, Data?) -> Bool = {
+            $0.isInboundRecoveryPlaceholder(transportInfo: $1)
+        }
+        _ = pin
     }
 
     @Test("same-account nickname copies key on the addressed peer")
@@ -133,22 +130,5 @@ struct InboundRecoverySourceTests {
             await session.flushPendingResendsAfterOfflineReplay(now: now)
         }
         _ = pin
-    }
-
-    private func placeholderProps(deliveryState: DeliveryState) -> EncryptedMessage.UnwrappedProps {
-        EncryptedMessage.UnwrappedProps(
-            id: UUID(),
-            base: BaseCommunication(id: UUID(), data: Data()),
-            sentDate: Date(),
-            receiveDate: nil,
-            deliveryState: deliveryState,
-            message: CryptoMessage(
-                text: "",
-                metadata: Data(),
-                recipient: .nickname("peer"),
-                sentDate: Date(),
-                destructionTime: nil),
-            senderSecretName: "peer",
-            senderDeviceId: UUID())
     }
 }

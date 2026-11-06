@@ -117,6 +117,12 @@ actor PeerIdentityTrustProbe {
     }
 }
 
+/// Frames a transport probe saw go by, kept for a test to match against lane selection.
+private actor CapturedFrames {
+    var frames: [ReceivedMessage] = []
+    func capture(_ frame: ReceivedMessage) { frames.append(frame) }
+}
+
 @Suite(.serialized)
 actor EndToEndTests {
     let crypto = NeedleTailCrypto()
@@ -3981,6 +3987,7 @@ actor EndToEndTests {
                     text: "",
                     metadata: Data(),
                     recipient: .nickname("carol"),
+                    transportInfo: SessionDelegate.recoveryPlaceholderMarker,
                     sentDate: Date(),
                     destructionTime: nil),
                 senderSecretName: "alice",
@@ -4019,6 +4026,157 @@ actor EndToEndTests {
         _ = await bobTask?.value
     }
     
+    @Test("A refile whose channel persist throws leaves the placeholder in place")
+    func testRefileThatThrowsLeavesPlaceholderInPlace() async throws {
+        var aliceTask: Task<Void, Never>?
+        var bobTask: Task<Void, Never>?
+        defer {
+            Task {
+                aliceTask?.cancel()
+                bobTask?.cancel()
+                await shutdownSessions()
+            }
+        }
+
+        func waitUntil(
+            timeoutSeconds: TimeInterval = 8,
+            _ condition: @escaping @Sendable () async -> Bool
+        ) async -> Bool {
+            let deadline = Date().addingTimeInterval(timeoutSeconds)
+            while Date() < deadline {
+                if await condition() { return true }
+                try? await Task.sleep(until: .now + .milliseconds(50))
+            }
+            return false
+        }
+
+        let senderStore = createSenderStore()
+        let recipientStore = createRecipientStore()
+        let aliceTransport = _MockTransportDelegate(session: _senderSession, store: store)
+        let bobTransport = _MockTransportDelegate(session: _recipientSession, store: store)
+        let aliceStream = AsyncStream<ReceivedMessage> { continuation in
+            bobTransport.continuation = continuation
+        }
+        let bobStream = AsyncStream<ReceivedMessage> { continuation in
+            aliceTransport.continuation = continuation
+        }
+        let sd = SessionDelegate(session: _senderSession)
+        let rsd = SessionDelegate(session: _recipientSession)
+        try await createSenderSession(store: senderStore, transport: aliceTransport, sessionDelegate: sd)
+        try await createRecipientSession(store: recipientStore, transport: bobTransport, sessionDelegate: rsd)
+        try await createFriendship(
+            aliceSession: _senderSession,
+            sd: sd,
+            bobSession: _recipientSession,
+            rsd: rsd)
+
+        aliceTask = Task {
+            for await received in aliceStream {
+                if received.sender == self.sMockUserData.ssn { continue }
+                _ = try? await self.receiveIgnoringRecoverableErrors(self._senderSession, received: received)
+            }
+        }
+        bobTask = Task {
+            for await received in bobStream {
+                if received.sender == self.rMockUserData.rsn { continue }
+                _ = try? await self.receiveIgnoringRecoverableErrors(self._recipientSession, received: received)
+            }
+        }
+        try await Task.sleep(until: .now + .milliseconds(100))
+
+        try await _senderSession.send(
+            recipient: .nickname("bob"),
+            text: "establish lane")
+        #expect(
+            await waitUntil {
+                await recipientStore.getAllMessages().contains { $0.sharedId != "" }
+            },
+            "Establish message must persist before staging the placeholder")
+
+        guard let aliceDeviceId = await _senderSession.sessionContext?.sessionUser.deviceId,
+              let bobConversation = try await recipientStore.fetchCommunications().first else {
+            Issue.record("Alice device id or Bob's conversation missing")
+            return
+        }
+        let databaseKey = try await _recipientSession.getDatabaseSymmetricKey()
+        let sessionContextId = await _recipientSession.sessionContext?.sessionContextId ?? 0
+
+        let channelName = "room"
+        let channelMetadata = try BinaryEncoder().encode(ChannelInfo(
+            name: channelName,
+            administrator: "alice",
+            members: ["alice", "bob"],
+            operators: ["alice"]))
+        try await senderStore.createCommunication(BaseCommunication(
+            id: UUID(),
+            props: .init(
+                messageCount: 0,
+                administrator: "alice",
+                operators: ["alice"],
+                members: ["alice", "bob"],
+                metadata: channelMetadata,
+                blockedMembers: [],
+                communicationType: .channel(channelName)),
+            symmetricKey: try await _senderSession.getDatabaseSymmetricKey()))
+
+        // A channel message's placeholder is filed in the sender's DM.
+        let sharedId = UUID().uuidString
+        let messageId = UUID()
+        let placeholder = try EncryptedMessage(
+            id: messageId,
+            communicationId: bobConversation.id,
+            sessionContextId: sessionContextId,
+            sharedId: sharedId,
+            sequenceNumber: 1,
+            props: EncryptedMessage.UnwrappedProps(
+                id: messageId,
+                base: bobConversation,
+                sentDate: Date(),
+                receiveDate: Date(),
+                deliveryState: .waitingDelivery,
+                message: CryptoMessage(
+                    text: "",
+                    metadata: Data(),
+                    recipient: .nickname("alice"),
+                    transportInfo: SessionDelegate.recoveryPlaceholderMarker,
+                    sentDate: Date(),
+                    destructionTime: nil),
+                senderSecretName: "alice",
+                senderDeviceId: aliceDeviceId),
+            symmetricKey: databaseKey)
+        try await recipientStore.createMessage(placeholder, symmetricKey: databaseKey)
+        await recipientStore.failCreateMessage(sharedId: sharedId)
+
+        try await _senderSession.send(
+            recipient: .channel(channelName),
+            text: "channel body",
+            metadata: channelMetadata,
+            sharedIdOverride: sharedId)
+
+        // Same sender, same queue: once this persists the channel frame has been handled.
+        try await _senderSession.send(
+            recipient: .nickname("bob"),
+            text: "after the channel frame")
+        #expect(
+            await waitUntil {
+                for row in await recipientStore.getAllMessages() {
+                    if await row.props(symmetricKey: databaseKey)?.message.text == "after the channel frame" {
+                        return true
+                    }
+                }
+                return false
+            },
+            "The frame after the channel message must persist, proving the channel frame was handled")
+
+        let rows = await recipientStore.getAllMessages().filter { $0.sharedId == sharedId }
+        #expect(rows.map(\.id) == [messageId], "Until the content exists the placeholder is the only record of the message")
+
+        aliceTransport.continuation?.finish()
+        bobTransport.continuation?.finish()
+        _ = await aliceTask?.value
+        _ = await bobTask?.value
+    }
+
     @Test("Device Synchronization Issues - Simulate Clock Drift and Processing Delays")
     func testDeviceSynchronizationIssues() async throws {
         // Setup two devices with their own sessions
@@ -6628,6 +6786,9 @@ actor EndToEndTests {
         let bobStore = createRecipientStore()
         try await createSenderMaxSkipSession(store: createSenderStore(), transport: aliceTransport, sessionDelegate: sd)
         try await createRecipientMaxSkipSession(store: bobStore, transport: bobTransport, sessionDelegate: rsd)
+        // A server that accepted these frames never retransmits them; a retransmit past
+        // the dropper would heal the lane by a path production does not have.
+        await _senderMaxSkipSession.messagePipeline.testSetAckDeadlineNanosecondsForTests(3_600_000_000_000)
         
         aliceRepairTask = Task {
             for await received in aliceRepairStream {
@@ -6674,7 +6835,8 @@ actor EndToEndTests {
         })
         
         try await _senderMaxSkipSession.send(recipient: .nickname("bob"), text: "warmup")
-        try await Task.sleep(until: .now + .milliseconds(200))
+        // Sample after the warmup lands, so only repair can raise the count.
+        #expect(await waitUntil { await bobStore.getAllMessages().count >= 3 })
         let baselineMessageCount = await bobStore.getAllMessages().count
         
         actor Dropper {
@@ -10723,8 +10885,9 @@ actor EndToEndTests {
         }
         let tokensBeforeFirst = try await ratchetTokens()
         
-        // Delivery 1: every row is walked once (active-first pass, then the deferred
-        // archive pass, which no longer re-tries the preferred row it just rejected).
+        // Delivery 1: every row is walked once. The archived rows are snapshots of one
+        // lane, so they all hold the frame's epoch and run in the active-first pass;
+        // the deferred archive pass re-tries none of the rows that pass rejected.
         let writesBeforeFirst = await recipientStore.updateSessionIdentityCallCount
         await deliver(frame.messageId)
         #expect(await pollUntil(timeout: 30) { await bothPassesRecorded(frame.messageId) },
@@ -10740,7 +10903,7 @@ actor EndToEndTests {
         #expect(Set(firstAttemptedLanes).count == firstAttemptedLanes.count, "a lane is attempted at most once per frame")
         #expect(laneIds.isSubset(of: Set(firstAttemptedLanes)), "every existing row for the device is tried once")
         #expect(firstAttempts == laneIds.count + 1, "every row once plus the ensured blank: \(first.map(\.candidateOrder))")
-        #expect(firstSkips == 1, "the archive pass skips the preferred row the active-first pass already rejected")
+        #expect(firstSkips == laneIds.count, "the archive pass skips every row the active-first pass already rejected")
         #expect(firstSkippedUnchanged >= 1, "the ensured blank fails before touching its row, so it is not written back")
         for entry in first {
             #expect(
@@ -10795,6 +10958,22 @@ actor EndToEndTests {
         _ = await bobTask?.value
     }
     
+    /// Row ids a session holds, for every peer.
+    private func rowIds(_ session: PQSSession) async throws -> Set<UUID> {
+        let cache = try #require(await session.cache)
+        return Set(try await cache.fetchSessionIdentities().map(\.id))
+    }
+
+    /// The first captured frame `receiver` has accepted, with its lane-selection stats.
+    private func acceptedCapture(in captured: CapturedFrames, on receiver: PQSSession) async -> (frame: ReceivedMessage, stats: InboundLaneSelectionStats)? {
+        for frame in await captured.frames {
+            if let stats = await laneStats(on: receiver, sharedId: frame.messageId).first, stats.winningLaneId != nil {
+                return (frame, stats)
+            }
+        }
+        return nil
+    }
+
     @Test("messages crossing in either direction stay on the established lane")
     func crossingFramesStayOnEstablishedLane() async throws {
         var aliceTask: Task<Void, Never>?
@@ -10839,30 +11018,6 @@ actor EndToEndTests {
             await bobSession.hasActiveInboundSessionIdentity(secretName: "alice", deviceId: aliceDeviceId)
         })
         
-        /// Rows a session holds for one peer device: `(id, archived, local OTK id in the snapshot)`.
-        @Sendable func rows(on session: PQSSession, peer: String, deviceId: UUID) async throws -> [(id: UUID, archived: Bool, stateOTK: UUID?)] {
-            let cache = try #require(await session.cache)
-            let key = try await session.getDatabaseSymmetricKey()
-            var out: [(id: UUID, archived: Bool, stateOTK: UUID?)] = []
-            for identity in try await cache.fetchSessionIdentities() {
-                guard let p = await identity.props(symmetricKey: key), p.secretName == peer, p.deviceId == deviceId else { continue }
-                out.append((identity.id, p.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix), p.ratchetOneTimePrivateKey?.id))
-            }
-            return out
-        }
-        @Sendable func inboundCount(_ session: PQSSession) async -> Int {
-            await session.messagePipeline.inboundLaneSelectionStatsLog.count
-        }
-        /// Sends from `sender` and waits for `receiver` to run lane selection on one more frame;
-        /// returns that frame's stats.
-        @Sendable func sendAndAwaitInbound(
-            from sender: PQSSession, to recipient: String, on receiver: PQSSession, text: String
-        ) async throws -> InboundLaneSelectionStats {
-            let before = await inboundCount(receiver)
-            try await sender.send(recipient: .nickname(recipient), text: text)
-            #expect(await pollUntil(timeout: 20) { await inboundCount(receiver) > before }, "\(text) should reach lane selection")
-            return try #require(await receiver.messagePipeline.inboundLaneSelectionStatsLog.dropFirst(before).first)
-        }
         actor HeldFrames {
             var frames: [ReceivedMessage] = []
             func hold(_ frame: ReceivedMessage) { frames.append(frame) }
@@ -10972,31 +11127,6 @@ actor EndToEndTests {
             await bobSession.hasActiveInboundSessionIdentity(secretName: "alice", deviceId: aliceDeviceId)
         })
 
-        /// Rows bob holds for alice's device: `(id, archived, local OTK id in the snapshot)`.
-        @Sendable func bobRows() async throws -> [(id: UUID, archived: Bool, stateOTK: UUID?)] {
-            let cache = try #require(await bobSession.cache)
-            let key = try await bobSession.getDatabaseSymmetricKey()
-            var out: [(id: UUID, archived: Bool, stateOTK: UUID?)] = []
-            for identity in try await cache.fetchSessionIdentities() {
-                guard let p = await identity.props(symmetricKey: key), p.secretName == "alice", p.deviceId == aliceDeviceId else { continue }
-                out.append((identity.id, p.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix), p.ratchetOneTimePrivateKey?.id))
-            }
-            return out
-        }
-        @Sendable func bobLanePasses() async -> Int {
-            await bobSession.messagePipeline.inboundLaneSelectionStatsLog.count
-        }
-        /// Sends from alice and waits for bob to run lane selection on one more frame; returns that frame's stats.
-        @Sendable func sendAndAwaitBobInbound(text: String) async throws -> InboundLaneSelectionStats {
-            let before = await bobLanePasses()
-            try await aliceSession.send(recipient: .nickname("bob"), text: text)
-            #expect(await pollUntil(timeout: 20) { await bobLanePasses() > before }, "\(text) should reach lane selection")
-            return try #require(await bobSession.messagePipeline.inboundLaneSelectionStatsLog.dropFirst(before).first)
-        }
-        actor CapturedFrames {
-            var frames: [ReceivedMessage] = []
-            func capture(_ frame: ReceivedMessage) { frames.append(frame) }
-        }
 
         // Deliver one of alice's initiating frames normally and keep a copy of what
         // crossed the wire. Friendship traffic may still be in flight, so the frame
@@ -11007,18 +11137,10 @@ actor EndToEndTests {
             return true
         }
         try await aliceSession.send(recipient: .nickname("bob"), text: "initiating")
-        @Sendable func acceptedCapture() async -> (frame: ReceivedMessage, stats: InboundLaneSelectionStats)? {
-            for frame in await captured.frames {
-                if let stats = await laneStats(on: bobSession, sharedId: frame.messageId).first, stats.winningLaneId != nil {
-                    return (frame, stats)
-                }
-            }
-            return nil
-        }
-        #expect(await pollUntil(timeout: 20) { await acceptedCapture() != nil }, "the initiating frame should decrypt on bob")
-        let (frame, accepted) = try #require(await acceptedCapture())
+        #expect(await pollUntil(timeout: 20) { await acceptedCapture(in: captured, on: bobSession) != nil }, "the initiating frame should decrypt on bob")
+        let (frame, accepted) = try #require(await acceptedCapture(in: captured, on: bobSession))
         aliceTransport.shouldDeliver = nil
-        let rowsBefore = try await bobRows()
+        let rowsBefore = try await rows(on: bobSession, peer: "alice", deviceId: aliceDeviceId)
         let bobRow = try #require(rowsBefore.first)
         #expect(rowsBefore.count == 1 && accepted.winningLaneId == bobRow.id, "\(accepted.candidateOrder)")
         #expect(await pollUntil(timeout: 10) { await bobAccepted.contains(frame.messageId) }, "the original delivery is ACKed")
@@ -11035,7 +11157,7 @@ actor EndToEndTests {
         // The server replays the accepted frame as a new packet: the signed payload is
         // byte-identical, the envelope id is fresh and no logical id is carried.
         let replayId = UUID().uuidString
-        let passesBeforeReplay = await bobLanePasses()
+        let passesBeforeReplay = await inboundCount(bobSession)
         try await bobSession.receiveMessage(
             message: frame.message,
             sender: frame.sender,
@@ -11046,15 +11168,15 @@ actor EndToEndTests {
                 "the replay is ACKed as already accepted")
         #expect(await laneStats(on: bobSession, sharedId: replayId).isEmpty,
                 "an already-accepted frame never reaches lane selection")
-        #expect(await bobLanePasses() == passesBeforeReplay)
-        let rowsAfterReplay = try await bobRows()
+        #expect(await inboundCount(bobSession) == passesBeforeReplay)
+        let rowsAfterReplay = try await rows(on: bobSession, peer: "alice", deviceId: aliceDeviceId)
         #expect(rowsAfterReplay.map(\.id) == [bobRow.id] && rowsAfterReplay.first?.archived == false,
                 "no new row for alice's device and the established row stays active: \(rowsAfterReplay)")
 
         // Alice's next in-order frame still decrypts on the established row.
-        let next = try await sendAndAwaitBobInbound(text: "next in order")
+        let next = try await sendAndAwaitInbound(from: aliceSession, to: "bob", on: bobSession, text: "next in order")
         #expect(next.winningLaneId == bobRow.id && next.attempts.count == 1, "\(next.candidateOrder)")
-        #expect(try await bobRows().map(\.id) == [bobRow.id], "bob never needed a second row for alice's device")
+        #expect(try await rows(on: bobSession, peer: "alice", deviceId: aliceDeviceId).map(\.id) == [bobRow.id], "bob never needed a second row for alice's device")
 
         bobTransport.continuation?.finish()
         aliceTransport.continuation?.finish()
@@ -11166,16 +11288,17 @@ actor EndToEndTests {
             }
             return true
         }
-        @Sendable func rowIds(_ session: PQSSession) async throws -> Set<UUID> {
-            let cache = try #require(await session.cache)
-            return Set(try await cache.fetchSessionIdentities().map(\.id))
-        }
 
         // Baseline, in order: every device bootstraps its lanes.
         let baselineStart = await wireState.sent.count
         for (name, session) in [("alice", aliceSession), ("child1", aliceChild1), ("child2", aliceChild2)] {
             try await session.send(recipient: .nickname("bob"), text: "baseline from \(name)")
         }
+        // Bob answers only after Alice's first frames land, or both sides open lanes at once.
+        #expect(await pollUntil(timeout: 30) {
+            let frames = await wireState.sent.dropFirst(baselineStart)
+            return frames.count >= 9 ? await delivered(Array(frames)) : false
+        }, "alice's baseline frames should all be decrypted")
         try await bobSession.send(recipient: .nickname("alice"), text: "baseline from bob")
         #expect(await pollUntil(timeout: 30) { await delivered(Array(wireState.sent.dropFirst(baselineStart))) },
                 "baseline frames should all be decrypted")
@@ -11326,6 +11449,11 @@ struct SessionDelegate: MessagingPolicy, RecoveryObserver {
     {}
     func shouldPersist(transportInfo _: Data?) -> Bool { true }
     func shouldReplayNonPersistentOutbound(transportInfo _: Data?) -> Bool { false }
+    /// A seeded row's `transportInfo` when it stands for a host's recovery placeholder.
+    static let recoveryPlaceholderMarker = Data("inboundRecoveryPlaceholder".utf8)
+    func isInboundRecoveryPlaceholder(transportInfo: Data?) -> Bool {
+        transportInfo == Self.recoveryPlaceholderMarker
+    }
     func retrieveUserInfo(_: Data?) async -> (secretName: String, deviceId: String)? {
         forcedRetrieveUserInfo
     }
@@ -12022,6 +12150,8 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     /// If set, publishing rotated keys will throw this error (test-only).
     /// Used to simulate rotation publish failures.
     var publishRotatedKeysError: Error?
+    /// Runs during the publish, so a test can land a commit inside rotation's round-trip.
+    var onPublishRotatedKeys: (@Sendable () async throws -> Void)?
     
     /// If set, `findConfiguration` throws this error after optional hang (dogfood API timeout).
     var findConfigurationError: Error?
@@ -12038,7 +12168,7 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
     /// If set, OTK curve uploads will throw on the first N calls then succeed.
     /// Thread-safe via OTKErrorInjector actor.
     private let otkErrorInjector = OTKErrorInjector()
-    func setOTKUploadFailCount(_ count: Int, error: PQSError = .oneTimeKeyUploadFailed) async {
+    func setOTKUploadFailCount(_ count: Int, error: any Error = PQSError.oneTimeKeyUploadFailed) async {
         await otkErrorInjector.configure(failCount: count, error: error)
     }
     var otkUploadAttemptCount: Int {
@@ -12279,6 +12409,7 @@ final class _MockTransportDelegate: PQSTransport, PQSKeyDirectory, PQSRecoveryTr
         if let publishRotatedKeysError {
             throw publishRotatedKeysError
         }
+        try await onPublishRotatedKeys?()
         await rotationTracker.increment()
         try await store.publishRotatedKeys(for: secretName, deviceId: deviceId, rotated: keys)
     }
@@ -12347,10 +12478,10 @@ private actor RotationTracker {
 
 private actor OTKErrorInjector {
     private var remainingFailures: Int = 0
-    private var error: PQSError = .oneTimeKeyUploadFailed
+    private var error: any Error = PQSError.oneTimeKeyUploadFailed
     private(set) var attemptCount: Int = 0
     
-    func configure(failCount: Int, error: PQSError) {
+    func configure(failCount: Int, error: any Error) {
         remainingFailures = failCount
         self.error = error
         attemptCount = 0
@@ -12378,6 +12509,7 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     var localDeviceSalt: String?
     var encyrptedConfigurationForTesting = Data()
     var createdMessages = [EncryptedMessage]()
+    var failingCreateMessageSharedId: String?
     var contacts = [ContactModel]()
     let recoveryLedger = InMemoryRecoveryLedger()
     /// Disk-persistence boundary spy: jobs currently retained by the store.
@@ -12396,6 +12528,13 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     var createLocalSessionContextError: Error?
     func setCreateLocalSessionContextError(_ error: Error?) {
         createLocalSessionContextError = error
+    }
+
+    /// When set, `replaceLocalSessionContext` throws instead of writing — models a
+    /// commit that never reaches the disk.
+    var replaceLocalSessionContextError: Error?
+    func setReplaceLocalSessionContextError(_ error: Error?) {
+        replaceLocalSessionContextError = error
     }
 
     init(mockUserData: MockUserData, session: PQSSession, isSender: Bool) {
@@ -12422,24 +12561,37 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     func updateLocalSessionContext(_ data: Data) async throws { sessionContext = data }
     func deleteLocalSessionContext() async throws { sessionContext = nil }
     /// Atomic replace, as a production store does in one transaction.
-    func replaceLocalSessionContext(_ data: Data) async throws { sessionContext = data }
+    func replaceLocalSessionContext(_ data: Data) async throws {
+        if let replaceLocalSessionContextError {
+            throw replaceLocalSessionContextError
+        }
+        sessionContext = data
+    }
     func fetchLocalDeviceSalt(keyData: Data) async throws -> Data {
         keyData + "salt".data(using: .utf8)!
     }
     func deleteLocalDeviceSalt() async throws {}
+    /// A SQL store hands out a new `SessionIdentity` instance per fetch and keeps its own
+    /// bytes on write, so a row cached by one process never changes under another. The
+    /// default shares instances, which hides stale-cache bugs; opt in to model the real store.
+    var detachesRows = false
+    func setDetachesRows(_ enabled: Bool) { detachesRows = enabled }
+    private func row(_ session: SessionIdentity) -> SessionIdentity {
+        detachesRows ? SessionIdentity(id: session.id, data: session.data) : session
+    }
     func fetchSessionIdentities() async throws -> [DoubleRatchetKit.SessionIdentity] {
-        identities
+        identities.map(row)
     }
     /// Store-write spy: every identity row update that reached this store.
     var updateSessionIdentityCallCount = 0
     func updateSessionIdentity(_ session: DoubleRatchetKit.SessionIdentity) async throws {
         updateSessionIdentityCallCount += 1
         identities.removeAll(where: { $0.id == session.id })
-        identities.append(session)
+        identities.append(row(session))
     }
     
     func createSessionIdentity(_ session: SessionIdentity) async throws {
-        identities.append(session)
+        identities.append(row(session))
     }
     func fetchLocalDeviceSalt() async throws -> String {
         guard let salt = localDeviceSalt else { throw PQSError.saltError }
@@ -12554,15 +12706,27 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     }
     
     func createMessage(_ message: EncryptedMessage, symmetricKey: SymmetricKey) async throws {
+        if message.sharedId == failingCreateMessageSharedId {
+            throw PQSError.databaseNotInitialized
+        }
         createdMessages.append(message)
+    }
+
+    func failCreateMessage(sharedId: String) {
+        failingCreateMessageSharedId = sharedId
     }
     
     func getAllMessages() async -> [EncryptedMessage] {
         return createdMessages
     }
     
-    func updateMessage(_: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws
-    {}
+    /// As SQLiteStore: an update of a row that is gone throws `recordNotFound`.
+    func updateMessage(_ message: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws {
+        guard let index = createdMessages.firstIndex(where: { $0.id == message.id }) else {
+            throw SessionCache.CacheErrors.messageNotFound
+        }
+        createdMessages[index] = message
+    }
     func removeMessage(_: SessionModels.EncryptedMessage) async throws {}
     func deleteMessage(_ message: SessionModels.EncryptedMessage) async throws {
         createdMessages.removeAll(where: { $0.id == message.id })

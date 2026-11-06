@@ -25,6 +25,11 @@ extension MessagePipeline {
             "sharedId=\(message.sharedMessageId)",
         ]
 
+        if auditSink.isEnabled {
+            parts.append(
+                RatchetHeaderAudit(signedMessage: message.message)?.unverifiedCitedFields
+                    ?? "hdrCitesOtk=unreadable")
+        }
         if suppressed {
             parts.append("suppressed=true")
         }

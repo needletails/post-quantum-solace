@@ -55,6 +55,9 @@ fileprivate extension ForwardingHostPolicy {
     func shouldReplayNonPersistentOutbound(transportInfo: Data?) -> Bool {
         base.shouldReplayNonPersistentOutbound(transportInfo: transportInfo)
     }
+    func isInboundRecoveryPlaceholder(transportInfo: Data?) -> Bool {
+        base.isInboundRecoveryPlaceholder(transportInfo: transportInfo)
+    }
     func retrieveUserInfo(_ transportInfo: Data?) async -> (secretName: String, deviceId: String)? {
         await base.retrieveUserInfo(transportInfo)
     }

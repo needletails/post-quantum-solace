@@ -105,13 +105,16 @@ actor MessagePipeline {
     /// This is set by the session manager and contains the current cryptographic context.
     var session: PQSSession?
 
+    /// The owning session's audit sink, bound at construction so lines written
+    /// before the first ratchet call sets ``session`` still reach the audit files.
+    let auditSink: any PQSAuditSink
+
     func audit(
         _ channel: PQSAuditLog.Channel,
         _ message: @autoclosure () -> String,
-        level: Level = .warning,
-        on session: PQSSession? = nil
+        level: Level = .warning
     ) {
-        (session ?? self.session)?.auditSink.log(channel, message(), level: level)
+        auditSink.log(channel, message(), level: level)
     }
 
     /// Handles cryptographic operations (e.g. encryption/decryption).
@@ -168,8 +171,9 @@ actor MessagePipeline {
     /// otherwise re-enqueue (and re-send) it from cache during that window.
     var inFlightJobIds: Set<UUID> = []
 
-    /// Archive-fallback pending tokens (`ArchivedInboundFallbackToken.storageKey`).
-    var archivedInboundFallbackPasses: Set<String> = []
+    /// Archive-fallback pending tokens (`ArchivedInboundFallbackToken.storageKey`), each
+    /// with the active-first verdicts its pass needs. A relaunch re-runs active-first.
+    var archivedInboundFallbackPasses: [String: [InboundAttemptFailure]] = [:]
 
     /// Completed archive-pass tokens. Blocks same-token re-defer storms.
     var archivedInboundFallbackExhausted: Set<String> = []
@@ -197,6 +201,9 @@ actor MessagePipeline {
     /// Last time we sent a peer `refreshOneTimeKeys` control message for a given peer secret name.
     /// Used to debounce control-plane churn during reconnect bursts.
     var lastPeerRefreshRequestAt: [String: Date] = [:]
+
+    /// Ephemerals of lanes that have not started, until the lane's ratchet state holds one.
+    var handshakeEphemeralByLane: [UUID: X25519PrivateKey] = [:]
 
     /// The active identity row that most recently decrypted traffic for a concrete peer device.
     /// Legacy persistence races can leave more than one active row for the same device; retaining
@@ -263,18 +270,6 @@ actor MessagePipeline {
         ttl: 60 * 10,
         limit: 256,
         maxReplays: 5)
-
-    /// Last `messageResendUnavailable` notice emitted per requester device, so repeats
-    /// re-send the same notice sharedId instead of minting a new UUID storm.
-    struct RecentUnavailableNotice: Sendable {
-        let sharedId: String
-        let message: CryptoMessage
-        let unavailableIds: Set<String>
-        let createdAt: Date
-    }
-    var recentUnavailableNoticeByRequesterDevice: [String: RecentUnavailableNotice] = [:]
-    let recentUnavailableNoticeTTL: TimeInterval = 60 * 10
-    let recentUnavailableNoticeLimit = 64
 
     /// Signed ratchet frames whose encryption succeeded but whose transport send has not.
     /// Retrying these frames avoids advancing the outbound ratchet a second time for the same
@@ -392,11 +387,18 @@ actor MessagePipeline {
     /// ready to handle message processing tasks. The ratchet manager and job consumer
     /// are configured to use the cryptographic executor for serialized operations.
     ///
-    /// - Parameter logger: Custom logger instance, defaults to a basic logger.
-    ///   The logger is used for debugging, telemetry, and audit trails.
+    /// - Parameters:
+    ///   - logger: Custom logger instance, defaults to a basic logger.
+    ///     The logger is used for debugging, telemetry, and audit trails.
+    ///   - auditSink: The owning session's audit sink. Defaults to a new file-backed sink.
     /// - Note: The processor is not ready for use until a session is set and the delegate is configured.
-    init(logger: NeedleTailLogger = NeedleTailLogger(), ratchetConfiguration: RatchetConfiguration? = nil) {
+    init(
+        logger: NeedleTailLogger = NeedleTailLogger(),
+        ratchetConfiguration: RatchetConfiguration? = nil,
+        auditSink: any PQSAuditSink = FilePQSAuditSink()
+    ) {
         self.logger = logger
+        self.auditSink = auditSink
         ratchetManager = MessageRatchet(
             executor: cryptoExecutor,
             logger: logger,
@@ -966,6 +968,7 @@ actor MessagePipeline {
         administrator: String,
         members: Set<String>,
         operators: Set<String>,
+        title: String? = nil,
         symmetricKey: SymmetricKey,
         session: PQSSession,
         cache: SessionCache,
@@ -995,7 +998,8 @@ actor MessagePipeline {
             enabledBotNames: existingInfo?.enabledBotNames,
             botMemberWelcome: existingInfo?.botMemberWelcome,
             botOperatorWelcome: existingInfo?.botOperatorWelcome,
-            botIdleHint: existingInfo?.botIdleHint)
+            botIdleHint: existingInfo?.botIdleHint,
+            title: title ?? existingInfo?.title)
         let wireMetadata = try BinaryEncoder().encode(wireInfo)
         let localMetadata = try BinaryEncoder().encode(
             ChannelStoredMetadata(core: wireInfo, overlay: existingStored?.overlay))

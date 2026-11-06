@@ -721,19 +721,14 @@ struct DogfoodRecoveryStormPolicyTests {
             envelopeMessageId: sharedId,
             fingerprint: Data("offline-poison-ct".utf8))
         var exhausted = Set<String>()
-        var pending = Set<String>()
         var deferCount = 0
 
         for _ in 0..<20 {
             guard InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: token,
-                exhausted: exhausted,
-                pendingPass: pending
+                exhausted: exhausted
             ) else { continue }
             deferCount += 1
-            pending.insert(token.storageKey)
-            // Production removes pending at archive-pass start, then marks exhausted.
-            pending.remove(token.storageKey)
             exhausted = InboundRecoveryStormPolicy.exhaustedAfterArchivePassCompleted(
                 current: exhausted,
                 token: token
@@ -756,8 +751,7 @@ struct DogfoodRecoveryStormPolicyTests {
         #expect(
             !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: token,
-                exhausted: exhausted,
-                pendingPass: []
+                exhausted: exhausted
             ))
     }
 
@@ -772,15 +766,13 @@ struct DogfoodRecoveryStormPolicyTests {
         #expect(
             !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: token,
-                exhausted: exhausted,
-                pendingPass: []))
+                exhausted: exhausted))
         // Heal / new archive generation clears exhaustion for that ciphertext.
         exhausted.remove(token.storageKey)
         #expect(
             InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: token,
-                exhausted: exhausted,
-                pendingPass: []))
+                exhausted: exhausted))
     }
 
     @Test("dogfood C2g: new fingerprint clears exhaustion and re-arms one archive defer")
@@ -802,49 +794,18 @@ struct DogfoodRecoveryStormPolicyTests {
         #expect(
             !InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: prior,
-                exhausted: exhausted,
-                pendingPass: []))
+                exhausted: exhausted))
         #expect(
             InboundRecoveryStormPolicy.shouldDeferArchivedFallback(
                 token: remint,
-                exhausted: exhausted,
-                pendingPass: []),
+                exhausted: exhausted),
             "BUG: reminted CT token must retain an independent archive pass")
         #expect(InboundRecoveryStormPolicy.tokensAreIndependent(prior, remint))
     }
 
-    @Test("dogfood C2h: pending archive pass defers dead-epoch terminalization")
-    func dogfoodC2h_pendingArchivePassDefersDeadEpochTerminalization() {
-        let token = ArchivedInboundFallbackToken(
-            senderSecretName: "nudge",
-            senderDeviceId: UUID(),
-            envelopeMessageId: "B07A45EC-780E-4B5C-AEAB-D5DAB91B9292",
-            fingerprint: Data("archive-pending-ct".utf8))
-        #expect(
-            !InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
-                token: token,
-                pendingPass: [token.storageKey]),
-            "BUG: terminalizing while archive pass is queued false-positives contentUnrecoverable")
-        #expect(
-            InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
-                token: token,
-                pendingPass: []),
-            "Absent pending pass must still terminalize (archive pass exhausted or never deferred)")
-        let other = ArchivedInboundFallbackToken(
-            senderSecretName: token.senderSecretName,
-            senderDeviceId: token.senderDeviceId,
-            envelopeMessageId: token.envelopeMessageId,
-            fingerprint: Data("different-ct".utf8))
-        #expect(
-            InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
-                token: other,
-                pendingPass: [token.storageKey]),
-            "Independent fingerprint token must not inherit another frame's deferral")
-    }
-
     @Test("dogfood C2i: preferred expiredKey promotes only when an alternate proved maxSkipped")
     func dogfoodC2i_expiredKeyPromotesWhenAlternateProvedMaxSkipped() {
-        let promoted = InboundRecoveryStormPolicy.terminalTryAllError(
+        let promoted = terminalClass(
             preferred: RatchetError.expiredKey,
             alternates: [RatchetError.maxSkippedHeadersExceeded])
         #expect(
@@ -852,25 +813,106 @@ struct DogfoodRecoveryStormPolicyTests {
             "BUG: archived maxSkipped is hidden by preferred expiredKey and the frame is deleted")
 
         let pqxdhStyle = NSError(domain: "corecrypto", code: 503_316_581)
-        let nonProving = InboundRecoveryStormPolicy.terminalTryAllError(
+        let nonProving = terminalClass(
             preferred: RatchetError.expiredKey,
             alternates: [pqxdhStyle, RatchetError.stateUninitialized])
         #expect((nonProving as? RatchetError) == .expiredKey)
 
-        let lone = InboundRecoveryStormPolicy.terminalTryAllError(
+        let lone = terminalClass(
             preferred: RatchetError.expiredKey,
             alternates: [])
         #expect((lone as? RatchetError) == .expiredKey)
 
-        let alreadyMaxSkipped = InboundRecoveryStormPolicy.terminalTryAllError(
+        let alreadyMaxSkipped = terminalClass(
             preferred: RatchetError.maxSkippedHeadersExceeded,
             alternates: [RatchetError.expiredKey])
         #expect((alreadyMaxSkipped as? RatchetError) == .maxSkippedHeadersExceeded)
 
-        let decryptionFailed = InboundRecoveryStormPolicy.terminalTryAllError(
+        let decryptionFailed = terminalClass(
             preferred: RatchetError.decryptionFailed,
             alternates: [RatchetError.maxSkippedHeadersExceeded])
         #expect((decryptionFailed as? RatchetError) == .decryptionFailed)
+    }
+
+    @Test("dogfood 2026-10-28: the class is the epoch holder's, then a blank's missingOneTimeKey, then the preferred row's")
+    func terminalClassFollowsTheFrameEpochHolder() {
+        // Child C7420C75 at 02:10:08Z: no row holds the frame's epoch. The stateful
+        // lanes said maxSkipped (not their frame); the ensured blank said
+        // missingOneTimeKey (the frame cites a one-time key this device does not
+        // hold). The class is the blank's, so recovery replaces the batch and asks
+        // the peer to refresh instead of NACKing a lane that cannot open.
+        let blank = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+            attempt(RatchetError.maxSkippedHeadersExceeded, isPreferred: true),
+            attempt(RatchetError.maxSkippedHeadersExceeded),
+            attempt(RatchetError.missingOneTimeKey, stateLess: true),
+        ])
+        #expect((blank as? RatchetError) == .missingOneTimeKey)
+
+        // Master at 23:20:46Z: the frames belong to 2824A981, which said maxSkipped.
+        // A fresh row had just become preferred and said missingOneTimeKey.
+        let holder = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+            attempt(RatchetError.missingOneTimeKey, isPreferred: true),
+            attempt(RatchetError.maxSkippedHeadersExceeded, holdsFrameEpoch: true),
+            attempt(RatchetError.missingOneTimeKey, stateLess: true),
+        ])
+        #expect((holder as? RatchetError) == .maxSkippedHeadersExceeded)
+
+        // Child at 23:41:41Z: a chain desync. The one matching row failed AEAD and
+        // every other row said missingOneTimeKey. No new batch fixes that.
+        let aead = NSError(domain: "corecrypto", code: 503_316_581)
+        let desync = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+            attempt(RatchetError.missingOneTimeKey, isPreferred: true),
+            attempt(aead, holdsFrameEpoch: true),
+            attempt(RatchetError.missingOneTimeKey, stateLess: true),
+        ])
+        #expect((desync as NSError).domain == "corecrypto")
+
+        // Only missingOneTimeKey proves the claim. A blank's other failures, the
+        // refusal of a replay among them, say nothing about the frame's keys.
+        for blankError in [RatchetError.decryptionFailed, RatchetError.maxSkippedHeadersExceeded, aead] as [Error] {
+            let unproven = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+                attempt(RatchetError.headerDecryptFailed, isPreferred: true),
+                attempt(blankError, stateLess: true),
+            ])
+            #expect((unproven as? RatchetError) == .headerDecryptFailed)
+        }
+
+        // Preferred is the marked attempt wherever it landed in the list: a state-less
+        // preferred row runs after the stateful ones, and a pass merges two lists.
+        let marked = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+            attempt(RatchetError.maxSkippedHeadersExceeded),
+            attempt(RatchetError.headerDecryptFailed, isPreferred: true),
+        ])
+        #expect((marked as? RatchetError) == .headerDecryptFailed)
+
+        // expiredKey is thrown past a header match, so it comes from the row that owns
+        // the frame: C2i's override has to reach the holder too.
+        let expired = InboundRecoveryStormPolicy.terminalTryAllError(attempts: [
+            attempt(RatchetError.expiredKey, holdsFrameEpoch: true, isPreferred: true),
+            attempt(RatchetError.maxSkippedHeadersExceeded),
+        ])
+        #expect((expired as? RatchetError) == .maxSkippedHeadersExceeded)
+    }
+
+    private func attempt(
+        _ error: Error,
+        stateLess: Bool = false,
+        holdsFrameEpoch: Bool = false,
+        isPreferred: Bool = false
+    ) -> InboundAttemptFailure {
+        InboundAttemptFailure(
+            laneId: UUID(),
+            label: "test",
+            error: error,
+            stateLess: stateLess,
+            holdsFrameEpoch: holdsFrameEpoch,
+            isPreferred: isPreferred)
+    }
+
+    /// The class from a preferred lane and alternates, none of them on the frame's epoch.
+    private func terminalClass(preferred: Error, alternates: [Error]) -> Error {
+        InboundRecoveryStormPolicy.terminalTryAllError(
+            attempts: [attempt(preferred, isPreferred: true)] + alternates.map { attempt($0) })
     }
 }
 
@@ -918,6 +960,7 @@ struct DogfoodOrphanRemintThrashPolicyTests {
             recoverySessionId: recoverySessionId,
             initiatingMarkSessionId: initiatingMark,
             markIsStateLess: markIsStateLess,
+            citationProvesDeadLane: true,
             priorRetransportCount: 0,
             remintsAfterRetransportProveFail: 0)
         #expect(
@@ -932,6 +975,7 @@ struct DogfoodOrphanRemintThrashPolicyTests {
             recoverySessionId: recoverySessionId,
             initiatingMarkSessionId: initiatingMark,
             markIsStateLess: markIsStateLess,
+            citationProvesDeadLane: true,
             priorRetransportCount: 0,
             remintsAfterRetransportProveFail: 1)
         #expect(postEscape == .retransportAlreadyServiced)
@@ -945,33 +989,34 @@ struct DogfoodOrphanRemintThrashPolicyTests {
             messageRecordSessionId: sessionId,
             recoverySessionId: sessionId,
             initiatingMarkSessionId: sessionId,
-            markIsStateLess: false)
+            markIsStateLess: false,
+            citationProvesDeadLane: true)
         #expect(
             decision == .mintFreshAfterRetransportProveFailed,
             "BUG: settled recovery with budget must escape-remint, got \(decision)")
     }
 
-    @Test("dogfood C3c: live recovery reuses wave for unrelated MessageRecord")
-    func dogfoodC3c_liveRecoveryReusesWaveForUnrelatedMessageRecord() {
+    @Test("dogfood C3c: answered lane carries a replay for unrelated MessageRecord")
+    func dogfoodC3c_answeredLaneCarriesReplayForUnrelatedMessageRecord() {
         let decision = OrphanResendRemintPolicy.decision(
             messageRecordSessionId: UUID(),
             recoverySessionId: UUID(),
             initiatingMarkSessionId: nil,
             markIsStateLess: false,
-            recoverySessionIsLiveActive: true)
+            hasAnsweredLane: true)
         #expect(
-            decision == .reuseRecoveryWave,
-            "BUG: live recovery reminted instead of wave reuse, got \(decision)")
+            decision == .replayOnAnsweredLane,
+            "BUG: answered lane reminted instead of carrying the replay, got \(decision)")
     }
 
-    @Test("dogfood C3c: dead recovery still allows mint for unrelated MessageRecord")
-    func dogfoodC3c_deadRecoveryStillMints() {
+    @Test("dogfood C3c: no answered lane still allows mint for unrelated MessageRecord")
+    func dogfoodC3c_noAnsweredLaneStillMints() {
         let decision = OrphanResendRemintPolicy.decision(
             messageRecordSessionId: UUID(),
             recoverySessionId: UUID(),
             initiatingMarkSessionId: nil,
             markIsStateLess: false,
-            recoverySessionIsLiveActive: false)
+            hasAnsweredLane: false)
         #expect(decision == .mintFresh)
     }
 }

@@ -198,11 +198,15 @@ extension MessagePipeline {
     /// processor before session delegates and cache state are released.
     func prepareForShutdown() async {
         isPausedUntilTransportReady = true
+        cancelServerAcceptDeadlines()
         await jobConsumer.gracefulShutdown()
-        guard isRunning else { return }
-        await withCheckedContinuation { continuation in
-            processingIdleWaiters.append(continuation)
+        if isRunning {
+            await withCheckedContinuation { continuation in
+                processingIdleWaiters.append(continuation)
+            }
         }
+        // The job that was in flight may have registered a deadline after the first cancel.
+        cancelServerAcceptDeadlines()
     }
     
     // MARK: - Startup
@@ -495,6 +499,16 @@ extension MessagePipeline {
             try await cache.deleteJob(job)
             return .processed
             
+        } catch is InboundDecryptDeferral {
+            // The active-first pass missed and queued the archive pass for this
+            // frame. That pass re-runs the whole decrypt and, if it fails too,
+            // lands in the handlers below. Nothing is asked of the sender before it.
+            if case .streamMessage(let message) = props.task.task {
+                audit(.recovery, "pqs.recovery.inboundDeferredToArchivePass sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
+            }
+            try await cache.deleteJob(job)
+            return .deleted
+
         } catch let ratchetError as RatchetError where ratchetError == .maxSkippedHeadersExceeded {
             switch props.task.task {
             case .streamMessage(let message):
@@ -753,10 +767,6 @@ extension MessagePipeline {
                         level: .info,
                         message: "pqs.recovery.coalesced failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) reason=pendingPeerRefresh")
                     await session.markInboundFailure(message, failureClass: failureClass)
-                    // Coalesced frames follow the leader's rule: the NACK just
-                    // deferred above owns recovery, so this only terminalizes when
-                    // no NACK is pending (see `maybeTerminalizeDeadEpochInbound`).
-                    await maybeTerminalizeDeadEpochInbound(message, session: session)
                     try await cache.deleteJob(job)
                     return .deleted
                 }
@@ -786,10 +796,7 @@ extension MessagePipeline {
                 // batch replacement and the cooldown-bypassing peerRefresh re-emit.
                 await session.markInboundFailure(message, failureClass: failureClass)
                 // Dead-epoch frames never heal by re-decrypt, only by the sender
-                // answering the NACK deferred above. Terminal is owned by
-                // oobUnavailable / resendSubmissionCap while that NACK is pending;
-                // this only terminalizes a tuple with no NACK left to answer.
-                await maybeTerminalizeDeadEpochInbound(message, session: session)
+                // answering the NACK deferred above. `oobUnavailable` owns terminal.
 
                 // The published-batch replacement (key generation + two uploads with
                 // retry backoff) and the subsequent peerRefresh emit must not block the
@@ -812,7 +819,10 @@ extension MessagePipeline {
                     // instead of racing delete/upload cycles against the same
                     // server config row (HTTP 409 "concurrent user update").
                     let batchesReplaced = await session.replacePublishedOneTimeKeyBatchesForRecovery()
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled else {
+                        auditSink.log(.recovery, "pqs.recovery.otkBatchReplacementCancelled failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) sharedId=\(sharedMessageId) batchesReplaced=\(batchesReplaced) proceeding=noPeerRefresh")
+                        return
+                    }
                     if !batchesReplaced {
                         // Non-terminal: replacement throws before any local mutation
                         // and retained privates keep every previously published key
@@ -821,9 +831,7 @@ extension MessagePipeline {
                         // re-encrypt — aborting here strands the episode open with no
                         // heal path (subsequent failures coalesce instead of
                         // re-emitting) until TTL expiry.
-                        logger.log(
-                            level: .warning,
-                            message: "pqs.recovery.otkBatchReplacementIncomplete failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId) sharedId=\(sharedMessageId) proceeding=peerRefresh")
+                        auditSink.log(.recovery, "pqs.recovery.otkBatchReplacementIncomplete failureClass=\(failureClass) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) sharedId=\(sharedMessageId) proceeding=peerRefresh")
                     }
 
                     // Bilateral one-time-key churn is symmetric: the peer failing on
@@ -1042,14 +1050,14 @@ extension MessagePipeline {
                         message: "pqs.outbound.parkedForViability sharedId=\(message.sharedId) recipient=\(message.message.recipient) error=\(error)")
                     return .paused
                 }
-                await noteResendReplayDropped(sharedId: message.sharedId, reason: "unhandledError=\(error)")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "unhandledError=\(PQSAuditRedaction.describe(error))")
                 // A persisted user message whose job is about to be deleted must fail
                 // visibly; a silent delete left the bubble in `.sending` forever.
                 if message.isPersistedOutbound {
                     await markPersistedOutboundFailed(
                         session: session,
                         localMessageId: message.localId,
-                        reason: "unhandledError=\(error)")
+                        reason: "unhandledError=\(PQSAuditRedaction.describe(error))")
                 }
             }
             
@@ -1086,7 +1094,7 @@ extension MessagePipeline {
                         failedMessageId: sharedMessageId,
                         logicalSharedId: inbound.logicalSharedId)
                 } else {
-                    audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
+                    audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(PQSAuditRedaction.describe(error))")
                     await session.scheduleTransportProtocolWork {
                         await delegate?.inboundRecoveryDeferred(
                             senderSecretName: senderSecretName,
@@ -1236,76 +1244,6 @@ extension MessagePipeline {
             failureClass: failureClass)
     }
 
-    /// `missingOneTimeKey` proves the sender's session epoch is dead: the
-    /// referenced one-time key is consumed, so this *envelope* can never decrypt
-    /// locally. The *content* still heals via sender re-encryption on the healed
-    /// lane — every caller has just registered a deferred NACK for this envelope
-    /// (`deferPeerResendUntilReestablished`), and dogfood 2026-09-26 showed
-    /// sixteen dead-epoch envelopes terminalized here and then settled via
-    /// `logicalReplay` after that NACK drained. Terminalizing at the failure
-    /// event told the host `inboundContentUnrecoverable` (spool purge + a
-    /// `failed` receipt to the author) for content that arrived minutes later.
-    ///
-    /// Terminal for a dead-epoch envelope is therefore owned by the events that
-    /// prove the sender cannot answer the NACK: `oobUnavailable`
-    /// (`handleOutOfBandResendUnavailable`) or `resendSubmissionCap`
-    /// (`sendDeferredResendRequests`). This path only terminalizes when no NACK
-    /// is pending for the tuple, so a redelivery of an already-settled or
-    /// cleared envelope is still swallowed without another OTK/peerRefresh storm.
-    /// `markInboundContentUnrecoverable` is once-per-tuple, so redelivered
-    /// copies do not re-notify the host.
-    ///
-    /// When an archive fallback pass is already queued for this ciphertext,
-    /// defer as well: the pass removes the token at start and rethrows on
-    /// failure, so the next handler invocation re-evaluates with no timer.
-    private func maybeTerminalizeDeadEpochInbound(
-        _ message: InboundTaskMessage,
-        session: PQSSession
-    ) async {
-        let token = ArchivedInboundFallbackToken(
-            senderSecretName: message.senderSecretName,
-            senderDeviceId: message.senderDeviceId,
-            envelopeMessageId: message.sharedMessageId,
-            fingerprint: PQSSession.nackFrameFingerprint(for: message))
-        let pendingPass = archivedInboundFallbackPasses
-        guard InboundRecoveryStormPolicy.shouldTerminalizeDeadEpochNow(
-            token: token,
-            pendingPass: pendingPass
-        ) else {
-            audit(
-                .recovery,
-                "pqs.recovery.deadEpochTerminalizationDeferred reason=archivePassPending sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
-            return
-        }
-        if await session.hasPendingResendAfterReestablishment(
-            sender: message.senderSecretName,
-            deviceId: message.senderDeviceId,
-            failedMessageId: message.sharedMessageId)
-        {
-            audit(
-                .recovery,
-                "pqs.recovery.deadEpochTerminalizationDeferred reason=resendPending sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString)")
-            return
-        }
-        await terminalizeDeadEpochInbound(message, session: session)
-    }
-
-    private func terminalizeDeadEpochInbound(
-        _ message: InboundTaskMessage,
-        session: PQSSession
-    ) async {
-        let newlyTerminal = await session.markInboundContentUnrecoverable(
-            sender: message.senderSecretName,
-            deviceId: message.senderDeviceId,
-            sharedId: message.sharedMessageId)
-        guard newlyTerminal else { return }
-        audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=missingOneTimeKeyDeadEpoch")
-        await session.sessionDelegate?.inboundContentUnrecoverable(
-            senderSecretName: message.senderSecretName,
-            senderDeviceId: message.senderDeviceId,
-            sharedMessageId: message.sharedMessageId)
-    }
-
     /// Undecryptable inbound policy (orphan-resend):
     /// 1. Drop the frame and request a bounded resend.
     /// 2. Never open receive-side Automatic Session Reset / `peerRefresh` for these
@@ -1346,40 +1284,31 @@ extension MessagePipeline {
         // undecryptable: clear cooldown/suppress so sender orphanResend can be asked
         // again (bounded). Same ciphertext redelivery must not rearm (cap burn).
         let frameFingerprint = PQSSession.nackFrameFingerprint(for: message)
-        let preferenceKey = peerDeviceIdentityPreferenceKey(
-            secretName: message.senderSecretName,
-            deviceId: message.senderDeviceId)
+        let earlierFailedEnvelopes = await session.noteFailedEnvelope(message)
         // Preference map is success-only (never written on try-all failure — that
         // dogfood cascade demoted unique session ids under blankForHeader storms).
         // Pin existence alone is NOT prove-fail: offline backlog / ephemeral frames
-        // fail on a healthy preferred. Demoting that pin on every undecryptable
-        // thrash-demotes the live lane (dogfood 745495D9 after 386AD133). Clear +
-        // demote only when orphan replay rearm proves retransported material still
-        // cannot decrypt — matching "demote remains rearm-gated".
-        let pinnedPreferredId = preferredSessionIdentityIdByPeerDevice[preferenceKey]
+        // fail on a healthy preferred. Clear it only when orphan replay rearm proves
+        // retransported material still cannot decrypt. The pinned row stays active
+        // even then: a pin means the peer answered it, and only a decrypt archives
+        // an answered lane (dogfood 745495D9 after 386AD133).
         let rearmedAfterFailedReplay = await session.armPeerResendRetryAfterFailedReplay(
             sender: message.senderSecretName,
             deviceId: message.senderDeviceId,
             failedMessageId: message.sharedMessageId,
+            earlierFailedEnvelopes: earlierFailedEnvelopes,
             currentFingerprint: frameFingerprint)
         var preferredCleared = false
         if rearmedAfterFailedReplay {
             logger.log(
                 level: .info,
                 message: "pqs.recovery.orphanReplayStillUndecryptable failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) action=rearmNack")
-            // Stuck preferred after failed owner retransport — clear pin, demote that
-            // active, and demote zombie blanks so NACK control / next initiating frame
-            // can land.
+            // Stuck preferred after failed owner retransport — clear pin and demote
+            // zombie blanks so NACK control / next initiating frame can land.
             clearPreferredSessionIdentity(
                 secretName: message.senderSecretName,
                 deviceId: message.senderDeviceId)
             preferredCleared = true
-            if let pinnedPreferredId {
-                _ = try? await session.demoteProveFailedActive(
-                    sessionId: pinnedPreferredId,
-                    secretName: message.senderSecretName,
-                    deviceId: message.senderDeviceId)
-            }
             _ = try? await session.demoteZombieStateLessActives(
                 secretName: message.senderSecretName,
                 deviceId: message.senderDeviceId)
@@ -1424,40 +1353,6 @@ extension MessagePipeline {
         }
 
         if await session.shouldSuppressInboundFailure(message, failureClass: failureClass) {
-            let submissionCount = await session.resendRequestSubmissionCount(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId,
-                failedMessageId: message.sharedMessageId)
-            if submissionCount >= PQSSessionConstants.peerResendRequestMaxSubmissions {
-                // Lost-NACK safety while awaiting sender: close this sharedId only.
-                await session.clearPendingResends(
-                    sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId,
-                    messageIds: [message.sharedMessageId])
-                auditInboundDecryptFailure(
-                    message: message,
-                    failureClass: failureClass,
-                    error: diagnostic,
-                    action: "contentUnrecoverable",
-                    suppressed: true,
-                    metadata: diagnostic.map { ["diagnostic": $0] } ?? [:])
-                let newlyTerminal = await session.markInboundContentUnrecoverable(
-                    sender: message.senderSecretName,
-                    deviceId: message.senderDeviceId,
-                    sharedId: message.sharedMessageId)
-                if newlyTerminal {
-                    audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
-                    await session.sessionDelegate?.inboundContentUnrecoverable(
-                        senderSecretName: message.senderSecretName,
-                        senderDeviceId: message.senderDeviceId,
-                        sharedMessageId: message.sharedMessageId)
-                }
-                logger.log(
-                    level: .warning,
-                    message: "pqs.recovery.resendRequestExhausted failureClass=\(failureClass) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) sharedId=\(message.sharedMessageId) attempts=\(submissionCount)")
-                try await cache.deleteJob(job)
-                return .deleted
-            }
             // Already requested resend for this tuple; wait for sender orphanResend /
             // replay. Do not mint a receive-side repair session.
             auditInboundDecryptFailure(
@@ -1540,7 +1435,6 @@ extension MessagePipeline {
         // for the retry itself. Sender orphan-resend owns content heal.
         _ = preferredCleared
         _ = liveOrphanOrRecovery
-        _ = preferenceKey
         let didRequestResend = await requestPeerResendIfAllowed(
             message: message,
             failureClass: failureClass,
@@ -1677,9 +1571,9 @@ extension MessagePipeline {
 
         switch transportEvent {
         case .sessionReestablishment(let envelope):
-            return "pqs.recovery.reestablishmentSendFailed sharedId=\(outboundTask.sharedId) kind=\(envelope.kind.rawValue) response=\(envelope.isResponse) epoch=\(envelope.epoch) intent=\(envelope.intentId?.uuidString ?? "nil") retryAttempt=\(attempt) error=\(error)"
+            return "pqs.recovery.reestablishmentSendFailed sharedId=\(outboundTask.sharedId) kind=\(envelope.kind.rawValue) response=\(envelope.isResponse) epoch=\(envelope.epoch) intent=\(envelope.intentId?.uuidString ?? "nil") retryAttempt=\(attempt) error=\(PQSAuditRedaction.describe(error))"
         case .linkedDeviceReprovisioning(let bundle):
-            return "pqs.recovery.linkedDeviceReprovisioningSendFailed sharedId=\(outboundTask.sharedId) targetDeviceId=\(bundle.targetDeviceId) retryAttempt=\(attempt) error=\(error)"
+            return "pqs.recovery.linkedDeviceReprovisioningSendFailed sharedId=\(outboundTask.sharedId) targetDeviceId=\(bundle.targetDeviceId) retryAttempt=\(attempt) error=\(PQSAuditRedaction.describe(error))"
         case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished:
             return nil
         }
@@ -1771,26 +1665,11 @@ extension MessagePipeline {
             deviceId: message.senderDeviceId,
             failedMessageId: message.sharedMessageId)
         if submissionCount >= PQSSessionConstants.peerResendRequestMaxSubmissions {
-            // Lost-NACK safety: the peer is expected to answer; when our NACK never
-            // arrives, stop asking for this sharedId only. Never open receive ASR.
-            await session.clearPendingResends(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId,
-                messageIds: [message.sharedMessageId])
+            // Rate limit, not a verdict (see `peerResendRequestMaxSubmissions`): stop
+            // asking for this sharedId in this process. Never open receive ASR.
             logger.log(
                 level: .warning,
                 message: "pqs.recovery.resendRequestExhausted failureClass=\(failureClass) sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId) attempts=\(submissionCount)")
-            let newlyTerminal = await session.markInboundContentUnrecoverable(
-                sender: message.senderSecretName,
-                deviceId: message.senderDeviceId,
-                sharedId: message.sharedMessageId)
-            if newlyTerminal {
-                audit(.recovery, "pqs.recovery.contentUnrecoverable sharedId=\(message.sharedMessageId) sender=\(message.senderSecretName) deviceId=\(message.senderDeviceId.uuidString) reason=resendSubmissionCap attempts=\(submissionCount)")
-                await session.sessionDelegate?.inboundContentUnrecoverable(
-                    senderSecretName: message.senderSecretName,
-                    senderDeviceId: message.senderDeviceId,
-                    sharedMessageId: message.sharedMessageId)
-            }
             return false
         }
 
@@ -2040,10 +1919,18 @@ extension MessagePipeline {
             deviceId: props.deviceId,
             flow: .outbound)
         let canBypassCooldown =
-            (isRecoveryCriticalControl || requiresFreshNoOTKLane)
+            isRecoveryCriticalControl
             && consumeOutboundRepairBypass(sharedId: message.sharedId)
+        // Only a lane with state throws `missingOneTimeKey`, so a new row cures it and
+        // the cooldown guards nothing: this repair consumes no key. A frame from the
+        // peer can promote the old lane over the new row before the retry runs, and
+        // the retry then fails there through no fault of the repair. Each such failure
+        // takes a frame from the peer, so this cannot spin. A retry that failed on the
+        // new row itself has nothing left to try.
+        let failedOnBlank = await failedOnLiveBlank(message, cache: cache, symmetricKey: symmetricKey)
+        let replacesFailedLane = requiresFreshNoOTKLane && !failedOnBlank
 
-        guard canAttempt || canBypassCooldown else {
+        guard canAttempt || canBypassCooldown || replacesFailedLane else {
             if isRecoveryCriticalControl {
                 await session.endReestablishmentEpisode(
                     sender: props.secretName,
@@ -2095,14 +1982,15 @@ extension MessagePipeline {
             } else {
                 // Outbound repair only needs a fresh state-less row. Consuming an OTK
                 // here races with inbound recovery and depletes the peer's pool.
-                replacement = try await session.resetSessionIdentityForFreshSession(
-                    secretName: props.secretName,
-                    deviceId: props.deviceId,
-                    sendOneTimeIdentities: false,
-                    reason: requiresFreshNoOTKLane
-                        ? "outboundMissingOneTimeKey"
-                        : "outboundRepair",
-                    reuseStateLessRepairLane: !requiresFreshNoOTKLane)
+                replacement = requiresFreshNoOTKLane
+                    ? try await session.replaceLaneFromLocalKeys(
+                        secretName: props.secretName,
+                        deviceId: props.deviceId)
+                    : try await session.resetSessionIdentityForFreshSession(
+                        secretName: props.secretName,
+                        deviceId: props.deviceId,
+                        sendOneTimeIdentities: false,
+                        reason: "outboundRepair")
                 clearPreferredSessionIdentity(
                     secretName: props.secretName,
                     deviceId: props.deviceId)
@@ -2151,6 +2039,20 @@ extension MessagePipeline {
             try await cache.deleteJob(job)
             return .deleted
         }
+    }
+
+    /// The job names a live row with no state, which outbound resolution honors.
+    private func failedOnLiveBlank(
+        _ message: OutboundTaskMessage,
+        cache: SessionCache,
+        symmetricKey: SymmetricKey
+    ) async -> Bool {
+        guard let identity = try? await cache.fetchSessionIdentities()
+            .first(where: { $0.id == message.recipientIdentity.id }),
+              let props = await identity.props(symmetricKey: symmetricKey)
+        else { return false }
+        return !props.hasRatchetState
+            && !props.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix)
     }
 
     private func reportTerminalOutboundRepairIfNeeded(

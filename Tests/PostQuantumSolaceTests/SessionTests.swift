@@ -488,7 +488,7 @@ actor SessionTests {
     }
 
     @Test
-    func refreshOneTimeKeys_doesNotPersistGeneratedX25519Keys_whenUploadFails() async throws {
+    func refreshOneTimeKeys_keepsNoGeneratedPrivateKeys_whenUploadRejected() async throws {
         let mockCache = MockCache()
         let appSymmetricKey = await self.session.deriveAppSymmetricKey(passwordData: "secret".data(using: .utf8)!,
             salt: Data()
@@ -539,7 +539,7 @@ actor SessionTests {
         #expect(refreshedContext.activeUserConfiguration.signedOneTimePublicKeys.count == retainedIds.count)
         #expect(
             refreshedContext.sessionUser.deviceKeys.oneTimePrivateKeys.count == bundle.deviceKeys.oneTimePrivateKeys.count,
-            "Failed uploads must not persist generated private keys, but already-local private keys remain for in-flight messages.")
+            "A rejected upload takes back the private keys stored ahead of it and publishes no public.")
         #expect(Set(refreshedContext.activeUserConfiguration.signedOneTimePublicKeys.map(\.id)) == Set(retainedIds))
 
         await session.shutdown()

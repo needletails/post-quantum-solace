@@ -172,7 +172,8 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
                 }
                 
                 // Replay idempotency: only the first consumption request for this
-                // id still finds its signed public entry.
+                // id still finds its signed public entry. A reply citing an
+                // initiator's handshake ephemeral never finds one: nothing was published.
                 guard sessionContext.activeUserConfiguration.signedOneTimePublicKeys.contains(where: { $0.id == id }) else {
                     await retireUpdateKeyTask(taskId)
                     return
@@ -187,17 +188,15 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
                 let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: sessionUser.deviceKeys.signingPrivateKey)
                 let newSignedKey = try UserConfiguration.SignedOneTimePublicKey(key: publicKey, deviceId: sessionUser.deviceId, signingKey: signingKey)
                 
-                try await session.transportDelegate?.updateOneTimeKeys(
-                    for: sessionUser.secretName,
-                    deviceId: sessionUser.deviceId.uuidString,
-                    keys: [newSignedKey]
-                )
-                
-                // The server accepted the replacement. Apply this task's delta to the
-                // *current* context, not the snapshot taken before the round-trip: a
-                // sibling replacement may have committed in the meantime, and writing the
-                // snapshot back would resurrect its spent public key and drop its new
-                // private key (the peer could then pick an OTK we cannot decrypt).
+                // Store the replacement's private half first, so the server can only serve
+                // a key this device can open. A failed upload leaves one unused private, and
+                // the spent public entry stays, so a replay mints again.
+                //
+                // Both commits apply this task's delta to the *current* context, not the
+                // snapshot taken above: a sibling replacement may commit in the meantime,
+                // and writing the snapshot back would resurrect its spent public key and
+                // drop its new private key (the peer could then pick an OTK we cannot
+                // decrypt).
                 //
                 // Mutation and persistence run as one exclusive commit: persisting
                 // re-installs the stored blob as the live context, so an overlapping
@@ -210,6 +209,18 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
                     var user = context.sessionUser
                     user.deviceKeys = deviceKeys
                     context.updateSessionUser(user)
+                }) != nil else {
+                    throw PQSError.sessionNotInitialized
+                }
+                
+                try await session.transportDelegate?.updateOneTimeKeys(
+                    for: sessionUser.secretName,
+                    deviceId: sessionUser.deviceId.uuidString,
+                    keys: [newSignedKey]
+                )
+                
+                // The server accepted the replacement.
+                guard try await session.commitLiveSessionContextMutation({ context in
                     context.activeUserConfiguration.signedOneTimePublicKeys.removeAll { $0.id == id }
                     context.activeUserConfiguration.signedOneTimePublicKeys.append(newSignedKey)
                 }) != nil else {
@@ -316,41 +327,65 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
         var remoteMLKEMPublicKey: MLKEMPublicKey
     }
     
+    /// A fresh X3DH ephemeral for one lane's handshake. It lives only in that lane's
+    /// ratchet state: never in `DeviceKeys`, never published, so the server cannot
+    /// serve it and a reply citing it spends no published key.
+    private func mintHandshakeEphemeral() throws -> X25519PrivateKey {
+        try X25519PrivateKey(id: UUID(), crypto.generateCurve25519PrivateKey().rawRepresentation)
+    }
+
+    /// One lane, one ephemeral. A replay and a queued send can both reach a state-less row
+    /// before either starts the handshake, and a second key on that row reads to the ratchet
+    /// as a local key change: an epoch before frame 0, which a blank row can never mirror.
+    private func handshakeEphemeral(forLane laneId: UUID) throws -> X25519PrivateKey {
+        if let held = handshakeEphemeralByLane[laneId] { return held }
+        let minted = try mintHandshakeEphemeral()
+        handshakeEphemeralByLane[laneId] = minted
+        return minted
+    }
+    
     func loadKeys(
         props: SessionIdentity.UnwrappedProps,
         sessionContext: SessionContext,
         session: PQSSession,
-        sessionIdentityId: UUID
+        laneId: UUID
     ) async throws -> LoadedKeysResult {
         /// Loads the key material for one outbound encrypt on one lane.
-        /// - No ratchet state: a handshake from the pool keys.
-        /// - Ratchet state: the keys in the lane's own snapshot.
+        /// - No ratchet state: a handshake from the final ML-KEM key, plus a minted
+        ///   ephemeral when the row consumed a peer's one-time key. Never a published key.
+        /// - Ratchet state: the keys in the lane's own snapshot, and no others.
         /// - Routine ML-KEM rotation due: the published bundle and the pool move on;
         ///   an established lane keeps its snapshot keys.
         
-        var localOneTimePrivateKey: X25519PrivateKey?
+        let localOneTimePrivateKey: X25519PrivateKey?
         var localMLKEMPrivateKey: MLKEMPrivateKey
         var remoteLongTermPublicKey: Data
         var remoteOneTimePublicKey: X25519PublicKey?
         var remoteMLKEMPublicKey: MLKEMPublicKey
-        var effectiveSessionContext = sessionContext
         
         // Local keys are recipient-scoped: an established lane keeps the keys in its
-        // ratchet snapshot, a lane without state starts a handshake from the pool.
+        // ratchet snapshot, a lane without state starts a handshake. The curve slot is
+        // X3DH's ephemeral and the ML-KEM slot the signed-prekey role. A pool key here
+        // is shared by every lane this device starts, and a peer's reply spends it
+        // while the server still serves it, so the next peer it reaches gets
+        // `missingOneTimeKey` (dogfood 2026-10-28: A4FEDB36 cited on two devices' lanes).
         // `keyLoadingState` is session-scoped (the process's first send, a rotation)
-        // and says nothing about this lane. Handing an established lane fresh pool
+        // and says nothing about this lane. Handing an established lane fresh
         // keys reads to the ratchet as a local key change and fires an epoch
         // re-key the peer only mirrors in order: every frame they sent before
         // seeing it fails on this lane (the responder's first reply, or the first
         // send after a relaunch, with the peer's traffic crossing it).
         if props.hasRatchetState {
+            handshakeEphemeralByLane[laneId] = nil
             localOneTimePrivateKey = props.ratchetOneTimePrivateKey
             localMLKEMPrivateKey = props.ratchetMLKEMPrivateKey
-                ?? effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
+                ?? sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
         } else {
-            localOneTimePrivateKey = effectiveSessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last
-            localMLKEMPrivateKey = effectiveSessionContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last
-                ?? effectiveSessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
+            // The ephemeral agrees only with a consumed key. With none it adds nothing to
+            // the handshake, and a peer that sees it embedded wants a local key on its
+            // reply, which only a re-key of the established lane can supply.
+            localOneTimePrivateKey = props.oneTimePublicKey == nil ? nil : try handshakeEphemeral(forLane: laneId)
+            localMLKEMPrivateKey = sessionContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
         }
         
         remoteLongTermPublicKey = props.longTermPublicKey
@@ -368,29 +403,9 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
            try await session.rotateMLKEMKeysIfNeeded(),
            !props.hasRatchetState,
            let refreshedContext = await session.sessionContext {
-            effectiveSessionContext = refreshedContext
-            localMLKEMPrivateKey = refreshedContext.sessionUser.deviceKeys.mlKEMOneTimePrivateKeys.last
-                ?? refreshedContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
+            localMLKEMPrivateKey = refreshedContext.sessionUser.deviceKeys.finalMLKEMPrivateKey
         }
         
-        // Strict encrypt throws if a sending handshake still wants a remote OTK
-        // but the state copy of our local OTK is gone (cleared on inbound
-        // consume, or a reminted lane that kept peer OTK props). Re-supply
-        // from the deferred-consumption pool only while the sending handshake
-        // is unfinished — doing so after the handshake would look like a
-        // sending-key change and trigger a DH ratchet.
-        if localOneTimePrivateKey == nil {
-            let needsSendingHandshake: Bool
-            if let status = try? await ratchetManager.sessionStatus(sessionId: sessionIdentityId) {
-                needsSendingHandshake = !status.sendingHandshakeFinished
-            } else {
-                needsSendingHandshake = !props.hasRatchetState
-            }
-            if needsSendingHandshake {
-                localOneTimePrivateKey = effectiveSessionContext.sessionUser.deviceKeys.oneTimePrivateKeys.last
-            }
-        }
-
         if shouldEmitKeyPayloadLogs {
             logger.log(level: .debug, message: """
                 loadKeys: recipient=\(props.secretName) \n

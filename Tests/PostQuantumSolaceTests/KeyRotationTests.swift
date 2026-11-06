@@ -68,6 +68,21 @@ actor KeyRotationTests {
         return (transport, cacheStore)
     }
 
+    private func refresh(_ kind: KeyKind, policy: PQSSession.OneTimeKeyRefreshPolicy) async -> Bool {
+        switch kind {
+        case .x25519: await session.refreshOneTimeKeysTask(policy: policy)
+        case .mlKEM: await session.refreshMLKEMOneTimeKeysTask(policy: policy)
+        }
+    }
+
+    private func heldPrivateIds(_ kind: KeyKind) async throws -> [UUID] {
+        let deviceKeys = try #require(await session.sessionContext).sessionUser.deviceKeys
+        switch kind {
+        case .x25519: return deviceKeys.oneTimePrivateKeys.map(\.id)
+        case .mlKEM: return deviceKeys.mlKEMOneTimePrivateKeys.map(\.id)
+        }
+    }
+
     private func makeLinkedSignedDevice(from context: SessionContext) throws -> UserConfiguration.SignedDeviceConfiguration {
         let signingPrivateKey = try Curve25519.Signing.PrivateKey(
             rawRepresentation: context.sessionUser.deviceKeys.signingPrivateKey
@@ -1410,6 +1425,132 @@ actor KeyRotationTests {
         #expect(publishedNew.isSubset(of: heldPrivateIds),
                 "Every advertised replacement must have its private key held locally")
 
+        await session.shutdown()
+    }
+
+    /// Dogfood 2026-10-28: 9CC8CF14 failed `missingOneTimeKey` on every row, which needs
+    /// a key this device held nowhere. An upload that outruns its commit can leave the
+    /// server serving exactly that: a batch whose private halves were never stored.
+    @Test("a batch this device could not store is never uploaded", arguments:
+            [KeyKind.x25519, .mlKEM],
+            [PQSSession.OneTimeKeyRefreshPolicy.replenishBatch, .replacePublishedBatch])
+    func failedCommitPublishesNoBatch(kind: KeyKind, policy: PQSSession.OneTimeKeyRefreshPolicy) async throws {
+        let (transport, cacheStore) = try await setupRotatableSession()
+        // Room for a replenish to mint, with every local public still on the server so
+        // no prune commit fails ahead of the batch.
+        try await session.commitSessionContextMutation { context in
+            context.activeUserConfiguration.signedOneTimePublicKeys.removeLast(5)
+            context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeLast(5)
+            return true
+        }
+        await transport.setOTKUploadFailCount(0)
+        await cacheStore.setReplaceLocalSessionContextError(PQSError.sessionEncryptionError)
+
+        let refreshed = switch kind {
+        case .x25519: await session.refreshOneTimeKeysTask(policy: policy)
+        case .mlKEM: await session.refreshMLKEMOneTimeKeysTask(policy: policy)
+        }
+
+        #expect(refreshed == false)
+        #expect(await transport.otkUploadAttemptCount == 0)
+        await cacheStore.setReplaceLocalSessionContextError(nil)
+        await session.shutdown()
+    }
+
+    @Test("a replacement key this device could not store is never uploaded")
+    func failedCommitPublishesNoReplacementKey() async throws {
+        let (transport, cacheStore) = try await setupRotatableSession()
+        let context = try #require(await session.sessionContext)
+        let spent = try #require(context.activeUserConfiguration.signedOneTimePublicKeys.first)
+        await transport.resetCallTracking()
+        await cacheStore.setReplaceLocalSessionContextError(PQSError.sessionEncryptionError)
+
+        let pipeline = await session.messagePipeline
+        await pipeline.bindSessionForTesting(session)
+        await pipeline.updateOneTimeKey(remove: spent.id)
+        for task in Array(await pipeline.updateKeyTasks.values) {
+            await task.value
+        }
+
+        #expect(await transport.updateOneTimeKeysCallCount == 0)
+        await cacheStore.setReplaceLocalSessionContextError(nil)
+        await session.shutdown()
+    }
+
+    /// Storing privates ahead of the upload must not cost anything when the upload then
+    /// fails: every retry mints a batch, and the retained pool is already at its cap.
+    @Test("failed uploads evict no retained key and leave the published list alone")
+    func failedUploadsKeepRetainedKeys() async throws {
+        let (transport, _) = try await setupRotatableSession()
+        #expect(await session.refreshOneTimeKeysTask(policy: .replacePublishedBatch))
+        let before = try #require(await session.sessionContext)
+        #expect(before.sessionUser.deviceKeys.oneTimePrivateKeys.count == PQSSessionConstants.retainedOneTimePrivateKeyCap)
+        await transport.setOTKUploadFailCount(3)
+
+        #expect(await session.refreshOneTimeKeysTask(policy: .replacePublishedBatch) == false)
+
+        let after = try #require(await session.sessionContext)
+        let held = Set(after.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id))
+        #expect(held.isSuperset(of: before.sessionUser.deviceKeys.oneTimePrivateKeys.map(\.id)))
+        #expect(after.activeUserConfiguration.signedOneTimePublicKeys.map(\.id)
+            == before.activeUserConfiguration.signedOneTimePublicKeys.map(\.id))
+        await session.shutdown()
+    }
+
+    /// The retry that lands is the one that evicts, so a rejected attempt's privates must
+    /// not still be in the pool to count against the cap. The prior 200 lose only the 100
+    /// the new batch displaces, as with no failure at all.
+    @Test("a rejected upload costs no retained key when its retry lands", arguments: [KeyKind.x25519, .mlKEM])
+    func rejectedUploadThenRetryKeepsRetainedKeys(kind: KeyKind) async throws {
+        let (transport, _) = try await setupRotatableSession()
+        #expect(await refresh(kind, policy: .replacePublishedBatch))
+        let before = try await heldPrivateIds(kind)
+        #expect(before.count == PQSSessionConstants.retainedOneTimePrivateKeyCap)
+        await transport.setOTKUploadFailCount(1)
+
+        #expect(await refresh(kind, policy: .replacePublishedBatch))
+
+        let after = try await heldPrivateIds(kind)
+        #expect(after.count == PQSSessionConstants.retainedOneTimePrivateKeyCap)
+        #expect(Set(after).intersection(before).count == PQSSessionConstants.oneTimeKeyBatchSize)
+        await session.shutdown()
+    }
+
+    /// Top-ups have no cap, so a rejected attempt's privates would stay for good.
+    @Test("rejected top-ups leave no private behind", arguments: [KeyKind.x25519, .mlKEM])
+    func rejectedTopUpsLeaveNoPrivates(kind: KeyKind) async throws {
+        let (transport, _) = try await setupRotatableSession()
+        try await session.commitSessionContextMutation { context in
+            context.activeUserConfiguration.signedOneTimePublicKeys.removeLast(5)
+            context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeLast(5)
+            return true
+        }
+        let before = try await heldPrivateIds(kind)
+        await transport.setOTKUploadFailCount(6)
+
+        #expect(await refresh(kind, policy: .replenishBatch) == false)
+        #expect(await refresh(kind, policy: .replenishBatch) == false)
+
+        #expect(try await heldPrivateIds(kind) == before)
+        await session.shutdown()
+    }
+
+    /// An upload that died without an answer may have landed, so the server could be
+    /// serving this batch: its privates have to stay.
+    @Test("an upload with no answer keeps its privates", arguments: [KeyKind.x25519, .mlKEM])
+    func unansweredUploadKeepsPrivates(kind: KeyKind) async throws {
+        let (transport, _) = try await setupRotatableSession()
+        try await session.commitSessionContextMutation { context in
+            context.activeUserConfiguration.signedOneTimePublicKeys.removeLast(5)
+            context.activeUserConfiguration.signedMLKEMOneTimePublicKeys.removeLast(5)
+            return true
+        }
+        let before = try await heldPrivateIds(kind)
+        await transport.setOTKUploadFailCount(1, error: URLError(.timedOut))
+
+        #expect(await refresh(kind, policy: .replenishBatch) == false)
+
+        #expect(try await heldPrivateIds(kind).count == before.count + 5)
         await session.shutdown()
     }
 
