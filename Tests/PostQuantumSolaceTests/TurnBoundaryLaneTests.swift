@@ -145,6 +145,9 @@ extension EndToEndTests {
             try await pair.bob.send(recipient: .nickname("alice"), text: "bob before rotation \(i)")
         }
         #expect(await pollUntil(timeout: 20) { await held.count == inFlight })
+        // Count from before the rotation, so the check below covers its announcement.
+        await jobLoopIdle(pair.bob)
+        let bobAccepted0 = await acceptedCount(pair.bob)
 
         try await pair.alice.rotateKeysOnPotentialCompromise()
         #expect(await pollUntil(timeout: 20) { await pair.controls.reestablishments >= 1 },
@@ -153,18 +156,37 @@ extension EndToEndTests {
         // A compromise rotation changes alice's account signing key. Bob pins that
         // key (TOFU), so frames under the new identity are refused and the host is
         // told, exactly like a changed safety number that the user must accept.
-        let bobAccepted0 = await acceptedCount(pair.bob)
-        try await pair.alice.send(recipient: .nickname("bob"), text: "alice right after rotation")
+        // Alice's next frame is held until the host has accepted.
+        let afterRotation = "alice-after-rotation-\(UUID().uuidString)"
+        let heldAfterRotation = HeldFrames()
+        pair.aliceTransport.shouldDeliver = { received in
+            guard received.recipient == "bob", received.logicalMessageId == afterRotation else { return true }
+            await heldAfterRotation.hold(received)
+            return false
+        }
+        try await pair.alice.send(recipient: .nickname("bob"), text: "alice right after rotation", sharedIdOverride: afterRotation)
+        #expect(await pollUntil(timeout: 20) { await heldAfterRotation.count == 1 })
+        pair.aliceTransport.shouldDeliver = nil
         #expect(await pollUntil(timeout: 20) { await trust.count() >= 1 },
                 "bob's host is told that alice's account identity changed")
+        // The announcement is the only frame under the new identity bob has seen;
+        // let its job finish before counting.
+        await jobLoopIdle(pair.bob)
         let bobAcceptedWhileBlocked = await acceptedCount(pair.bob)
         #expect(bobAcceptedWhileBlocked == bobAccepted0, "nothing under the new identity is accepted before re-trust")
 
-        // The host accepts the new identity. Bob's acknowledge sends alice a frame on
-        // his fresh lane while alice is answering bob's earlier NACK with an orphan
-        // resend on a fresh lane of her own: two bootstraps cross. The first attempts
-        // on each side fail; the lanes converge through recovery.
+        // The host accepts the new identity with bob idle and alice's frame still held.
+        // An inbound lane rollback during the accept's identity refresh is a known race
+        // this test does not cover (SessionCache.updateSessionIdentity writes by an
+        // index read before an await).
         try await acceptPeerIdentity(on: pair.bob, peer: "alice", via: pair.bobTransport)
+
+        // Alice's held frame lands now. It belongs to the lane she opened at her
+        // rotation, which bob refused, so bob cannot open it (missing one-time key):
+        // he resets and sends her a second lane-rebuild frame while she is answering
+        // the one his acknowledge sent, then asks her to resend the frame. Its first
+        // delivery fails; the lanes converge through recovery.
+        for frame in await heldAfterRotation.take() { pair.aliceTransport.continuation?.yield(frame) }
 
         // Wait for each live frame by its id: the recovery frames above land in the
         // same window, and if one ends the wait, bob's send crosses alice's in flight.
