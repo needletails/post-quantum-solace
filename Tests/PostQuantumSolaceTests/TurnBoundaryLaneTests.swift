@@ -166,15 +166,15 @@ extension EndToEndTests {
         // on each side fail; the lanes converge through recovery.
         try await acceptPeerIdentity(on: pair.bob, peer: "alice", via: pair.bobTransport)
 
+        // Wait for each live frame by its id: the recovery frames above land in the
+        // same window, and if one ends the wait, bob's send crosses alice's in flight.
         pair.bobTransport.shouldDeliver = nil
-        let bobAccepted1 = await acceptedCount(pair.bob)
-        let aliceAccepted1 = await acceptedCount(pair.alice)
-        try await pair.alice.send(recipient: .nickname("bob"), text: "alice after re-trust")
-        #expect(await pollUntil(timeout: 30) { await self.acceptedCount(pair.bob) > bobAccepted1 },
-                "alice's traffic reaches bob under the new identity")
-        try await pair.bob.send(recipient: .nickname("alice"), text: "bob after re-trust")
-        #expect(await pollUntil(timeout: 30) { await self.acceptedCount(pair.alice) > aliceAccepted1 },
-                "bob's traffic reaches alice under the new identity")
+        let aliceLive = "alice-after-retrust-\(UUID().uuidString)"
+        try await pair.alice.send(recipient: .nickname("bob"), text: "alice after re-trust", sharedIdOverride: aliceLive)
+        #expect(await persisted(pair.bob, aliceLive), "alice's traffic reaches bob under the new identity")
+        let bobLive = "bob-after-retrust-\(UUID().uuidString)"
+        try await pair.bob.send(recipient: .nickname("alice"), text: "bob after re-trust", sharedIdOverride: bobLive)
+        #expect(await persisted(pair.alice, bobLive), "bob's traffic reaches alice under the new identity")
 
         // Bob's identity did not change, so the frames he sent before alice's
         // rotation still decrypt on alice when they finally land.

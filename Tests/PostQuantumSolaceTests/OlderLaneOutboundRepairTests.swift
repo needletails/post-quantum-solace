@@ -99,12 +99,6 @@ extension EndToEndTests {
         }
     }
 
-    private func arrives(_ sharedId: String, on session: PQSSession) async -> Bool {
-        await pollUntil(timeout: 20) {
-            (try? await session.cache?.fetchMessageIfExists(sharedId: sharedId)) != nil
-        }
-    }
-
     @Test("a send on an older lane leaves while directory lookups time out")
     func olderLaneSendSurvivesDirectoryTimeouts() async throws {
         let probe = OutboundUnrecoverableProbe()
@@ -118,7 +112,7 @@ extension EndToEndTests {
         let sharedId = UUID().uuidString
         try await pair.alice.send(recipient: .nickname("bob"), text: "sent while lookups time out", sharedIdOverride: sharedId)
 
-        #expect(await arrives(sharedId, on: pair.bob), "the message left alice")
+        #expect(await persisted(pair.bob, sharedId), "the message left alice")
         let unrecoverable = await probe.recorded()
         #expect(unrecoverable.isEmpty, "\(unrecoverable)")
         await pair.finish()
@@ -157,7 +151,7 @@ extension EndToEndTests {
         await alice.messagePipeline.setTaskDelegate(delegate)
         try await alice.send(recipient: .nickname("bob"), text: "alice answers", sharedIdOverride: sharedId)
 
-        #expect(await arrives(sharedId, on: pair.bob), "the message left alice")
+        #expect(await persisted(pair.bob, sharedId), "the message left alice")
         #expect(await delegate.attemptCount == 3, "the frame promoted the old lane, so the first retry failed there")
         let unrecoverable = await probe.recorded()
         #expect(unrecoverable.isEmpty, "\(unrecoverable)")
