@@ -156,14 +156,28 @@ extension EndToEndTests {
         await session.messagePipeline.inboundLaneSelectionStatsLog.count
     }
 
+    /// Waits for `session` to persist the message `sharedId` names and finish its
+    /// job. Unlike the counts above, recovery traffic landing at the same time
+    /// cannot satisfy it.
+    func persisted(_ session: PQSSession, _ sharedId: String, timeout: TimeInterval = 30) async -> Bool {
+        let landed = await pollUntil(timeout: timeout) {
+            (try? await session.cache?.fetchMessageIfExists(sharedId: sharedId)) != nil
+        }
+        // The row is written mid-job, before the lane activates and resends settle.
+        await session.waitForOutboundJobDrain()
+        return landed
+    }
+
     /// Sends from `sender` and waits for `receiver` to run lane selection on one
-    /// more frame; returns that frame's stats.
+    /// more frame and finish its job; returns that frame's stats.
     func sendAndAwaitInbound(
         from sender: PQSSession, to recipient: String, on receiver: PQSSession, text: String
     ) async throws -> InboundLaneSelectionStats {
         let before = await inboundCount(receiver)
         try await sender.send(recipient: .nickname(recipient), text: text)
         #expect(await pollUntil(timeout: 20) { await self.inboundCount(receiver) > before }, "\(text) should reach lane selection")
+        // Lane selection is recorded mid-job, before the frame is persisted and its lane activates.
+        await receiver.waitForOutboundJobDrain()
         return try #require(await receiver.messagePipeline.inboundLaneSelectionStatsLog.dropFirst(before).first)
     }
 

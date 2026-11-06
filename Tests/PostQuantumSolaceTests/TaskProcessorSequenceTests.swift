@@ -1016,11 +1016,15 @@ actor TaskProcessorSequenceTests {
             session: session
         )
 
+        // `enqueue` returns before the job runs when a loop from setup is still draining.
+        // The host report is the handler's last step, so the checks below follow it.
+        #expect(try await waitUntil {
+            await peerProbe.contains(
+                secretName: "bob",
+                deviceId: peerDeviceId,
+                failedSharedMessageId: "peer_signing_key_out_of_sync")
+        })
         #expect(await probe.count() == 0, "Peer identity pin failures must not be routed as local linked-device compromise")
-        #expect(await peerProbe.contains(
-            secretName: "bob",
-            deviceId: peerDeviceId,
-            failedSharedMessageId: "peer_signing_key_out_of_sync"))
         #expect(await session.isInboundFailureQuarantined(
             sender: "bob",
             deviceId: peerDeviceId,
@@ -3666,7 +3670,8 @@ actor TaskProcessorSequenceTests {
 
         try await session.messagePipeline.enqueue(task, session: session)
 
-        #expect(await delegate.invocationCount == 1)
+        // `enqueue` returns before the job runs when a loop from setup is still draining.
+        #expect(try await waitUntil { await delegate.invocationCount == 1 })
         #expect(
             try await cache.fetchJobs().count == 1,
             "Cancellation must retain the durable job for a future event")

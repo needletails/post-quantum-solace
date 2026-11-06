@@ -23,12 +23,6 @@ extension EndToEndTests {
         try BinaryDecoder().decode(RatchetMessage.self, from: try #require(frame.message.signed).data).header
     }
 
-    private func persisted(_ session: PQSSession, _ sharedId: String) async -> Bool {
-        await pollUntil(timeout: 30) {
-            (try? await session.cache?.fetchMessageIfExists(sharedId: sharedId)) != nil
-        }
-    }
-
     /// Alice opens a fresh lane toward bob and sends one frame on it, held in transit.
     private func heldFirstFrame(_ pair: ConnectedPair, consumingAKey: Bool = true) async throws -> ReceivedMessage {
         _ = try await pair.alice.resetSessionIdentityForFreshSession(

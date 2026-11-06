@@ -32,12 +32,6 @@ extension PQSSession {
 }
 
 extension EndToEndTests {
-    private func persisted(_ session: PQSSession, _ sharedId: String, timeout: TimeInterval = 20) async -> Bool {
-        await pollUntil(timeout: timeout) {
-            (try? await session.cache?.fetchMessageIfExists(sharedId: sharedId)) != nil
-        }
-    }
-
     private func identity(on session: PQSSession, id: UUID) async throws -> SessionIdentity {
         let cache = try #require(await session.cache)
         return try #require(try await cache.fetchSessionIdentities().first { $0.id == id })
@@ -352,8 +346,11 @@ extension EndToEndTests {
             messageId: replayId,
             logicalMessageId: nil)
 
-        #expect(await pollUntil(timeout: 30) { await pair.bobTransport.outOfBandResendRequestCount > 0 },
-                "the failed archive pass asks the sender")
+        // The submission is counted after the transport returns, so wait on it, not on the transport.
+        #expect(await pollUntil(timeout: 30) {
+            await pair.bob.resendRequestSubmissionCount(
+                sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: replayId) > 0
+        }, "the failed archive pass asks the sender")
         #expect(await pair.bobTransport.outOfBandResendRequestCount == 1)
         #expect(await pair.bob.resendRequestSubmissionCount(
             sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: replayId) == 1)
@@ -791,6 +788,8 @@ extension EndToEndTests {
 
         #expect(await pollUntil(timeout: 30) { await pair.bobTransport.outOfBandResendRequestCount > 0 },
                 "the failed copy asks the sender")
+        // The request leaves mid-job; read bob's state once the job is done.
+        await pair.bob.waitForOutboundJobDrain()
         #expect(await !accepted(pair, envelope: replayId))
         #expect(await pair.bob.hasPendingResendAfterReestablishment(
             sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: sharedId))
