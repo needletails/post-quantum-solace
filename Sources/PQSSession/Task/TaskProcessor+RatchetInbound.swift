@@ -906,7 +906,7 @@ extension MessagePipeline {
         // this, frames a peer sent before our rotation steered our next send back onto the
         // lane the peer had dropped.
         var rowEpochDigest: Data?
-        if let headerEpochDigest, let cache = await session.cache,
+        if headerEpochDigest != nil, let cache = await session.cache,
            let row = try await cache.fetchSessionIdentities().first(where: { $0.id == decryptionSessionIdentity.id }) {
             rowEpochDigest = try await row.props(symmetricKey: session.getDatabaseSymmetricKey())?.ratchetEpochDigest
         }

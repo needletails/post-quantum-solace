@@ -4719,7 +4719,7 @@ extension TaskProcessorSequenceTests {
             await session.flushPendingResendsAfterOfflineReplay()
             await session.clearResendCooldownsForTests()
         }
-        let before = await rearmNacks(peer)
+        _ = await rearmNacks(peer)
         await session.endReestablishmentEpisode(sender: peer, deviceId: deviceId)
         await session.clearResendCooldownsForTests()
         let mid = await rearmNacks(peer)
@@ -4783,7 +4783,7 @@ extension TaskProcessorSequenceTests {
         try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_e1_env0", logical))
         await script.set("probe_e1_env1", RatchetError.missingOneTimeKey)
         try await rearmDeliver(try rearmFrame(peer, deviceId, "probe_e1_env1", logical))
-        let awaiting = await session.isAwaitingSenderOrphanResend(sender: peer, deviceId: deviceId, messageId: "probe_e1_env1")
+        _ = await session.isAwaitingSenderOrphanResend(sender: peer, deviceId: deviceId, messageId: "probe_e1_env1")
         let pending = await session.hasPendingResendAfterReestablishment(sender: peer, deviceId: deviceId, failedMessageId: "probe_e1_env1")
         #expect(pending, "OTK path defers its NACK")
         await session.shutdown()
@@ -4822,8 +4822,8 @@ extension TaskProcessorSequenceTests {
         await session.setConnectivity(true)
         try await exhaustInboundHandshakeDeferrals()
         let pending = await session.hasPendingResendAfterReestablishment(sender: peer, deviceId: deviceId, failedMessageId: "probe_e3_env1")
-        let episode = await session.hasOpenReestablishmentEpisode(sender: peer, deviceId: deviceId)
-        let nacks = await rearmNacks(peer)
+        _ = await session.hasOpenReestablishmentEpisode(sender: peer, deviceId: deviceId)
+        _ = await rearmNacks(peer)
         #expect(pending, "With no NACK for this envelope the frame must stay in recovery")
         await session.shutdown()
     }
