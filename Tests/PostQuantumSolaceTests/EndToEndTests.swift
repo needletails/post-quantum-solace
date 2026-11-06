@@ -117,6 +117,12 @@ actor PeerIdentityTrustProbe {
     }
 }
 
+/// Frames a transport probe saw go by, kept for a test to match against lane selection.
+private actor CapturedFrames {
+    var frames: [ReceivedMessage] = []
+    func capture(_ frame: ReceivedMessage) { frames.append(frame) }
+}
+
 @Suite(.serialized)
 actor EndToEndTests {
     let crypto = NeedleTailCrypto()
@@ -10952,6 +10958,22 @@ actor EndToEndTests {
         _ = await bobTask?.value
     }
     
+    /// Row ids a session holds, for every peer.
+    private func rowIds(_ session: PQSSession) async throws -> Set<UUID> {
+        let cache = try #require(await session.cache)
+        return Set(try await cache.fetchSessionIdentities().map(\.id))
+    }
+
+    /// The first captured frame `receiver` has accepted, with its lane-selection stats.
+    private func acceptedCapture(in captured: CapturedFrames, on receiver: PQSSession) async -> (frame: ReceivedMessage, stats: InboundLaneSelectionStats)? {
+        for frame in await captured.frames {
+            if let stats = await laneStats(on: receiver, sharedId: frame.messageId).first, stats.winningLaneId != nil {
+                return (frame, stats)
+            }
+        }
+        return nil
+    }
+
     @Test("messages crossing in either direction stay on the established lane")
     func crossingFramesStayOnEstablishedLane() async throws {
         var aliceTask: Task<Void, Never>?
@@ -10996,30 +11018,6 @@ actor EndToEndTests {
             await bobSession.hasActiveInboundSessionIdentity(secretName: "alice", deviceId: aliceDeviceId)
         })
         
-        /// Rows a session holds for one peer device: `(id, archived, local OTK id in the snapshot)`.
-        @Sendable func rows(on session: PQSSession, peer: String, deviceId: UUID) async throws -> [(id: UUID, archived: Bool, stateOTK: UUID?)] {
-            let cache = try #require(await session.cache)
-            let key = try await session.getDatabaseSymmetricKey()
-            var out: [(id: UUID, archived: Bool, stateOTK: UUID?)] = []
-            for identity in try await cache.fetchSessionIdentities() {
-                guard let p = await identity.props(symmetricKey: key), p.secretName == peer, p.deviceId == deviceId else { continue }
-                out.append((identity.id, p.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix), p.ratchetOneTimePrivateKey?.id))
-            }
-            return out
-        }
-        @Sendable func inboundCount(_ session: PQSSession) async -> Int {
-            await session.messagePipeline.inboundLaneSelectionStatsLog.count
-        }
-        /// Sends from `sender` and waits for `receiver` to run lane selection on one more frame;
-        /// returns that frame's stats.
-        @Sendable func sendAndAwaitInbound(
-            from sender: PQSSession, to recipient: String, on receiver: PQSSession, text: String
-        ) async throws -> InboundLaneSelectionStats {
-            let before = await inboundCount(receiver)
-            try await sender.send(recipient: .nickname(recipient), text: text)
-            #expect(await pollUntil(timeout: 20) { await inboundCount(receiver) > before }, "\(text) should reach lane selection")
-            return try #require(await receiver.messagePipeline.inboundLaneSelectionStatsLog.dropFirst(before).first)
-        }
         actor HeldFrames {
             var frames: [ReceivedMessage] = []
             func hold(_ frame: ReceivedMessage) { frames.append(frame) }
@@ -11129,31 +11127,6 @@ actor EndToEndTests {
             await bobSession.hasActiveInboundSessionIdentity(secretName: "alice", deviceId: aliceDeviceId)
         })
 
-        /// Rows bob holds for alice's device: `(id, archived, local OTK id in the snapshot)`.
-        @Sendable func bobRows() async throws -> [(id: UUID, archived: Bool, stateOTK: UUID?)] {
-            let cache = try #require(await bobSession.cache)
-            let key = try await bobSession.getDatabaseSymmetricKey()
-            var out: [(id: UUID, archived: Bool, stateOTK: UUID?)] = []
-            for identity in try await cache.fetchSessionIdentities() {
-                guard let p = await identity.props(symmetricKey: key), p.secretName == "alice", p.deviceId == aliceDeviceId else { continue }
-                out.append((identity.id, p.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix), p.ratchetOneTimePrivateKey?.id))
-            }
-            return out
-        }
-        @Sendable func bobLanePasses() async -> Int {
-            await bobSession.messagePipeline.inboundLaneSelectionStatsLog.count
-        }
-        /// Sends from alice and waits for bob to run lane selection on one more frame; returns that frame's stats.
-        @Sendable func sendAndAwaitBobInbound(text: String) async throws -> InboundLaneSelectionStats {
-            let before = await bobLanePasses()
-            try await aliceSession.send(recipient: .nickname("bob"), text: text)
-            #expect(await pollUntil(timeout: 20) { await bobLanePasses() > before }, "\(text) should reach lane selection")
-            return try #require(await bobSession.messagePipeline.inboundLaneSelectionStatsLog.dropFirst(before).first)
-        }
-        actor CapturedFrames {
-            var frames: [ReceivedMessage] = []
-            func capture(_ frame: ReceivedMessage) { frames.append(frame) }
-        }
 
         // Deliver one of alice's initiating frames normally and keep a copy of what
         // crossed the wire. Friendship traffic may still be in flight, so the frame
@@ -11164,18 +11137,10 @@ actor EndToEndTests {
             return true
         }
         try await aliceSession.send(recipient: .nickname("bob"), text: "initiating")
-        @Sendable func acceptedCapture() async -> (frame: ReceivedMessage, stats: InboundLaneSelectionStats)? {
-            for frame in await captured.frames {
-                if let stats = await laneStats(on: bobSession, sharedId: frame.messageId).first, stats.winningLaneId != nil {
-                    return (frame, stats)
-                }
-            }
-            return nil
-        }
-        #expect(await pollUntil(timeout: 20) { await acceptedCapture() != nil }, "the initiating frame should decrypt on bob")
-        let (frame, accepted) = try #require(await acceptedCapture())
+        #expect(await pollUntil(timeout: 20) { await acceptedCapture(in: captured, on: bobSession) != nil }, "the initiating frame should decrypt on bob")
+        let (frame, accepted) = try #require(await acceptedCapture(in: captured, on: bobSession))
         aliceTransport.shouldDeliver = nil
-        let rowsBefore = try await bobRows()
+        let rowsBefore = try await rows(on: bobSession, peer: "alice", deviceId: aliceDeviceId)
         let bobRow = try #require(rowsBefore.first)
         #expect(rowsBefore.count == 1 && accepted.winningLaneId == bobRow.id, "\(accepted.candidateOrder)")
         #expect(await pollUntil(timeout: 10) { await bobAccepted.contains(frame.messageId) }, "the original delivery is ACKed")
@@ -11192,7 +11157,7 @@ actor EndToEndTests {
         // The server replays the accepted frame as a new packet: the signed payload is
         // byte-identical, the envelope id is fresh and no logical id is carried.
         let replayId = UUID().uuidString
-        let passesBeforeReplay = await bobLanePasses()
+        let passesBeforeReplay = await inboundCount(bobSession)
         try await bobSession.receiveMessage(
             message: frame.message,
             sender: frame.sender,
@@ -11203,15 +11168,15 @@ actor EndToEndTests {
                 "the replay is ACKed as already accepted")
         #expect(await laneStats(on: bobSession, sharedId: replayId).isEmpty,
                 "an already-accepted frame never reaches lane selection")
-        #expect(await bobLanePasses() == passesBeforeReplay)
-        let rowsAfterReplay = try await bobRows()
+        #expect(await inboundCount(bobSession) == passesBeforeReplay)
+        let rowsAfterReplay = try await rows(on: bobSession, peer: "alice", deviceId: aliceDeviceId)
         #expect(rowsAfterReplay.map(\.id) == [bobRow.id] && rowsAfterReplay.first?.archived == false,
                 "no new row for alice's device and the established row stays active: \(rowsAfterReplay)")
 
         // Alice's next in-order frame still decrypts on the established row.
-        let next = try await sendAndAwaitBobInbound(text: "next in order")
+        let next = try await sendAndAwaitInbound(from: aliceSession, to: "bob", on: bobSession, text: "next in order")
         #expect(next.winningLaneId == bobRow.id && next.attempts.count == 1, "\(next.candidateOrder)")
-        #expect(try await bobRows().map(\.id) == [bobRow.id], "bob never needed a second row for alice's device")
+        #expect(try await rows(on: bobSession, peer: "alice", deviceId: aliceDeviceId).map(\.id) == [bobRow.id], "bob never needed a second row for alice's device")
 
         bobTransport.continuation?.finish()
         aliceTransport.continuation?.finish()
@@ -11322,10 +11287,6 @@ actor EndToEndTests {
                 }
             }
             return true
-        }
-        @Sendable func rowIds(_ session: PQSSession) async throws -> Set<UUID> {
-            let cache = try #require(await session.cache)
-            return Set(try await cache.fetchSessionIdentities().map(\.id))
         }
 
         // Baseline, in order: every device bootstraps its lanes.
