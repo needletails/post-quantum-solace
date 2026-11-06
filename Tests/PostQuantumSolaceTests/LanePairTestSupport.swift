@@ -96,6 +96,10 @@ extension EndToEndTests {
         try await createRecipientSession(store: bobStore, transport: bobTransport, sessionDelegate: rsd)
         let alice = _senderSession
         let bob = _recipientSession
+        // The mock transport never confirms a server accept; a live server does within
+        // milliseconds. Without this, every frame comes back as an overdue resend after 10 s.
+        await alice.messagePipeline.testSetAckDeadlineNanosecondsForTests(3_600_000_000_000)
+        await bob.messagePipeline.testSetAckDeadlineNanosecondsForTests(3_600_000_000_000)
         let controls = ControlCounter()
         let aliceTask = Task {
             for await received in aliceStream where received.recipient == "alice" {
@@ -156,6 +160,16 @@ extension EndToEndTests {
         await session.messagePipeline.inboundLaneSelectionStatsLog.count
     }
 
+    /// Waits for `session`'s job loop to stop. Lane selection and the chat row are
+    /// written mid-job, before the lane activates and resends settle, so a caller that
+    /// saw either lets the job finish before it reads or changes session state.
+    func jobLoopIdle(_ session: PQSSession, timeout: TimeInterval = 20) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while await session.messagePipeline.isRunning, Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
     /// Waits for `session` to persist the message `sharedId` names and finish its
     /// job. Unlike the counts above, recovery traffic landing at the same time
     /// cannot satisfy it.
@@ -163,8 +177,7 @@ extension EndToEndTests {
         let landed = await pollUntil(timeout: timeout) {
             (try? await session.cache?.fetchMessageIfExists(sharedId: sharedId)) != nil
         }
-        // The row is written mid-job, before the lane activates and resends settle.
-        await session.waitForOutboundJobDrain()
+        await jobLoopIdle(session)
         return landed
     }
 
@@ -176,8 +189,7 @@ extension EndToEndTests {
         let before = await inboundCount(receiver)
         try await sender.send(recipient: .nickname(recipient), text: text)
         #expect(await pollUntil(timeout: 20) { await self.inboundCount(receiver) > before }, "\(text) should reach lane selection")
-        // Lane selection is recorded mid-job, before the frame is persisted and its lane activates.
-        await receiver.waitForOutboundJobDrain()
+        await jobLoopIdle(receiver)
         return try #require(await receiver.messagePipeline.inboundLaneSelectionStatsLog.dropFirst(before).first)
     }
 

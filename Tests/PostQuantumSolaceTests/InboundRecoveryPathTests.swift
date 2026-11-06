@@ -789,7 +789,7 @@ extension EndToEndTests {
         #expect(await pollUntil(timeout: 30) { await pair.bobTransport.outOfBandResendRequestCount > 0 },
                 "the failed copy asks the sender")
         // The request leaves mid-job; read bob's state once the job is done.
-        await pair.bob.waitForOutboundJobDrain()
+        await jobLoopIdle(pair.bob)
         #expect(await !accepted(pair, envelope: replayId))
         #expect(await pair.bob.hasPendingResendAfterReestablishment(
             sender: "alice", deviceId: pair.aliceDeviceId, failedMessageId: sharedId))
