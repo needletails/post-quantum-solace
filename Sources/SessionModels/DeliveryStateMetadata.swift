@@ -92,17 +92,24 @@ public struct DeliveryStateMetadata: Codable, Sendable {
     /// the message's lifecycle and is typically derived from the message's unique ID.
     public let sharedId: String
 
+    /// On a receipt mirrored to this account's other devices: the channel member whose
+    /// receipt this is, so every device can keep who read what. `nil` on a peer's own
+    /// receipt and on mirrors from builds before members were kept.
+    public let memberSecretName: String?
+
     /// Initializes a new instance of `DeliveryStateMetadata`.
     ///
     /// - Parameters:
     ///   - state: The current delivery state of the message
     ///   - sharedId: A unique identifier shared across the communication context
+    ///   - memberSecretName: The channel member a mirrored receipt is for
     ///
     /// - Note: The `sharedId` should be consistent with the message it represents
     ///          and should not change during the message's lifecycle.
-    public init(state: DeliveryState, sharedId: String) {
+    public init(state: DeliveryState, sharedId: String, memberSecretName: String? = nil) {
         self.state = state
         self.sharedId = sharedId
+        self.memberSecretName = memberSecretName
     }
 }
 
