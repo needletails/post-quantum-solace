@@ -216,6 +216,10 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
             sessionIdentities = identities // Update the cache
         }
         if let index = sessionIdentities.firstIndex(where: { $0.id == session.id }) {
+            // Watch: other calls on this actor can run during this await. A delete of an
+            // earlier row here (an inbound lane rollback while the host accepts a peer's
+            // new identity) leaves `index` one row off: it traps or overwrites the next
+            // row. Seen once in compromiseRotationWithCrossingTraffic, never on a device.
             try await store.updateSessionIdentity(session)
             sessionIdentities[index] = session
         } else {
@@ -546,6 +550,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         guard let index = try await jobIndex(for: job) else {
             throw CacheErrors.jobNotFound
         }
+        // Watch: same stale-index risk as updateSessionIdentity(_:) if a job is deleted meanwhile.
         try await store.updateJob(job) // Persist the updated job in the store
         jobs[index] = job // Publish only after persistence succeeds
     }
@@ -593,6 +598,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         guard let jobIndex = try await jobIndex(for: job) else {
             throw CacheErrors.jobNotFound
         }
+        // Watch: same stale-index risk as updateSessionIdentity(_:), for both indexes.
         try await store.updateSessionIdentity(
             sessionIdentity,
             andPreparedJob: job)
