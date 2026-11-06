@@ -198,11 +198,15 @@ extension MessagePipeline {
     /// processor before session delegates and cache state are released.
     func prepareForShutdown() async {
         isPausedUntilTransportReady = true
+        cancelServerAcceptDeadlines()
         await jobConsumer.gracefulShutdown()
-        guard isRunning else { return }
-        await withCheckedContinuation { continuation in
-            processingIdleWaiters.append(continuation)
+        if isRunning {
+            await withCheckedContinuation { continuation in
+                processingIdleWaiters.append(continuation)
+            }
         }
+        // The job that was in flight may have registered a deadline after the first cancel.
+        cancelServerAcceptDeadlines()
     }
     
     // MARK: - Startup

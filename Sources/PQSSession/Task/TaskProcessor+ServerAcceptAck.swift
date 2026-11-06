@@ -111,6 +111,16 @@ extension MessagePipeline {
         }
     }
 
+    /// Stops every accept deadline without forgetting the envelopes. Shutdown calls this: a
+    /// session without a transport cannot answer a deadline, and the timers otherwise fired
+    /// every period for as long as the process lived.
+    func cancelServerAcceptDeadlines() {
+        for task in unackedServerAcceptDeadlineTasks.values {
+            task.cancel()
+        }
+        unackedServerAcceptDeadlineTasks.removeAll()
+    }
+
     func resendUnackedOutboundEnvelopes(reason: String, session: PQSSession) async {
         messagingConnectionEpoch &+= 1
         let currentEpoch = messagingConnectionEpoch
@@ -217,8 +227,11 @@ extension MessagePipeline {
         }
 
         guard let transportDelegate = await session.transportDelegate else {
-            // Keep waiting on the same envelope; re-arm so a later writer can recover.
-            startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
+            // No transport, so nothing to resend on and no deadline to run: the envelope
+            // stays in the map, parked. The next transport (`setTransportDelegate`) or
+            // connection epoch (`resendUnackedOutboundEnvelopes`) arms it again. Re-arming
+            // here made every unacked envelope of a shut-down session fire every period
+            // for as long as the process lived.
             audit(
                 .send,
                 "pqs.send.ackOverdueResend transportMissing envelopeMessageId=\(envelopeMessageId)",
@@ -238,8 +251,11 @@ extension MessagePipeline {
                 "pqs.send.ackOverdueResend envelopeMessageId=\(envelopeMessageId) sharedId=\(entry.sharedId) attempt=\(entry.resendAttempts)",
                 level: .info)
         } catch is CancellationError {
-            // External cancel (e.g. teardown) — only re-arm if still awaiting accept.
-            guard unackedServerAcceptByEnvelopeId[envelopeMessageId] != nil else { return }
+            // External cancel (e.g. teardown) — only re-arm if still awaiting accept and a
+            // transport remains; teardown drops the transport and cancelled these on purpose.
+            guard unackedServerAcceptByEnvelopeId[envelopeMessageId] != nil,
+                  !isPausedUntilTransportReady,
+                  await session.transportDelegate != nil else { return }
             startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
             audit(
                 .send,
@@ -356,6 +372,10 @@ extension MessagePipeline {
 
     private func startServerAcceptDeadline(envelopeMessageId: String, session: PQSSession) {
         let deadline = serverAcceptAckDeadlineNanosecondsOverride ?? serverAcceptAckDeadlineNanoseconds
+        // One deadline per envelope. A handler that is running has already left the slot, so
+        // whatever still sits here is a timer that would fire a second resend (a rearm that
+        // landed while the handler awaited its send, for example).
+        unackedServerAcceptDeadlineTasks[envelopeMessageId]?.cancel()
         unackedServerAcceptDeadlineTasks[envelopeMessageId] = Task { [weak self, weak session] in
             do {
                 try await Task.sleep(nanoseconds: deadline)

@@ -237,6 +237,63 @@ struct ServerAcceptAckTests {
         await session.shutdown()
     }
 
+    @Test("a deadline that fires with no transport parks the envelope until one arrives")
+    func testDeadlineWithoutTransportParksUntilATransportArrives() async throws {
+        let session = PQSSession()
+        let processor = await session.messagePipeline
+        let events = ServerAcceptAckEventRecorder()
+        await session.setServerAcceptAckOverdueHandler { envelopeId in
+            await events.record(envelopeId)
+        }
+        await processor.testSetAckDeadlineNanosecondsForTests(10_000_000)
+        let outbound = pending(envelopeMessageId: "parked")
+        await processor.registerUnackedServerAccept(
+            pending: outbound,
+            localId: UUID(),
+            sharedId: "shared-id",
+            isPersistedOutbound: true,
+            session: session)
+        await events.waitForFirst()
+        // With no transport the handler parks the envelope and arms nothing, so no second
+        // fire follows in many deadline periods.
+        try await Task.sleep(for: .milliseconds(150))
+        #expect(await events.all() == ["parked"], "the handler fired once")
+        #expect(await processor.unackedServerAcceptDeadlineTasks["parked"] == nil)
+        #expect(await processor.isAwaitingServerAccept("parked") == true)
+
+        // Installing a transport on the session arms its pipeline's deadlines again, and the
+        // next fire resends in place.
+        let transport = PreparedTransportProbe()
+        await session.setTransportDelegate(conformer: transport)
+        await transport.waitForCapturedSends(atLeast: 1)
+        #expect(await transport.capturedPayloads().contains(outbound.message.signed?.data ?? Data()))
+        await processor.confirmServerAcceptedEnvelope("parked", session: session)
+        try? await processor.ratchetManager.flushAndClose()
+        await session.shutdown()
+    }
+
+    @Test("shutdown stops the deadlines and keeps the envelopes")
+    func testShutdownCancelsDeadlines() async throws {
+        let processor = MessagePipeline()
+        let session = PQSSession()
+        await processor.testSetAckDeadlineNanosecondsForTests(5_000_000_000)
+        for id in ["shutdown-1", "shutdown-2"] {
+            await processor.registerUnackedServerAccept(
+                pending: pending(envelopeMessageId: id),
+                localId: UUID(),
+                sharedId: "shared-id",
+                isPersistedOutbound: true,
+                session: session)
+        }
+        #expect(await processor.unackedServerAcceptDeadlineTasks.count == 2)
+        await processor.prepareForShutdown()
+        #expect(await processor.unackedServerAcceptDeadlineTasks.isEmpty)
+        #expect(await processor.isAwaitingServerAccept("shutdown-1") == true)
+        #expect(await processor.isAwaitingServerAccept("shutdown-2") == true)
+        try? await processor.ratchetManager.flushAndClose()
+        await session.shutdown()
+    }
+
     @Test("isAwaitingServerAccept tracks unacked map")
     func testIsAwaitingServerAccept() async {
         let processor = MessagePipeline()

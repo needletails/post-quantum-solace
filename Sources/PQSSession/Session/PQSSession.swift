@@ -1300,6 +1300,11 @@ public actor PQSSession: SessionCacheSynchronizer {
     func setTransportDelegate(conformer: (any PQSNetworkHost)?) async {
         transportDelegate = conformer
         await messagePipeline.setDelegate(conformer)
+        // Envelopes whose accept deadline fired with no transport were parked; a transport
+        // gives them a window again.
+        if conformer != nil {
+            await messagePipeline.rearmAllServerAcceptDeadlines(session: self)
+        }
     }
 
     /// Sets the database delegate conforming to `PQSPersistenceHost`.

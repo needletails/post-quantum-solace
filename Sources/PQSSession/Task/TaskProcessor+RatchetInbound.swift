@@ -407,7 +407,8 @@ extension MessagePipeline {
                                 inboundTask: inboundTask,
                                 session: session,
                                 headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
-                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                                headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest)
                             return
                         }
 
@@ -431,7 +432,8 @@ extension MessagePipeline {
                                 inboundTask: inboundTask,
                                 session: session,
                                 headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
-                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                                headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest)
                             return
                         case .skipStale:
                             logger.log(
@@ -443,7 +445,8 @@ extension MessagePipeline {
                                 inboundTask: inboundTask,
                                 session: session,
                                 headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
-                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                                headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest)
                             return
                         case .process:
                             processedReestablishment = envelope
@@ -517,7 +520,8 @@ extension MessagePipeline {
                                         inboundTask: inboundTask,
                                         session: session,
                                         headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
-                                        headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
+                                        headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                                        headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest)
                                     return
                                 }
                                 // Keep the proven lane after a correlated peerRefresh
@@ -582,7 +586,8 @@ extension MessagePipeline {
                                 inboundTask: inboundTask,
                                 session: session,
                                 headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
-                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId)
+                                headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                                headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest)
                             return
                         }
                         try await session.installLinkedDeviceReprovisioningBundle(bundle)
@@ -673,6 +678,7 @@ extension MessagePipeline {
                     session: session,
                     headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
                     headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                    headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest,
                     activateLane: !contentHeld || bootstrappedLane,
                     acknowledgeTransport: false)
                 didAcceptInbound = true
@@ -686,6 +692,7 @@ extension MessagePipeline {
                     session: session,
                     headerOneTimeKeyId: verificationResult.ratchetMessage.header.oneTimeKeyId,
                     headerMLKEMOneTimeKeyId: verificationResult.ratchetMessage.header.mlKEMOneTimeKeyId,
+                    headerEpochDigest: verificationResult.ratchetMessage.header.ratchetEpochDigest,
                     acknowledgeTransport: false)
                 didAcceptInbound = true
                 // Persist branch settles pending resend under `if canSaveMessage`
@@ -889,10 +896,25 @@ extension MessagePipeline {
         session: PQSSession,
         headerOneTimeKeyId: UUID?,
         headerMLKEMOneTimeKeyId: UUID?,
+        headerEpochDigest: Data? = nil,
         activateLane: Bool = true,
         acknowledgeTransport: Bool = true
     ) async throws -> SessionIdentity {
-        let activated = activateLane
+        // A frame from an epoch the row has since moved past is a late frame opened from the
+        // row's stash. It proves the row could open it, not that the peer sends on the row
+        // now, so it neither promotes the row nor makes it the outbound preference. Without
+        // this, frames a peer sent before our rotation steered our next send back onto the
+        // lane the peer had dropped.
+        var rowEpochDigest: Data?
+        if let headerEpochDigest, let cache = await session.cache,
+           let row = try await cache.fetchSessionIdentities().first(where: { $0.id == decryptionSessionIdentity.id }) {
+            rowEpochDigest = try await row.props(symmetricKey: session.getDatabaseSymmetricKey())?.ratchetEpochDigest
+        }
+        let frameOnRowEpoch = headerEpochDigest == nil || rowEpochDigest == nil || headerEpochDigest == rowEpochDigest
+        if !frameOnRowEpoch {
+            audit(.recovery, "pqs.recovery.laneNotProvenByEarlierEpochFrame sender=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) sessionId=\(decryptionSessionIdentity.id)")
+        }
+        let activated = activateLane && frameOnRowEpoch
             ? try await session.activateSessionIdentityAfterInboundDecrypt(decryptionSessionIdentity)
             : decryptionSessionIdentity
         // Do not publish preference / clear recovery state until the durable
@@ -910,7 +932,7 @@ extension MessagePipeline {
         // archive (promotion refused) must not capture general outbound.
         let activatedIsActive = try await activated.props(symmetricKey: session.getDatabaseSymmetricKey())
             .map { !$0.deviceName.hasPrefix(PQSSessionConstants.inactiveSessionDeviceNamePrefix) } ?? false
-        if activatedIsActive {
+        if activatedIsActive, frameOnRowEpoch {
             preferredSessionIdentityIdByPeerDevice[
                 peerDeviceIdentityPreferenceKey(
                     secretName: inboundTask.senderSecretName,
