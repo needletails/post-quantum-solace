@@ -1362,7 +1362,7 @@ extension MessagePipeline {
                     logger.log(
                         level: .warning,
                         message: "pqs.recovery.resendDrainFailed reason=\(reason) count=\(unsubmitted.count) chunk=\(chunkIndex + 1)/\(chunks.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId) error=\(error)")
-                    audit(.recovery, "pqs.recovery.resendDrainFailed reason=\(reason) count=\(unsubmitted.count) chunk=\(chunkIndex + 1)/\(chunks.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId.uuidString) error=\(error)")
+                    audit(.recovery, "pqs.recovery.resendDrainFailed reason=\(reason) count=\(unsubmitted.count) chunk=\(chunkIndex + 1)/\(chunks.count) sender=\(key.senderName) deviceId=\(key.senderDeviceId.uuidString) error=\(PQSAuditRedaction.describe(error))")
                     break chunkLoop
                 }
             }

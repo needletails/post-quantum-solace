@@ -284,7 +284,7 @@ extension MessagePipeline {
                             logger.log(
                                 level: .warning,
                                 message: "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId) error=\(error)")
-                            audit(.recovery, "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) error=\(error)")
+                            audit(.recovery, "pqs.recovery.inboundInitiatingSlotEnsureFailed peer=\(inboundTask.senderSecretName) deviceId=\(inboundTask.senderDeviceId.uuidString) error=\(PQSAuditRedaction.describe(error))")
                         }
                     }
                 }
@@ -1180,7 +1180,7 @@ extension MessagePipeline {
             return data
         } catch {
             failures.append(failure(error))
-            stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .failed, failure: "\(error)"))
+            stats.attempts.append(.init(laneId: laneId, kind: kind, outcome: .failed, failure: "\(PQSAuditRedaction.describe(error))"))
             inboundNegativeDecryptCache.recordFailure(
                 laneId: laneId, fingerprint: fingerprint, laneState: stateToken, error: error)
             if await rollBackFailedAttempt(

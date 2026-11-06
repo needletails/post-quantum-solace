@@ -30,6 +30,21 @@ public enum PQSAuditRedaction {
         return "h:" + digest.prefix(4).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// Describes an error for an audit line. Foundation's errors carry messages and URLs
+    /// (a failed key-rotation request names the account in its path), so they are reduced
+    /// to domain and code. Swift errors print as they are: the ratchet and session errors
+    /// name keys and counts, never accounts.
+    public static func describe(_ error: Error) -> String {
+        let bridged = error as NSError
+        let foundationDomains: Set<String> = [
+            NSURLErrorDomain, NSCocoaErrorDomain, NSPOSIXErrorDomain, NSOSStatusErrorDomain, NSMachErrorDomain,
+        ]
+        if foundationDomains.contains(bridged.domain) || error is DecodingError || error is EncodingError {
+            return "\(bridged.domain):\(bridged.code)"
+        }
+        return String(describing: error)
+    }
+
     public static func redact(_ line: String) -> String {
         line.split(separator: " ", omittingEmptySubsequences: false).map { field -> String in
             guard let equals = field.firstIndex(of: "=") else { return String(field) }

@@ -1466,7 +1466,7 @@ extension PQSSession {
                 envelopeMessageIds: envelopeMessageIds)
             auditSink.log(
                 .recovery,
-                "pqs.recovery.resendUnavailableEmitFailed requester=\(requester) deviceId=\(deviceId.uuidString) unavailableCount=\(envelopeMessageIds.count) error=\(error) reason=\(reason)")
+                "pqs.recovery.resendUnavailableEmitFailed requester=\(requester) deviceId=\(deviceId.uuidString) unavailableCount=\(envelopeMessageIds.count) error=\(PQSAuditRedaction.describe(error)) reason=\(reason)")
             return false
         }
     }

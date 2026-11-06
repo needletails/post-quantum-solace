@@ -175,7 +175,7 @@ extension MessagePipeline {
             } catch {
                 audit(
                     .send,
-                    "pqs.send.resendEpoch failed envelopeMessageId=\(envelopeMessageId) reason=\(reason) error=\(error)",
+                    "pqs.send.resendEpoch failed envelopeMessageId=\(envelopeMessageId) reason=\(reason) error=\(PQSAuditRedaction.describe(error))",
                     level: .error)
             }
         }
@@ -266,7 +266,7 @@ extension MessagePipeline {
             startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
             audit(
                 .send,
-                "pqs.send.ackOverdueResend failed envelopeMessageId=\(envelopeMessageId) error=\(error)",
+                "pqs.send.ackOverdueResend failed envelopeMessageId=\(envelopeMessageId) error=\(PQSAuditRedaction.describe(error))",
                 level: .error)
         }
     }
@@ -306,7 +306,7 @@ extension MessagePipeline {
                 unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
                 audit(
                     .send,
-                    "pqs.send.retryFailedServerAccept failed envelopeMessageId=\(envelopeMessageId) error=\(error)",
+                    "pqs.send.retryFailedServerAccept failed envelopeMessageId=\(envelopeMessageId) error=\(PQSAuditRedaction.describe(error))",
                     level: .error)
             }
         }

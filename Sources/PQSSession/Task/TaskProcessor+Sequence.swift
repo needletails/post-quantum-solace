@@ -1050,14 +1050,14 @@ extension MessagePipeline {
                         message: "pqs.outbound.parkedForViability sharedId=\(message.sharedId) recipient=\(message.message.recipient) error=\(error)")
                     return .paused
                 }
-                await noteResendReplayDropped(sharedId: message.sharedId, reason: "unhandledError=\(error)")
+                await noteResendReplayDropped(sharedId: message.sharedId, reason: "unhandledError=\(PQSAuditRedaction.describe(error))")
                 // A persisted user message whose job is about to be deleted must fail
                 // visibly; a silent delete left the bubble in `.sending` forever.
                 if message.isPersistedOutbound {
                     await markPersistedOutboundFailed(
                         session: session,
                         localMessageId: message.localId,
-                        reason: "unhandledError=\(error)")
+                        reason: "unhandledError=\(PQSAuditRedaction.describe(error))")
                 }
             }
             
@@ -1094,7 +1094,7 @@ extension MessagePipeline {
                         failedMessageId: sharedMessageId,
                         logicalSharedId: inbound.logicalSharedId)
                 } else {
-                    audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(error)")
+                    audit(.recovery, "pqs.recovery.unhandledInboundError sharedId=\(sharedMessageId) sender=\(senderSecretName) deviceId=\(senderDeviceId.uuidString) error=\(PQSAuditRedaction.describe(error))")
                     await session.scheduleTransportProtocolWork {
                         await delegate?.inboundRecoveryDeferred(
                             senderSecretName: senderSecretName,
@@ -1571,9 +1571,9 @@ extension MessagePipeline {
 
         switch transportEvent {
         case .sessionReestablishment(let envelope):
-            return "pqs.recovery.reestablishmentSendFailed sharedId=\(outboundTask.sharedId) kind=\(envelope.kind.rawValue) response=\(envelope.isResponse) epoch=\(envelope.epoch) intent=\(envelope.intentId?.uuidString ?? "nil") retryAttempt=\(attempt) error=\(error)"
+            return "pqs.recovery.reestablishmentSendFailed sharedId=\(outboundTask.sharedId) kind=\(envelope.kind.rawValue) response=\(envelope.isResponse) epoch=\(envelope.epoch) intent=\(envelope.intentId?.uuidString ?? "nil") retryAttempt=\(attempt) error=\(PQSAuditRedaction.describe(error))"
         case .linkedDeviceReprovisioning(let bundle):
-            return "pqs.recovery.linkedDeviceReprovisioningSendFailed sharedId=\(outboundTask.sharedId) targetDeviceId=\(bundle.targetDeviceId) retryAttempt=\(attempt) error=\(error)"
+            return "pqs.recovery.linkedDeviceReprovisioningSendFailed sharedId=\(outboundTask.sharedId) targetDeviceId=\(bundle.targetDeviceId) retryAttempt=\(attempt) error=\(PQSAuditRedaction.describe(error))"
         case .synchronizeOneTimeKeys, .refreshOneTimeKeys, .publishedOneTimeKeysReplenished:
             return nil
         }
