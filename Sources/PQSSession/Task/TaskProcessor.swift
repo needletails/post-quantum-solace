@@ -970,6 +970,7 @@ actor MessagePipeline {
         operators: Set<String>,
         title: String? = nil,
         image: Data? = nil,
+        imageVersion: UInt64? = nil,
         symmetricKey: SymmetricKey,
         session: PQSSession,
         cache: SessionCache,
@@ -1001,10 +1002,14 @@ actor MessagePipeline {
             botOperatorWelcome: existingInfo?.botOperatorWelcome,
             botIdleHint: existingInfo?.botIdleHint,
             title: title ?? existingInfo?.title,
-            image: existingInfo?.image)
-        let wireMetadata = try BinaryEncoder().encode(currentInfo.carryingImageUpdate(image))
+            image: existingInfo?.image,
+            imageVersion: existingInfo?.imageVersion)
+        let wireMetadata = try BinaryEncoder().encode(
+            currentInfo.carryingImageUpdate(image, version: imageVersion))
         let localMetadata = try BinaryEncoder().encode(
-            ChannelStoredMetadata(core: currentInfo.updatingImage(image), overlay: existingStored?.overlay))
+            ChannelStoredMetadata(
+                core: currentInfo.updatingImage(image, version: imageVersion),
+                overlay: existingStored?.overlay))
 
         props.administrator = administrator
         props.members = members

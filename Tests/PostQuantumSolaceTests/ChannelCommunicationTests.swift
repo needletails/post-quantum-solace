@@ -198,13 +198,14 @@ actor ChannelCommunicationTests {
                     title: "General")),
             shouldSynchronize: false)
 
-        func update(members: Set<String>, image: Data?) async throws {
+        func update(members: Set<String>, image: Data?, imageVersion: UInt64? = nil) async throws {
             try await session.messagePipeline.updateChannelMembership(
                 channelName: "general",
                 administrator: "alice",
                 members: members,
                 operators: ["alice"],
                 image: image,
+                imageVersion: imageVersion,
                 symmetricKey: symmetricKey,
                 session: session,
                 cache: cache,
@@ -225,7 +226,9 @@ actor ChannelCommunicationTests {
         // Setting the image stores it and sends it.
         try await update(members: ["alice", "bob"], image: picture)
         #expect(try await stored().image == picture)
+        #expect(try await stored().imageVersion == 1)
         #expect(try await lastSent().image == picture)
+        #expect(try await lastSent().imageVersion == 1)
 
         // A roster change keeps it stored, and keeps it off the wire.
         try await update(members: ["alice", "bob", "carol"], image: nil)
@@ -233,13 +236,25 @@ actor ChannelCommunicationTests {
         #expect(try await stored().title == "General")
         #expect(try await stored().members.contains("carol"))
         #expect(try await lastSent().image == nil)
+        #expect(try await lastSent().imageDigest == ChannelInfo.imageDigest(of: picture))
+        #expect(try await stored().imageDigest == nil)
+        #expect(try await stored().imageVersion == 1)
+        #expect(try await lastSent().imageVersion == 1)
         #expect(try await lastSent().members.contains("carol"))
 
         // Empty data removes it here and tells the members to remove it.
         try await update(members: ["alice", "bob", "carol"], image: Data())
         #expect(try await stored().image == nil)
         #expect(try await lastSent().image == Data())
-        #expect(await delegate.channelMetadata.count == 3)
+        #expect(try await lastSent().imageDigest == Data())
+        #expect(try await stored().imageVersion == 2)
+
+        // An image received from another device is stored with the version it came with.
+        try await update(members: ["alice", "bob", "carol"], image: picture, imageVersion: 7)
+        #expect(try await stored().image == picture)
+        #expect(try await stored().imageVersion == 7)
+        #expect(try await lastSent().imageVersion == 7)
+        #expect(await delegate.channelMetadata.count == 4)
 
         await session.shutdown()
     }

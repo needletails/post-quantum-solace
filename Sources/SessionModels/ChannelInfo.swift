@@ -5,6 +5,7 @@
 //  Created by Cole M on 11/19/25.
 //
 
+import Crypto
 import Foundation
 
 /// A lightweight, on-the-wire description of a channel-style communication.
@@ -27,6 +28,8 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         case botIdleHint
         case title
         case image
+        case imageDigest
+        case imageVersion
     }
 
     /// Display name / handle for the channel (e.g. `"design"`).
@@ -53,6 +56,14 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
     /// synchronization carries it only when it changes: absent means "keep yours", empty
     /// data means "remove it". `nil` in storage on channels without a picture.
     public let image: Data?
+    /// SHA-256 of the image the sender holds, on every synchronization: empty when it holds
+    /// none, `nil` from senders that predate it. Never stored. A device whose own image
+    /// does not match missed an update and can ask for it.
+    public let imageDigest: Data?
+    /// Counts the image's changes (set, replaced or removed), so every device can tell
+    /// which of two images is the newer one and a group settles on a single image. Stored
+    /// with the image and sent on every synchronization; `nil` until the first change.
+    public let imageVersion: UInt64?
 
     public init(
         name: String,
@@ -64,7 +75,9 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         botOperatorWelcome: String? = nil,
         botIdleHint: String? = nil,
         title: String? = nil,
-        image: Data? = nil
+        image: Data? = nil,
+        imageDigest: Data? = nil,
+        imageVersion: UInt64? = nil
     ) {
         self.name = name
         self.administrator = administrator
@@ -76,6 +89,8 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         self.botIdleHint = botIdleHint
         self.title = title
         self.image = image
+        self.imageDigest = imageDigest
+        self.imageVersion = imageVersion
     }
 
     public init(from decoder: Decoder) throws {
@@ -90,6 +105,8 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         botIdleHint = try container.decodeIfPresent(String.self, forKey: .botIdleHint)
         title = try container.decodeIfPresent(String.self, forKey: .title)
         image = try container.decodeIfPresent(Data.self, forKey: .image)
+        imageDigest = try container.decodeIfPresent(Data.self, forKey: .imageDigest)
+        imageVersion = try container.decodeIfPresent(UInt64.self, forKey: .imageVersion)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -116,23 +133,43 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         if let image {
             try container.encode(image, forKey: .image)
         }
+        if let imageDigest {
+            try container.encode(imageDigest, forKey: .imageDigest)
+        }
+        if let imageVersion {
+            try container.encode(imageVersion, forKey: .imageVersion)
+        }
     }
 
-    /// The copy to store after an image update: `nil` keeps the stored image, empty data
-    /// removes it, anything else replaces it.
-    public func updatingImage(_ update: Data?) -> ChannelInfo {
-        guard let update else { return self }
-        return replacingImage(update.isEmpty ? nil : update)
+    /// The fingerprint a synchronization carries for `image`: empty when there is none.
+    public static func imageDigest(of image: Data?) -> Data {
+        guard let image, !image.isEmpty else { return Data() }
+        return Data(SHA256.hash(data: image))
+    }
+
+    /// The copy to store after an image update: `nil` keeps the stored image and its
+    /// version, empty data removes the image, anything else replaces it. A change takes
+    /// `version` when it arrived from another device, else the next version.
+    public func updatingImage(_ update: Data?, version: UInt64? = nil) -> ChannelInfo {
+        guard let update else {
+            return replacingImage(image, digest: nil, version: imageVersion)
+        }
+        return replacingImage(
+            update.isEmpty ? nil : update,
+            digest: nil,
+            version: version ?? (imageVersion ?? 0) + 1)
     }
 
     /// The copy to send after an image update. It carries the update itself, never the
     /// stored image: a synchronization is one encrypted copy per member device, so a
-    /// roster-only change must stay small.
-    public func carryingImageUpdate(_ update: Data?) -> ChannelInfo {
-        replacingImage(update)
+    /// roster-only change must stay small. The fingerprint of the resulting image rides
+    /// along every time.
+    public func carryingImageUpdate(_ update: Data?, version: UInt64? = nil) -> ChannelInfo {
+        let stored = updatingImage(update, version: version)
+        return replacingImage(update, digest: Self.imageDigest(of: stored.image), version: stored.imageVersion)
     }
 
-    private func replacingImage(_ image: Data?) -> ChannelInfo {
+    private func replacingImage(_ image: Data?, digest: Data?, version: UInt64?) -> ChannelInfo {
         ChannelInfo(
             name: name,
             administrator: administrator,
@@ -143,6 +180,8 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
             botOperatorWelcome: botOperatorWelcome,
             botIdleHint: botIdleHint,
             title: title,
-            image: image)
+            image: image,
+            imageDigest: digest,
+            imageVersion: version)
     }
 }

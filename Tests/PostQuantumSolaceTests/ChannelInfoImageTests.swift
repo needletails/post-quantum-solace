@@ -8,6 +8,7 @@
 //
 
 import BinaryCodable
+import Crypto
 import Foundation
 import SessionModels
 import Testing
@@ -59,8 +60,12 @@ struct ChannelInfoImageTests {
         #expect(info(image: picture).updatingImage(replacement).image == replacement)
         #expect(info().updatingImage(nil).image == nil)
         #expect(info().updatingImage(Data()).image == nil)
-        // Nothing else moves.
-        #expect(info(image: picture).updatingImage(replacement) == info(image: replacement))
+        // Nothing else moves but the image's version.
+        let replaced = info(image: picture).updatingImage(replacement)
+        #expect(replaced.imageVersion == 1)
+        #expect(replaced.title == "Family")
+        #expect(replaced.members == ["alice", "bob"])
+        #expect(replaced.administrator == "alice")
     }
 
     @Test("the wire copy carries the image update itself, never the stored image")
@@ -71,6 +76,64 @@ struct ChannelInfoImageTests {
         // Empty data is the removal marker and must reach the members.
         #expect(info(image: picture).carryingImageUpdate(Data()).image == Data())
         #expect(info(image: picture).carryingImageUpdate(replacement).image == replacement)
-        #expect(info(image: picture).carryingImageUpdate(nil) == info())
+    }
+
+    /// Every synchronization says which image the sender holds, in 32 bytes, so a device
+    /// that missed the image (or its removal) can tell and repair itself.
+    @Test("the wire copy always carries the fingerprint of the sender's image; the stored copy never does")
+    func wireCopyCarriesTheImageFingerprint() throws {
+        let replacement = Data([0x89, 0x50, 0x4E, 0x47])
+        func sha(_ data: Data) -> Data { Data(SHA256.hash(data: data)) }
+
+        #expect(info(image: picture).carryingImageUpdate(nil).imageDigest == sha(picture))
+        #expect(info(image: picture).carryingImageUpdate(replacement).imageDigest == sha(replacement))
+        // Empty means "I hold no image", which is different from an older sender's nil.
+        #expect(info().carryingImageUpdate(nil).imageDigest == Data())
+        #expect(info(image: picture).carryingImageUpdate(Data()).imageDigest == Data())
+        #expect(ChannelInfo.imageDigest(of: picture) == sha(picture))
+        #expect(ChannelInfo.imageDigest(of: nil) == Data())
+
+        #expect(info(image: picture).updatingImage(nil).imageDigest == nil)
+        #expect(info(image: picture).carryingImageUpdate(nil).updatingImage(replacement).imageDigest == nil)
+
+        let wire = info(image: picture).carryingImageUpdate(nil)
+        let decoded = try BinaryDecoder().decode(ChannelInfo.self, from: BinaryEncoder().encode(wire))
+        #expect(decoded.imageDigest == sha(picture))
+        #expect(decoded.image == nil)
+        // A sender from before fingerprints decodes with none.
+        #expect(try BinaryDecoder().decode(ChannelInfo.self, from: BinaryEncoder().encode(info())).imageDigest == nil)
+    }
+
+    /// A group has one image. Each change takes the next version, the version is stored
+    /// with the image and sent with every synchronization, and the higher version wins.
+    @Test("an image change takes the next version unless one is given; keeping the image keeps its version")
+    func imageVersion() throws {
+        let replacement = Data([0x89, 0x50, 0x4E, 0x47])
+        #expect(info().imageVersion == nil)
+
+        // A change made on this device.
+        let first = info().updatingImage(picture)
+        #expect(first.imageVersion == 1)
+        #expect(first.updatingImage(replacement).imageVersion == 2)
+        // Removing the image is a change too.
+        #expect(first.updatingImage(Data()).imageVersion == 2)
+        #expect(first.updatingImage(Data()).image == nil)
+        // No update keeps both.
+        #expect(first.updatingImage(nil).imageVersion == 1)
+        #expect(first.updatingImage(nil, version: 9).imageVersion == 1)
+
+        // A change received from another device keeps the version it came with.
+        #expect(first.updatingImage(replacement, version: 7).imageVersion == 7)
+
+        // The wire copy carries the version of the image it describes.
+        #expect(first.carryingImageUpdate(nil).imageVersion == 1)
+        #expect(first.carryingImageUpdate(replacement).imageVersion == 2)
+        #expect(first.carryingImageUpdate(replacement, version: 7).imageVersion == 7)
+
+        // Stored and decoded with the image; absent on channels that never had one.
+        let stored = ChannelStoredMetadata(core: first, overlay: nil)
+        let decoded = try BinaryDecoder().decode(ChannelStoredMetadata.self, from: BinaryEncoder().encode(stored))
+        #expect(decoded.core.imageVersion == 1)
+        #expect(decoded.core.image == picture)
     }
 }
