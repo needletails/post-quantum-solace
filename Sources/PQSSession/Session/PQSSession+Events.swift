@@ -380,6 +380,7 @@ public extension PQSSession {
         members: Set<String>,
         operators: Set<String>,
         title: String? = nil,
+        image: Data? = nil,
         welcomeMessage: String? = nil,
         transportInfo: Data? = nil,
         shouldSynchronize: Bool = true
@@ -394,7 +395,8 @@ public extension PQSSession {
             administrator: administrator,
             members: members,
             operators: operators,
-            title: title)
+            title: title
+        ).updatingImage(image)
         
         let metadata = try BinaryEncoder().encode(info)
         
@@ -452,6 +454,7 @@ public extension PQSSession {
         members: Set<String>,
         operators: Set<String>,
         title: String? = nil,
+        image: Data? = nil,
         shouldSynchronize: Bool
     ) async throws {
         guard let cache else {
@@ -463,6 +466,7 @@ public extension PQSSession {
             members: members,
             operators: operators,
             title: title,
+            image: image,
             symmetricKey: getDatabaseSymmetricKey(),
             session: self,
             cache: cache,

@@ -5,6 +5,7 @@
 //  Created by Cole M on 11/19/25.
 //
 
+import Foundation
 
 /// A lightweight, on-the-wire description of a channel-style communication.
 ///
@@ -25,6 +26,7 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         case botOperatorWelcome
         case botIdleHint
         case title
+        case image
     }
 
     /// Display name / handle for the channel (e.g. `"design"`).
@@ -47,6 +49,10 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
     /// `#slug_<uuid>` wire identifier. Synchronized to every member; `nil` on channels
     /// created before titles were shared.
     public let title: String?
+    /// The channel's picture (JPEG or PNG bytes). Stored on every member's device, but a
+    /// synchronization carries it only when it changes: absent means "keep yours", empty
+    /// data means "remove it". `nil` in storage on channels without a picture.
+    public let image: Data?
 
     public init(
         name: String,
@@ -57,7 +63,8 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         botMemberWelcome: String? = nil,
         botOperatorWelcome: String? = nil,
         botIdleHint: String? = nil,
-        title: String? = nil
+        title: String? = nil,
+        image: Data? = nil
     ) {
         self.name = name
         self.administrator = administrator
@@ -68,6 +75,7 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         self.botOperatorWelcome = botOperatorWelcome
         self.botIdleHint = botIdleHint
         self.title = title
+        self.image = image
     }
 
     public init(from decoder: Decoder) throws {
@@ -81,6 +89,7 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         botOperatorWelcome = try container.decodeIfPresent(String.self, forKey: .botOperatorWelcome)
         botIdleHint = try container.decodeIfPresent(String.self, forKey: .botIdleHint)
         title = try container.decodeIfPresent(String.self, forKey: .title)
+        image = try container.decodeIfPresent(Data.self, forKey: .image)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -104,5 +113,36 @@ public struct ChannelInfo: Codable, Sendable, Hashable {
         if let title {
             try container.encode(title, forKey: .title)
         }
+        if let image {
+            try container.encode(image, forKey: .image)
+        }
+    }
+
+    /// The copy to store after an image update: `nil` keeps the stored image, empty data
+    /// removes it, anything else replaces it.
+    public func updatingImage(_ update: Data?) -> ChannelInfo {
+        guard let update else { return self }
+        return replacingImage(update.isEmpty ? nil : update)
+    }
+
+    /// The copy to send after an image update. It carries the update itself, never the
+    /// stored image: a synchronization is one encrypted copy per member device, so a
+    /// roster-only change must stay small.
+    public func carryingImageUpdate(_ update: Data?) -> ChannelInfo {
+        replacingImage(update)
+    }
+
+    private func replacingImage(_ image: Data?) -> ChannelInfo {
+        ChannelInfo(
+            name: name,
+            administrator: administrator,
+            members: members,
+            operators: operators,
+            enabledBotNames: enabledBotNames,
+            botMemberWelcome: botMemberWelcome,
+            botOperatorWelcome: botOperatorWelcome,
+            botIdleHint: botIdleHint,
+            title: title,
+            image: image)
     }
 }

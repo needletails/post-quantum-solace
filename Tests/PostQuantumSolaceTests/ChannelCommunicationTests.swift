@@ -168,5 +168,117 @@ actor ChannelCommunicationTests {
 
         await session.shutdown()
     }
+
+    /// The channel picture is stored on every roster update but sent only when it changes:
+    /// a synchronization is one encrypted copy per member device, so a roster-only update
+    /// must not carry it.
+    @Test("updateChannelMembership stores the channel image and sends it only when it changes")
+    func testUpdateChannelMembership_imageStoredAndSentOnlyOnChange() async throws {
+        let (cache, symmetricKey) = try await setupSession()
+        let delegate = SynchronizationCapturingDelegate()
+        await session.setPQSSessionDelegate(conformer: delegate)
+        let picture = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0x03])
+
+        try await session.messagePipeline.createChannelCommunication(
+            sender: "alice",
+            recipient: .channel("general"),
+            channelName: "general",
+            administrator: "alice",
+            members: ["alice", "bob"],
+            operators: ["alice"],
+            symmetricKey: symmetricKey,
+            session: session,
+            cache: cache,
+            metadata: try BinaryEncoder().encode(
+                ChannelInfo(
+                    name: "general",
+                    administrator: "alice",
+                    members: ["alice", "bob"],
+                    operators: ["alice"],
+                    title: "General")),
+            shouldSynchronize: false)
+
+        func update(members: Set<String>, image: Data?) async throws {
+            try await session.messagePipeline.updateChannelMembership(
+                channelName: "general",
+                administrator: "alice",
+                members: members,
+                operators: ["alice"],
+                image: image,
+                symmetricKey: symmetricKey,
+                session: session,
+                cache: cache,
+                shouldSynchronize: true)
+        }
+        func stored() async throws -> ChannelInfo {
+            let communication = try await session.messagePipeline.conversation(
+                cache: cache,
+                communicationType: .channel("general"),
+                session: session)
+            let props = try #require(await communication.props(symmetricKey: symmetricKey))
+            return try BinaryDecoder().decode(ChannelStoredMetadata.self, from: props.metadata).core
+        }
+        func lastSent() async throws -> ChannelInfo {
+            try BinaryDecoder().decode(ChannelInfo.self, from: try #require(await delegate.channelMetadata.last))
+        }
+
+        // Setting the image stores it and sends it.
+        try await update(members: ["alice", "bob"], image: picture)
+        #expect(try await stored().image == picture)
+        #expect(try await lastSent().image == picture)
+
+        // A roster change keeps it stored, and keeps it off the wire.
+        try await update(members: ["alice", "bob", "carol"], image: nil)
+        #expect(try await stored().image == picture)
+        #expect(try await stored().title == "General")
+        #expect(try await stored().members.contains("carol"))
+        #expect(try await lastSent().image == nil)
+        #expect(try await lastSent().members.contains("carol"))
+
+        // Empty data removes it here and tells the members to remove it.
+        try await update(members: ["alice", "bob", "carol"], image: Data())
+        #expect(try await stored().image == nil)
+        #expect(try await lastSent().image == Data())
+        #expect(await delegate.channelMetadata.count == 3)
+
+        await session.shutdown()
+    }
+}
+
+/// Records the metadata of each channel synchronization instead of sending it.
+private actor SynchronizationCapturingDelegate: MessagingPolicy, RecoveryObserver {
+    var channelMetadata: [Data] = []
+
+    func synchronizeCommunication(recipient: MessageRecipient, sharedIdentifier _: String, metadata: Data) async throws {
+        if case .channel = recipient {
+            channelMetadata.append(metadata)
+        }
+    }
+
+    func requestMetadata(recipient _: MessageRecipient) async throws {}
+    func requestFriendshipStateChange(recipient _: MessageRecipient, blockData _: Data?, metadata _: Data, currentState _: FriendshipMetadata.State) async throws {}
+    func deliveryStateChanged(recipient _: MessageRecipient, metadata _: Data) async throws {}
+    func createdContact(recipient _: MessageRecipient) async throws {}
+    func editMessage(recipient _: MessageRecipient, metadata _: Data) async throws {}
+    nonisolated func shouldPersist(transportInfo _: Data?) -> Bool { true }
+    nonisolated func shouldReplayNonPersistentOutbound(transportInfo _: Data?) -> Bool { false }
+    nonisolated func isInboundRecoveryPlaceholder(transportInfo _: Data?) -> Bool { false }
+    func retrieveUserInfo(_: Data?) async -> (secretName: String, deviceId: String)? { nil }
+    nonisolated func updateCryptoMessageMetadata(_ message: CryptoMessage, sharedMessageId _: String) -> CryptoMessage { message }
+    func updateEncryptableMessageMetadata(_ message: EncryptedMessage, transportInfo _: Data?, identity _: SessionIdentity, recipient _: MessageRecipient) async -> EncryptedMessage { message }
+    nonisolated func shouldFinishCommunicationSynchronization(_: Data?) -> Bool { false }
+    func processMessage(_: CryptoMessage, senderSecretName _: String, senderDeviceId _: UUID) async -> Bool { true }
+    func shouldSendAutomaticDeliveryReceipts() async -> Bool { false }
+
+    func inboundRecoveryDeferred(senderSecretName _: String, senderDeviceId _: UUID, failedSharedMessageId _: String, failureClass _: String) async {}
+    func inboundMessagePendingRecovery(senderSecretName _: String, senderDeviceId _: UUID, sharedMessageId _: String) async {}
+    func inboundCiphertextAccepted(sharedMessageId _: String) async {}
+    func inboundContentUnrecoverable(senderSecretName _: String, senderDeviceId _: UUID, sharedMessageId _: String) async {}
+    func outboundMessageUnrecoverable(sharedMessageId _: String, reason _: String) async {}
+    func reestablishmentEpisodeDidEnd(senderSecretName _: String, senderDeviceId _: UUID) async {}
+    func linkedDeviceReportedPotentialCompromise(deviceId _: UUID, intentId _: UUID?) async {}
+    func peerAccountIdentityChanged(secretName _: String, deviceId _: UUID, failedSharedMessageId _: String?) async {}
+    func shouldSuppressInboundRecoveryFromSender(_: String) async -> Bool { false }
+    func preferredOnlinePeerDeviceId(for _: String) async -> UUID? { nil }
 }
 
