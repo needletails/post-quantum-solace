@@ -844,4 +844,15 @@ extension PQSSession: ContactService {
         guard let cache else { throw PQSError.databaseNotInitialized }
         try await cache.deleteCommunication(communication)
     }
+
+    /// Deletes a contact from the store and the in-memory cache together.
+    ///
+    /// Deleting on the persistence host directly leaves the cache holding the model, so the
+    /// next `createContact` for that name finds a contact the store no longer has and fails
+    /// updating its row.
+    /// - Throws: `PQSError.databaseNotInitialized` before the cache exists, or the store's error.
+    public func deleteContact(_ id: UUID) async throws {
+        guard let cache else { throw PQSError.databaseNotInitialized }
+        try await cache.deleteContact(id)
+    }
 }
