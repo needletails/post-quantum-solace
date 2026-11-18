@@ -1421,7 +1421,7 @@ extension MessagePipeline {
         guard let cache = await session.cache else { return }
         let persisted: EncryptedMessage
         do {
-            persisted = try await cache.fetchStoredMessage(id: localMessageId)
+            persisted = try await cache.fetchMessage(id: localMessageId)
         } catch {
             return
         }

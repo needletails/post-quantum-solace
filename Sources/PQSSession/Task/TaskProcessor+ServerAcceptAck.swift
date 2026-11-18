@@ -336,7 +336,7 @@ extension MessagePipeline {
     ) async {
         guard let cache = await session.cache else { return }
         do {
-            let persisted = try await cache.fetchStoredMessage(id: localMessageId)
+            let persisted = try await cache.fetchMessage(id: localMessageId)
             let symmetricKey = try await session.getDatabaseSymmetricKey()
             guard var props = await persisted.props(symmetricKey: symmetricKey) else { return }
             // A peer's receipt outranks a missing server accept.

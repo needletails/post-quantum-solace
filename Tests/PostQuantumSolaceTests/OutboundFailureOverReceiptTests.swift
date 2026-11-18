@@ -391,4 +391,38 @@ extension EndToEndTests {
         #expect(observed == .waitingDelivery, "observed \(String(describing: observed))")
         await finishRig(rig)
     }
+
+    // MARK: - A retry after a receipt
+
+    /// The message failed, a peer's read receipt then corrected the stored row, and Retry is
+    /// tapped on the bubble that was drawn as failed.
+    @Test("A read receipt survives a retry of the failed message")
+    func readReceiptSurvivesARetryOfTheFailedMessage() async throws {
+        let rig = try await startAcceptRig()
+        let pending = try await envelope(rig, "bob", rig.bobMaster)
+        try await deliverToBobMaster(rig)
+        try await exhaustAcceptBudget(rig, for: [pending])
+        let failed = try await rowState(rig)
+        try #require(failed == .failed("serverAcceptExhausted"), "setup: the message failed first")
+        try await hostAppliesReceipt(rig, .read)
+        let applied = try await rowState(rig)
+        try #require(applied == .read, "setup: the receipt was applied over the failure")
+        await rig.pair.alice.retryFailedServerAcceptOutbound(localMessageId: rig.localId)
+        let observed = try await rowState(rig)
+        #expect(observed == .read, "a read message must not be written back to sending: observed \(String(describing: observed))")
+        await finishRig(rig)
+    }
+
+    @Test("Control: a retry moves a failed message nobody has receipted back to sending")
+    func retryMovesAnUnreceiptedFailedMessageBackToSending() async throws {
+        let rig = try await startAcceptRig()
+        let pending = try await envelope(rig, "bob", rig.bobMaster)
+        try await exhaustAcceptBudget(rig, for: [pending])
+        let failed = try await rowState(rig)
+        try #require(failed == .failed("serverAcceptExhausted"), "setup: the message failed first")
+        await rig.pair.alice.retryFailedServerAcceptOutbound(localMessageId: rig.localId)
+        let observed = try await rowState(rig)
+        #expect(observed == .sending, "observed \(String(describing: observed))")
+        await finishRig(rig)
+    }
 }
