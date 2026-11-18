@@ -12639,7 +12639,10 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     func removeCommunication(_: SessionModels.BaseCommunication) async throws {}
     func deleteCommunication(_: SessionModels.BaseCommunication) async throws {}
     func fetchMessages(sharedCommunicationId _: UUID) async throws -> [MessageRecord] { [] }
-    func fetchMessage(id _: UUID) async throws -> SessionModels.EncryptedMessage {
+    func fetchMessage(id: UUID) async throws -> SessionModels.EncryptedMessage {
+        if let exact = createdMessages.first(where: { $0.id == id }) {
+            return returnsFreshMessageRows ? try freshCopy(exact) : exact
+        }
         if let existing = createdMessages.first {
             return existing
         }
@@ -12657,8 +12660,25 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
             sequenceNumber: 1, data: Data())
     }
     
+    /// As the app's SQLiteStore: every fetch decodes a new instance, so a caller that mutates
+    /// the returned row changes the store only through `updateMessage`. Off by default: the
+    /// stored instance itself is returned.
+    private var returnsFreshMessageRows = false
+
+    func setReturnsFreshMessageRows(_ enabled: Bool) {
+        returnsFreshMessageRows = enabled
+    }
+
+    private func freshCopy(_ stored: EncryptedMessage) throws -> EncryptedMessage {
+        try EncryptedMessage(
+            id: stored.id, communicationId: stored.communicationId,
+            sessionContextId: stored.sessionContextId, sharedId: stored.sharedId,
+            sequenceNumber: stored.sequenceNumber, data: stored.data)
+    }
+
     func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage? {
-        createdMessages.first(where: { $0.sharedId == sharedId })
+        guard let stored = createdMessages.first(where: { $0.sharedId == sharedId }) else { return nil }
+        return returnsFreshMessageRows ? try freshCopy(stored) : stored
     }
     
     func updateSessionIdentity(_ session: SessionIdentity, andPreparedJob job: JobModel) async throws {

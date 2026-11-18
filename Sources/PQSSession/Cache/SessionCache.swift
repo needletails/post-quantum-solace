@@ -268,6 +268,12 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         }
     }
 
+    /// Fetches a message by its ID from the store, not `messages`: the host writes receipts
+    /// to the store directly, so the cached copy can hold an older delivery state.
+    func fetchStoredMessage(id: UUID) async throws -> EncryptedMessage {
+        try await store.fetchMessage(id: id)
+    }
+
     /// Fetches a message by its shared message ID.
     /// - Parameter sharedMessageId: The shared message ID of the message to fetch.
     /// - Returns: The fetched message.
