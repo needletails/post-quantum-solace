@@ -147,6 +147,14 @@ actor MessagePipeline {
     /// any state transition.
     var isPausedUntilTransportReady = false
 
+    /// Explicit resumes so far (`loadTasks(..., session:)`), and the count when the job in
+    /// hand started. A resume that arrives while a job runs finds the loop busy and starts
+    /// nothing; if that job is a send that then fails, the pause it would set waits for a
+    /// resume that has already happened, so the loop restarts once instead.
+    var transportResumeCount = 0
+    var transportResumeCountAtJobStart = 0
+    var restartAfterMissedResume = false
+
     /// Event-driven shutdown waiters resumed when the active processing loop exits.
     var processingIdleWaiters: [CheckedContinuation<Void, Never>] = []
 

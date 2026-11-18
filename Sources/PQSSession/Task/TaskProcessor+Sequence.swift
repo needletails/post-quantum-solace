@@ -173,6 +173,7 @@ extension MessagePipeline {
             // `loadTasks(..., session:)` is the explicit event-driven resume path
             // used after registration/writer readiness.
             isPausedUntilTransportReady = false
+            transportResumeCount &+= 1
             try await startProcessingIfNeeded(session)
         }
     }
@@ -231,7 +232,9 @@ extension MessagePipeline {
         // A paused job stays durable but must wait for a concrete future event
         // (`enqueue`, `resumeJobQueue`, viability/writer readiness). Immediately
         // reloading it here turns CancellationError into a tight cache/crypto loop.
-        guard loopExit == .drained else {
+        let missedResume = restartAfterMissedResume
+        restartAfterMissedResume = false
+        guard loopExit == .drained || missedResume else {
             return
         }
 
@@ -301,6 +304,7 @@ extension MessagePipeline {
                         // exactly a reconnect drain racing an executing send.
                         inFlightJobIds.insert(job.id)
                         defer { inFlightJobIds.remove(job.id) }
+                        transportResumeCountAtJobStart = transportResumeCount
                         let outcome = try await process(
                             job,
                             cache: cache,
@@ -1530,7 +1534,12 @@ extension MessagePipeline {
         // writer-ready event. Timer requeues can race the recycled writer and duplicate
         // warning storms without adding a new recovery signal.
         updatedProps.delayedUntil = nil
-        isPausedUntilTransportReady = true
+        if transportResumeCount != transportResumeCountAtJobStart {
+            // That resume already ran, while this send was in flight.
+            restartAfterMissedResume = true
+        } else {
+            isPausedUntilTransportReady = true
+        }
         _ = try await job.updateProps(symmetricKey: symmetricKey, props: updatedProps)
         do {
             try await cache.updateJob(job)
