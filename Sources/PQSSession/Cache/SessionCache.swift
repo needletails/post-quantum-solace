@@ -41,7 +41,7 @@ extension DataPacket: CachedRow {}
 /// ## Key Features
 /// - **Consistent API**: All methods follow standardized naming patterns without prepositions
 /// - **Thread Safety**: Uses actor isolation for concurrent access
-/// - **Cache Management**: Built-in cache clearing, refreshing, and statistics
+/// - **Cache Management**: Built-in cache refreshing and statistics
 /// - **Error Handling**: Comprehensive error types with detailed descriptions
 /// - **Synchronization**: Optional external synchronization support
 ///
@@ -62,7 +62,6 @@ extension DataPacket: CachedRow {}
 ///
 /// // Cache management
 /// let stats = cache.getCacheStats()
-/// await cache.clearCache()
 /// try await cache.refreshCache()
 /// ```
 actor SessionCache: PQSStore, PQSRecoveryStore {
@@ -98,7 +97,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// while a reload reads, every list write records its row (`upsert`, `replace`, `remove`). So
     /// the result is the store's rows, except that a row written since this read began keeps its
     /// state in memory (its value there, or absent if it was removed), and rows added to memory
-    /// since then follow the store's. If a reload that began later, or `clearCache`, replaced the
+    /// since then follow the store's. If a reload that began later replaced the
     /// list meanwhile, memory is newer than this read and is returned as it is. One read, however
     /// often writers publish.
     private func reloaded<Row: CachedRow>(
@@ -152,8 +151,8 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// write, and other calls on this actor run during that await and can remove rows, so the
     /// row's position is looked up now.
     private func replace<Row: CachedRow>(_ row: Row, in list: inout [Row]) {
-        noteWrite(Row.self, row.id)
         if let index = list.firstIndex(where: { $0.id == row.id }) {
+            noteWrite(Row.self, row.id)
             list[index] = row
         }
     }
@@ -161,14 +160,6 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     private func remove<Row: CachedRow>(_ id: UUID, from list: inout [Row]) {
         noteWrite(Row.self, id)
         list.removeAll { $0.id == id }
-    }
-
-    /// Empties `list`. Reloads still reading began before this, so they leave memory as it is.
-    private func clear<Row: CachedRow>(_ list: inout [Row]) {
-        list.removeAll()
-        guard reloadsReading > 0 else { return }
-        sequence += 1
-        listReplaced[ObjectIdentifier(Row.self)] = sequence
     }
 
     /// Whether `store` is the very object this cache writes through. Value-type
@@ -751,19 +742,6 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     }
 
     // MARK: - Cache Management
-
-    /// Clears all cached data, including session identities, messages, contacts, communications, jobs, media jobs, and local device configuration/salt.
-    /// Use this to reset the in-memory cache without affecting the persistent store.
-    func clearCache() async {
-        clear(&sessionIdentities)
-        messages.removeAll()
-        clear(&contacts)
-        clear(&communicationTypes)
-        clear(&jobs)
-        clear(&mediaJobs)
-        localDeviceConfiguration = nil
-        localDeviceSalt = nil
-    }
 
     /// Refreshes the cache by fetching fresh data from the persistent store for all major entities.
     /// - Throws: An error if any fetch operation from the store fails.

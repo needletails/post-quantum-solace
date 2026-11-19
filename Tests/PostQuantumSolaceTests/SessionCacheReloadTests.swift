@@ -202,6 +202,22 @@ struct SessionCacheReloadTests {
     /// which inserts a row memory lacks) on a list never loaded made it non-empty with one
     /// row, and every later fetch returned that row alone. The relaunch flow this breaks is
     /// EndToEndTests.previousRunJobIsSentFirstAfterRelaunch.
+    @Test("A job deleted while a create loads the cold job list stays deleted")
+    func jobDeletedDuringCreatePreloadStaysDeleted() async throws {
+        let store = Store()
+        let onDisk = try job()
+        store.jobs = [onDisk]
+        let cache = SessionCache(store: store) // a new process: the job list was never loaded
+        store.afterNextRead[.jobs] = { try await cache.deleteJob(onDisk) }
+
+        let created = try job()
+        try await cache.createJob(created)
+
+        let ids = try await cache.fetchJobs().map(\.id)
+        #expect(ids == [created.id], "the deleted job came back or the new one is missing: \(ids)")
+        #expect(store.jobs.map(\.id) == [created.id])
+    }
+
     @Test("A create on a list never loaded keeps the rows already on disk")
     func coldCreatesKeepStoredRows() async throws {
         let store = Store()
@@ -442,25 +458,6 @@ struct SessionCacheReloadTests {
         _ = try await cache.fetchSessionIdentities()
 
         #expect(try await memoryData(cache, a.id) == Data([0xA9]), "memory went back to the bytes from before the other process's write")
-    }
-
-    @Test("A reload that began before clearCache leaves memory empty, so the next fetch reads the store")
-    func reloadAcrossClearCacheLeavesMemoryEmpty() async throws {
-        let store = Store()
-        let cache = SessionCache(store: store)
-        let a = identity(0xA1), b = identity(0xB1)
-        try await cache.createSessionIdentity(a)
-        try await cache.createSessionIdentity(b)
-        let a2 = identity(0xA2, id: a.id)
-        store.afterNextRead[.identities] = {
-            try await cache.updateSessionIdentity(a2)
-            await cache.clearCache()
-        }
-
-        try await cache.refreshCache()
-
-        #expect(try await memoryData(cache, a.id) == Data([0xA2]), "memory went back to the earlier bytes or lost the row")
-        #expect(try await memoryData(cache, b.id) == Data([0xB1]))
     }
 
     @Test("fetchMediaJob(id:) does not put back a media job deleted during its read")

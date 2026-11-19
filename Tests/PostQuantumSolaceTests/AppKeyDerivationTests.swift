@@ -46,7 +46,7 @@ extension EndToEndTests {
         let saltlessKey = await crypto.deriveStrictSymmetricKey(data: passwordData, salt: salt)
         let blob = try #require(try crypto.encrypt(data: BinaryEncoder().encode(context), symmetricKey: saltlessKey))
         try await aliceStore.updateLocalSessionContext(blob)
-        await _senderSession.cache?.clearCache()
+        _ = try await _senderSession.cache?.reloadLocalSessionContext()
 
         #expect(!(await _senderSession.verifyAppPassword(password)))
         await #expect(throws: (any Error).self) {
