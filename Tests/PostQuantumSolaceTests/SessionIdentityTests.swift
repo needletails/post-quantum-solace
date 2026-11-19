@@ -56,7 +56,23 @@ actor SessionIdentityTests {
             afterNextUpdate = nil
             try await hook()
         }
-        
+        enum Table: Hashable { case identities, contacts, communications, jobs, mediaJobs }
+        /// Test-only: run once, after the next read of a table has taken its rows and before it
+        /// returns, as a real store's await gives other cache calls a turn. Off by default.
+        var afterNextRead = [Table: @Sendable () async throws -> Void]()
+        private func rows<Row>(_ table: Table, _ rows: [Row]) async throws -> [Row] {
+            if let hook = afterNextRead.removeValue(forKey: table) { try await hook() }
+            return rows
+        }
+        /// Test-only: run once, at the start of the next contact, communication or media-job
+        /// update or delete, before the row changes. Off by default.
+        var beforeNextWrite: (@Sendable () async throws -> Void)?
+        private func runBeforeNextWrite() async throws {
+            guard let hook = beforeNextWrite else { return }
+            beforeNextWrite = nil
+            try await hook()
+        }
+
         // Core session context methods
         func createLocalSessionContext(_ data: Data) async throws { sessionContext = data }
         func fetchLocalSessionContext() async throws -> Data { 
@@ -78,7 +94,7 @@ actor SessionIdentityTests {
         func createLocalDeviceConfiguration(_ configuration: Data) async throws {}
         
         // Session identity methods
-        func fetchSessionIdentities() async throws -> [SessionIdentity] { identities }
+        func fetchSessionIdentities() async throws -> [SessionIdentity] { try await rows(.identities, identities) }
         func updateSessionIdentity(_ session: SessionIdentity) async throws {
             if failNextSessionIdentityUpdate {
                 failNextSessionIdentityUpdate = false
@@ -99,22 +115,38 @@ actor SessionIdentityTests {
         
         // Stub implementations for unused methods (simplified)
         func removeContact(_: UUID) async throws {}
-        func deleteContact(_: UUID) async throws {}
-        func createMediaJob(_: DataPacket) async throws {}
-        func fetchAllMediaJobs() async throws -> [DataPacket] { [] }
-        func fetchMediaJob(id _: UUID) async throws -> DataPacket? { nil }
-        func deleteMediaJob(_: UUID) async throws {}
-        func fetchContacts() async throws -> [ContactModel] { contacts }
+        func deleteContact(_ id: UUID) async throws {
+            try await runBeforeNextWrite()
+            contacts.removeAll(where: { $0.id == id })
+        }
+        var mediaJobs = [DataPacket]()
+        func createMediaJob(_ packet: DataPacket) async throws { mediaJobs.append(packet) }
+        func fetchAllMediaJobs() async throws -> [DataPacket] { try await rows(.mediaJobs, mediaJobs) }
+        func fetchMediaJob(id: UUID) async throws -> DataPacket? { mediaJobs.first { $0.id == id } }
+        func deleteMediaJob(_ id: UUID) async throws {
+            try await runBeforeNextWrite()
+            mediaJobs.removeAll(where: { $0.id == id })
+        }
+        func fetchContacts() async throws -> [ContactModel] { try await rows(.contacts, contacts) }
         func createContact(_ contact: ContactModel) async throws { contacts.append(contact) }
         func updateContact(_ contact: ContactModel) async throws {
+            try await runBeforeNextWrite()
             contacts.removeAll(where: { $0.id == contact.id })
             contacts.append(contact)
         }
-        func fetchCommunications() async throws -> [BaseCommunication] { [] }
-        func createCommunication(_: BaseCommunication) async throws {}
-        func updateCommunication(_: BaseCommunication) async throws {}
+        var communications = [BaseCommunication]()
+        func fetchCommunications() async throws -> [BaseCommunication] { try await rows(.communications, communications) }
+        func createCommunication(_ communication: BaseCommunication) async throws { communications.append(communication) }
+        func updateCommunication(_ communication: BaseCommunication) async throws {
+            try await runBeforeNextWrite()
+            communications.removeAll(where: { $0.id == communication.id })
+            communications.append(communication)
+        }
         func removeCommunication(_: BaseCommunication) async throws {}
-        func deleteCommunication(_: BaseCommunication) async throws {}
+        func deleteCommunication(_ communication: BaseCommunication) async throws {
+            try await runBeforeNextWrite()
+            communications.removeAll(where: { $0.id == communication.id })
+        }
         func fetchMessages(sharedCommunicationId _: UUID) async throws -> [MessageRecord] { [] }
         func fetchMessage(id _: UUID) async throws -> EncryptedMessage {
             try .init(id: UUID(), communicationId: UUID(), sessionContextId: 1, sharedId: "123", sequenceNumber: 1, data: Data())
@@ -176,7 +208,7 @@ actor SessionIdentityTests {
         func messageCount(sharedIdentifier _: UUID) async throws -> Int { 0 }
         var jobs = [JobModel]()
         func readJobs() async throws -> [JobModel] { jobs }
-        func fetchJobs() async throws -> [JobModel] { jobs }
+        func fetchJobs() async throws -> [JobModel] { try await rows(.jobs, jobs) }
         func createJob(_ job: JobModel) async throws { jobs.append(job) }
         func updateJob(_ job: JobModel) async throws {
             jobs.removeAll(where: { $0.id == job.id })
