@@ -287,6 +287,24 @@ extension MessagePipeline {
         let matching = unackedServerAcceptByEnvelopeId.filter { $0.value.localId == localMessageId }
         guard !matching.isEmpty else { return false }
 
+        // The retry starts a new wait for the accept. Reset the entries before the row write:
+        // a registration or cleanup that runs during it must see the retried entries (the
+        // ledger's TTL counts from here), not exhausted ones it would fail again.
+        let retriedAt = Date()
+        func retried(_ entry: UnackedOutboundEnvelope) -> UnackedOutboundEnvelope {
+            var entry = entry
+            entry.resendAttempts = 0
+            entry.readSideRecycleConsumed = false
+            entry.connectionEpoch = messagingConnectionEpoch
+            entry.pending.createdAt = retriedAt
+            return entry
+        }
+        for envelopeMessageId in matching.keys {
+            if let entry = unackedServerAcceptByEnvelopeId[envelopeMessageId] {
+                unackedServerAcceptByEnvelopeId[envelopeMessageId] = retried(entry)
+            }
+        }
+
         await markPersistedOutboundSending(session: session, localMessageId: localMessageId)
 
         var didSend = false
@@ -294,12 +312,7 @@ extension MessagePipeline {
             // The user asked for this resend, so it goes out even when the entry left the
             // ledger while the row was written (an accept then found the row still failed
             // and left it; the server's answer to this resend moves it on).
-            var entry = unackedServerAcceptByEnvelopeId[envelopeMessageId] ?? snapshot
-            entry.resendAttempts = 0
-            entry.readSideRecycleConsumed = false
-            entry.connectionEpoch = messagingConnectionEpoch
-            // The retry starts a new wait for the accept; the ledger's TTL counts from here.
-            entry.pending.createdAt = Date()
+            let entry = unackedServerAcceptByEnvelopeId[envelopeMessageId] ?? retried(snapshot)
             unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
             guard let transportDelegate = await session.transportDelegate else { continue }
             do {

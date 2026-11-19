@@ -111,4 +111,50 @@ extension EndToEndTests {
         let observed = try await retryAfterWaiting(9 * 60, thenCleanupBy: .registration)
         #expect(observed == .waitingDelivery, "the server accepted the retried message: observed \(String(describing: observed))")
     }
+
+    /// A registration that starts while the Retry is still writing the row back to sending.
+    /// Its cleanup and its exhausted-entry check must see the retried entry, not the one the
+    /// Retry is about to replace.
+    func retryWithRegistrationDuringRowWrite(age: TimeInterval) async throws -> DeliveryState? {
+        let rig = try await startAcceptRig()
+        let alice = rig.pair.alice
+        let pending = try await envelope(rig, "bob", rig.bobMaster)
+        try await exhaustAcceptBudget(rig, for: [pending])
+        try #require(try await rowState(rig) == .failed("serverAcceptExhausted"), "setup: the message failed first")
+        try await backdateTrackedEnvelope(rig, pending, by: age)
+
+        let registered = OnceLanded()
+        await rig.pair.aliceStore.setBeforeNextMessageUpdate {
+            // The registration runs on its own, as after a reconnect, and gets ahead of the
+            // row write; its own row write then lands after the Retry's.
+            Task { await alice.resendUnackedOutboundEnvelopes(reason: "IRC registered") }
+            for _ in 0..<200 {
+                if await alice.isAwaitingServerAccept(pending) == false { break }
+                await Task.yield()
+            }
+            await registered.mark()
+        }
+        _ = await alice.retryFailedServerAcceptOutbound(localMessageId: rig.localId)
+        try #require(await registered.value, "setup: the registration ran during the retry's row write")
+        // Let the registration finish its own work.
+        _ = await pollUntil(timeout: 2) { false }
+        // The server answers the retried copy with an accept.
+        await alice.confirmServerAcceptedEnvelope(pending)
+        _ = await pollUntil(timeout: 1) { false }
+        let observed = try await rowState(rig)
+        await finishRig(rig)
+        return observed
+    }
+
+    @Test("A registration during the row write of a retry over ten minutes old does not fail it")
+    func registrationDuringRowWriteOfAnOldRetry() async throws {
+        let observed = try await retryWithRegistrationDuringRowWrite(age: 11 * 60)
+        #expect(observed == .waitingDelivery, "observed \(String(describing: observed))")
+    }
+
+    @Test("A registration during the row write of a retry under ten minutes old does not fail it")
+    func registrationDuringRowWriteOfARecentRetry() async throws {
+        let observed = try await retryWithRegistrationDuringRowWrite(age: 9 * 60)
+        #expect(observed == .waitingDelivery, "observed \(String(describing: observed))")
+    }
 }
