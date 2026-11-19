@@ -1428,7 +1428,10 @@ extension MessagePipeline {
         do {
             let symmetricKey = try await session.getDatabaseSymmetricKey()
             guard var props = await persisted.props(symmetricKey: symmetricKey) else { return }
-            guard case .sending = props.deliveryState else { return }
+            // Sending, or failed only for lack of this accept: an exhausted envelope stays
+            // tracked, so its accept can still arrive, and then the server has the message.
+            guard props.deliveryState == .sending
+                || props.deliveryState == .failed("serverAcceptExhausted") else { return }
             props.deliveryState = .waitingDelivery
             let updated = try await persisted.updateMessage(with: props, symmetricKey: symmetricKey)
             try await cache.updateMessage(updated, symmetricKey: symmetricKey)
