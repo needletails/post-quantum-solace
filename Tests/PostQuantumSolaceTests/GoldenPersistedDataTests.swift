@@ -252,6 +252,16 @@ struct GoldenPersistedDataTests {
             pinned: "Ak5CVE4WAAAAU2Vzc2lvbk1vZGVscy5Kb2JNb2RlbAIAAAABAAAAYREAAAABAAAAAAAAQACAAAAAAAAAAQEAAABiBwAAAAECAAAAyv4=")
     }
 
+    @Test("EncryptedMessage outer shell v1 encoding is stable")
+    func encryptedMessageShellGolden() throws {
+        try assertGolden(
+            "EncryptedMessage.shell",
+            try EncryptedMessage(
+                id: Self.id1, communicationId: Self.id2, sessionContextId: 7, sharedId: "shared-1",
+                sequenceNumber: 42, data: Data([0xCA, 0xFE])),
+            pinned: "Ak5CVE4eAAAAU2Vzc2lvbk1vZGVscy5FbmNyeXB0ZWRNZXNzYWdlBgAAAAIAAABpZBEAAAABAAAAAAAAQACAAAAAAAAAAQEAAABhEQAAAAEAAAAAAABAAIAAAAAAAAACAQAAAGIJAAAAAQcAAAAAAAAAAQAAAGMNAAAAAQgAAABzaGFyZWQtMQEAAABkCQAAAAEqAAAAAAAAAAEAAABlBwAAAAECAAAAyv4=")
+    }
+
     @Test("BaseCommunication outer shell v1 encoding is stable")
     func communicationShellGolden() throws {
         try assertGolden(

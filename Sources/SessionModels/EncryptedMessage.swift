@@ -78,7 +78,14 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     public let sequenceNumber: Int
 
     /// The encrypted data of the message containing the serialized `UnwrappedProps`.
-    public private(set) var data: Data
+    ///
+    /// An app passes the instance it holds back to the session, so a store reads these
+    /// bytes to write the row while another call's `updateMessage(with:)` replaces them on
+    /// another thread: every access takes `lock`.
+    public var data: Data { lock.withLock { storage } }
+
+    /// The bytes of `data`. Touched only with `lock` held.
+    private var storage: Data
 
     /// Thread-safe lock for protecting encryption/decryption operations.
     private let lock = NSLock()
@@ -94,6 +101,26 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
         case sharedId = "c"
         case sequenceNumber = "d"
         case data = "e"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        communicationId = try container.decode(UUID.self, forKey: .communicationId)
+        sessionContextId = try container.decode(Int.self, forKey: .sessionContextId)
+        sharedId = try container.decode(String.self, forKey: .sharedId)
+        sequenceNumber = try container.decode(Int.self, forKey: .sequenceNumber)
+        storage = try container.decode(Data.self, forKey: .data)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(communicationId, forKey: .communicationId)
+        try container.encode(sessionContextId, forKey: .sessionContextId)
+        try container.encode(sharedId, forKey: .sharedId)
+        try container.encode(sequenceNumber, forKey: .sequenceNumber)
+        try container.encode(data, forKey: .data)
     }
 
     /// Asynchronously retrieves the decrypted properties of the message.
@@ -233,7 +260,7 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
             throw PQSError.encryptionFailed
         }
-        self.data = encryptedData
+        self.storage = encryptedData
     }
 
     /// Initializes a new `EncryptedMessage` instance with existing encrypted data.
@@ -262,7 +289,7 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
         self.sessionContextId = sessionContextId
         self.sharedId = sharedId
         self.sequenceNumber = sequenceNumber
-        self.data = data
+        self.storage = data
     }
 
     /// Asynchronously decrypts the properties of the message using the provided symmetric key.
@@ -277,8 +304,8 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         try lock.withLock { [weak self] in
             guard let self else { throw PQSError.decryptionFailed }
-            guard !data.isEmpty else { throw PQSError.decryptionFailed }
-            guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
+            guard !storage.isEmpty else { throw PQSError.decryptionFailed }
+            guard let decrypted = try crypto.decrypt(data: storage, symmetricKey: symmetricKey) else {
                 throw PQSError.decryptionFailed
             }
             guard !decrypted.isEmpty else { throw PQSError.decryptionFailed }
@@ -309,7 +336,7 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
                 guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
                     throw PQSError.encryptionFailed
                 }
-                self.data = encryptedData
+                self.storage = encryptedData
             }
             return try await decryptProps(symmetricKey: symmetricKey)
         } catch {
@@ -335,7 +362,7 @@ public final class EncryptedMessage: SecureModelProtocol, @unchecked Sendable, H
             guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
                 throw PQSError.encryptionFailed
             }
-            self.data = encryptedData
+            self.storage = encryptedData
             return self
         }
     }

@@ -12671,9 +12671,9 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
             sequenceNumber: 1, data: Data())
     }
     
-    /// As the app's SQLiteStore: every fetch decodes a new instance, so a caller that mutates
-    /// the returned row changes the store only through `updateMessage`. Off by default: the
-    /// stored instance itself is returned.
+    /// As the app's SQLiteStore: every fetch decodes a new instance and every write keeps the
+    /// row's bytes as read then, so a caller that mutates a row changes the store only
+    /// through `updateMessage`. Off by default: the instance itself is stored and returned.
     private var returnsFreshMessageRows = false
 
     func setReturnsFreshMessageRows(_ enabled: Bool) {
@@ -12762,7 +12762,7 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
         if message.sharedId == failingCreateMessageSharedId {
             throw PQSError.databaseNotInitialized
         }
-        createdMessages.append(message)
+        createdMessages.append(returnsFreshMessageRows ? try freshCopy(message) : message)
     }
 
     func failCreateMessage(sharedId: String) {
@@ -12783,7 +12783,7 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
         guard let index = createdMessages.firstIndex(where: { $0.id == message.id }) else {
             throw SessionCache.CacheErrors.messageNotFound
         }
-        createdMessages[index] = message
+        createdMessages[index] = returnsFreshMessageRows ? try freshCopy(message) : message
     }
     func removeMessage(_: SessionModels.EncryptedMessage) async throws {}
     func deleteMessage(_ message: SessionModels.EncryptedMessage) async throws {
