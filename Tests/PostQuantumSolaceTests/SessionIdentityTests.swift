@@ -48,6 +48,14 @@ actor SessionIdentityTests {
         let recoveryLedger = InMemoryRecoveryLedger()
         var failNextSessionIdentityDelete = false
         var failNextSessionIdentityUpdate = false
+        /// Test-only: run once, after the next identity or job update has been written and
+        /// before it returns, as a store's await gives other cache calls a turn. Off by default.
+        var afterNextUpdate: (@Sendable () async throws -> Void)?
+        private func runAfterNextUpdate() async throws {
+            guard let hook = afterNextUpdate else { return }
+            afterNextUpdate = nil
+            try await hook()
+        }
         
         // Core session context methods
         func createLocalSessionContext(_ data: Data) async throws { sessionContext = data }
@@ -78,6 +86,7 @@ actor SessionIdentityTests {
             }
             identities.removeAll(where: { $0.id == session.id })
             identities.append(session)
+            try await runAfterNextUpdate()
         }
         func createSessionIdentity(_ session: SessionIdentity) async throws { identities.append(session) }
         func deleteSessionIdentity(_ id: UUID) async throws {
@@ -172,6 +181,7 @@ actor SessionIdentityTests {
         func updateJob(_ job: JobModel) async throws {
             jobs.removeAll(where: { $0.id == job.id })
             jobs.append(job)
+            try await runAfterNextUpdate()
         }
         func removeJob(_ job: JobModel) async throws { jobs.removeAll(where: { $0.id == job.id }) }
         func deleteJob(_ job: JobModel) async throws { jobs.removeAll(where: { $0.id == job.id }) }

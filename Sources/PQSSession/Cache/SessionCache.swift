@@ -215,15 +215,14 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
             let identities = try await store.fetchSessionIdentities()
             sessionIdentities = identities // Update the cache
         }
-        if let index = sessionIdentities.firstIndex(where: { $0.id == session.id }) {
-            // Watch: other calls on this actor can run during this await. A delete of an
-            // earlier row here (an inbound lane rollback while the host accepts a peer's
-            // new identity) leaves `index` one row off: it traps or overwrites the next
-            // row. Seen once in compromiseRotationWithCrossingTraffic, never on a device.
-            try await store.updateSessionIdentity(session)
-            sessionIdentities[index] = session
-        } else {
+        guard sessionIdentities.contains(where: { $0.id == session.id }) else {
             throw CacheErrors.sessionIdentityNotFound
+        }
+        try await store.updateSessionIdentity(session)
+        // Other calls on this actor run during the await and can delete rows, so the row's
+        // position is looked up after it, not before.
+        if let index = sessionIdentities.firstIndex(where: { $0.id == session.id }) {
+            sessionIdentities[index] = session
         }
     }
 
@@ -542,12 +541,15 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Parameter job: The job to be updated.
     /// - Throws: An error if the update fails.
     func updateJob(_ job: JobModel) async throws {
-        guard let index = try await jobIndex(for: job) else {
+        guard try await jobIndex(for: job) != nil else {
             throw CacheErrors.jobNotFound
         }
-        // Watch: same stale-index risk as updateSessionIdentity(_:) if a job is deleted meanwhile.
         try await store.updateJob(job) // Persist the updated job in the store
-        jobs[index] = job // Publish only after persistence succeeds
+        // Publish only after persistence succeeds, at the position the job has now (see
+        // `updateSessionIdentity(_:)`).
+        if let index = jobs.firstIndex(where: { $0.id == job.id }) {
+            jobs[index] = job
+        }
     }
 
     /// Index of `job` in the warm list, consulting the store on a miss.
@@ -586,19 +588,23 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
             sessionIdentities = identities
             identityIndex = sessionIdentities.firstIndex(where: { $0.id == sessionIdentity.id })
         }
-        guard let identityIndex else {
+        guard identityIndex != nil else {
             throw CacheErrors.sessionIdentityNotFound
         }
         // Same rule for the job row (see `jobIndex(for:)`).
-        guard let jobIndex = try await jobIndex(for: job) else {
+        guard try await jobIndex(for: job) != nil else {
             throw CacheErrors.jobNotFound
         }
-        // Watch: same stale-index risk as updateSessionIdentity(_:), for both indexes.
         try await store.updateSessionIdentity(
             sessionIdentity,
             andPreparedJob: job)
-        sessionIdentities[identityIndex] = sessionIdentity
-        jobs[jobIndex] = job
+        // Positions as they are now (see `updateSessionIdentity(_:)`).
+        if let index = sessionIdentities.firstIndex(where: { $0.id == sessionIdentity.id }) {
+            sessionIdentities[index] = sessionIdentity
+        }
+        if let index = jobs.firstIndex(where: { $0.id == job.id }) {
+            jobs[index] = job
+        }
     }
 
     /// Removes a job from the cache and store.
