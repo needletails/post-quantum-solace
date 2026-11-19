@@ -336,17 +336,47 @@ extension MessagePipeline {
         return didSend
     }
 
+    /// Runs `body` as the only delivery-state write in flight (FIFO).
+    ///
+    /// A message's delivery state changes by reading its stored row and writing it back: here
+    /// for an accept, a failure and a retry, and in the host, which applies a peer's receipt
+    /// inside `processMessage`. Two of those that overlap both read the old state, and the
+    /// later write replaces the earlier one (an accept wrote "waiting for delivery" over a
+    /// read receipt). Nothing called in `body` may wait for another call of this function.
+    func withExclusiveDeliveryStateWrite<T>(_ body: () async throws -> T) async rethrows -> T {
+        if deliveryStateWriteInProgress {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                deliveryStateWriteWaiters.append(continuation)
+            }
+        }
+        deliveryStateWriteInProgress = true
+        defer {
+            if deliveryStateWriteWaiters.isEmpty {
+                deliveryStateWriteInProgress = false
+            } else {
+                // Ownership passes directly to the next waiter.
+                deliveryStateWriteWaiters.removeFirst().resume()
+            }
+        }
+        return try await body()
+    }
+
     func markPersistedOutboundSending(session: PQSSession, localMessageId: UUID) async {
         guard let cache = await session.cache else { return }
         do {
-            let persisted = try await cache.fetchMessage(id: localMessageId)
-            let symmetricKey = try await session.getDatabaseSymmetricKey()
-            guard var props = await persisted.props(symmetricKey: symmetricKey) else { return }
-            guard case .failed = props.deliveryState else { return }
-            props.deliveryState = .sending
-            let updated = try await persisted.updateMessage(with: props, symmetricKey: symmetricKey)
-            try await cache.updateMessage(updated, symmetricKey: symmetricKey)
-            await session.receiverDelegate?.updatedMessage(updated)
+            let updated: EncryptedMessage? = try await withExclusiveDeliveryStateWrite {
+                let persisted = try await cache.fetchMessage(id: localMessageId)
+                let symmetricKey = try await session.getDatabaseSymmetricKey()
+                guard var props = await persisted.props(symmetricKey: symmetricKey) else { return nil }
+                guard case .failed = props.deliveryState else { return nil }
+                props.deliveryState = .sending
+                let updated = try await persisted.updateMessage(with: props, symmetricKey: symmetricKey)
+                try await cache.updateMessage(updated, symmetricKey: symmetricKey)
+                return updated
+            }
+            if let updated {
+                await session.receiverDelegate?.updatedMessage(updated)
+            }
         } catch {
             logger.log(level: .debug, message: "markPersistedOutboundSending failed: \(error)")
         }
@@ -359,15 +389,20 @@ extension MessagePipeline {
     ) async {
         guard let cache = await session.cache else { return }
         do {
-            let persisted = try await cache.fetchMessage(id: localMessageId)
-            let symmetricKey = try await session.getDatabaseSymmetricKey()
-            guard var props = await persisted.props(symmetricKey: symmetricKey) else { return }
-            // A peer's receipt outranks a missing server accept.
-            if props.deliveryState == .delivered || props.deliveryState == .read { return }
-            props.deliveryState = .failed(reason)
-            let updated = try await persisted.updateMessage(with: props, symmetricKey: symmetricKey)
-            try await cache.updateMessage(updated, symmetricKey: symmetricKey)
-            await session.receiverDelegate?.updatedMessage(updated)
+            let updated: EncryptedMessage? = try await withExclusiveDeliveryStateWrite {
+                let persisted = try await cache.fetchMessage(id: localMessageId)
+                let symmetricKey = try await session.getDatabaseSymmetricKey()
+                guard var props = await persisted.props(symmetricKey: symmetricKey) else { return nil }
+                // A peer's receipt outranks a missing server accept.
+                if props.deliveryState == .delivered || props.deliveryState == .read { return nil }
+                props.deliveryState = .failed(reason)
+                let updated = try await persisted.updateMessage(with: props, symmetricKey: symmetricKey)
+                try await cache.updateMessage(updated, symmetricKey: symmetricKey)
+                return updated
+            }
+            if let updated {
+                await session.receiverDelegate?.updatedMessage(updated)
+            }
         } catch {
             logger.log(level: .debug, message: "markPersistedOutboundFailed failed: \(error)")
         }

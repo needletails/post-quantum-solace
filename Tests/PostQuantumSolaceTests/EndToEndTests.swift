@@ -12645,6 +12645,7 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     func deleteCommunication(_: SessionModels.BaseCommunication) async throws {}
     func fetchMessages(sharedCommunicationId _: UUID) async throws -> [MessageRecord] { [] }
     func fetchMessage(id: UUID) async throws -> SessionModels.EncryptedMessage {
+        await simulateMessageLatency()
         if let exact = createdMessages.first(where: { $0.id == id }) {
             return returnsFreshMessageRows ? try freshCopy(exact) : exact
         }
@@ -12674,6 +12675,20 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
         returnsFreshMessageRows = enabled
     }
 
+    /// Simulated latency: when set, a message fetch (by id, or by shared id if it exists) and a
+    /// message update each wait this long before they touch the rows, as a database call
+    /// takes time and lets other calls run meanwhile. Off by default.
+    private var simulatedMessageLatency: Duration?
+    func setSimulatedMessageLatency(_ latency: Duration?) {
+        simulatedMessageLatency = latency
+    }
+
+    private func simulateMessageLatency() async {
+        if let simulatedMessageLatency {
+            try? await Task.sleep(for: simulatedMessageLatency)
+        }
+    }
+
     /// Test-only: runs once inside the next `updateMessage`, before the row is written, as a
     /// store's await lets other calls run. Off by default.
     private var beforeNextMessageUpdate: (@Sendable () async -> Void)?
@@ -12689,6 +12704,7 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     }
 
     func fetchMessageIfExists(sharedId: String) async throws -> EncryptedMessage? {
+        await simulateMessageLatency()
         guard let stored = createdMessages.first(where: { $0.sharedId == sharedId }) else { return nil }
         return returnsFreshMessageRows ? try freshCopy(stored) : stored
     }
@@ -12754,6 +12770,7 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     
     /// As SQLiteStore: an update of a row that is gone throws `recordNotFound`.
     func updateMessage(_ message: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws {
+        await simulateMessageLatency()
         if let action = beforeNextMessageUpdate {
             beforeNextMessageUpdate = nil
             await action()

@@ -379,10 +379,13 @@ extension MessagePipeline {
             var canSaveMessage = true
             
             if !contentHeld, let sessionDelegate = await session.sessionDelegate {
-                canSaveMessage = await sessionDelegate.processMessage(
-                    decodedMessage,
-                    senderSecretName: inboundTask.senderSecretName,
-                    senderDeviceId: inboundTask.senderDeviceId)
+                // The host applies a peer's receipt in here, a write of the message's row.
+                canSaveMessage = await withExclusiveDeliveryStateWrite {
+                    await sessionDelegate.processMessage(
+                        decodedMessage,
+                        senderSecretName: inboundTask.senderSecretName,
+                        senderDeviceId: inboundTask.senderDeviceId)
+                }
             }
 
             if !contentHeld,
@@ -1421,23 +1424,23 @@ extension MessagePipeline {
     /// so clients can show a stable "sent" state without waiting for a peer receipt.
     func markPersistedOutboundPastSendingIfNeeded(session: PQSSession, localMessageId: UUID) async {
         guard let cache = await session.cache else { return }
-        let persisted: EncryptedMessage
         do {
-            persisted = try await cache.fetchMessage(id: localMessageId)
-        } catch {
-            return
-        }
-        do {
-            let symmetricKey = try await session.getDatabaseSymmetricKey()
-            guard var props = await persisted.props(symmetricKey: symmetricKey) else { return }
-            // Sending, or failed only for lack of this accept: an exhausted envelope stays
-            // tracked, so its accept can still arrive, and then the server has the message.
-            guard props.deliveryState == .sending
-                || props.deliveryState == .failed("serverAcceptExhausted") else { return }
-            props.deliveryState = .waitingDelivery
-            let updated = try await persisted.updateMessage(with: props, symmetricKey: symmetricKey)
-            try await cache.updateMessage(updated, symmetricKey: symmetricKey)
-            await session.receiverDelegate?.updatedMessage(updated)
+            let updated: EncryptedMessage? = try await withExclusiveDeliveryStateWrite {
+                guard let persisted = try? await cache.fetchMessage(id: localMessageId) else { return nil }
+                let symmetricKey = try await session.getDatabaseSymmetricKey()
+                guard var props = await persisted.props(symmetricKey: symmetricKey) else { return nil }
+                // Sending, or failed only for lack of this accept: an exhausted envelope stays
+                // tracked, so its accept can still arrive, and then the server has the message.
+                guard props.deliveryState == .sending
+                    || props.deliveryState == .failed("serverAcceptExhausted") else { return nil }
+                props.deliveryState = .waitingDelivery
+                let updated = try await persisted.updateMessage(with: props, symmetricKey: symmetricKey)
+                try await cache.updateMessage(updated, symmetricKey: symmetricKey)
+                return updated
+            }
+            if let updated {
+                await session.receiverDelegate?.updatedMessage(updated)
+            }
         } catch {
             logger.log(level: .debug, message: "markPersistedOutboundPastSendingIfNeeded failed: \(error)")
         }

@@ -319,6 +319,9 @@ actor MessagePipeline {
     var serverAcceptAckDeadlineNanosecondsOverride: UInt64?
     let serverAcceptAckDeadlineNanoseconds: UInt64 = 10_000_000_000
     let maxServerAcceptResendAttempts = 5
+    /// See `withExclusiveDeliveryStateWrite`.
+    var deliveryStateWriteInProgress = false
+    var deliveryStateWriteWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Jobs currently entering the ratchet, keyed by their logical shared id.
     var processingOutboundJobBySharedId: [String: JobModel] = [:]

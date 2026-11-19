@@ -220,9 +220,9 @@ extension EndToEndTests {
     }
 
     /// A late accept for the failed message is handled while the retry is still moving the
-    /// row back to sending: the accept finds the row failed and leaves it, and the retry then
-    /// writes sending. The retry's resend must still go out, so the server's answer to it
-    /// moves the row on.
+    /// row back to sending: the accept takes the envelope out of the ledger at once, and its
+    /// own row write waits for the retry's. The retry's resend must still go out, and the
+    /// server's answer to it finds the message past sending.
     @Test("An accept that lands during the retry's row write still moves the message past sending")
     func acceptDuringRetryRowWriteStillMovesThePastSending() async throws {
         let rig = try await startAcceptRig()
@@ -236,11 +236,20 @@ extension EndToEndTests {
         let landed = OnceLanded()
         let store = rig.pair.aliceStore
         await store.setBeforeNextMessageUpdate {
-            await alice.confirmServerAcceptedEnvelope(pending)
-            await landed.mark()
+            // The accept is handled on its own, as the inbound loop handles it. Awaited in
+            // here it could never finish: its row write waits for the one this call is in.
+            Task {
+                await alice.confirmServerAcceptedEnvelope(pending)
+                await landed.mark()
+            }
+            for _ in 0..<200 {
+                if await alice.isAwaitingServerAccept(pending) == false { break }
+                await Task.yield()
+            }
         }
         _ = await alice.retryFailedServerAcceptOutbound(localMessageId: rig.localId)
-        try #require(await landed.value, "setup: the accept landed during the retry's row write")
+        let handled = await pollUntil(timeout: 10) { await landed.value }
+        try #require(handled, "setup: the accept that started during the retry's row write was handled")
 
         let resent = await rig.server.copyCount(of: pending) - before
         #expect(resent == 1, "the retry must still send the message once (sent \(resent))")
