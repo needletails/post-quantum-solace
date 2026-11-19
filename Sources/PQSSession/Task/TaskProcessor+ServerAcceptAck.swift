@@ -290,9 +290,11 @@ extension MessagePipeline {
         await markPersistedOutboundSending(session: session, localMessageId: localMessageId)
 
         var didSend = false
-        for envelopeMessageId in matching.keys {
-            // Accepted, evicted or taken for the identified fallback while we awaited.
-            guard var entry = unackedServerAcceptByEnvelopeId[envelopeMessageId] else { continue }
+        for (envelopeMessageId, snapshot) in matching {
+            // The user asked for this resend, so it goes out even when the entry left the
+            // ledger while the row was written (an accept then found the row still failed
+            // and left it; the server's answer to this resend moves it on).
+            var entry = unackedServerAcceptByEnvelopeId[envelopeMessageId] ?? snapshot
             entry.resendAttempts = 0
             entry.readSideRecycleConsumed = false
             entry.connectionEpoch = messagingConnectionEpoch

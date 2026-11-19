@@ -12669,6 +12669,13 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
         returnsFreshMessageRows = enabled
     }
 
+    /// Test-only: runs once inside the next `updateMessage`, before the row is written, as a
+    /// store's await lets other calls run. Off by default.
+    private var beforeNextMessageUpdate: (@Sendable () async -> Void)?
+    func setBeforeNextMessageUpdate(_ action: (@Sendable () async -> Void)?) {
+        beforeNextMessageUpdate = action
+    }
+
     private func freshCopy(_ stored: EncryptedMessage) throws -> EncryptedMessage {
         try EncryptedMessage(
             id: stored.id, communicationId: stored.communicationId,
@@ -12742,6 +12749,10 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     
     /// As SQLiteStore: an update of a row that is gone throws `recordNotFound`.
     func updateMessage(_ message: SessionModels.EncryptedMessage, symmetricKey _: SymmetricKey) async throws {
+        if let action = beforeNextMessageUpdate {
+            beforeNextMessageUpdate = nil
+            await action()
+        }
         guard let index = createdMessages.firstIndex(where: { $0.id == message.id }) else {
             throw SessionCache.CacheErrors.messageNotFound
         }

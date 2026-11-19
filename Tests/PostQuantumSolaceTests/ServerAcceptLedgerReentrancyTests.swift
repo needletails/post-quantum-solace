@@ -218,4 +218,42 @@ extension EndToEndTests {
         #expect(copies == 1 + 5, "the original plus a budget of five resends: \(copies) copies")
         await finishRig(rig)
     }
+
+    /// A late accept for the failed message is handled while the retry is still moving the
+    /// row back to sending: the accept finds the row failed and leaves it, and the retry then
+    /// writes sending. The retry's resend must still go out, so the server's answer to it
+    /// moves the row on.
+    @Test("An accept that lands during the retry's row write still moves the message past sending")
+    func acceptDuringRetryRowWriteStillMovesThePastSending() async throws {
+        let rig = try await startAcceptRig()
+        let alice = rig.pair.alice
+        let pending = try await envelope(rig, "bob", rig.bobMaster)
+        try await exhaustAcceptBudget(rig, for: [pending])
+        let failed = try await rowState(rig)
+        try #require(failed == .failed("serverAcceptExhausted"), "setup: the message failed first")
+        let before = await rig.server.copyCount(of: pending)
+
+        let landed = OnceLanded()
+        let store = rig.pair.aliceStore
+        await store.setBeforeNextMessageUpdate {
+            await alice.confirmServerAcceptedEnvelope(pending)
+            await landed.mark()
+        }
+        _ = await alice.retryFailedServerAcceptOutbound(localMessageId: rig.localId)
+        try #require(await landed.value, "setup: the accept landed during the retry's row write")
+
+        let resent = await rig.server.copyCount(of: pending) - before
+        #expect(resent == 1, "the retry must still send the message once (sent \(resent))")
+        // The server answers every copy it takes with an accept.
+        if resent > 0 { await alice.confirmServerAcceptedEnvelope(pending) }
+        let state = try await rowState(rig)
+        #expect(state == .waitingDelivery, "an accepted message must not stay sending: \(String(describing: state))")
+        #expect(await alice.isAwaitingServerAccept(pending) == false)
+        await finishRig(rig)
+    }
+}
+
+actor OnceLanded {
+    private(set) var value = false
+    func mark() { value = true }
 }
