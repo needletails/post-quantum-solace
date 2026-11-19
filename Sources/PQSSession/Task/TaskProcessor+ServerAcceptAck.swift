@@ -157,6 +157,10 @@ extension MessagePipeline {
 
             do {
                 try await transportDelegate.sendMessage(entry.pending.message, metadata: entry.pending.metadata)
+                // An accept or another resend may have run during the send: drop an
+                // accepted envelope, and count onto the entry the ledger holds now.
+                guard let current = unackedServerAcceptByEnvelopeId[envelopeMessageId] else { continue }
+                entry = current
                 if replayingSilentWindow {
                     // One accept window on the new connection. The next miss fails the bubble.
                     entry.readSideRecycleConsumed = true
@@ -241,8 +245,10 @@ extension MessagePipeline {
 
         do {
             try await transportDelegate.sendMessage(entry.pending.message, metadata: entry.pending.metadata)
-            // Dropped if accept won the race during send.
-            guard unackedServerAcceptByEnvelopeId[envelopeMessageId] != nil else { return }
+            // Dropped if accept won the race during send; otherwise count onto the entry
+            // the ledger holds now, which another resend may have changed meanwhile.
+            guard let current = unackedServerAcceptByEnvelopeId[envelopeMessageId] else { return }
+            entry = current
             entry.resendAttempts += 1
             unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
             startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
@@ -284,26 +290,26 @@ extension MessagePipeline {
         await markPersistedOutboundSending(session: session, localMessageId: localMessageId)
 
         var didSend = false
-        for (envelopeMessageId, var entry) in matching {
+        for envelopeMessageId in matching.keys {
+            // Accepted, evicted or taken for the identified fallback while we awaited.
+            guard var entry = unackedServerAcceptByEnvelopeId[envelopeMessageId] else { continue }
             entry.resendAttempts = 0
             entry.readSideRecycleConsumed = false
             entry.connectionEpoch = messagingConnectionEpoch
-            guard let transportDelegate = await session.transportDelegate else {
-                unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
-                continue
-            }
+            unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
+            guard let transportDelegate = await session.transportDelegate else { continue }
             do {
                 try await transportDelegate.sendMessage(entry.pending.message, metadata: entry.pending.metadata)
-                unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
+                didSend = true
+                // Dropped if the accept landed during the send.
+                guard unackedServerAcceptByEnvelopeId[envelopeMessageId] != nil else { continue }
                 unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)?.cancel()
                 startServerAcceptDeadline(envelopeMessageId: envelopeMessageId, session: session)
                 audit(
                     .send,
                     "pqs.send.retryFailedServerAccept envelopeMessageId=\(envelopeMessageId) sharedId=\(entry.sharedId)",
                     level: .info)
-                didSend = true
             } catch {
-                unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
                 audit(
                     .send,
                     "pqs.send.retryFailedServerAccept failed envelopeMessageId=\(envelopeMessageId) error=\(PQSAuditRedaction.describe(error))",
