@@ -1153,6 +1153,8 @@ extension MessagePipeline {
             return nil
         }
         do {
+            await beginRatchetLaneUse()
+            defer { endRatchetLaneUse() }
             try await initializeRecipient(
                 sessionIdentity: lane.identity,
                 props: lane.props,

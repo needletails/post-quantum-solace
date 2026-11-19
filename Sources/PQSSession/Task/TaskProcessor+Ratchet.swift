@@ -319,6 +319,36 @@ extension MessagePipeline: SessionIdentityDelegate, TaskSequenceDelegate {
         }
     }
     
+    /// Waits for the lane use in flight, then takes the turn (FIFO). Pair with
+    /// `endRatchetLaneUse`. Nothing inside a turn may ask for another one.
+    func beginRatchetLaneUse() async {
+        if isUsingRatchetLane {
+            await withCheckedContinuation { ratchetLaneUseWaiters.append($0) }
+        }
+        isUsingRatchetLane = true
+    }
+
+    func endRatchetLaneUse() {
+        if ratchetLaneUseWaiters.isEmpty {
+            isUsingRatchetLane = false
+        } else {
+            // Ownership passes directly to the next waiter.
+            ratchetLaneUseWaiters.removeFirst().resume()
+        }
+    }
+
+    /// Evicts the ratchet manager's snapshot of each lane so its next use rebuilds from
+    /// the stored row (`PQSSession.refreshSessionCache`). Waits out a lane use in flight;
+    /// that is one encrypt or decrypt, never a transport send, so it also returns
+    /// promptly while the job queue is busy, paused or idle.
+    func discardCachedLanes(_ ids: [UUID]) async {
+        await beginRatchetLaneUse()
+        defer { endRatchetLaneUse() }
+        for id in ids {
+            await ratchetManager.discardCachedLane(id)
+        }
+    }
+
     struct LoadedKeysResult: Sendable {
         var localOneTimePrivateKey: X25519PrivateKey?
         var localMLKEMPrivateKey: MLKEMPrivateKey

@@ -995,6 +995,8 @@ extension MessagePipeline {
         let signedMessage: SignedRatchetMessage
         let sentHeader: EncryptedHeader
         do {
+            await beginRatchetLaneUse()
+            defer { endRatchetLaneUse() }
             try await ratchetManager.initiateSession(
                 sessionIdentity: sessionIdentity,
                 sessionSymmetricKey: databaseSymmetricKey,

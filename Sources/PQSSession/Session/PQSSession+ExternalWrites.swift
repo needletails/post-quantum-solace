@@ -39,8 +39,8 @@ extension PQSSession {
         // branch encrypts from the stale state and writes that back over the other
         // process's advance (dogfood 2026-10-24..27: the master's first frame after each
         // launch failed on its linked device while the extension's frames decrypted).
-        for identity in try await cache.fetchSessionIdentities() {
-            await messagePipeline.ratchetManager.discardCachedLane(identity.id)
-        }
+        // This also runs while jobs do (a store-change signal during a backlog drain),
+        // so the pipeline evicts them, never under an encrypt or decrypt in flight.
+        await messagePipeline.discardCachedLanes(try await cache.fetchSessionIdentities().map(\.id))
     }
 }

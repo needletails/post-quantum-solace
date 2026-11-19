@@ -179,6 +179,15 @@ actor MessagePipeline {
     /// otherwise re-enqueue (and re-send) it from cache during that window.
     var inFlightJobIds: Set<UUID> = []
 
+    /// One lane use at a time (`beginRatchetLaneUse`): from the call that loads a lane
+    /// into the ratchet manager (`initiateSession`, `respondToSession`) to the last call
+    /// that reads that snapshot (`encrypt`, `decrypt`). `discardCachedLanes` takes the
+    /// same turn, so a lane is never evicted between its load and its use. Evicted
+    /// there, the use throws `missingConfiguration` and the job loop deletes the job:
+    /// the frame is never sent, or the received one is dropped.
+    var isUsingRatchetLane = false
+    var ratchetLaneUseWaiters: [CheckedContinuation<Void, Never>] = []
+
     /// Archive-fallback pending tokens (`ArchivedInboundFallbackToken.storageKey`), each
     /// with the active-first verdicts its pass needs. A relaunch re-runs active-first.
     var archivedInboundFallbackPasses: [String: [InboundAttemptFailure]] = [:]
