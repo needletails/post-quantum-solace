@@ -12614,13 +12614,18 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
     func fetchAllMediaJobs() async throws -> [SessionModels.DataPacket] { [] }
     func fetchMediaJob(id _: UUID) async throws -> SessionModels.DataPacket? { nil }
     func deleteMediaJob(_: UUID) async throws {}
-    func fetchContacts() async throws -> [SessionModels.ContactModel] { contacts }
+    /// As `row(_:)` for identities: with `detachesRows`, the store reads a contact's bytes
+    /// on every write and hands out a new instance per fetch, as a SQL store does.
+    private func row(_ contact: ContactModel) -> ContactModel {
+        detachesRows ? ContactModel(id: contact.id, data: contact.data) : contact
+    }
+    func fetchContacts() async throws -> [SessionModels.ContactModel] { contacts.map(row) }
     func createContact(_ contact: SessionModels.ContactModel) async throws {
-        contacts.append(contact)
+        contacts.append(row(contact))
     }
     func updateContact(_ contact: SessionModels.ContactModel) async throws {
         if let index = contacts.firstIndex(where: { $0.id == contact.id }) {
-            contacts[index] = contact
+            contacts[index] = row(contact)
         }
     }
     /// As `row(_:)` for identities: with `detachesRows`, the store reads a communication's

@@ -52,7 +52,17 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     /// The encrypted data associated with the contact model.
     /// Contains the serialized and encrypted contact properties. This data is opaque and
     /// requires the correct symmetric key for decryption.
-    public var data: Data
+    ///
+    /// The session cache hands one instance to every caller, so a store reads these bytes
+    /// to write the row while another call's `updateProps` replaces them on another
+    /// thread: every access takes `lock`.
+    public var data: Data {
+        get { lock.withLock { storage } }
+        set { lock.withLock { storage = newValue } }
+    }
+
+    /// The bytes of `data`. Touched only with `lock` held.
+    private var storage: Data
     
     /// A lock for synchronizing access to the model's properties.
     /// Ensures thread-safe operations when reading or writing the encrypted data.
@@ -67,6 +77,18 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case id = "a"
         case data = "b"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        storage = try container.decode(Data.self, forKey: .data)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(data, forKey: .data)
     }
     
     /// Asynchronously retrieves the decrypted properties of the contact model, if available.
@@ -156,7 +178,7 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
             throw PQSError.encryptionFailed
         }
-        self.data = encryptedData
+        self.storage = encryptedData
     }
     
     /// Initializes a new instance of `ContactModel` with existing encrypted data.
@@ -172,7 +194,7 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
         data: Data
     ) {
         self.id = id
-        self.data = data
+        self.storage = data
     }
     
     /// Asynchronously decrypts the properties of the contact model.
@@ -189,7 +211,7 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
     public func decryptProps(symmetricKey: SymmetricKey) async throws -> UnwrappedProps {
         try lock.withLock { [weak self] in
             guard let self else { throw PQSError.encryptionFailed }
-            guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
+            guard let decrypted = try crypto.decrypt(data: storage, symmetricKey: symmetricKey) else {
                 throw PQSError.decryptionFailed
             }
             return try BinaryDecoder().decode(UnwrappedProps.self, from: decrypted)
@@ -215,7 +237,7 @@ public final class ContactModel: SecureModelProtocol, Codable, @unchecked Sendab
                 guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
                     throw PQSError.encryptionFailed
                 }
-                self.data = encryptedData
+                self.storage = encryptedData
             }
             return try await decryptProps(symmetricKey: symmetricKey)
         } catch {
