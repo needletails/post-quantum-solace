@@ -137,6 +137,8 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
 
     /// Puts `row` in place of the row with its id, or at the end if there is none. A create
     /// publishes after its store write, so a reload may already have read the row and put it in.
+    /// Fetches read the store only while a list is empty, so creates load an empty list first
+    /// (`fetch…`): one row put in a list never loaded would stand for every row on disk.
     private func upsert<Row: CachedRow>(_ row: Row, in list: inout [Row]) {
         noteWrite(Row.self, row.id)
         if let index = list.firstIndex(where: { $0.id == row.id }) {
@@ -282,6 +284,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Parameter session: The session identity to be created.
     /// - Throws: An error if the creation fails.
     func createSessionIdentity(_ session: SessionIdentity) async throws {
+        _ = try await fetchSessionIdentities()
         try await store.createSessionIdentity(session)
         upsert(session, in: &sessionIdentities)
     }
@@ -532,6 +535,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Parameter contact: The contact to be created.
     /// - Throws: An error if the creation fails.
     func createContact(_ contact: ContactModel) async throws {
+        _ = try await fetchContacts()
         try await store.createContact(contact)
         upsert(contact, in: &contacts) // Cache the new contact
     }
@@ -545,6 +549,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         // never lands in memory. Memory can lag the store (e.g. a contact re-created around a
         // delete while the array was already populated): appending then heals the staleness
         // instead of aborting the caller's state transition with `contactNotFound`.
+        _ = try await fetchContacts()
         try await store.updateContact(contact)
         upsert(contact, in: &contacts)
     }
@@ -573,6 +578,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Parameter type: The communication type to be created.
     /// - Throws: An error if the creation fails.
     func createCommunication(_ type: BaseCommunication) async throws {
+        _ = try await fetchCommunications()
         try await store.createCommunication(type)
         upsert(type, in: &communicationTypes) // Cache the new communication type
     }
@@ -614,6 +620,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Parameter job: The job to be created.
     /// - Throws: An error if the creation fails.
     func createJob(_ job: JobModel) async throws {
+        _ = try await fetchJobs()
         try await store.createJob(job) // Persist the job in the store
         upsert(job, in: &jobs) // Cache the new job
     }
@@ -695,6 +702,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Parameter packet: The `DataPacket` representing the media job to be created.
     /// - Throws: An error if the creation fails in the store.
     func createMediaJob(_ packet: DataPacket) async throws {
+        _ = try await fetchAllMediaJobs()
         try await store.createMediaJob(packet) // Persist the media job in the store
         upsert(packet, in: &mediaJobs) // Cache the new media job
     }

@@ -198,6 +198,44 @@ struct SessionCacheReloadTests {
         #expect(try await cache.fetchAllMediaJobs().count == 2)
     }
 
+    /// Fetches read the store only while a list is empty. A create (or a contact update,
+    /// which inserts a row memory lacks) on a list never loaded made it non-empty with one
+    /// row, and every later fetch returned that row alone. The relaunch flow this breaks is
+    /// EndToEndTests.previousRunJobIsSentFirstAfterRelaunch.
+    @Test("A create on a list never loaded keeps the rows already on disk")
+    func coldCreatesKeepStoredRows() async throws {
+        let store = Store()
+        let storedIdentity = identity(0xA1)
+        let storedContact = ContactModel(id: UUID(), data: Data([1]))
+        let otherContact = ContactModel(id: UUID(), data: Data([2]))
+        store.identities = [storedIdentity]
+        store.contacts = [storedContact]
+        store.communications = [BaseCommunication(id: UUID(), data: Data([3]))]
+        store.jobs = [try job()]
+        store.mediaJobs = [DataPacket(id: UUID(), data: Data([4]))]
+        let cache = SessionCache(store: store) // a new process: every list empty, rows on disk
+
+        try await cache.createSessionIdentity(identity(0xB1))
+        try await cache.createContact(ContactModel(id: UUID(), data: Data([5])))
+        try await cache.createCommunication(BaseCommunication(id: UUID(), data: Data([6])))
+        try await cache.createJob(try job())
+        try await cache.createMediaJob(DataPacket(id: UUID(), data: Data([7])))
+
+        #expect(try await cache.fetchSessionIdentities().count == 2, "identities")
+        #expect(try await cache.fetchContacts().count == 2, "contacts")
+        #expect(try await cache.fetchCommunications().count == 2, "communications")
+        #expect(try await cache.fetchJobs().count == 2, "jobs")
+        #expect(try await cache.fetchAllMediaJobs().count == 2, "media jobs")
+
+        let updateStore = Store()
+        updateStore.contacts = [storedContact, otherContact]
+        let updating = SessionCache(store: updateStore)
+        try await updating.updateContact(ContactModel(id: storedContact.id, data: Data([9])))
+        let contacts = try await updating.fetchContacts()
+        #expect(contacts.count == 2, "contact update")
+        #expect(contacts.first { $0.id == storedContact.id }?.data == Data([9]))
+    }
+
     @Test("commitPreparedOutbound's preload keeps an identity update that finished during its read")
     func commitPreloadKeepsIdentityUpdate() async throws {
         let store = Store()
@@ -324,6 +362,7 @@ struct SessionCacheReloadTests {
         try await cache.createCommunication(BaseCommunication(id: UUID(), data: Data([0])))
         try await cache.createMediaJob(DataPacket(id: UUID(), data: Data([0])))
         let created = try (0..<50).map { _ in try job() }
+        store.reads = [:] // the creates above loaded their empty lists; count the refresh only
         // Another task's writes publish during every read, to the list being read and to the
         // others. Bounded at 50 reads, so a reload that reads until none landed still ends.
         store.afterEachRead = { _ in
