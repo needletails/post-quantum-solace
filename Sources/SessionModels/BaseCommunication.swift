@@ -109,11 +109,33 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
     ///
     /// This data is encrypted using the symmetric key provided during initialization
     /// and can only be decrypted with the same key.
-    public var data: Data
+    ///
+    /// The session cache hands one instance to every caller, so a store or a message
+    /// encoding it reads these bytes while `updateProps` replaces them on another
+    /// thread: every access takes `lock`.
+    public var data: Data {
+        get { lock.withLock { storage } }
+        set { lock.withLock { storage = newValue } }
+    }
+
+    /// The bytes of `data`. Touched only with `lock` held.
+    private var storage: Data
     
     /// Coding keys for serialization, using obfuscated names for security.
     enum CodingKeys: String, CodingKey, Codable & Sendable {
         case id, data = "a"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        storage = try container.decode(Data.self, forKey: .data)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(data, forKey: .data)
     }
     
     /// Asynchronously retrieves the decrypted properties of the communication model.
@@ -249,7 +271,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
         guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
             throw PQSError.encryptionFailed
         }
-        self.data = encryptedData
+        self.storage = encryptedData
     }
     
     /// Initializes a new instance of `BaseCommunication` with existing encrypted data.
@@ -273,7 +295,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
         data: Data
     ) {
         self.id = id
-        self.data = data
+        self.storage = data
     }
     
     /// Asynchronously decrypts the properties of the communication model.
@@ -295,8 +317,8 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
         try lock.withLock { [weak self] in
             guard let self else { throw PQSError.decryptionFailed }
             let crypto = NeedleTailCrypto()
-            guard !data.isEmpty else { throw PQSError.decryptionFailed }
-            guard let decrypted = try crypto.decrypt(data: data, symmetricKey: symmetricKey) else {
+            guard !storage.isEmpty else { throw PQSError.decryptionFailed }
+            guard let decrypted = try crypto.decrypt(data: storage, symmetricKey: symmetricKey) else {
                 throw PQSError.decryptionFailed
             }
             guard !decrypted.isEmpty else { throw PQSError.decryptionFailed }
@@ -340,7 +362,7 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
             guard let encryptedData = try crypto.encrypt(data: data, symmetricKey: symmetricKey) else {
                 throw PQSError.encryptionFailed
             }
-            self.data = encryptedData
+            self.storage = encryptedData
         }
         return try await decryptProps(symmetricKey: symmetricKey)
     }

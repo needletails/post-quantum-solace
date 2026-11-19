@@ -12623,17 +12623,22 @@ actor MockIdentityStore: PQSStore, PQSRecoveryStore {
             contacts[index] = contact
         }
     }
+    /// As `row(_:)` for identities: with `detachesRows`, the store reads a communication's
+    /// bytes on every write and hands out a new instance per fetch, as a SQL store does.
+    private func row(_ communication: BaseCommunication) -> BaseCommunication {
+        detachesRows ? BaseCommunication(id: communication.id, data: communication.data) : communication
+    }
     func fetchCommunications() async throws -> [SessionModels.BaseCommunication] {
-        communications
+        communications.map(row)
     }
     func createCommunication(_ communication: SessionModels.BaseCommunication) async throws {
-        communications.append(communication)
+        communications.append(row(communication))
     }
     func updateCommunication(_ communication: SessionModels.BaseCommunication) async throws {
         if let idx = communications.firstIndex(where: { $0.id == communication.id }) {
-            communications[idx] = communication
+            communications[idx] = row(communication)
         } else {
-            communications.append(communication)
+            communications.append(row(communication))
         }
     }
     func removeCommunication(_: SessionModels.BaseCommunication) async throws {}
