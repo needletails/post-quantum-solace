@@ -24,6 +24,14 @@ protocol SessionCacheSynchronizer: Sendable {
     func synchronizeLocalConfiguration(_ data: Data) async throws
 }
 
+/// A row of one of `SessionCache`'s lists, by its store id.
+protocol CachedRow { var id: UUID { get } }
+extension SessionIdentity: CachedRow {}
+extension ContactModel: CachedRow {}
+extension BaseCommunication: CachedRow {}
+extension JobModel: CachedRow {}
+extension DataPacket: CachedRow {}
+
 /// An actor that manages session caching and synchronization.
 ///
 /// This actor provides a two-tier caching system with in-memory cache and persistent store.
@@ -61,14 +69,18 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     // MARK: - Properties
 
     private let store: any PQSPersistenceHost
-    private var sessionIdentities = [SessionIdentity]() { didSet { listChanges &+= 1 } }
+    private var sessionIdentities = [SessionIdentity]()
     private var messages = [EncryptedMessage]()
-    private var contacts = [ContactModel]() { didSet { listChanges &+= 1 } }
-    private var communicationTypes = [BaseCommunication]() { didSet { listChanges &+= 1 } }
-    private var jobs = [JobModel]() { didSet { listChanges &+= 1 } }
-    private var mediaJobs = [DataPacket]() { didSet { listChanges &+= 1 } }
-    /// Counts changes to the lists above (see `reloaded(_:)`).
-    private var listChanges = 0
+    private var contacts = [ContactModel]()
+    private var communicationTypes = [BaseCommunication]()
+    private var jobs = [JobModel]()
+    private var mediaJobs = [DataPacket]()
+    /// For `reloaded(_:_:)`, kept while a reload reads: a counter ordering reload starts and list
+    /// writes, the last write to each row by list, and per list the latest start that replaced it.
+    private var reloadsReading = 0
+    private var sequence = 0
+    private var rowWrites = [ObjectIdentifier: [UUID: Int]]()
+    private var listReplaced = [ObjectIdentifier: Int]()
     private var localDeviceConfiguration: Data?
     private var localDeviceSalt: Data?
     var synchronizer: SessionCacheSynchronizer?
@@ -79,18 +91,82 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         self.store = store
     }
 
-    /// Reads rows from the store for a caller that puts them in memory in place of what is there.
+    /// Reads rows from the store for a caller that puts them in memory in place of `memory()`.
     /// The store answers after an await, and other calls on this actor run meanwhile: rows read
     /// before a write that this cache then published to memory would put older data back (an
-    /// identity's earlier ratchet bytes, a deleted job). So the read is repeated until no list
-    /// changed while it was in flight. Writers persist before they publish, so a read that starts
-    /// after a change sees it.
-    private func reloaded<Row>(_ read: () async throws -> [Row]) async throws -> [Row] {
-        while true {
-            let changes = listChanges
-            let rows = try await read()
-            if listChanges == changes { return rows }
+    /// identity's earlier ratchet bytes, a deleted job). Writers persist before they publish, and
+    /// while a reload reads, every list write records its row (`upsert`, `replace`, `remove`). So
+    /// the result is the store's rows, except that a row written since this read began keeps its
+    /// state in memory (its value there, or absent if it was removed), and rows added to memory
+    /// since then follow the store's. If a reload that began later, or `clearCache`, replaced the
+    /// list meanwhile, memory is newer than this read and is returned as it is. One read, however
+    /// often writers publish.
+    private func reloaded<Row: CachedRow>(
+        _ memory: () -> [Row],
+        _ read: () async throws -> [Row]
+    ) async throws -> [Row] {
+        sequence += 1
+        let start = sequence
+        reloadsReading += 1
+        defer {
+            reloadsReading -= 1
+            if reloadsReading == 0 {
+                rowWrites.removeAll()
+                listReplaced.removeAll()
+            }
         }
+        let stored = try await read()
+        let list = ObjectIdentifier(Row.self)
+        if let replaced = listReplaced[list], replaced > start { return memory() }
+        listReplaced[list] = start
+        let written = Set((rowWrites[list] ?? [:]).filter { $0.value > start }.keys)
+        if written.isEmpty { return stored }
+        let kept = memory().filter { written.contains($0.id) }
+        let storedIds = Set(stored.map(\.id))
+        return stored.compactMap { row -> Row? in
+            written.contains(row.id) ? kept.first { $0.id == row.id } : row
+        } + kept.filter { !storedIds.contains($0.id) }
+    }
+
+    /// Records a write to a row of `Row`'s list for the reloads reading (see `reloaded(_:_:)`).
+    private func noteWrite<Row: CachedRow>(_: Row.Type, _ id: UUID) {
+        guard reloadsReading > 0 else { return }
+        sequence += 1
+        rowWrites[ObjectIdentifier(Row.self), default: [:]][id] = sequence
+    }
+
+    /// Puts `row` in place of the row with its id, or at the end if there is none. A create
+    /// publishes after its store write, so a reload may already have read the row and put it in.
+    private func upsert<Row: CachedRow>(_ row: Row, in list: inout [Row]) {
+        noteWrite(Row.self, row.id)
+        if let index = list.firstIndex(where: { $0.id == row.id }) {
+            list[index] = row
+        } else {
+            list.append(row)
+        }
+    }
+
+    /// Replaces the row with `row`'s id if `list` holds it. Callers publish after their store
+    /// write, and other calls on this actor run during that await and can remove rows, so the
+    /// row's position is looked up now.
+    private func replace<Row: CachedRow>(_ row: Row, in list: inout [Row]) {
+        noteWrite(Row.self, row.id)
+        if let index = list.firstIndex(where: { $0.id == row.id }) {
+            list[index] = row
+        }
+    }
+
+    private func remove<Row: CachedRow>(_ id: UUID, from list: inout [Row]) {
+        noteWrite(Row.self, id)
+        list.removeAll { $0.id == id }
+    }
+
+    /// Empties `list`. Reloads still reading began before this, so they leave memory as it is.
+    private func clear<Row: CachedRow>(_ list: inout [Row]) {
+        list.removeAll()
+        guard reloadsReading > 0 else { return }
+        sequence += 1
+        listReplaced[ObjectIdentifier(Row.self)] = sequence
     }
 
     /// Whether `store` is the very object this cache writes through. Value-type
@@ -207,7 +283,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if the creation fails.
     func createSessionIdentity(_ session: SessionIdentity) async throws {
         try await store.createSessionIdentity(session)
-        sessionIdentities.append(session)
+        upsert(session, in: &sessionIdentities)
     }
 
     /// Fetches all session identities from the store and updates the cache.
@@ -217,7 +293,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         if !sessionIdentities.isEmpty {
             return sessionIdentities
         } else {
-            let identities = try await reloaded { try await store.fetchSessionIdentities() }
+            let identities = try await reloaded({ sessionIdentities }) { try await store.fetchSessionIdentities() }
             sessionIdentities = identities // Update the cache
             return identities
         }
@@ -228,18 +304,14 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if the update fails.
     func updateSessionIdentity(_ session: SessionIdentity) async throws {
         if sessionIdentities.isEmpty {
-            let identities = try await reloaded { try await store.fetchSessionIdentities() }
+            let identities = try await reloaded({ sessionIdentities }) { try await store.fetchSessionIdentities() }
             sessionIdentities = identities // Update the cache
         }
         guard sessionIdentities.contains(where: { $0.id == session.id }) else {
             throw CacheErrors.sessionIdentityNotFound
         }
         try await store.updateSessionIdentity(session)
-        // Other calls on this actor run during the await and can delete rows, so the row's
-        // position is looked up after it, not before.
-        if let index = sessionIdentities.firstIndex(where: { $0.id == session.id }) {
-            sessionIdentities[index] = session
-        }
+        replace(session, in: &sessionIdentities)
     }
 
     func updateSessionIdentity(_ session: SessionIdentity, andPreparedJob job: JobModel) async throws {
@@ -252,11 +324,11 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     func deleteSessionIdentity(_ id: UUID) async throws {
         do {
             try await store.deleteSessionIdentity(id)
-            sessionIdentities.removeAll(where: { $0.id == id })
+            remove(id, from: &sessionIdentities)
         } catch {
             let identities = try await store.fetchSessionIdentities()
             guard identities.contains(where: { $0.id == id }) else {
-                sessionIdentities.removeAll(where: { $0.id == id })
+                remove(id, from: &sessionIdentities)
                 return
             }
             throw error
@@ -451,7 +523,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if fetching fails.
     func fetchContacts() async throws -> [ContactModel] {
         if contacts.isEmpty {
-            contacts = try await reloaded { try await store.fetchContacts() }
+            contacts = try await reloaded({ contacts }) { try await store.fetchContacts() }
         }
         return contacts
     }
@@ -461,24 +533,20 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if the creation fails.
     func createContact(_ contact: ContactModel) async throws {
         try await store.createContact(contact)
-        contacts.append(contact) // Cache the new contact
+        upsert(contact, in: &contacts) // Cache the new contact
     }
 
     /// Updates an existing contact in the cache and store.
     /// - Parameter contact: The contact to be updated.
     /// - Throws: An error if the update fails.
     func updateContact(_ contact: ContactModel) async throws {
-        // Persist first, then publish (see `reloaded(_:)`). Stores throw for a missing row
+        // Persist first, then publish (see `reloaded(_:_:)`). Stores throw for a missing row
         // (GRDB `RecordError.recordNotFound`), so a nonexistent contact still fails loudly and
         // never lands in memory. Memory can lag the store (e.g. a contact re-created around a
         // delete while the array was already populated): appending then heals the staleness
         // instead of aborting the caller's state transition with `contactNotFound`.
         try await store.updateContact(contact)
-        if let index = contacts.firstIndex(where: { $0.id == contact.id }) {
-            contacts[index] = contact
-        } else {
-            contacts.append(contact)
-        }
+        upsert(contact, in: &contacts)
     }
 
     /// Removes a contact from the cache and store.
@@ -486,7 +554,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if the removal fails.
     func deleteContact(_ id: UUID) async throws {
         try await store.deleteContact(id)
-        contacts.removeAll(where: { $0.id == id })
+        remove(id, from: &contacts)
     }
 
     // MARK: - Communication Type Methods
@@ -496,7 +564,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if fetching fails.
     func fetchCommunications() async throws -> [BaseCommunication] {
         if communicationTypes.isEmpty {
-            communicationTypes = try await reloaded { try await store.fetchCommunications() }
+            communicationTypes = try await reloaded({ communicationTypes }) { try await store.fetchCommunications() }
         }
         return communicationTypes
     }
@@ -506,7 +574,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if the creation fails.
     func createCommunication(_ type: BaseCommunication) async throws {
         try await store.createCommunication(type)
-        communicationTypes.append(type) // Cache the new communication type
+        upsert(type, in: &communicationTypes) // Cache the new communication type
     }
 
     /// Updates an existing communication type in the cache and store.
@@ -517,11 +585,8 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
             throw CacheErrors.communicationTypeNotFound
         }
         try await store.updateCommunication(type)
-        // Publish after persisting, at the position the row has now (see `reloaded(_:)` and
-        // `updateSessionIdentity(_:)`).
-        if let index = communicationTypes.firstIndex(where: { $0.id == type.id }) {
-            communicationTypes[index] = type
-        }
+        // Publish after persisting (see `reloaded(_:_:)`).
+        replace(type, in: &communicationTypes)
     }
 
     /// Removes a communication type from the cache and store.
@@ -529,7 +594,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if the removal fails.
     func deleteCommunication(_ communication: BaseCommunication) async throws {
         try await store.deleteCommunication(communication)
-        communicationTypes.removeAll(where: { $0.id == communication.id })
+        remove(communication.id, from: &communicationTypes)
     }
 
     // MARK: - Job Methods
@@ -540,7 +605,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     func fetchJobs() async throws -> [JobModel] {
         // If the jobs cache is empty, fetch from the store
         if jobs.isEmpty {
-            jobs = try await reloaded { try await store.fetchJobs() }
+            jobs = try await reloaded({ jobs }) { try await store.fetchJobs() }
         }
         return jobs
     }
@@ -550,7 +615,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if the creation fails.
     func createJob(_ job: JobModel) async throws {
         try await store.createJob(job) // Persist the job in the store
-        jobs.append(job) // Cache the new job
+        upsert(job, in: &jobs) // Cache the new job
     }
 
     /// Updates an existing job in the cache and store.
@@ -561,11 +626,8 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
             throw CacheErrors.jobNotFound
         }
         try await store.updateJob(job) // Persist the updated job in the store
-        // Publish only after persistence succeeds, at the position the job has now (see
-        // `updateSessionIdentity(_:)`).
-        if let index = jobs.firstIndex(where: { $0.id == job.id }) {
-            jobs[index] = job
-        }
+        // Publish only after persistence succeeds.
+        replace(job, in: &jobs)
     }
 
     /// Index of `job` in the warm list, consulting the store on a miss.
@@ -574,15 +636,13 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// its store builds a fresh `SessionCache` whose list is empty while the row is
     /// still on disk; deciding `jobNotFound` from memory alone rolled the ratchet
     /// back and skipped the send (dogfood 2026-10-19..21, 2,910 occurrences).
-    /// Rows found on disk are merged in rather than replacing the list, so a
-    /// `createJob` that appended during the await is not lost.
+    /// On a miss the list is reloaded; `reloaded(_:_:)` keeps a `createJob` that
+    /// published during the read.
     private func jobIndex(for job: JobModel) async throws -> Int? {
         if let index = jobs.firstIndex(where: { $0.id == job.id }) {
             return index
         }
-        for stored in try await reloaded({ try await store.fetchJobs() }) where !jobs.contains(where: { $0.id == stored.id }) {
-            jobs.append(stored)
-        }
+        jobs = try await reloaded({ jobs }) { try await store.fetchJobs() }
         return jobs.firstIndex(where: { $0.id == job.id })
     }
 
@@ -600,7 +660,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         // (dogfood 2026-09-17 23:35, lanes 3E0E4F00 / EA6A76D3).
         var identityIndex = sessionIdentities.firstIndex(where: { $0.id == sessionIdentity.id })
         if identityIndex == nil {
-            let identities = try await reloaded { try await store.fetchSessionIdentities() }
+            let identities = try await reloaded({ sessionIdentities }) { try await store.fetchSessionIdentities() }
             sessionIdentities = identities
             identityIndex = sessionIdentities.firstIndex(where: { $0.id == sessionIdentity.id })
         }
@@ -614,13 +674,8 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         try await store.updateSessionIdentity(
             sessionIdentity,
             andPreparedJob: job)
-        // Positions as they are now (see `updateSessionIdentity(_:)`).
-        if let index = sessionIdentities.firstIndex(where: { $0.id == sessionIdentity.id }) {
-            sessionIdentities[index] = sessionIdentity
-        }
-        if let index = jobs.firstIndex(where: { $0.id == job.id }) {
-            jobs[index] = job
-        }
+        replace(sessionIdentity, in: &sessionIdentities)
+        replace(job, in: &jobs)
     }
 
     /// Removes a job from the cache and store.
@@ -631,7 +686,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         // list is empty. Clearing memory before the store lets a concurrent
         // fetch resurrect the row that is still being deleted.
         try await store.deleteJob(job)
-        jobs.removeAll(where: { $0.id == job.id })
+        remove(job.id, from: &jobs)
     }
 
     // MARK: - Media Job Methods
@@ -641,7 +696,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if the creation fails in the store.
     func createMediaJob(_ packet: DataPacket) async throws {
         try await store.createMediaJob(packet) // Persist the media job in the store
-        mediaJobs.append(packet) // Cache the new media job
+        upsert(packet, in: &mediaJobs) // Cache the new media job
     }
 
     /// Fetches all media jobs from the cache or store.
@@ -649,12 +704,14 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if fetching fails from the store.
     func fetchAllMediaJobs() async throws -> [DataPacket] {
         if mediaJobs.isEmpty {
-            mediaJobs = try await reloaded { try await store.fetchAllMediaJobs() } // Fetch from the store if cache is empty
+            mediaJobs = try await reloaded({ mediaJobs }) { try await store.fetchAllMediaJobs() } // Fetch from the store if cache is empty
         }
         return mediaJobs // Return the cached media jobs
     }
 
     /// Finds a specific media job by its ID, either from the cache or the store.
+    /// A row read from the store is not added to the list: it could be deleted while the read is
+    /// in flight, and on a cold cache one row would stand for the whole list.
     /// - Parameter id: The unique identifier of the media job to fetch.
     /// - Returns: An optional `DataPacket` representing the media job if found, or `nil` if not found.
     /// - Throws: An error if fetching fails from the store.
@@ -663,11 +720,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
             return job // Return from cache if found
         }
         do {
-            let job = try await store.fetchMediaJob(id: id) // Fetch from the store
-            if let job {
-                mediaJobs.append(job) // Cache the fetched job if found
-            }
-            return job // Return the fetched job or nil if not found
+            return try await store.fetchMediaJob(id: id) // Fetch from the store
         } catch {
             throw CacheErrors.mediaJobNotFound
         }
@@ -686,7 +739,7 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if the removal fails in the store.
     func deleteMediaJob(_ id: UUID) async throws {
         try await store.deleteMediaJob(id) // Remove from the store
-        mediaJobs.removeAll(where: { $0.id == id }) // Remove from cache
+        remove(id, from: &mediaJobs) // Remove from cache
     }
 
     // MARK: - Cache Management
@@ -694,12 +747,12 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// Clears all cached data, including session identities, messages, contacts, communications, jobs, media jobs, and local device configuration/salt.
     /// Use this to reset the in-memory cache without affecting the persistent store.
     func clearCache() async {
-        sessionIdentities.removeAll()
+        clear(&sessionIdentities)
         messages.removeAll()
-        contacts.removeAll()
-        communicationTypes.removeAll()
-        jobs.removeAll()
-        mediaJobs.removeAll()
+        clear(&contacts)
+        clear(&communicationTypes)
+        clear(&jobs)
+        clear(&mediaJobs)
         localDeviceConfiguration = nil
         localDeviceSalt = nil
     }
@@ -708,11 +761,11 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
     /// - Throws: An error if any fetch operation from the store fails.
     /// Use this to synchronize the in-memory cache with the latest data from the store.
     func refreshCache() async throws {
-        sessionIdentities = try await reloaded { try await store.fetchSessionIdentities() }
-        contacts = try await reloaded { try await store.fetchContacts() }
-        communicationTypes = try await reloaded { try await store.fetchCommunications() }
-        jobs = try await reloaded { try await store.fetchJobs() }
-        mediaJobs = try await reloaded { try await store.fetchAllMediaJobs() }
+        sessionIdentities = try await reloaded({ sessionIdentities }) { try await store.fetchSessionIdentities() }
+        contacts = try await reloaded({ contacts }) { try await store.fetchContacts() }
+        communicationTypes = try await reloaded({ communicationTypes }) { try await store.fetchCommunications() }
+        jobs = try await reloaded({ jobs }) { try await store.fetchJobs() }
+        mediaJobs = try await reloaded({ mediaJobs }) { try await store.fetchAllMediaJobs() }
     }
 
     /// Returns statistics about the current state of the cache.

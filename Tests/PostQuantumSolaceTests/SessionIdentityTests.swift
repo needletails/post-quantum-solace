@@ -60,9 +60,23 @@ actor SessionIdentityTests {
         /// Test-only: run once, after the next read of a table has taken its rows and before it
         /// returns, as a real store's await gives other cache calls a turn. Off by default.
         var afterNextRead = [Table: @Sendable () async throws -> Void]()
+        /// Test-only: run after every read of any table, after `afterNextRead`. Off by default.
+        var afterEachRead: (@Sendable (Table) async throws -> Void)?
+        /// Reads taken, by table.
+        var reads = [Table: Int]()
         private func rows<Row>(_ table: Table, _ rows: [Row]) async throws -> [Row] {
+            reads[table, default: 0] += 1
             if let hook = afterNextRead.removeValue(forKey: table) { try await hook() }
+            if let hook = afterEachRead { try await hook(table) }
             return rows
+        }
+        /// Test-only: run once, after the next create has stored its row and before it returns.
+        /// Off by default.
+        var afterNextCreate: (@Sendable () async throws -> Void)?
+        private func runAfterNextCreate() async throws {
+            guard let hook = afterNextCreate else { return }
+            afterNextCreate = nil
+            try await hook()
         }
         /// Test-only: run once, at the start of the next contact, communication or media-job
         /// update or delete, before the row changes. Off by default.
@@ -104,7 +118,10 @@ actor SessionIdentityTests {
             identities.append(session)
             try await runAfterNextUpdate()
         }
-        func createSessionIdentity(_ session: SessionIdentity) async throws { identities.append(session) }
+        func createSessionIdentity(_ session: SessionIdentity) async throws {
+            identities.append(session)
+            try await runAfterNextCreate()
+        }
         func deleteSessionIdentity(_ id: UUID) async throws {
             if failNextSessionIdentityDelete {
                 failNextSessionIdentityDelete = false
@@ -120,15 +137,21 @@ actor SessionIdentityTests {
             contacts.removeAll(where: { $0.id == id })
         }
         var mediaJobs = [DataPacket]()
-        func createMediaJob(_ packet: DataPacket) async throws { mediaJobs.append(packet) }
+        func createMediaJob(_ packet: DataPacket) async throws {
+            mediaJobs.append(packet)
+            try await runAfterNextCreate()
+        }
         func fetchAllMediaJobs() async throws -> [DataPacket] { try await rows(.mediaJobs, mediaJobs) }
-        func fetchMediaJob(id: UUID) async throws -> DataPacket? { mediaJobs.first { $0.id == id } }
+        func fetchMediaJob(id: UUID) async throws -> DataPacket? { try await rows(.mediaJobs, mediaJobs).first { $0.id == id } }
         func deleteMediaJob(_ id: UUID) async throws {
             try await runBeforeNextWrite()
             mediaJobs.removeAll(where: { $0.id == id })
         }
         func fetchContacts() async throws -> [ContactModel] { try await rows(.contacts, contacts) }
-        func createContact(_ contact: ContactModel) async throws { contacts.append(contact) }
+        func createContact(_ contact: ContactModel) async throws {
+            contacts.append(contact)
+            try await runAfterNextCreate()
+        }
         func updateContact(_ contact: ContactModel) async throws {
             try await runBeforeNextWrite()
             contacts.removeAll(where: { $0.id == contact.id })
@@ -136,7 +159,10 @@ actor SessionIdentityTests {
         }
         var communications = [BaseCommunication]()
         func fetchCommunications() async throws -> [BaseCommunication] { try await rows(.communications, communications) }
-        func createCommunication(_ communication: BaseCommunication) async throws { communications.append(communication) }
+        func createCommunication(_ communication: BaseCommunication) async throws {
+            communications.append(communication)
+            try await runAfterNextCreate()
+        }
         func updateCommunication(_ communication: BaseCommunication) async throws {
             try await runBeforeNextWrite()
             communications.removeAll(where: { $0.id == communication.id })
@@ -209,7 +235,10 @@ actor SessionIdentityTests {
         var jobs = [JobModel]()
         func readJobs() async throws -> [JobModel] { jobs }
         func fetchJobs() async throws -> [JobModel] { try await rows(.jobs, jobs) }
-        func createJob(_ job: JobModel) async throws { jobs.append(job) }
+        func createJob(_ job: JobModel) async throws {
+            jobs.append(job)
+            try await runAfterNextCreate()
+        }
         func updateJob(_ job: JobModel) async throws {
             jobs.removeAll(where: { $0.id == job.id })
             jobs.append(job)

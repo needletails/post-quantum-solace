@@ -11,9 +11,12 @@
 //  jobs) lost their change the same way when a reload ran during their store write.
 //  Reproduced against the app's SQLiteStore with no forcing (scratch harness
 //  RealStoreCacheReloadRaceTests); these tests take the same order deterministically.
+//  A reload must also finish after one read however often writers publish, and a create whose
+//  row a reload already read must not leave the row in memory twice.
 //
 //  Real piece: SessionCache. Double: the store, which runs a cache call after a read has taken
-//  its rows (or at the start of a write), the turn a real store's await gives.
+//  its rows (or at the start of a write, or after a create has stored its row), the turn a real
+//  store's await gives.
 //
 
 import DoubleRatchetKit
@@ -305,6 +308,146 @@ struct SessionCacheReloadTests {
 
         #expect(!store.mediaJobs.contains { $0.id == doomed.id })
         #expect(!(await cache.isCached(doomed)), "the deleted media job is back in memory")
+    }
+
+    // MARK: - One read per reload, one copy per row
+
+    @Test("refreshCache reads each list once while cache writes land during every read, and memory ends equal to the store")
+    func refreshReadsOnceWhileWritesLand() async throws {
+        let store = Store()
+        let cache = SessionCache(store: store)
+        let a = identity(0)
+        try await cache.createSessionIdentity(a)
+        try await cache.createJob(try job())
+        let contactId = UUID()
+        try await cache.createContact(ContactModel(id: contactId, data: Data([0])))
+        try await cache.createCommunication(BaseCommunication(id: UUID(), data: Data([0])))
+        try await cache.createMediaJob(DataPacket(id: UUID(), data: Data([0])))
+        let created = try (0..<50).map { _ in try job() }
+        // Another task's writes publish during every read, to the list being read and to the
+        // others. Bounded at 50 reads, so a reload that reads until none landed still ends.
+        store.afterEachRead = { _ in
+            let n = store.reads.values.reduce(0, +)
+            guard n <= created.count else { return }
+            try await cache.updateSessionIdentity(SessionIdentity(id: a.id, data: Data([UInt8(n)])))
+            try await cache.createJob(created[n - 1])
+            try await cache.updateContact(ContactModel(id: contactId, data: Data([UInt8(n)])))
+        }
+
+        try await cache.refreshCache()
+        store.afterEachRead = nil
+
+        #expect(store.reads == [.identities: 1, .contacts: 1, .communications: 1, .jobs: 1, .mediaJobs: 1],
+                "a reload read a list more than once")
+        #expect(try await cache.fetchSessionIdentities().map(\.data) == store.identities.map(\.data), "identity")
+        #expect(Set(try await cache.fetchJobs().map(\.id)) == Set(store.jobs.map(\.id)), "jobs")
+        #expect(try await cache.fetchJobs().count == store.jobs.count, "a job held twice")
+        #expect(try await cache.fetchContacts().map(\.data) == store.contacts.map(\.data), "contact")
+    }
+
+    @Test("An identity created while a reload reads the store is held once, and its next update reaches it")
+    func identityCreatedUnderReloadIsHeldOnce() async throws {
+        let store = Store()
+        let cache = SessionCache(store: store)
+        try await cache.createSessionIdentity(identity(0x01))
+        let b = identity(0xB1)
+        // The reload reads after the create's store write and before the create publishes.
+        store.afterNextCreate = { try await cache.refreshCache() }
+
+        try await cache.createSessionIdentity(b)
+        try await cache.updateSessionIdentity(identity(0xB2, id: b.id))
+
+        #expect(try await cache.fetchSessionIdentities().filter { $0.id == b.id }.map(\.data) == [Data([0xB2])],
+                "a second copy kept the earlier bytes")
+    }
+
+    @Test("A job, contact, communication and media job created while a cold fetch reads the store are each held once")
+    func rowsCreatedUnderColdFetchAreHeldOnce() async throws {
+        let store = Store()
+        let cache = SessionCache(store: store)
+        let created = try job()
+        let contact = ContactModel(id: UUID(), data: Data([1]))
+        let communication = BaseCommunication(id: UUID(), data: Data([2]))
+        let packet = DataPacket(id: UUID(), data: Data([3]))
+        // Each list is empty, so each fetch reads the store; it runs after the create's store
+        // write and before the create publishes.
+        store.afterNextCreate = { _ = try await cache.fetchJobs() }
+        try await cache.createJob(created)
+        store.afterNextCreate = { _ = try await cache.fetchContacts() }
+        try await cache.createContact(contact)
+        store.afterNextCreate = { _ = try await cache.fetchCommunications() }
+        try await cache.createCommunication(communication)
+        store.afterNextCreate = { _ = try await cache.fetchAllMediaJobs() }
+        try await cache.createMediaJob(packet)
+
+        #expect(try await cache.fetchJobs().filter { $0.id == created.id }.count == 1, "job")
+        #expect(try await cache.fetchContacts().filter { $0.id == contact.id }.count == 1, "contact")
+        #expect(try await cache.fetchCommunications().filter { $0.id == communication.id }.count == 1, "communication")
+        #expect(try await cache.fetchAllMediaJobs().filter { $0.id == packet.id }.count == 1, "media job")
+    }
+
+    @Test("A reload that read before another process's write does not undo a later reload that loaded it")
+    func olderReloadDoesNotUndoNewerReload() async throws {
+        let store = Store()
+        let a = identity(0xA1)
+        store.identities = [a]
+        let cache = SessionCache(store: store) // cold: the fetch below reads the store
+        let advanced = identity(0xA9, id: a.id)
+        store.afterNextRead[.identities] = {
+            // While that read is in flight, another process advances the lane and the host
+            // refreshes the cache.
+            store.identities = [advanced]
+            try await cache.refreshCache()
+        }
+
+        _ = try await cache.fetchSessionIdentities()
+
+        #expect(try await memoryData(cache, a.id) == Data([0xA9]), "memory went back to the bytes from before the other process's write")
+    }
+
+    @Test("A reload that began before clearCache leaves memory empty, so the next fetch reads the store")
+    func reloadAcrossClearCacheLeavesMemoryEmpty() async throws {
+        let store = Store()
+        let cache = SessionCache(store: store)
+        let a = identity(0xA1), b = identity(0xB1)
+        try await cache.createSessionIdentity(a)
+        try await cache.createSessionIdentity(b)
+        let a2 = identity(0xA2, id: a.id)
+        store.afterNextRead[.identities] = {
+            try await cache.updateSessionIdentity(a2)
+            await cache.clearCache()
+        }
+
+        try await cache.refreshCache()
+
+        #expect(try await memoryData(cache, a.id) == Data([0xA2]), "memory went back to the earlier bytes or lost the row")
+        #expect(try await memoryData(cache, b.id) == Data([0xB1]))
+    }
+
+    @Test("fetchMediaJob(id:) does not put back a media job deleted during its read")
+    func singleMediaJobReadDoesNotBringBackDeletedJob() async throws {
+        let store = Store()
+        let cache = SessionCache(store: store)
+        try await cache.createMediaJob(DataPacket(id: UUID(), data: Data([1])))
+        let doomed = DataPacket(id: UUID(), data: Data([2]))
+        store.mediaJobs.append(doomed) // on disk, not in memory
+        store.afterNextRead[.mediaJobs] = { try await cache.deleteMediaJob(doomed.id) }
+
+        _ = try await cache.fetchMediaJob(id: doomed.id)
+
+        #expect(!store.mediaJobs.contains { $0.id == doomed.id })
+        #expect(!(await cache.isCached(doomed)), "the deleted media job is back in memory")
+    }
+
+    @Test("fetchMediaJob(id:) on a cold cache leaves fetchAllMediaJobs reading the store")
+    func coldSingleMediaJobReadKeepsTheListWhole() async throws {
+        let store = Store()
+        let first = DataPacket(id: UUID(), data: Data([1])), second = DataPacket(id: UUID(), data: Data([2]))
+        store.mediaJobs = [first, second]
+        let cache = SessionCache(store: store)
+
+        #expect(try await cache.fetchMediaJob(id: first.id)?.id == first.id)
+        #expect(try await cache.fetchAllMediaJobs().map(\.id) == [first.id, second.id], "the list held only the row read by id")
     }
 
     // MARK: - Controls
