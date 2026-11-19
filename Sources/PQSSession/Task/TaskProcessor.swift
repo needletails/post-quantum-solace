@@ -268,7 +268,7 @@ actor MessagePipeline {
         let sessionIdentityId: UUID
         let x25519OneTimeKeyId: String?
         let mlKEMOneTimeKeyId: String
-        let createdAt: Date
+        var createdAt: Date
     }
 
     /// Recent non-persistent SDK control payloads, keyed by shared id.

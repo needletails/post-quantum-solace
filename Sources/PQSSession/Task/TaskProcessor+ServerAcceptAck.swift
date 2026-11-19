@@ -298,6 +298,8 @@ extension MessagePipeline {
             entry.resendAttempts = 0
             entry.readSideRecycleConsumed = false
             entry.connectionEpoch = messagingConnectionEpoch
+            // The retry starts a new wait for the accept; the ledger's TTL counts from here.
+            entry.pending.createdAt = Date()
             unackedServerAcceptByEnvelopeId[envelopeMessageId] = entry
             guard let transportDelegate = await session.transportDelegate else { continue }
             do {
