@@ -367,6 +367,26 @@ public final class BaseCommunication: Codable, @unchecked Sendable, Equatable {
         return try await decryptProps(symmetricKey: symmetricKey)
     }
     
+    /// Adds one to the message count and returns it, as one step under the lock: the
+    /// sequence number of the next stored message. Reading the count with `props` and
+    /// writing it back with `updateProps` lets another caller read in between, and two
+    /// messages stored at the same time got the same number.
+    package func takeNextMessageNumber(symmetricKey: SymmetricKey) throws -> Int {
+        try lock.withLock {
+            let crypto = NeedleTailCrypto()
+            guard let decrypted = try? crypto.decrypt(data: storage, symmetricKey: symmetricKey),
+                  var props = try? BinaryDecoder().decode(UnwrappedProps.self, from: decrypted) else {
+                throw PQSError.propsError
+            }
+            props.messageCount += 1
+            guard let encrypted = try crypto.encrypt(data: BinaryEncoder().encode(props), symmetricKey: symmetricKey) else {
+                throw PQSError.encryptionFailed
+            }
+            storage = encrypted
+            return props.messageCount
+        }
+    }
+
     /// Creates a decrypted model of the specified type from the communication properties.
     ///
     /// This method decrypts the communication properties and creates an instance of

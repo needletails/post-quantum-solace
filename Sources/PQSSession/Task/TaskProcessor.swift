@@ -868,17 +868,15 @@ actor MessagePipeline {
     ) async throws -> EncryptedMessage {
         var communicationModel: BaseCommunication
         var shouldUpdateCommunication: Bool
+        // A conversation created below starts at zero, and so does its first message.
+        var sequenceNumber = 0
 
         do {
             communicationModel = try await conversation(
                 cache: cache,
                 communicationType: message.recipient,
                 session: session)
-            guard var props = await communicationModel.props(symmetricKey: symmetricKey) else {
-                throw PQSError.propsError
-            }
-            props.messageCount += 1
-            _ = try await communicationModel.updateProps(symmetricKey: symmetricKey, props: props)
+            sequenceNumber = try communicationModel.takeNextMessageNumber(symmetricKey: symmetricKey)
             shouldUpdateCommunication = true
         } catch {
             communicationModel = try await createCommunicationModel(
@@ -899,6 +897,7 @@ actor MessagePipeline {
             symmetricKey: symmetricKey,
             members: recipients,
             sharedId: sharedIdOverride ?? UUID().uuidString,
+            sequenceNumber: sequenceNumber,
             shouldUpdateCommunication: shouldUpdateCommunication)
         await session.receiverDelegate?.createdMessage(savedMessage)
         return savedMessage

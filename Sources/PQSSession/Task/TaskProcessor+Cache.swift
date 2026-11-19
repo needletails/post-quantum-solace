@@ -137,11 +137,7 @@ extension MessagePipeline {
             throw JobProcessorErrors.missingIdentity
         }
 
-        guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else {
-            throw PQSError.propsError
-        }
-
-        let newMessageCount = communicationProps.messageCount + 1
+        let newMessageCount = try communication.takeNextMessageNumber(symmetricKey: symmetricKey)
         let messageId = UUID()
         let messageModel = try EncryptedMessage(
             id: messageId,
@@ -161,9 +157,6 @@ extension MessagePipeline {
             symmetricKey: symmetricKey
         )
 
-        var newProps = communicationProps
-        newProps.messageCount = newMessageCount
-        _ = try await communication.updateProps(symmetricKey: symmetricKey, props: newProps)
         try await session.cache?.updateCommunication(communication)
 
         return messageModel
@@ -197,6 +190,7 @@ extension MessagePipeline {
     ///     symmetricKey: sessionKey,
     ///     members: ["user1", "user2"],
     ///     sharedId: "shared-message-id",
+    ///     sequenceNumber: sequenceNumber,
     ///     shouldUpdateCommunication: true
     /// )
     /// ```
@@ -210,6 +204,8 @@ extension MessagePipeline {
     ///   - symmetricKey: Key used to encrypt the message model and its metadata.
     ///   - members: List of communication participants for delegate notifications.
     ///   - sharedId: Shared message identifier used to group related messages.
+    ///   - sequenceNumber: The message's number in the conversation, from
+    ///                     `BaseCommunication.takeNextMessageNumber`.
     ///   - shouldUpdateCommunication: If true, updates and persists the communication props
     ///                                and notifies delegates of changes.
     /// - Returns: A persistable `EncryptedMessage` object ready for transmission.
@@ -223,6 +219,7 @@ extension MessagePipeline {
         symmetricKey: SymmetricKey,
         members: Set<String>,
         sharedId: String,
+        sequenceNumber: Int,
         shouldUpdateCommunication: Bool = false
     ) async throws -> EncryptedMessage {
         guard let sessionContext = await session.sessionContext else {
@@ -231,16 +228,13 @@ extension MessagePipeline {
 
         let sessionUser = sessionContext.sessionUser
 
-        guard let communicationProps = await communication.props(symmetricKey: symmetricKey) else {
-            throw PQSError.propsError
-        }
         let messageId = UUID()
         let messageModel = try EncryptedMessage(
             id: messageId,
             communicationId: communication.id,
             sessionContextId: sessionContext.sessionContextId,
             sharedId: sharedId,
-            sequenceNumber: communicationProps.messageCount,
+            sequenceNumber: sequenceNumber,
             props: .init(
                 id: messageId,
                 base: communication,

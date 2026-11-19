@@ -1554,23 +1554,8 @@ extension MessagePipeline {
                     session: session
                 )
                 
-                var communication = try await communicationModel.makeDecryptedModel(of: Communication.self, symmetricKey: databaseSymmetricKey)
-                communication.messageCount += 1
-                
-                _ = try await communicationModel.updateProps(
-                    symmetricKey: databaseSymmetricKey,
-                    props: BaseCommunication.UnwrappedProps(
-                        sharedId: communication.sharedId,
-                        messageCount: communication.messageCount,
-                        administrator: communication.administrator,
-                        operators: communication.operators,
-                        members: communication.members,
-                        metadata: communication.metadata,
-                        blockedMembers: communication.blockedMembers,
-                        communicationType: communication.communicationType
-                    )
-                )
-                
+                _ = try communicationModel.takeNextMessageNumber(symmetricKey: databaseSymmetricKey)
+
                 shouldUpdateCommunication = true
             } catch {
                 communicationModel = try await createCommunicationModel(
@@ -1626,23 +1611,8 @@ extension MessagePipeline {
                     session: session
                 )
                 
-                var communication = try await communicationModel.makeDecryptedModel(of: Communication.self, symmetricKey: databaseSymmetricKey)
-                communication.messageCount += 1
-                
-                _ = try await communicationModel.updateProps(
-                    symmetricKey: databaseSymmetricKey,
-                    props: BaseCommunication.UnwrappedProps(
-                        sharedId: communication.sharedId,
-                        messageCount: communication.messageCount,
-                        administrator: communication.administrator,
-                        operators: communication.operators,
-                        members: communication.members,
-                        metadata: communication.metadata,
-                        blockedMembers: communication.blockedMembers,
-                        communicationType: communication.communicationType
-                    )
-                )
-                
+                _ = try communicationModel.takeNextMessageNumber(symmetricKey: databaseSymmetricKey)
+
                 shouldUpdateCommunication = true
             } catch {
                 communicationModel = try await createCommunicationModel(
@@ -1695,9 +1665,7 @@ extension MessagePipeline {
                     session: session
                 )
                 
-                guard var newProps = await communicationModel.props(symmetricKey: databaseSymmetricKey) else { return }
-                newProps.messageCount += 1
-                _ = try await communicationModel.updateProps(symmetricKey: databaseSymmetricKey, props: newProps)
+                guard (try? communicationModel.takeNextMessageNumber(symmetricKey: databaseSymmetricKey)) != nil else { return }
                 shouldUpdateCommunication = true
             } catch {
                 // Create the communication if it doesn't exist for channel (only when metadata contains ChannelInfo)
