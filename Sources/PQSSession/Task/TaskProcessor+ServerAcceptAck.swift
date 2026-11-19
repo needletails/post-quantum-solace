@@ -15,6 +15,11 @@ extension MessagePipeline {
         session: PQSSession
     ) async {
         let envelopeMessageId = pending.metadata.envelopeMessageId
+        // The ledger's TTL is a wait for the server's accept, so it counts from this send. An
+        // envelope kept from a send that failed at the transport still carries the time it
+        // was encrypted, which can be more than the TTL ago.
+        var pending = pending
+        pending.createdAt = Date()
         unackedServerAcceptDeadlineTasks.removeValue(forKey: envelopeMessageId)?.cancel()
         await cleanupUnackedServerAccept(session: session)
         unackedServerAcceptByEnvelopeId[envelopeMessageId] = UnackedOutboundEnvelope(
