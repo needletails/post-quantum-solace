@@ -48,7 +48,7 @@ actor SessionIdentityTests {
         let recoveryLedger = InMemoryRecoveryLedger()
         var failNextSessionIdentityDelete = false
         var failNextSessionIdentityUpdate = false
-        /// Test-only: run once, after the next identity or job update has been written and
+        /// Test-only: run once, after the next identity, job or contact update has been written and
         /// before it returns, as a store's await gives other cache calls a turn. Off by default.
         var afterNextUpdate: (@Sendable () async throws -> Void)?
         private func runAfterNextUpdate() async throws {
@@ -156,6 +156,7 @@ actor SessionIdentityTests {
             try await runBeforeNextWrite()
             contacts.removeAll(where: { $0.id == contact.id })
             contacts.append(contact)
+            try await runAfterNextUpdate()
         }
         var communications = [BaseCommunication]()
         func fetchCommunications() async throws -> [BaseCommunication] { try await rows(.communications, communications) }

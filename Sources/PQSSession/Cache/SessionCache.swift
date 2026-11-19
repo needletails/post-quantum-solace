@@ -539,10 +539,15 @@ actor SessionCache: PQSStore, PQSRecoveryStore {
         // (GRDB `RecordError.recordNotFound`), so a nonexistent contact still fails loudly and
         // never lands in memory. Memory can lag the store (e.g. a contact re-created around a
         // delete while the array was already populated): appending then heals the staleness
-        // instead of aborting the caller's state transition with `contactNotFound`.
-        _ = try await fetchContacts()
+        // instead of aborting the caller's state transition with `contactNotFound`. A contact
+        // memory held is only replaced: one a delete removed during the store write stays out.
+        let cached = try await fetchContacts().contains { $0.id == contact.id }
         try await store.updateContact(contact)
-        upsert(contact, in: &contacts)
+        if cached {
+            replace(contact, in: &contacts)
+        } else {
+            upsert(contact, in: &contacts)
+        }
     }
 
     /// Removes a contact from the cache and store.

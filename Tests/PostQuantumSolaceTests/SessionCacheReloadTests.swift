@@ -460,6 +460,49 @@ struct SessionCacheReloadTests {
         #expect(try await memoryData(cache, a.id) == Data([0xA9]), "memory went back to the bytes from before the other process's write")
     }
 
+    // A contact's update and delete overlapping: whichever order the two store writes and the
+    // two publishes take, memory must not keep a contact the store no longer has.
+    @Test("A contact deleted while its update was being saved stays deleted")
+    func contactDeletedDuringUpdateStaysDeleted() async throws {
+        let store = Store()
+        let cache = SessionCache(store: store)
+        let contact = ContactModel(id: UUID(), data: Data([1]))
+        try await cache.createContact(contact)
+        store.afterNextUpdate = { try await cache.deleteContact(contact.id) }
+
+        try await cache.updateContact(ContactModel(id: contact.id, data: Data([2])))
+
+        #expect(store.contacts.isEmpty)
+        #expect(!(await cache.isCached(contact)), "memory holds a contact the store deleted")
+    }
+
+    @Test("A contact updated while its delete was being saved stays deleted")
+    func contactUpdatedDuringDeleteStaysDeleted() async throws {
+        let store = Store()
+        let cache = SessionCache(store: store)
+        let contact = ContactModel(id: UUID(), data: Data([1]))
+        try await cache.createContact(contact)
+        store.beforeNextWrite = { try await cache.updateContact(ContactModel(id: contact.id, data: Data([2]))) }
+
+        try await cache.deleteContact(contact.id)
+
+        #expect(store.contacts.isEmpty)
+        #expect(!(await cache.isCached(contact)), "memory holds a contact the store deleted")
+    }
+
+    @Test("An update for a contact the store holds and memory lacks puts it in memory (control)")
+    func contactUpdateHealsMemoryThatLagsTheStore() async throws {
+        let store = Store()
+        let cache = SessionCache(store: store)
+        try await cache.createContact(ContactModel(id: UUID(), data: Data([1])))
+        let other = ContactModel(id: UUID(), data: Data([2]))
+        store.contacts.append(other) // written by another process after this cache loaded
+
+        try await cache.updateContact(ContactModel(id: other.id, data: Data([3])))
+
+        #expect(try await cache.fetchContacts().first { $0.id == other.id }?.data == Data([3]))
+    }
+
     @Test("fetchMediaJob(id:) does not put back a media job deleted during its read")
     func singleMediaJobReadDoesNotBringBackDeletedJob() async throws {
         let store = Store()
